@@ -454,14 +454,18 @@ const Builder = struct {
         try self.addEdge(cur.*, then_block);
         try self.addEdge(cur.*, else_block orelse merge_block);
 
-        // Lower the then branch.
+        // Lower the then branch.  `if (opt) |val|` payload is in scope
+        // for the then-body only.
+        if (if_data.payload_token) |pt| try self.registerCaptures(pt);
         var then_cur = then_block;
         try self.lowerStmt(if_data.ast.then_expr, &then_cur);
         // Then-branch exits flow into merge.
         try self.addEdge(then_cur, merge_block);
 
-        // Lower the else branch if present.
+        // Lower the else branch if present.  `else |err|` payload is
+        // in scope for the else-body only.
         if (else_block) |eb| {
+            if (if_data.error_token) |et| try self.registerCaptures(et);
             var else_cur = eb;
             try self.lowerStmt(if_data.ast.else_expr.unwrap().?, &else_cur);
             try self.addEdge(else_cur, merge_block);
@@ -610,6 +614,8 @@ const Builder = struct {
             const case_full = tree.fullSwitchCase(case_node) orelse continue;
             const case_block = try self.newBlock();
             try self.addEdge(cur.*, case_block);
+            // `.tag => |val| ...` capture binds inside this case only.
+            if (case_full.payload_token) |pt| try self.registerCaptures(pt);
             var case_cur = case_block;
             try self.lowerStmt(case_full.ast.target_expr, &case_cur);
             try self.addEdge(case_cur, merge);
@@ -722,27 +728,49 @@ const Builder = struct {
         const data = tree.nodeData(catch_node).node_and_node;
         // Success path: lhs's side effects emit into cur.
         try self.lowerStmt(data[0], cur);
-        try self.emitCatchFork(data[1], cur);
+        try self.emitCatchFork(catch_node, cur);
     }
 
     /// Append a catch-body fork to `cur`: one edge straight to merge
-    /// (success), one through a new block where `body_node` lowers
-    /// (catch body), then both join.  `cur` advances to merge.
-    /// Used by `lowerCatchStmt` and `lowerVarDecl` (when init is a
-    /// top-level `.@"catch"` — the body's side effects then become
-    /// visible at the post-decl merge point).
-    fn emitCatchFork(self: *Builder, body_node: Ast.Node.Index, cur: *BlockId) !void {
+    /// (success), one through a new block where the catch body lowers,
+    /// then both join.  `cur` advances to merge.  Used by
+    /// `lowerCatchStmt`, `lowerVarDecl`, `lowerReturn`, `lowerAssign`
+    /// — every position where `expr catch BODY` can appear at top
+    /// level of an expression.
+    ///
+    /// `catch_node` is the `.@"catch"` Ast node itself (not its rhs)
+    /// so we can also resolve the optional `|err|` payload — Zig
+    /// AST doesn't surface it through a struct helper.
+    fn emitCatchFork(self: *Builder, catch_node: Ast.Node.Index, cur: *BlockId) !void {
+        const tree = self.tree;
+        const body_node = tree.nodeData(catch_node).node_and_node[1];
+
         const catch_block = try self.newBlock();
         const merge = try self.newBlock();
 
         try self.addEdge(cur.*, catch_block);
         try self.addEdge(cur.*, merge);
 
+        // `catch |err| BODY` — payload is `main_token + 2` when the
+        // token immediately following `catch` is `|`.  Scope: body only.
+        if (self.catchPayloadToken(catch_node)) |pt| {
+            try self.registerCaptures(pt);
+        }
+
         var catch_cur = catch_block;
         try self.lowerStmt(body_node, &catch_cur);
         try self.addEdge(catch_cur, merge);
 
         cur.* = merge;
+    }
+
+    fn catchPayloadToken(self: *Builder, catch_node: Ast.Node.Index) ?Ast.TokenIndex {
+        const tree = self.tree;
+        const main = tree.nodeMainToken(catch_node);
+        const tags = tree.tokens.items(.tag);
+        if (main + 1 >= tags.len) return null;
+        if (tags[main + 1] != .pipe) return null;
+        return main + 2;
     }
 
     fn lowerVarDecl(self: *Builder, decl_node: Ast.Node.Index, cur: *BlockId) !void {
@@ -786,10 +814,7 @@ const Builder = struct {
         if (init_opt) |init| {
             switch (tree.nodeTag(init)) {
                 .@"try" => try self.emitTryErrorExit(cur.*, self.posOf(init)),
-                .@"catch" => {
-                    const data = tree.nodeData(init).node_and_node;
-                    try self.emitCatchFork(data[1], cur);
-                },
+                .@"catch" => try self.emitCatchFork(init, cur),
                 else => {},
             }
         }
@@ -847,10 +872,7 @@ const Builder = struct {
         // Mirror the init-position try/catch dispatch.
         switch (tree.nodeTag(rhs)) {
             .@"try" => try self.emitTryErrorExit(cur.*, self.posOf(rhs)),
-            .@"catch" => {
-                const c = tree.nodeData(rhs).node_and_node;
-                try self.emitCatchFork(c[1], cur);
-            },
+            .@"catch" => try self.emitCatchFork(rhs, cur),
             else => {},
         }
     }
@@ -869,10 +891,7 @@ const Builder = struct {
         if (value_opt) |expr| {
             switch (tree.nodeTag(expr)) {
                 .@"try" => try self.emitTryErrorExit(cur.*, self.posOf(expr)),
-                .@"catch" => {
-                    const c = tree.nodeData(expr).node_and_node;
-                    try self.emitCatchFork(c[1], cur);
-                },
+                .@"catch" => try self.emitCatchFork(expr, cur),
                 else => {},
             }
         }
@@ -2062,6 +2081,119 @@ test "while-with-payload `while (opt) |val|` registers capture" {
         \\    _ = x;
         \\    return;
         \\}
+        \\
+    );
+    defer result.tree.deinit(gpa);
+    var cfg = result.cfg.?;
+    defer cfg.deinit(gpa);
+
+    var saw_copy_of = false;
+    for (cfg.blocks) |b| {
+        for (b.stmts) |s| {
+            if (s.kind == .assign and s.kind.assign.rhs_kind == .copy_of) {
+                saw_copy_of = true;
+            }
+        }
+    }
+    try std.testing.expect(saw_copy_of);
+}
+
+test "if-optional payload `if (opt) |val|` registers capture" {
+    const gpa = std.testing.allocator;
+    var result = try parseAndLower(gpa,
+        \\pub fn foo(opt: ?u32) void {
+        \\    var x: u32 = 0;
+        \\    if (opt) |val| {
+        \\        x = val;
+        \\    }
+        \\    _ = x;
+        \\    return;
+        \\}
+        \\
+    );
+    defer result.tree.deinit(gpa);
+    var cfg = result.cfg.?;
+    defer cfg.deinit(gpa);
+
+    var saw_copy_of = false;
+    for (cfg.blocks) |b| {
+        for (b.stmts) |s| {
+            if (s.kind == .assign and s.kind.assign.rhs_kind == .copy_of) {
+                saw_copy_of = true;
+            }
+        }
+    }
+    try std.testing.expect(saw_copy_of);
+}
+
+test "if-error-union payload `else |err|` registers capture" {
+    const gpa = std.testing.allocator;
+    var result = try parseAndLower(gpa,
+        \\pub fn foo(r: anyerror!u32) void {
+        \\    var e: anyerror = error.None;
+        \\    if (r) |_| {} else |err| {
+        \\        e = err;
+        \\    }
+        \\    _ = e;
+        \\    return;
+        \\}
+        \\
+    );
+    defer result.tree.deinit(gpa);
+    var cfg = result.cfg.?;
+    defer cfg.deinit(gpa);
+
+    var saw_copy_of = false;
+    for (cfg.blocks) |b| {
+        for (b.stmts) |s| {
+            if (s.kind == .assign and s.kind.assign.rhs_kind == .copy_of) {
+                saw_copy_of = true;
+            }
+        }
+    }
+    try std.testing.expect(saw_copy_of);
+}
+
+test "switch case payload `.tag => |val|` registers capture" {
+    const gpa = std.testing.allocator;
+    var result = try parseAndLower(gpa,
+        \\const U = union(enum) { a: u32, b: u32 };
+        \\pub fn foo(u: U) void {
+        \\    var x: u32 = 0;
+        \\    switch (u) {
+        \\        .a => |val| { x = val; },
+        \\        .b => |val| { x = val; },
+        \\    }
+        \\    _ = x;
+        \\    return;
+        \\}
+        \\
+    );
+    defer result.tree.deinit(gpa);
+    var cfg = result.cfg.?;
+    defer cfg.deinit(gpa);
+
+    var copy_of_count: u32 = 0;
+    for (cfg.blocks) |b| {
+        for (b.stmts) |s| {
+            if (s.kind == .assign and s.kind.assign.rhs_kind == .copy_of) {
+                copy_of_count += 1;
+            }
+        }
+    }
+    try std.testing.expect(copy_of_count >= 2);
+}
+
+test "catch payload `catch |err|` registers capture (stmt position)" {
+    const gpa = std.testing.allocator;
+    var result = try parseAndLower(gpa,
+        \\pub fn foo() void {
+        \\    var e: anyerror = error.None;
+        \\    sideEffect() catch |err| { e = err; };
+        \\    _ = e;
+        \\    return;
+        \\}
+        \\pub fn sideEffect() !void {}
         \\
     );
     defer result.tree.deinit(gpa);
