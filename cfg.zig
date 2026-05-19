@@ -202,6 +202,11 @@ fn bodyOf(tree: *const Ast, node: Ast.Node.Index) ?Ast.Node.Index {
 
 // ── Builder ────────────────────────────────────────────────
 
+const LoopCtx = struct {
+    header: BlockId,
+    merge: BlockId,
+};
+
 const Builder = struct {
     gpa: std.mem.Allocator,
     tree: *const Ast,
@@ -219,6 +224,11 @@ const Builder = struct {
     /// (always fires) and at function-fallthrough.
     deferred_normal: std.ArrayListUnmanaged(Ast.Node.Index) = .empty,
     deferred_err: std.ArrayListUnmanaged(Ast.Node.Index) = .empty,
+    /// Loop context stack — pushed by lowerWhile/lowerFor before
+    /// lowering the body, popped after.  `break` jumps to the
+    /// innermost merge; `continue` jumps to the innermost header.
+    /// Labels aren't modeled yet (always targets the innermost loop).
+    loop_stack: std.ArrayListUnmanaged(LoopCtx) = .empty,
     /// Stack of `errdefer` bodies, LIFO.  Replayed on error-exit paths
     /// only (try/catch — phase 9+).  At a plain `return X` Zig only fires
     /// these when X is an error value, but we can't always tell from
@@ -240,6 +250,7 @@ const Builder = struct {
         self.name_to_local.deinit(self.gpa);
         self.deferred_normal.deinit(self.gpa);
         self.deferred_err.deinit(self.gpa);
+        self.loop_stack.deinit(self.gpa);
     }
 
     fn newBlock(self: *Builder) !BlockId {
@@ -368,6 +379,8 @@ const Builder = struct {
             .@"switch", .switch_comma => try self.lowerSwitch(stmt_node, cur),
             .@"try" => try self.lowerTryStmt(stmt_node, cur),
             .@"catch" => try self.lowerCatchStmt(stmt_node, cur),
+            .@"break" => try self.lowerBreakOrContinue(cur, .@"break", stmt_node),
+            .@"continue" => try self.lowerBreakOrContinue(cur, .@"continue", stmt_node),
             // Nested blocks: recurse so empty blocks DON'T trigger
             // the conservative .plain collapse via lowering_gap.
             // (Empty switch arms `else => {}` are a common case.)
@@ -457,9 +470,12 @@ const Builder = struct {
         try self.addEdge(header, body);
         try self.addEdge(header, merge);
 
-        // Lower the body; on exit, back-edge to header.
+        // Lower the body; on exit, back-edge to header.  Push loop
+        // context so any `break`/`continue` inside lowers correctly.
+        try self.loop_stack.append(self.gpa, .{ .header = header, .merge = merge });
         var body_cur = body;
         try self.lowerStmt(while_data.ast.then_expr, &body_cur);
+        _ = self.loop_stack.pop();
         try self.addEdge(body_cur, header);
 
         // Optional else block (runs once when cond becomes false).
@@ -500,8 +516,10 @@ const Builder = struct {
         try self.addEdge(header, body);
         try self.addEdge(header, merge);
 
+        try self.loop_stack.append(self.gpa, .{ .header = header, .merge = merge });
         var body_cur = body;
         try self.lowerStmt(for_data.ast.then_expr, &body_cur);
+        _ = self.loop_stack.pop();
         try self.addEdge(body_cur, header); // back-edge for fixed-point iteration
 
         if (for_data.ast.else_expr.unwrap()) |else_expr| {
@@ -567,6 +585,35 @@ const Builder = struct {
         try self.lowerStmt(inner, cur);
         // Error path: synthetic sink.
         try self.emitTryErrorExit(cur.*, self.posOf(try_node));
+    }
+
+    /// `break`/`continue` — add an edge from cur to the innermost
+    /// loop's merge (break) or header (continue), then redirect cur
+    /// to a fresh dead block so any statements emitted after the
+    /// break/continue don't leak into the actual flow.  Labels not
+    /// modeled: always targets the innermost loop.
+    fn lowerBreakOrContinue(
+        self: *Builder,
+        cur: *BlockId,
+        kind: enum { @"break", @"continue" },
+        node: Ast.Node.Index,
+    ) !void {
+        if (self.loop_stack.items.len == 0) {
+            // Outside a loop — Zig wouldn't compile, but be defensive.
+            try self.appendStmt(cur.*, .{
+                .kind = .{ .lowering_gap = .{ .note = "break-outside-loop" } },
+                .pos = self.posOf(node),
+            });
+            return;
+        }
+        const ctx = self.loop_stack.items[self.loop_stack.items.len - 1];
+        const target = switch (kind) {
+            .@"break" => ctx.merge,
+            .@"continue" => ctx.header,
+        };
+        try self.addEdge(cur.*, target);
+        // Dead block for unreachable statements after break/continue.
+        cur.* = try self.newBlock();
     }
 
     /// Build the synthetic error-exit sink for an in-expression `try`.
@@ -1640,6 +1687,106 @@ test "assign to field (obj.x = src) falls back to lowering_gap" {
         }
     }
     try std.testing.expect(found_gap);
+}
+
+test "break inside while adds edge from body to merge" {
+    // Without phase 13, `break` fell through to lowering_gap and the
+    // body just continued to its back-edge — the analyzer never saw a
+    // direct body→merge edge that bypasses the header check.
+    const gpa = std.testing.allocator;
+    var result = try parseAndLower(gpa,
+        \\pub fn foo(x: bool) void {
+        \\    while (x) {
+        \\        if (x) break;
+        \\    }
+        \\    return;
+        \\}
+        \\
+    );
+    defer result.tree.deinit(gpa);
+    var cfg = result.cfg.?;
+    defer cfg.deinit(gpa);
+
+    // The merge block exists.  Count how many blocks have an edge to
+    // the merge block — pre-phase-13 it was 1 (header→merge only);
+    // now it should be ≥2 (header→merge AND a body-side→merge).
+    // We don't know merge's exact ID, so iterate: find blocks with
+    // ≥2 successors targeting any non-header block, OR count edges
+    // landing on each block and assert max ≥2 (header → merge AND
+    // break-block → merge).
+    var max_incoming: u32 = 0;
+    var incoming = try gpa.alloc(u32, cfg.blocks.len);
+    defer gpa.free(incoming);
+    @memset(incoming, 0);
+    for (cfg.blocks) |b| {
+        for (b.successors) |s| {
+            incoming[@intFromEnum(s)] += 1;
+        }
+    }
+    for (incoming) |c| {
+        if (c > max_incoming) max_incoming = c;
+    }
+    // Header gets ≥2 incoming (entry + body back-edge).  Merge gets
+    // ≥2 now (header→merge + break-block→merge).  So we expect at
+    // least TWO different blocks with ≥2 incoming edges.
+    var ge2_count: u32 = 0;
+    for (incoming) |c| if (c >= 2) {
+        ge2_count += 1;
+    };
+    try std.testing.expect(ge2_count >= 2);
+}
+
+test "continue inside for adds back-edge from body-mid to header" {
+    const gpa = std.testing.allocator;
+    var result = try parseAndLower(gpa,
+        \\pub fn foo(xs: []const u32) void {
+        \\    for (xs) |x| {
+        \\        if (x == 0) continue;
+        \\    }
+        \\    return;
+        \\}
+        \\
+    );
+    defer result.tree.deinit(gpa);
+    var cfg = result.cfg.?;
+    defer cfg.deinit(gpa);
+
+    // Header should have ≥3 incoming edges now: entry, body back-edge,
+    // continue back-edge.  Pre-phase-13 it was 2.
+    var incoming = try gpa.alloc(u32, cfg.blocks.len);
+    defer gpa.free(incoming);
+    @memset(incoming, 0);
+    for (cfg.blocks) |b| {
+        for (b.successors) |s| incoming[@intFromEnum(s)] += 1;
+    }
+    var max_in: u32 = 0;
+    for (incoming) |c| if (c > max_in) {
+        max_in = c;
+    };
+    try std.testing.expect(max_in >= 3);
+}
+
+test "break outside loop emits gap (defensive — Zig wouldn't compile)" {
+    const gpa = std.testing.allocator;
+    var result = try parseAndLower(gpa,
+        \\pub fn foo() void {
+        \\    break;
+        \\}
+        \\
+    );
+    defer result.tree.deinit(gpa);
+    var cfg = result.cfg.?;
+    defer cfg.deinit(gpa);
+
+    var found = false;
+    for (cfg.blocks) |b| {
+        for (b.stmts) |s| {
+            if (s.kind == .lowering_gap and
+                std.mem.eql(u8, s.kind.lowering_gap.note, "break-outside-loop"))
+                found = true;
+        }
+    }
+    try std.testing.expect(found);
 }
 
 test "try unwraps inner expression: copy_of(src) preserved through try" {
