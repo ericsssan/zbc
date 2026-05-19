@@ -344,10 +344,9 @@ const Builder = struct {
                 try self.lowerAssign(stmt_node, cur);
             },
             .@"return" => {
-                // Replay defers BEFORE the return so any arena-kills
-                // they perform show up in state before we check the
-                // returned value's origin.
-                try self.flushDefers(cur);
+                // lowerReturn handles its own defer-flush ordering —
+                // it has to interleave with try-error-exit / catch
+                // forking when the return value has those at top level.
                 try self.lowerReturn(stmt_node, cur);
             },
             .call, .call_one, .call_comma, .call_one_comma => {
@@ -681,7 +680,29 @@ const Builder = struct {
     fn lowerReturn(self: *Builder, ret_node: Ast.Node.Index, cur: *BlockId) !void {
         const tree = self.tree;
         const data = tree.nodeData(ret_node);
-        const value_kind: ExprKind = if (data.opt_node.unwrap()) |expr|
+        const value_opt = data.opt_node.unwrap();
+
+        // Top-level try/catch in the returned expression — model the
+        // error path BEFORE flushing defers (so the synthetic sink and
+        // the merge block both get the right view of state).  The
+        // err-exit sink does its own flushErrAndNormalDefers; the
+        // catch fork advances cur to a merge where we continue the
+        // success-path return.
+        if (value_opt) |expr| {
+            switch (tree.nodeTag(expr)) {
+                .@"try" => try self.emitTryErrorExit(cur.*, self.posOf(expr)),
+                .@"catch" => {
+                    const c = tree.nodeData(expr).node_and_node;
+                    try self.emitCatchFork(c[1], cur);
+                },
+                else => {},
+            }
+        }
+
+        // Success-path defers: fire before the return-value check.
+        try self.flushDefers(cur);
+
+        const value_kind: ExprKind = if (value_opt) |expr|
             self.classifyExpr(expr)
         else
             .plain;
@@ -1412,6 +1433,69 @@ test "var-decl init `foo() catch BODY` forks: catch body's kill visible downstre
         }
     }
     try std.testing.expect(kill_in_non_entry);
+}
+
+test "return position `return try foo()` adds error-exit sink with defer replayed" {
+    const gpa = std.testing.allocator;
+    var result = try parseAndLower(gpa,
+        \\pub fn foo() !u32 {
+        \\    var arena = Arena.init(0);
+        \\    defer arena.deinit();
+        \\    return try sideEffect();
+        \\}
+        \\const Arena = struct {
+        \\    pub fn init(_: u32) Arena { return .{}; }
+        \\    pub fn deinit(_: *Arena) void {}
+        \\};
+        \\pub fn sideEffect() !u32 { return 0; }
+        \\
+    );
+    defer result.tree.deinit(gpa);
+    var cfg = result.cfg.?;
+    defer cfg.deinit(gpa);
+
+    // Two distinct blocks should each contain an arena_kill + ret:
+    //   - the success-path return block (defer flushed inline)
+    //   - the err-exit sink (errdefer + defer flushed)
+    var sink_count: u32 = 0;
+    for (cfg.blocks) |b| {
+        var has_kill = false;
+        var has_ret = false;
+        for (b.stmts) |s| {
+            if (s.kind == .arena_kill) has_kill = true;
+            if (s.kind == .ret) has_ret = true;
+        }
+        if (has_kill and has_ret) sink_count += 1;
+    }
+    try std.testing.expect(sink_count >= 2);
+}
+
+test "return position `return foo() catch BODY` forks and merges into ret" {
+    const gpa = std.testing.allocator;
+    var result = try parseAndLower(gpa,
+        \\pub fn foo() u32 {
+        \\    return sideEffect() catch 0;
+        \\}
+        \\pub fn sideEffect() !u32 { return 0; }
+        \\
+    );
+    defer result.tree.deinit(gpa);
+    var cfg = result.cfg.?;
+    defer cfg.deinit(gpa);
+
+    // Catch fork: entry → catch_block + entry → merge; catch_block →
+    // merge; merge contains the ret.  At least one block has ≥2
+    // successors AND there exists a ret somewhere.
+    var multi_succ = false;
+    var has_ret_anywhere = false;
+    for (cfg.blocks) |b| {
+        if (b.successors.len >= 2) multi_succ = true;
+        for (b.stmts) |s| {
+            if (s.kind == .ret) has_ret_anywhere = true;
+        }
+    }
+    try std.testing.expect(multi_succ);
+    try std.testing.expect(has_ret_anywhere);
 }
 
 test "try unwraps inner expression: copy_of(src) preserved through try" {
