@@ -612,6 +612,52 @@ test "invariant #1 fires through NESTED-namespace dispatch (phase 30)" {
     try std.testing.expect(found);
 }
 
+test "invariant #1 fires through @import().Subfield re-export (phase 31)" {
+    // foo.zig does `const Inner = @import("lib.zig").Inner;` —
+    // pre-binding the nested member.  Subsequent calls use the
+    // alias directly: `Inner.inspect(tree_b, node)`.  Phase 31's
+    // subfield support chases the alias through lib's imap to
+    // land in inner.zig where the @takes annotation lives.
+    const gpa = std.testing.allocator;
+    var problems = try analyzeCrossFileMulti(gpa,
+        // foo.zig (main)
+        \\const Inner = @import("lib.zig").Inner;
+        \\const Ast = Inner.Ast;
+        \\const NodeIndex = Inner.NodeIndex;
+        \\pub fn foo() !void {
+        \\    var tree_a = try Ast.parse();
+        \\    var tree_b = try Ast.parse();
+        \\    const node = Inner.rootNode(tree_a);
+        \\    Inner.inspect(tree_b, node);
+        \\    return;
+        \\}
+        \\
+        ,
+        &.{
+            .{ .name = "lib.zig", .src =
+                \\pub const Inner = @import("inner.zig");
+                \\
+            },
+            .{ .name = "inner.zig", .src =
+                \\pub const Ast = struct { pub fn parse() !Ast { return .{}; } };
+                \\pub const NodeIndex = u32;
+                \\/// @returns node_index_of(ast)
+                \\pub fn rootNode(ast: Ast) NodeIndex { _ = ast; return 0; }
+                \\/// @takes node_index_of(t)
+                \\pub fn inspect(t: Ast, n: NodeIndex) void { _ = t; _ = n; }
+                \\
+            },
+        },
+    );
+    defer freeProblems(gpa, &problems);
+
+    var found = false;
+    for (problems.items) |p| {
+        if (std.mem.indexOf(u8, p.message, "invariant #1") != null) found = true;
+    }
+    try std.testing.expect(found);
+}
+
 test "node_index_any opts out: cross-Ast call passes without flag (phase 29)" {
     // Same shape as the positive phase-26 test, but inspect now has
     // `@takes node_index_any` instead of `node_index_of(t)`.  The

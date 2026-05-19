@@ -1381,7 +1381,15 @@ const Builder = struct {
             .identifier => {
                 const recv_name = tree.tokenSlice(tree.nodeMainToken(recv_node));
                 const entry = remote.imap.lookup(recv_name) orelse return null;
-                return (remote.cache.loadOrLookup(remote.base_dir, entry.path) catch null);
+                const direct = (remote.cache.loadOrLookup(remote.base_dir, entry.path) catch null) orelse return null;
+                // Pre-bound subfield: `const X = @import("...").Sub;`
+                // chase one more hop through the loaded file's imap.
+                if (entry.subfield) |sub| {
+                    const sub_entry = direct.imap.lookup(sub) orelse return null;
+                    const sub_dir = std.fs.path.dirname(direct.abs_path) orelse ".";
+                    return (remote.cache.loadOrLookup(sub_dir, sub_entry.path) catch null);
+                }
+                return direct;
             },
             .field_access => {
                 const fa = tree.nodeData(recv_node);

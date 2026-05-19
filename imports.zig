@@ -24,6 +24,11 @@ pub const Entry = struct {
     /// May be a relative path ("ast.zig", "../foo/bar.zig"), a std
     /// module ("std"), or any other string `@import` accepts.
     path: []const u8,
+    /// For `const X = @import("...").Y;` — the `Y` identifier slice.
+    /// Null for bare `const X = @import("...");`.  Phase 31 hop:
+    /// at resolve time, after loading `path`, look up `subfield` in
+    /// that file's own imap to chase one more level.
+    subfield: ?[]const u8 = null,
 };
 
 pub const Map = struct {
@@ -38,14 +43,14 @@ pub const Map = struct {
     }
 };
 
-/// Walk every top-level decl in `tree` looking for the shape
-/// `const NAME = @import("path");`.  Subsequent overwrites silently
-/// win (Zig forbids shadowing, so this can't happen in valid code).
+/// Walk every top-level decl in `tree` looking for two shapes:
+///   `const NAME = @import("path");`           — Entry{path, subfield=null}
+///   `const NAME = @import("path").Subfield;`  — Entry{path, subfield="Subfield"}
+/// Subsequent overwrites silently win (Zig forbids shadowing).
 pub fn build(gpa: std.mem.Allocator, tree: *const Ast) !Map {
     var m: Map = .{ .entries = .empty };
     errdefer m.deinit(gpa);
 
-    // tree.rootDecls() returns Node.Index slice of all top-level decls.
     const decls = tree.rootDecls();
     for (decls) |decl| {
         const var_decl = tree.fullVarDecl(decl) orelse continue;
@@ -53,25 +58,48 @@ pub fn build(gpa: std.mem.Allocator, tree: *const Ast) !Map {
         if (tree.tokens.items(.tag)[name_tok] != .identifier) continue;
         const init_node = var_decl.ast.init_node.unwrap() orelse continue;
 
-        // Init must be a builtin call to @import with a single string arg.
-        if (tree.nodeTag(init_node) != .builtin_call_two) continue;
-        const main = tree.nodeMainToken(init_node);
-        if (!std.mem.eql(u8, tree.tokenSlice(main), "@import")) continue;
-
-        // builtin_call_two: data is `opt_node_and_opt_node` — two
-        // optional arg slots.  @import takes exactly one.
-        const call_data = tree.nodeData(init_node).opt_node_and_opt_node;
-        const arg_node = call_data[0].unwrap() orelse continue;
-        if (tree.nodeTag(arg_node) != .string_literal) continue;
-        const path_raw = tree.tokenSlice(tree.nodeMainToken(arg_node));
-        // string_literal token includes the surrounding quotes — strip.
-        if (path_raw.len < 2 or path_raw[0] != '"' or path_raw[path_raw.len - 1] != '"') continue;
-        const path = path_raw[1 .. path_raw.len - 1];
-
         const name = tree.tokenSlice(name_tok);
-        try m.entries.put(gpa, name, .{ .name = name, .path = path });
+        if (extractImportPath(tree, init_node)) |path| {
+            try m.entries.put(gpa, name, .{ .name = name, .path = path });
+            continue;
+        }
+        if (extractImportFieldAccess(tree, init_node)) |hit| {
+            try m.entries.put(gpa, name, .{
+                .name = name,
+                .path = hit.path,
+                .subfield = hit.subfield,
+            });
+        }
     }
     return m;
+}
+
+/// Match `@import("string")` directly.  Returns the path slice (no quotes).
+fn extractImportPath(tree: *const Ast, init_node: Ast.Node.Index) ?[]const u8 {
+    if (tree.nodeTag(init_node) != .builtin_call_two) return null;
+    const main = tree.nodeMainToken(init_node);
+    if (!std.mem.eql(u8, tree.tokenSlice(main), "@import")) return null;
+    const call_data = tree.nodeData(init_node).opt_node_and_opt_node;
+    const arg_node = call_data[0].unwrap() orelse return null;
+    if (tree.nodeTag(arg_node) != .string_literal) return null;
+    const path_raw = tree.tokenSlice(tree.nodeMainToken(arg_node));
+    if (path_raw.len < 2 or path_raw[0] != '"' or path_raw[path_raw.len - 1] != '"') return null;
+    return path_raw[1 .. path_raw.len - 1];
+}
+
+/// Match `@import("string").Subfield` — a field_access whose lhs is
+/// the import call.  Returns both path and subfield identifier slices.
+fn extractImportFieldAccess(tree: *const Ast, init_node: Ast.Node.Index) ?struct {
+    path: []const u8,
+    subfield: []const u8,
+} {
+    if (tree.nodeTag(init_node) != .field_access) return null;
+    const fa = tree.nodeData(init_node);
+    const lhs = fa.node_and_token[0];
+    const sub_tok = fa.node_and_token[1];
+    const path = extractImportPath(tree, lhs) orelse return null;
+    if (tree.tokens.items(.tag)[sub_tok] != .identifier) return null;
+    return .{ .path = path, .subfield = tree.tokenSlice(sub_tok) };
 }
 
 // ── Tests ──────────────────────────────────────────────────
@@ -162,6 +190,31 @@ test "function-local @import is NOT extracted (top-level only)" {
     defer r.deinit(gpa);
 
     try std.testing.expect(r.map.lookup("std") == null);
+}
+
+test "extract @import().Subfield re-export shape (phase 31)" {
+    const gpa = std.testing.allocator;
+    var r = try buildFromSrc(gpa,
+        \\const Ast = @import("ast.zig").Ast;
+        \\
+    );
+    defer r.deinit(gpa);
+
+    const entry = r.map.lookup("Ast").?;
+    try std.testing.expectEqualStrings("ast.zig", entry.path);
+    try std.testing.expectEqualStrings("Ast", entry.subfield.?);
+}
+
+test "bare @import has subfield = null (phase 31 regression)" {
+    const gpa = std.testing.allocator;
+    var r = try buildFromSrc(gpa,
+        \\const ast = @import("ast.zig");
+        \\
+    );
+    defer r.deinit(gpa);
+
+    const entry = r.map.lookup("ast").?;
+    try std.testing.expect(entry.subfield == null);
 }
 
 test "non-string-literal @import arg ignored" {
