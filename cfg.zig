@@ -130,7 +130,15 @@ pub const StmtKind = union(enum) {
 
 pub const Stmt = struct {
     kind: StmtKind,
+    /// Start position — first token of the source construct.
     pos: SrcPos,
+    /// End position (exclusive) — one past the last token.  Used to
+    /// emit span-based Problem diagnostics (editors highlight the
+    /// full construct, not just a single column).  When the
+    /// statement isn't derived from a real source node (synthetic
+    /// gaps, etc.), the emitter may set end_pos == pos as a sentinel
+    /// and the diagnostic falls back to a single-column range.
+    end_pos: SrcPos,
 };
 
 // ── Expression-result classification ────────────────────────
@@ -459,6 +467,7 @@ const Builder = struct {
             try self.appendStmt(entry, .{
                 .kind = .{ .decl = .{ .local = local, .init_kind = .ast_init } },
                 .pos = self.posOfToken(name_tok),
+                .end_pos = self.posOfTokenEnd(name_tok),
             });
         }
     }
@@ -606,6 +615,7 @@ const Builder = struct {
                 try self.appendStmt(cur.*, .{
                     .kind = .{ .lowering_gap = .{ .note = @tagName(tag) } },
                     .pos = self.posOf(stmt_node),
+                    .end_pos = self.endPosOf(stmt_node),
                 });
             },
         }
@@ -624,6 +634,7 @@ const Builder = struct {
             try self.appendStmt(cur.*, .{
                 .kind = .{ .lowering_gap = .{ .note = "if-extract" } },
                 .pos = self.posOf(if_node),
+                .end_pos = self.endPosOf(if_node),
             });
             return;
         };
@@ -674,6 +685,7 @@ const Builder = struct {
             try self.appendStmt(cur.*, .{
                 .kind = .{ .lowering_gap = .{ .note = "while-extract" } },
                 .pos = self.posOf(while_node),
+                .end_pos = self.endPosOf(while_node),
             });
             return;
         };
@@ -733,6 +745,7 @@ const Builder = struct {
             try self.appendStmt(cur.*, .{
                 .kind = .{ .lowering_gap = .{ .note = "for-extract" } },
                 .pos = self.posOf(for_node),
+                .end_pos = self.endPosOf(for_node),
             });
             return;
         };
@@ -782,6 +795,7 @@ const Builder = struct {
             try self.appendStmt(cur.*, .{
                 .kind = .{ .lowering_gap = .{ .note = "switch-extract" } },
                 .pos = self.posOf(sw_node),
+                .end_pos = self.endPosOf(sw_node),
             });
             return;
         };
@@ -901,6 +915,7 @@ const Builder = struct {
             try self.appendStmt(cur.*, .{
                 .kind = .{ .lowering_gap = .{ .note = "break-outside-loop" } },
                 .pos = self.posOf(node),
+                .end_pos = self.endPosOf(node),
             });
             return;
         }
@@ -948,6 +963,7 @@ const Builder = struct {
             try self.appendStmt(cur.*, .{
                 .kind = .{ .lowering_gap = .{ .note = "labeled-break-no-loop" } },
                 .pos = self.posOf(node),
+                .end_pos = self.endPosOf(node),
             });
             return;
         }
@@ -977,6 +993,9 @@ const Builder = struct {
                 .is_borrowed_return_type = self.is_borrowed_return_type,
             } },
             .pos = pos,
+            // Synthetic ret — no source extent to highlight; fall back
+            // to a single-column range via end_pos = pos.
+            .end_pos = pos,
         });
     }
 
@@ -1040,6 +1059,7 @@ const Builder = struct {
             try self.appendStmt(cur.*, .{
                 .kind = .{ .lowering_gap = .{ .note = "var_decl-extract" } },
                 .pos = self.posOf(decl_node),
+                .end_pos = self.endPosOf(decl_node),
             });
             return;
         };
@@ -1048,6 +1068,7 @@ const Builder = struct {
             try self.appendStmt(cur.*, .{
                 .kind = .{ .lowering_gap = .{ .note = "var_decl-no-name" } },
                 .pos = self.posOf(decl_node),
+                .end_pos = self.endPosOf(decl_node),
             });
             return;
         }
@@ -1078,6 +1099,7 @@ const Builder = struct {
         try self.appendStmt(cur.*, .{
             .kind = .{ .decl = .{ .local = local, .init_kind = init_kind } },
             .pos = self.posOf(decl_node),
+            .end_pos = self.endPosOf(decl_node),
         });
 
         // Init-position try/catch: now that the decl has emitted, model
@@ -1143,6 +1165,7 @@ const Builder = struct {
                     .rhs_kind = self.classifyExpr(rhs),
                 } },
                 .pos = self.posOf(assign_node),
+                .end_pos = self.endPosOf(assign_node),
             });
         } else {
             // Untracked target (e.g. `obj.field = X`) — emit gap so the
@@ -1150,6 +1173,7 @@ const Builder = struct {
             try self.appendStmt(cur.*, .{
                 .kind = .{ .lowering_gap = .{ .note = "assign-target" } },
                 .pos = self.posOf(assign_node),
+                .end_pos = self.endPosOf(assign_node),
             });
         }
 
@@ -1192,11 +1216,13 @@ const Builder = struct {
                         try self.appendStmt(cur.*, .{
                             .kind = .{ .assign = .{ .target = t, .rhs_kind = .unknown } },
                             .pos = self.posOf(var_node),
+                            .end_pos = self.endPosOf(var_node),
                         });
                     } else {
                         try self.appendStmt(cur.*, .{
                             .kind = .{ .lowering_gap = .{ .note = "destructure-unresolved" } },
                             .pos = self.posOf(var_node),
+                            .end_pos = self.endPosOf(var_node),
                         });
                     }
                 },
@@ -1213,12 +1239,14 @@ const Builder = struct {
                     try self.appendStmt(cur.*, .{
                         .kind = .{ .decl = .{ .local = local, .init_kind = .unknown } },
                         .pos = self.posOf(var_node),
+                        .end_pos = self.endPosOf(var_node),
                     });
                 },
                 else => {
                     try self.appendStmt(cur.*, .{
                         .kind = .{ .lowering_gap = .{ .note = "destructure-target" } },
                         .pos = self.posOf(var_node),
+                        .end_pos = self.endPosOf(var_node),
                     });
                 },
             }
@@ -1274,6 +1302,7 @@ const Builder = struct {
                 .is_borrowed_return_type = self.is_borrowed_return_type,
             } },
             .pos = self.posOf(ret_node),
+            .end_pos = self.endPosOf(ret_node),
         });
         // Return terminates the block — no successor.
     }
@@ -1296,12 +1325,14 @@ const Builder = struct {
                 try self.appendStmt(cur.*, .{
                     .kind = .{ .lowering_gap = .{ .note = "deinit-no-receiver" } },
                     .pos = self.posOf(call_node),
+                    .end_pos = self.endPosOf(call_node),
                 });
                 return;
             };
             try self.appendStmt(cur.*, .{
                 .kind = .{ .arena_kill = .{ .arena_local = recv_local } },
                 .pos = self.posOf(call_node),
+                .end_pos = self.endPosOf(call_node),
             });
             return;
         }
@@ -1309,6 +1340,7 @@ const Builder = struct {
             try self.appendStmt(cur.*, .{
                 .kind = .thread_join,
                 .pos = self.posOf(call_node),
+                .end_pos = self.endPosOf(call_node),
             });
             return;
         }
@@ -1320,6 +1352,7 @@ const Builder = struct {
         try self.appendStmt(cur.*, .{
             .kind = .{ .lowering_gap = .{ .note = "call-untracked" } },
             .pos = self.posOf(call_node),
+            .end_pos = self.endPosOf(call_node),
         });
     }
 
@@ -1375,6 +1408,7 @@ const Builder = struct {
                         try self.appendStmt(cur.*, .{
                             .kind = .{ .ast_mutation_check = .{ .ast_local = ast_local } },
                             .pos = self.posOf(call_node),
+                            .end_pos = self.endPosOf(call_node),
                         });
                     }
                 }
@@ -1421,6 +1455,7 @@ const Builder = struct {
                     try self.appendStmt(cur.*, .{
                         .kind = .{ .worker_takes_check = .{ .value_local = vl } },
                         .pos = self.posOf(call_node),
+                        .end_pos = self.endPosOf(call_node),
                     });
                 }
             },
@@ -1449,6 +1484,7 @@ const Builder = struct {
                             .value_local = vl,
                         } },
                         .pos = self.posOf(call_node),
+                        .end_pos = self.endPosOf(call_node),
                     });
                 }
             }
@@ -1462,6 +1498,7 @@ const Builder = struct {
                         .value_local = vl,
                     } },
                     .pos = self.posOf(call_node),
+                    .end_pos = self.endPosOf(call_node),
                 });
             }
         }
@@ -1490,6 +1527,7 @@ const Builder = struct {
                         .expected_pass = expected_pass,
                     } },
                     .pos = self.posOf(call_node),
+                    .end_pos = self.endPosOf(call_node),
                 });
             }
         }
@@ -1501,6 +1539,7 @@ const Builder = struct {
                         .expected_pass = expected_pass,
                     } },
                     .pos = self.posOf(call_node),
+                    .end_pos = self.endPosOf(call_node),
                 });
             }
         }
@@ -1912,6 +1951,23 @@ const Builder = struct {
         return self.posOfToken(self.tree.firstToken(node));
     }
 
+    /// End position (exclusive) — one past the last token of `node`.
+    /// Walks lastToken's start + slice length.  Used together with
+    /// posOf to give diagnostics a real span the editor can highlight.
+    fn endPosOf(self: *Builder, node: Ast.Node.Index) SrcPos {
+        const tree = self.tree;
+        const last = tree.lastToken(node);
+        const start = tree.tokens.items(.start)[last];
+        const slice = tree.tokenSlice(last);
+        const end_byte: u32 = @intCast(start + slice.len);
+        const loc = tree.tokenLocation(0, last);
+        return .{
+            .byte = end_byte,
+            .line = @intCast(loc.line + 1),
+            .column = @intCast(loc.column + 1 + slice.len),
+        };
+    }
+
     fn posOfToken(self: *Builder, tok: Ast.TokenIndex) SrcPos {
         const tree = self.tree;
         const start = tree.tokens.items(.start)[tok];
@@ -1920,6 +1976,21 @@ const Builder = struct {
             .byte = start,
             .line = @intCast(loc.line + 1),
             .column = @intCast(loc.column + 1),
+        };
+    }
+
+    /// End-of-token (exclusive) position.  Single-token analog of
+    /// endPosOf.
+    fn posOfTokenEnd(self: *Builder, tok: Ast.TokenIndex) SrcPos {
+        const tree = self.tree;
+        const start = tree.tokens.items(.start)[tok];
+        const slice = tree.tokenSlice(tok);
+        const end_byte: u32 = @intCast(start + slice.len);
+        const loc = tree.tokenLocation(0, tok);
+        return .{
+            .byte = end_byte,
+            .line = @intCast(loc.line + 1),
+            .column = @intCast(loc.column + 1 + slice.len),
         };
     }
 

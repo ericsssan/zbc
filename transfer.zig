@@ -72,12 +72,12 @@ pub fn transfer(ctx: Ctx, state: *AbstractState, stmt: Stmt) !void {
         .assign => |a| try transferAssign(ctx, state, a, stmt.pos),
         .arena_kill => |k| try transferArenaKill(ctx, state, k, stmt.pos),
         .thread_join => try transferThreadJoin(ctx, state, stmt.pos),
-        .ret => |r| try transferRet(ctx, state, r, stmt.pos),
-        .use => |u| try transferUse(ctx, state, u, stmt.pos),
-        .ast_takes_check => |c| try transferAstTakesCheck(ctx, state, c, stmt.pos),
-        .scope_takes_check => |c| try transferScopeTakesCheck(ctx, state, c, stmt.pos),
-        .worker_takes_check => |c| try transferWorkerTakesCheck(ctx, state, c, stmt.pos),
-        .ast_mutation_check => |c| try transferAstMutationCheck(ctx, state, c, stmt.pos),
+        .ret => |r| try transferRet(ctx, state, r, stmt.pos, stmt.end_pos),
+        .use => |u| try transferUse(ctx, state, u, stmt.pos, stmt.end_pos),
+        .ast_takes_check => |c| try transferAstTakesCheck(ctx, state, c, stmt.pos, stmt.end_pos),
+        .scope_takes_check => |c| try transferScopeTakesCheck(ctx, state, c, stmt.pos, stmt.end_pos),
+        .worker_takes_check => |c| try transferWorkerTakesCheck(ctx, state, c, stmt.pos, stmt.end_pos),
+        .ast_mutation_check => |c| try transferAstMutationCheck(ctx, state, c, stmt.pos, stmt.end_pos),
         .lowering_gap => |g| try transferGap(ctx, state, g, stmt.pos),
     }
 }
@@ -87,6 +87,7 @@ fn transferWorkerTakesCheck(
     state: *AbstractState,
     c: @TypeOf(@as(StmtKind, undefined).worker_takes_check),
     pos: cfg.SrcPos,
+    end_pos: cfg.SrcPos,
 ) !void {
     const val_origin = state.locals.get(c.value_local) orelse return;
     // Only worker-tagged values participate.  Untagged values pass —
@@ -96,7 +97,7 @@ fn transferWorkerTakesCheck(
     // Safe iff the thread has been joined; before that, reading
     // worker memory from main is a data race.
     if (state.thread != .joined) {
-        try report(ctx, pos, .@"error",
+        try report(ctx, pos, end_pos, .@"error",
             "`{s}` is a worker-arena pointer read before thread.join() (invariant #3: worker memory unsafe to read before join)",
             .{ ctx.locals[@intFromEnum(c.value_local)].name });
     }
@@ -107,6 +108,7 @@ fn transferScopeTakesCheck(
     state: *AbstractState,
     c: @TypeOf(@as(StmtKind, undefined).scope_takes_check),
     pos: cfg.SrcPos,
+    end_pos: cfg.SrcPos,
 ) !void {
     const val_origin = state.locals.get(c.value_local) orelse return;
     // Only tagged scope values participate.  Untracked values
@@ -118,7 +120,7 @@ fn transferScopeTakesCheck(
     };
     const expected = try internPassId(ctx, c.expected_pass);
     if (aid_val != expected) {
-        try report(ctx, pos, .@"error",
+        try report(ctx, pos, end_pos, .@"error",
             "`{s}` is a ScopeId/SymbolId from a different pass than `{s}` (invariant #4: pass-tagged IDs must not cross pass boundaries)",
             .{
                 ctx.locals[@intFromEnum(c.value_local)].name,
@@ -132,11 +134,12 @@ fn transferAstMutationCheck(
     state: *AbstractState,
     c: @TypeOf(@as(StmtKind, undefined).ast_mutation_check),
     pos: cfg.SrcPos,
+    end_pos: cfg.SrcPos,
 ) !void {
     const origin = state.locals.get(c.ast_local) orelse return;
     switch (origin) {
         .ast => {
-            try report(ctx, pos, .@"error",
+            try report(ctx, pos, end_pos, .@"error",
                 "calling a `@mutates_ast` method on `{s}` invalidates derived caches (invariant #5: Ast is read-only after parse)",
                 .{ ctx.locals[@intFromEnum(c.ast_local)].name });
         },
@@ -149,6 +152,7 @@ fn transferAstTakesCheck(
     state: *AbstractState,
     c: @TypeOf(@as(StmtKind, undefined).ast_takes_check),
     pos: cfg.SrcPos,
+    end_pos: cfg.SrcPos,
 ) !void {
     const src_origin = state.locals.get(c.source_local) orelse return;
     const val_origin = state.locals.get(c.value_local) orelse return;
@@ -164,7 +168,7 @@ fn transferAstTakesCheck(
         else => return,
     };
     if (aid_src != aid_val) {
-        try report(ctx, pos, .@"error",
+        try report(ctx, pos, end_pos, .@"error",
             "`{s}` is a NodeIndex from a different Ast than `{s}` (invariant #1: NodeIndex must only flow back into its source Ast)",
             .{
                 ctx.locals[@intFromEnum(c.value_local)].name,
@@ -228,6 +232,7 @@ fn transferRet(
     state: *AbstractState,
     r: @TypeOf(@as(StmtKind, undefined).ret),
     pos: cfg.SrcPos,
+    end_pos: cfg.SrcPos,
 ) !void {
     // Only borrowed-shape return types can leak a borrowed origin.
     // Value-typed returns MOVE the value (and any arena it owns) to
@@ -241,7 +246,7 @@ fn transferRet(
         .arena => |aid| {
             // Function-local arena that's about to die at exit — flag.
             if (state.arenas.contains(aid)) {
-                try report(ctx, pos, .@"error",
+                try report(ctx, pos, end_pos, .@"error",
                     "returning a value borrowed from a function-local arena (escapes its lifetime)", .{});
             }
         },
@@ -254,9 +259,10 @@ fn transferUse(
     state: *AbstractState,
     u: @TypeOf(@as(StmtKind, undefined).use),
     pos: cfg.SrcPos,
+    end_pos: cfg.SrcPos,
 ) !void {
     const origin = state.locals.get(u.local) orelse return;
-    try checkOriginAlive(ctx, state, origin, pos, ctx.locals[@intFromEnum(u.local)].name);
+    try checkOriginAlive(ctx, state, origin, pos, end_pos, ctx.locals[@intFromEnum(u.local)].name);
 }
 
 fn transferGap(
@@ -341,13 +347,14 @@ fn checkOriginAlive(
     state: *const AbstractState,
     origin: Origin,
     pos: cfg.SrcPos,
+    end_pos: cfg.SrcPos,
     local_name: []const u8,
 ) !void {
     switch (origin) {
         .arena => |aid| {
             const st = state.arenas.get(aid) orelse return;
             if (st.state == .dead) {
-                try report(ctx, pos, .@"error",
+                try report(ctx, pos, end_pos, .@"error",
                     "`{s}` borrows from an arena that was deinit'd at byte {?}",
                     .{ local_name, st.killed_at });
             }
@@ -359,16 +366,24 @@ fn checkOriginAlive(
 fn report(
     ctx: Ctx,
     pos: cfg.SrcPos,
+    end_pos: cfg.SrcPos,
     severity: Severity,
     comptime fmt: []const u8,
     args: anytype,
 ) !void {
     const msg = try std.fmt.allocPrint(ctx.gpa, fmt, args);
+    // Fall back to a 1-wide range when the emitter used pos==end_pos
+    // as a synthetic-no-span sentinel.  Real spans (cfg.endPosOf) flow
+    // through unchanged and give editors the full construct extent.
+    const real_end: cfg.SrcPos = if (end_pos.byte > pos.byte)
+        end_pos
+    else
+        .{ .line = pos.line, .column = pos.column + 1, .byte = pos.byte + 1 };
     try ctx.problems.append(ctx.gpa, .{
         .rule_id = "ez/escape-check",
         .severity = severity,
         .start = .{ .line = pos.line, .column = pos.column, .byte = pos.byte },
-        .end = .{ .line = pos.line, .column = pos.column + 1, .byte = pos.byte + 1 },
+        .end = .{ .line = real_end.line, .column = real_end.column, .byte = real_end.byte },
         .message = msg,
     });
 }
