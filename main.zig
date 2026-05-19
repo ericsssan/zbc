@@ -1,4 +1,4 @@
-//! ez-borrow-check CLI — thin shell over the lib.zig library API.
+//! zbc CLI — thin shell over the lib.zig library API.
 //! Walks the .zig files passed on argv, runs the requested analysis
 //! mode, prints any Problems found in a grep-friendly format, and
 //! exits 0 if all-clean / 1 if any problems.
@@ -32,7 +32,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (paths.items.len == 0) {
-        std.debug.print("usage: ez-borrow-check [--escape] <file.zig>...\n", .{});
+        std.debug.print("usage: zbc [--escape] <file.zig>...\n", .{});
         std.process.exit(2);
     }
 
@@ -44,13 +44,13 @@ pub fn main(init: std.process.Init) !void {
     for (paths.items) |path| {
         const problems = if (escape_mode)
             lib.analyzeEscape(gpa, io, path, &cache_storage.?, &lib.DefaultConfig) catch |err| {
-                std.debug.print("ez-borrow-check: cannot analyze {s}: {s}\n", .{ path, @errorName(err) });
+                std.debug.print("zbc: cannot analyze {s}: {s}\n", .{ path, @errorName(err) });
                 any_problems = true;
                 continue;
             }
         else
             lib.analyzeHygiene(gpa, io, path) catch |err| {
-                std.debug.print("ez-borrow-check: cannot analyze {s}: {s}\n", .{ path, @errorName(err) });
+                std.debug.print("zbc: cannot analyze {s}: {s}\n", .{ path, @errorName(err) });
                 any_problems = true;
                 continue;
             };
