@@ -24,6 +24,7 @@ const annotations_mod = @import("annotations.zig");
 const analyzer_mod = @import("analyzer.zig");
 const imports_mod = @import("imports.zig");
 const remote_resolver_mod = @import("remote_resolver.zig");
+const config_mod = @import("config.zig");
 // Pulled in via test entry below so refAllDecls sees them.
 const _layer2_abstract_state = @import("abstract_state.zig");
 const _layer2_transfer = @import("transfer.zig");
@@ -212,6 +213,7 @@ test {
     _ = analyzer_mod;
     _ = imports_mod;
     _ = remote_resolver_mod;
+    _ = config_mod;
     _ = _layer2_abstract_state;
     _ = _layer2_transfer;
     std.testing.refAllDecls(@This());

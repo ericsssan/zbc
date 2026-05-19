@@ -32,6 +32,9 @@ const abstract_state = @import("abstract_state.zig");
 const annotations = @import("annotations.zig");
 const imports = @import("imports.zig");
 const remote_resolver = @import("remote_resolver.zig");
+const config_mod = @import("config.zig");
+
+pub const Config = config_mod.Config;
 
 /// Cross-file resolution context passed into lowerFunction.  When
 /// present, classifyCall can resolve `imported.method(...)` calls
@@ -196,19 +199,33 @@ pub fn lowerFunction(
     fn_decl: Ast.Node.Index,
     db: ?*const annotations.Db,
 ) !?Cfg {
-    return lowerFunctionWithRemote(gpa, tree, fn_decl, db, null);
+    return lowerFunctionFull(gpa, tree, fn_decl, db, null, &config_mod.Default);
 }
 
-/// Same as lowerFunction but accepts a cross-file resolution context.
-/// Use this from sweep entry points where you already have an imports
-/// map + cache built per-file; pass through so classifyCall can resolve
-/// `imported.method(...)` callees against the imported file's DB.
+/// Backwards-compat alias from phase 22.  Forwards to lowerFunctionFull
+/// with the Default config — preserves the previous 5-arg signature.
 pub fn lowerFunctionWithRemote(
     gpa: std.mem.Allocator,
     tree: *const Ast,
     fn_decl: Ast.Node.Index,
     db: ?*const annotations.Db,
     remote: ?*const RemoteCtx,
+) !?Cfg {
+    return lowerFunctionFull(gpa, tree, fn_decl, db, remote, &config_mod.Default);
+}
+
+/// Main entry point.  Generalizes the per-project knobs into Config
+/// (phase 42).  Existing callers that don't pass a Config get
+/// `Default`, which matches the historical ez behavior — type name
+/// "Ast", text patterns "Ast.parse" / "ArenaAllocator.init" /
+/// ".deinit(" / ".join(".
+pub fn lowerFunctionFull(
+    gpa: std.mem.Allocator,
+    tree: *const Ast,
+    fn_decl: Ast.Node.Index,
+    db: ?*const annotations.Db,
+    remote: ?*const RemoteCtx,
+    config: *const Config,
 ) !?Cfg {
     var buf: [1]Ast.Node.Index = undefined;
     const fn_proto = (try fnProto(tree, &buf, fn_decl)) orelse return null;
@@ -227,6 +244,7 @@ pub fn lowerFunctionWithRemote(
         .tree = tree,
         .db = db,
         .remote = remote,
+        .config = config,
         .is_borrowed_return_type = is_borrowed_ret,
     };
     defer builder.tempDeinit();
@@ -234,9 +252,9 @@ pub fn lowerFunctionWithRemote(
     const entry_id = try builder.newBlock();
     // Seed param locals BEFORE lowering the body so identifier
     // references inside the body resolve via name_to_local.  Params
-    // whose type text mentions "Ast" become Origin.ast(<aid>) at
-    // transfer time — enables invariant #1 checks inside functions
-    // that RECEIVE the Ast rather than create it.
+    // whose type text mentions the configured Ast type name become
+    // Origin.ast(<aid>) at transfer time — enables invariant #1
+    // checks inside functions that RECEIVE the Ast rather than create it.
     try builder.seedParams(fn_proto, entry_id);
 
     var cur_block = entry_id;
@@ -258,20 +276,30 @@ fn fnProto(tree: *const Ast, buf: *[1]Ast.Node.Index, node: Ast.Node.Index) !?As
     };
 }
 
+/// Does `text` contain any of `patterns` as a substring?  Used by
+/// the classifier + lowerCallStmt to dispatch on
+/// project-configurable text matches (phase 42).
+fn anyPatternMatches(text: []const u8, patterns: []const []const u8) bool {
+    for (patterns) |p| {
+        if (std.mem.indexOf(u8, text, p) != null) return true;
+    }
+    return false;
+}
+
 /// Heuristic: does the type expression's text contain a standalone
-/// "Ast" identifier token?  Matches `Ast`, `*Ast`, `*const Ast`,
-/// `?Ast`, `[]const Ast`, etc.  False positives (e.g. a type named
-/// `FooAst` would NOT match since we require an identifier-token
-/// boundary; but `Ast.Node` WOULD match) are bounded: extra params
+/// `config.ast_type_name` identifier token?  Matches `<Name>`, `*<Name>`,
+/// `*const <Name>`, `?<Name>`, `[]const <Name>`, etc.  Identifier-token
+/// boundary check, so e.g. `FooAst` wouldn't match a Name="Ast" config
+/// but `Ast.Node` would.  False positives are bounded — extra params
 /// tagged as Origin.ast inflate the AstId counter but don't cause
 /// false-positive invariant findings.
-fn typeTextMentionsAst(tree: *const Ast, type_node: Ast.Node.Index) bool {
+fn typeMentionsAst(tree: *const Ast, type_node: Ast.Node.Index, name: []const u8) bool {
     const first = tree.firstToken(type_node);
     const last = tree.lastToken(type_node);
     var t: Ast.TokenIndex = first;
     while (t <= last) : (t += 1) {
         if (tree.tokens.items(.tag)[t] == .identifier and
-            std.mem.eql(u8, tree.tokenSlice(t), "Ast"))
+            std.mem.eql(u8, tree.tokenSlice(t), name))
             return true;
     }
     return false;
@@ -306,6 +334,7 @@ const Builder = struct {
     tree: *const Ast,
     db: ?*const annotations.Db = null,
     remote: ?*const RemoteCtx = null,
+    config: *const Config = &config_mod.Default,
     blocks: std.ArrayListUnmanaged(BasicBlock) = .empty,
     /// Per-block staging — stmts being appended.  Flushed to `blocks[i].stmts`
     /// in finalize().
@@ -401,7 +430,7 @@ const Builder = struct {
             const name = tree.tokenSlice(name_tok);
             if (std.mem.eql(u8, name, "_")) continue;
             const type_node = param.type_expr orelse continue;
-            if (!typeTextMentionsAst(tree, type_node)) continue;
+            if (!typeMentionsAst(tree, type_node, self.config.ast_type_name)) continue;
 
             const local = try self.registerLocal(name, self.posOfToken(name_tok));
             try self.appendStmt(entry, .{
@@ -1238,7 +1267,7 @@ const Builder = struct {
         const end: usize = last_start + last_len;
         const text = tree.source[start..end];
 
-        if (std.mem.indexOf(u8, text, ".deinit(") != null) {
+        if (anyPatternMatches(text, self.config.arena_kill_patterns)) {
             // Identify the receiver local — first identifier in `text`.
             const recv_local = self.firstIdentifierLocal(text) orelse {
                 try self.appendStmt(cur.*, .{
@@ -1253,7 +1282,7 @@ const Builder = struct {
             });
             return;
         }
-        if (std.mem.indexOf(u8, text, ".join(") != null) {
+        if (anyPatternMatches(text, self.config.thread_join_patterns)) {
             try self.appendStmt(cur.*, .{
                 .kind = .thread_join,
                 .pos = self.posOf(call_node),
@@ -1597,16 +1626,15 @@ const Builder = struct {
         const end: usize = last_start + last_len;
         const text = tree.source[start..end];
 
-        if (std.mem.indexOf(u8, text, "ArenaAllocator.init") != null) {
+        if (anyPatternMatches(text, self.config.arena_init_patterns)) {
             return .arena_init;
         }
-        // `Ast.parse(...)` — fresh Ast.  Pattern match on source text
-        // for robustness against `std.zig.Ast.parse`, `Ast.parse`, etc.
-        // False positives (a custom `.parse` named function on an
-        // Ast-shaped namespace) would taint a non-Ast local with
-        // .ast — downstream node_index_of propagation would still be
-        // sound (the Ast tag just wouldn't match real Ast methods).
-        if (std.mem.indexOf(u8, text, "Ast.parse") != null) {
+        // `<config.ast_init_patterns>` substring match (default
+        // includes "Ast.parse").  False positives (a non-Ast call
+        // matching the pattern) would taint a local with .ast —
+        // downstream node_index_of propagation stays sound (the Ast
+        // tag just wouldn't match any real Ast method).
+        if (anyPatternMatches(text, self.config.ast_init_patterns)) {
             return .ast_init;
         }
 
@@ -3141,6 +3169,55 @@ test "destructuring var-decl `const a, const b = pair()` registers both locals" 
         }
     }
     try std.testing.expect(decl_count >= 2);
+}
+
+test "Config: custom ast_type_name detects a renamed Ast (phase 42)" {
+    // Project that calls its parse tree `Tree` and constructs via
+    // `Tree.from_source(...)`.  With a custom Config the analyzer
+    // recognizes Tree params + Tree.from_source constructor without
+    // any code change beyond passing the Config.
+    const gpa = std.testing.allocator;
+    const my_config: Config = .{
+        .ast_type_name = "Tree",
+        .ast_init_patterns = &.{"Tree.from_source"},
+    };
+
+    const src =
+        \\pub fn foo() void {
+        \\    var t = Tree.from_source("");
+        \\    _ = t;
+        \\    return;
+        \\}
+        \\const Tree = struct {
+        \\    pub fn from_source(_: []const u8) Tree { return .{}; }
+        \\};
+        \\
+    ;
+    const src_z = try gpa.dupeSentinel(u8, src, 0);
+    defer gpa.free(src_z);
+    var tree = try Ast.parse(gpa, src_z, .zig);
+    defer tree.deinit(gpa);
+
+    // First fn_decl.
+    var node_idx: u32 = 1;
+    while (node_idx < tree.nodes.len) : (node_idx += 1) {
+        const node: Ast.Node.Index = @enumFromInt(node_idx);
+        if (tree.nodeTag(node) != .fn_decl) continue;
+        var cfg = (try lowerFunctionFull(gpa, &tree, node, null, null, &my_config)) orelse continue;
+        defer cfg.deinit(gpa);
+
+        var saw_ast_init = false;
+        for (cfg.blocks) |b| {
+            for (b.stmts) |s| {
+                if (s.kind == .decl and s.kind.decl.init_kind == .ast_init) {
+                    saw_ast_init = true;
+                }
+            }
+        }
+        try std.testing.expect(saw_ast_init);
+        return;
+    }
+    try std.testing.expect(false); // no fn_decl found
 }
 
 test "classifyExpr: `Ast.parse(...)` → .ast_init (phase 25)" {
