@@ -1,12 +1,11 @@
-//! Layer 2 abstract state types per docs/borrow_checker_design.md.
+//! Layer 2 abstract state.
 //!
-//! Escape-analysis shape (not borrow-checking): each value carries an
-//! `Origin` tagging where its lifetime is bound; the state tracks which
-//! arenas are still live and which thread we're in.  Use-validity is
-//! a lookup, not a borrow-graph traversal.
+//! Each value carries an `Origin` tagging where its lifetime is bound;
+//! the state tracks which arenas are still live.  Use-validity is a
+//! lookup, not a borrow-graph traversal.
 //!
-//! Algorithm: standard worklist fixed-point over a CFG, with `join`
-//! conservatively combining states at merge points.
+//! Algorithm: worklist fixed-point over a CFG, with `join` conservatively
+//! combining states at merge points.
 
 const std = @import("std");
 
@@ -15,49 +14,40 @@ const std = @import("std");
 /// Local-variable slot id, function-scoped.
 pub const LocalId = enum(u32) { _ };
 
-/// Identifies a particular allocator/arena at its construction site.
-/// Two distinct ArenaIds == two distinct lifetimes; they never compare equal.
+/// Identifies a particular arena at its construction site.  Two distinct
+/// ArenaIds == two distinct lifetimes; they never compare equal.
 pub const ArenaId = enum(u32) { _ };
 
-/// Identifies a particular `Ast` (or Ast-holder) at construction time.
-/// Used to tag NodeIndex origins so we catch cross-Ast usage.
-pub const AstId = enum(u32) { _ };
-
-/// Identifies a particular analysis pass (scope-resolve, cfg-build, etc.).
-/// Used to tag ScopeId/SymbolId origins so a downstream pass can't reuse
-/// a previous pass's IDs.
-pub const PassId = enum(u32) { _ };
+/// Identifies a particular heap allocation at its site (gpa.alloc /
+/// gpa.create / dupe / etc.).  Distinct HeapIds == distinct allocations.
+pub const HeapId = enum(u32) { _ };
 
 /// CFG block identifier — see cfg.zig.
 pub const BlockId = enum(u32) { _ };
 
 // ── Origin ─────────────────────────────────────────────────
 
-/// What a value's lifetime is bound to.  The lookup-key for use-validity:
-/// "is this origin still live at the use point?"
+/// What a value's lifetime is bound to.
 pub const Origin = union(enum) {
-    /// No lifetime constraint — plain primitives, comptime consts, ints.
+    /// No lifetime constraint — plain primitives, comptime consts, ints,
+    /// caller-owned heap allocations.
     plain,
     /// Pointer/slice into an arena's bump memory.  Use is invalid once
-    /// the arena is dead.
+    /// the arena is dead; return is invalid when the arena is
+    /// function-local (escape).
     arena: ArenaId,
-    /// An Ast value itself, tagged with an AstId minted at parse-call
-    /// time.  Locals bound to `var tree = Ast.parse(...)` carry this.
-    /// Used as the source for `.ast_node` propagation when a function
-    /// annotated `@returns node_index_of(<param>)` is called with
-    /// this local as the arg.
-    ast: AstId,
-    /// NodeIndex tagged with the Ast it came from.  Use as an arg to an
-    /// Ast method must check Ast identity (enforcement: phase 26).
-    ast_node: AstId,
-    /// ScopeId / SymbolId from a particular pass.  Use in a different
-    /// pass is invalid.
-    pass: PassId,
-    /// Pointer into a worker-thread bump arena.  Reads from main
-    /// thread before the worker is joined are unsafe (drives
-    /// invariant #3).  No payload — just a marker; the per-call
-    /// validation reads ThreadContext from AbstractState.thread.
-    worker_arena,
+    /// Pointer/slice to a function-local stack variable.  Returning
+    /// such a value past the function's frame is undefined behavior
+    /// — the storage is reclaimed on return.  LocalId is the source
+    /// stack variable, retained for diagnostics.
+    stack: LocalId,
+    /// Heap allocation (gpa.alloc / gpa.create / dupe / ...).  Use
+    /// after the corresponding free is UB; the second free is a
+    /// double-free.
+    heap: HeapId,
+    /// Local was initialized to `undefined` and not yet assigned a
+    /// real value.  Reading or returning it is a bug.
+    undef,
     /// Multiple origins (e.g. struct of borrows).  Conservative: any
     /// constituent dying makes the composite invalid.
     composite: []const Origin,
@@ -67,10 +57,9 @@ pub const Origin = union(enum) {
         return switch (a) {
             .plain => true,
             .arena => |x| x == b.arena,
-            .ast => |x| x == b.ast,
-            .ast_node => |x| x == b.ast_node,
-            .pass => |x| x == b.pass,
-            .worker_arena => true,
+            .stack => |x| x == b.stack,
+            .heap => |x| x == b.heap,
+            .undef => true,
             .composite => |xs| blk: {
                 const ys = b.composite;
                 if (xs.len != ys.len) break :blk false;
@@ -85,19 +74,9 @@ pub const Origin = union(enum) {
 
 pub const ArenaState = struct {
     state: enum { live, dead },
-    /// When dead, the source position of the kill site — used in diagnostics.
+    /// When dead, the source position of the kill site — used in
+    /// diagnostics.
     killed_at: ?u32 = null,
-};
-
-// ── ThreadContext ──────────────────────────────────────────
-
-pub const ThreadContext = enum {
-    /// Main thread; worker-arena borrows are unreadable.
-    main,
-    /// Worker thread; main-arena borrows are unreadable.
-    worker,
-    /// Post-join; both arenas readable.
-    joined,
 };
 
 // ── AbstractState ──────────────────────────────────────────
@@ -110,16 +89,17 @@ pub const AbstractState = struct {
     /// so we can surface "use-after-kill at L; killed at K" diagnostics.
     arenas: std.AutoArrayHashMapUnmanaged(ArenaId, ArenaState) = .empty,
 
-    /// Current thread context.
-    thread: ThreadContext = .main,
+    /// Per-heap-allocation liveness.  Same shape as arenas.
+    heaps: std.AutoArrayHashMapUnmanaged(HeapId, ArenaState) = .empty,
 
     pub fn deinit(self: *AbstractState, gpa: std.mem.Allocator) void {
         self.locals.deinit(gpa);
         self.arenas.deinit(gpa);
+        self.heaps.deinit(gpa);
     }
 
     pub fn clone(self: *const AbstractState, gpa: std.mem.Allocator) !AbstractState {
-        var out: AbstractState = .{ .thread = self.thread };
+        var out: AbstractState = .{};
         try out.locals.ensureTotalCapacity(gpa, self.locals.count());
         for (self.locals.keys(), self.locals.values()) |k, v| {
             out.locals.putAssumeCapacity(k, v);
@@ -128,16 +108,19 @@ pub const AbstractState = struct {
         for (self.arenas.keys(), self.arenas.values()) |k, v| {
             out.arenas.putAssumeCapacity(k, v);
         }
+        try out.heaps.ensureTotalCapacity(gpa, self.heaps.count());
+        for (self.heaps.keys(), self.heaps.values()) |k, v| {
+            out.heaps.putAssumeCapacity(k, v);
+        }
         return out;
     }
 };
 
 pub const JoinResult = enum { unchanged, changed };
 
-/// Conservative CFG-merge join — see design doc §join.
+/// Conservative CFG-merge join:
 ///   - Locals: same origin → keep; different → collapse to .plain
 ///   - Arenas: dead on either side → dead on merge
-///   - Thread: must match (CFG should never join across thread bounds)
 pub fn join(
     self: *AbstractState,
     other: *const AbstractState,
@@ -171,12 +154,17 @@ pub fn join(
         }
     }
 
-    // Thread mismatch isn't error here — it just signals a thread-join
-    // point.  We collapse to .joined and let downstream interpretation
-    // decide if that's legal.
-    if (self.thread != other.thread) {
-        self.thread = .joined;
-        changed = true;
+    for (other.heaps.keys(), other.heaps.values()) |heap, other_state| {
+        const gop = try self.heaps.getOrPut(gpa, heap);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = other_state;
+            changed = true;
+            continue;
+        }
+        if (gop.value_ptr.state == .live and other_state.state == .dead) {
+            gop.value_ptr.* = other_state;
+            changed = true;
+        }
     }
 
     return if (changed) .changed else .unchanged;
@@ -234,15 +222,4 @@ test "join: dead-on-either-side wins for arenas" {
     try std.testing.expectEqual(JoinResult.changed, result);
     try std.testing.expect(lhs.arenas.get(a).?.state == .dead);
     try std.testing.expectEqual(@as(?u32, 42), lhs.arenas.get(a).?.killed_at);
-}
-
-test "join: thread mismatch collapses to joined" {
-    const gpa = std.testing.allocator;
-    var lhs: AbstractState = .{ .thread = .main };
-    defer lhs.deinit(gpa);
-    var rhs: AbstractState = .{ .thread = .worker };
-    defer rhs.deinit(gpa);
-    const result = try join(&lhs, &rhs, gpa);
-    try std.testing.expectEqual(JoinResult.changed, result);
-    try std.testing.expectEqual(ThreadContext.joined, lhs.thread);
 }

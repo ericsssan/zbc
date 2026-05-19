@@ -12,17 +12,14 @@
 //!
 //! Options:
 //!   --hygiene            Run Layer-1 annotation-presence rules
-//!                        instead of escape analysis.  Useful for
-//!                        projects that want to enforce explicit
-//!                        annotations everywhere.
-//!   --enable=<list>      Comma-separated invariant names to enable
-//!                        (e.g. --enable=ast_identity,arena_escape).
-//!                        Default is all invariants.
+//!                        instead of escape analysis.
+//!   --enable=<list>      Comma-separated invariant names to enable.
 //!   --disable=<list>     Comma-separated invariant names to disable.
-//!                        Subtracted from the enabled set.
-//!   --format=text|json   Output format (default: text).  JSON emits
-//!                        a single array across all input files,
-//!                        suitable for editor/CI tooling.
+//!   --arena-init=<csv>   Source-text patterns that mint a fresh
+//!                        arena (default: ArenaAllocator.init).
+//!   --arena-kill=<csv>   Source-text patterns that kill the receiver
+//!                        arena (default: .deinit().
+//!   --format=text|json   Output format (default: text).
 //!   --list-invariants    Print known invariant names and exit 0.
 //!   -h / --help          Print usage and exit 0.
 
@@ -42,23 +39,12 @@ pub fn main(init: std.process.Init) !void {
     var enabled: std.ArrayListUnmanaged(lib.Invariant) = .empty;
     defer enabled.deinit(gpa);
     try enabled.appendSlice(gpa, &lib.all_invariants);
-    // Default mode is escape analysis (drop-in adoption).  --hygiene
-    // opts into the older Layer-1 annotation-presence rules.
     var mode: Mode = .escape;
     var enabled_explicit = false;
     var format: Format = .text;
 
-    // Project-tunable patterns (default mirrors lib.DefaultConfig).
-    // Authors override via --ast-type / --ast-init / --arena-init /
-    // --arena-kill / --thread-join when their codebase uses different
-    // type names or constructor patterns.  Pattern lists are
-    // comma-separated.  Allocated slice-of-slice freed at exit.
-    var ast_type_name: []const u8 = lib.DefaultConfig.ast_type_name;
-    var ast_init_patterns: []const []const u8 = lib.DefaultConfig.ast_init_patterns;
     var arena_init_patterns: []const []const u8 = lib.DefaultConfig.arena_init_patterns;
     var arena_kill_patterns: []const []const u8 = lib.DefaultConfig.arena_kill_patterns;
-    var thread_join_patterns: []const []const u8 = lib.DefaultConfig.thread_join_patterns;
-    var ast_holder_types: []const []const u8 = lib.DefaultConfig.ast_holder_types;
     var pattern_allocations: std.ArrayListUnmanaged([]const []const u8) = .empty;
     defer {
         for (pattern_allocations.items) |slice| gpa.free(slice);
@@ -81,8 +67,6 @@ pub fn main(init: std.process.Init) !void {
             continue;
         }
         if (std.mem.eql(u8, a, "--escape")) {
-            // Kept for backward compatibility — escape is now the
-            // default.  Silent accept; document in --help comment.
             mode = .escape;
             continue;
         }
@@ -98,16 +82,6 @@ pub fn main(init: std.process.Init) !void {
             try parseInvariantList(gpa, a["--disable=".len..], &enabled, .remove);
             continue;
         }
-        if (std.mem.startsWith(u8, a, "--ast-type=")) {
-            ast_type_name = a["--ast-type=".len..];
-            continue;
-        }
-        if (std.mem.startsWith(u8, a, "--ast-init=")) {
-            const slice = try splitCsv(gpa, a["--ast-init=".len..]);
-            try pattern_allocations.append(gpa, slice);
-            ast_init_patterns = slice;
-            continue;
-        }
         if (std.mem.startsWith(u8, a, "--arena-init=")) {
             const slice = try splitCsv(gpa, a["--arena-init=".len..]);
             try pattern_allocations.append(gpa, slice);
@@ -118,18 +92,6 @@ pub fn main(init: std.process.Init) !void {
             const slice = try splitCsv(gpa, a["--arena-kill=".len..]);
             try pattern_allocations.append(gpa, slice);
             arena_kill_patterns = slice;
-            continue;
-        }
-        if (std.mem.startsWith(u8, a, "--thread-join=")) {
-            const slice = try splitCsv(gpa, a["--thread-join=".len..]);
-            try pattern_allocations.append(gpa, slice);
-            thread_join_patterns = slice;
-            continue;
-        }
-        if (std.mem.startsWith(u8, a, "--ast-holder=")) {
-            const slice = try splitCsv(gpa, a["--ast-holder=".len..]);
-            try pattern_allocations.append(gpa, slice);
-            ast_holder_types = slice;
             continue;
         }
         if (std.mem.startsWith(u8, a, "--format=")) {
@@ -157,9 +119,6 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(2);
     }
 
-    // Expand directory args into recursive .zig file lists.  Direct
-    // file paths pass through unchanged.  This + the new escape
-    // default + inference = `zbc src/` Just Works on any Zig codebase.
     var expanded: std.ArrayListUnmanaged([]const u8) = .empty;
     defer {
         for (expanded.items) |p| gpa.free(p);
@@ -177,25 +136,14 @@ pub fn main(init: std.process.Init) !void {
     }
 
     const config: lib.Config = .{
-        .ast_type_name = ast_type_name,
-        .ast_init_patterns = ast_init_patterns,
         .arena_init_patterns = arena_init_patterns,
         .arena_kill_patterns = arena_kill_patterns,
-        .thread_join_patterns = thread_join_patterns,
-        .ast_holder_types = ast_holder_types,
         .enabled = enabled.items,
     };
 
-    // Sweep-wide remote-resolver cache, shared across all workers.
-    // Thread-safe (mutex + double-checked locking inside Cache); the
-    // slow parse work runs OUTSIDE the lock so distinct files still
-    // parallelize.  Cuts redundant reparses of common imports
-    // (e.g. ast.zig imported from 30+ src/ files = parsed once
-    // total instead of once per worker that touches it).
     var shared_cache: ?lib.Cache = if (mode == .escape) lib.Cache.init(gpa, io) else null;
     defer if (shared_cache) |*c| c.deinit();
 
-    // Parallel fan-out: one Task per file, sharing the cache.
     const tasks = try gpa.alloc(Task, expanded.items.len);
     defer gpa.free(tasks);
     for (expanded.items, tasks) |path, *t| {
@@ -211,13 +159,6 @@ pub fn main(init: std.process.Init) !void {
         };
     }
 
-    // Group.concurrent vs Group.async: .concurrent forces a worker
-    // thread for each task (up to concurrent_limit = unlimited by
-    // default on Io.Threaded), giving real CPU parallelism.  .async
-    // would let the scheduler decide and can serialize tasks when
-    // the async_limit is small.  We want real parallelism here.
-    // Fall back to .async if .concurrent isn't supported by the Io
-    // backend (e.g. single-threaded testing envs).
     var group: std.Io.Group = .init;
     for (tasks) |*t| {
         group.concurrent(io, runOne, .{t}) catch
@@ -225,7 +166,6 @@ pub fn main(init: std.process.Init) !void {
     }
     group.await(io) catch {};
 
-    // Single-pass: collate problems, sort for deterministic output.
     var all_problems: std.ArrayListUnmanaged(IndexedProblem) = .empty;
     defer all_problems.deinit(gpa);
     var any_problems = false;
@@ -260,10 +200,6 @@ pub fn main(init: std.process.Init) !void {
     std.process.exit(if (any_problems) @as(u8, 1) else 0);
 }
 
-/// Split `csv` on commas, trim whitespace, drop empties.  Returns a
-/// gpa-owned slice-of-slices where each element points into `csv`
-/// (which lives for the process — argv strings are stable).  Caller
-/// frees only the outer slice; inner slices aren't separately allocated.
 fn splitCsv(gpa: std.mem.Allocator, csv: []const u8) ![]const []const u8 {
     var out: std.ArrayListUnmanaged([]const u8) = .empty;
     errdefer out.deinit(gpa);
@@ -276,27 +212,17 @@ fn splitCsv(gpa: std.mem.Allocator, csv: []const u8) ![]const []const u8 {
     return out.toOwnedSlice(gpa);
 }
 
-/// If `path` is a regular file, append (dupe'd) to `out`.
-/// If `path` is a directory, walk it recursively and append every
-/// `.zig` file found.  Skips hidden entries (.zig-cache/, .git/, etc.).
-/// Caller owns the duped paths in `out`.
 fn expandPath(
     gpa: std.mem.Allocator,
     io: std.Io,
     path: []const u8,
     out: *std.ArrayListUnmanaged([]const u8),
 ) !void {
-    var dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch |err| switch (err) {
-        // .NotDir is what openDir returns when path is a file; the
-        // exact name varies by zig version, so we catch anything
-        // not-a-directory by re-trying as a file below.
-        else => {
-            // Not a directory — assume regular file, append as-is.
-            const duped = try gpa.dupe(u8, path);
-            errdefer gpa.free(duped);
-            try out.append(gpa, duped);
-            return;
-        },
+    var dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch {
+        const duped = try gpa.dupe(u8, path);
+        errdefer gpa.free(duped);
+        try out.append(gpa, duped);
+        return;
     };
     defer dir.close(io);
 
@@ -305,7 +231,6 @@ fn expandPath(
     while (try walker.next(io)) |entry| {
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.basename, ".zig")) continue;
-        // Skip anything under a hidden directory (.zig-cache, .git).
         if (std.mem.indexOf(u8, entry.path, "/.") != null) continue;
         if (std.mem.startsWith(u8, entry.path, ".")) continue;
 
@@ -316,9 +241,7 @@ fn expandPath(
 }
 
 const Mode = enum { escape, hygiene };
-
 const Format = enum { text, json };
-
 const Op = enum { add, remove };
 
 fn parseInvariantList(
@@ -360,38 +283,23 @@ fn printUsage() void {
     std.debug.print(
         \\usage: zbc [options] <file.zig>...
         \\
-        \\Default mode is escape analysis — signature-driven inference
-        \\fills in annotations needed for invariant checks, so most code
-        \\just works without authors writing `///` annotations.
+        \\Default mode is escape analysis — flags slices borrowed from a
+        \\function-local arena that are returned past the arena's death.
         \\
         \\options:
-        \\  --hygiene             Run annotation-presence rules instead
-        \\                        of escape analysis.  For projects that
-        \\                        want to enforce explicit annotations.
+        \\  --hygiene             Run annotation-presence rules instead.
         \\  --enable=a,b,c        Enable only these invariants.
         \\  --disable=a,b         Disable these invariants from the set.
-        \\  --format=text|json    Output format (default: text).
-        \\  --list-invariants     Print known invariant names and exit.
-        \\  -h, --help            Print this help.
-        \\
-        \\project-tunable patterns (defaults match the ez parser shape):
-        \\  --ast-type=NAME       Identifier name treated as the Ast type
-        \\                        (default: Ast).
-        \\  --ast-init=A,B,C      Source-text patterns that mint a fresh
-        \\                        Ast (default: Ast.parse).
         \\  --arena-init=A,B      Patterns that mint a fresh arena
         \\                        (default: ArenaAllocator.init).
         \\  --arena-kill=A,B      Patterns that kill the receiver arena
         \\                        (default: .deinit().
-        \\  --thread-join=A,B     Patterns that join a worker thread
-        \\                        (default: .join().
-        \\  --ast-holder=A,B      Wrapper types treated as Ast-carrying
-        \\                        for inference (e.g. LintContext).
+        \\  --format=text|json    Output format (default: text).
+        \\  --list-invariants     Print known invariant names and exit.
+        \\  -h, --help            Print this help.
         \\
     , .{});
 }
-
-// ── Parallel-fanout types + helpers ────────────────────────
 
 const Task = struct {
     gpa: std.mem.Allocator,
@@ -399,10 +307,7 @@ const Task = struct {
     path: []const u8,
     mode: Mode,
     config: *const lib.Config,
-    /// Sweep-wide shared cache (null in hygiene mode where remote
-    /// resolution isn't needed).  Thread-safe via internal mutex.
     cache: ?*lib.Cache,
-    /// Outputs.  Owned by the task; collated after Group.await.
     problems: []lib.Problem,
     err: ?anyerror,
 };
@@ -420,8 +325,6 @@ fn indexedProblemLess(_: void, a: IndexedProblem, b: IndexedProblem) bool {
     return a.problem.start.column < b.problem.start.column;
 }
 
-/// Worker body — analyzes one file against the sweep-wide Cache.
-/// Errors stashed on the task so a bad file doesn't abort the sweep.
 fn runOne(t: *Task) std.Io.Cancelable!void {
     const problems = if (t.mode == .escape)
         lib.analyzeEscape(t.gpa, t.io, t.path, t.cache.?, t.config) catch |err| {
@@ -480,10 +383,6 @@ fn severityName(s: lib.Severity) []const u8 {
     };
 }
 
-/// Write `s` to stderr with the minimum JSON-string escapes per RFC 8259:
-/// quote, backslash, and control characters (< 0x20) become \uXXXX.
-/// No Unicode validation — Zig source files are valid UTF-8 already,
-/// and the user's diagnostic messages flow through unchanged.
 fn writeJsonEscaped(s: []const u8) void {
     for (s) |c| {
         switch (c) {
@@ -498,9 +397,6 @@ fn writeJsonEscaped(s: []const u8) void {
     }
 }
 
-/// Buffered mirror of writeJsonEscaped — used by tests and any
-/// future library-mode JSON sink that wants the escaped string
-/// in memory rather than streamed to stderr.
 fn jsonEscapeToBuf(gpa: std.mem.Allocator, s: []const u8) ![]u8 {
     var list: std.ArrayListUnmanaged(u8) = .empty;
     errdefer list.deinit(gpa);
@@ -528,17 +424,17 @@ test "parseInvariantList: add single" {
     const gpa = std.testing.allocator;
     var list: std.ArrayListUnmanaged(lib.Invariant) = .empty;
     defer list.deinit(gpa);
-    try parseInvariantList(gpa, "ast_identity", &list, .add);
+    try parseInvariantList(gpa, "arena_escape", &list, .add);
     try std.testing.expectEqual(@as(usize, 1), list.items.len);
-    try std.testing.expectEqual(lib.Invariant.ast_identity, list.items[0]);
+    try std.testing.expectEqual(lib.Invariant.arena_escape, list.items[0]);
 }
 
-test "parseInvariantList: add multiple, dedupes" {
+test "parseInvariantList: add dedupes" {
     const gpa = std.testing.allocator;
     var list: std.ArrayListUnmanaged(lib.Invariant) = .empty;
     defer list.deinit(gpa);
-    try parseInvariantList(gpa, "arena_escape,ast_mutation,arena_escape", &list, .add);
-    try std.testing.expectEqual(@as(usize, 2), list.items.len);
+    try parseInvariantList(gpa, "arena_escape,arena_escape", &list, .add);
+    try std.testing.expectEqual(@as(usize, 1), list.items.len);
 }
 
 test "parseInvariantList: remove from a set" {
@@ -546,10 +442,8 @@ test "parseInvariantList: remove from a set" {
     var list: std.ArrayListUnmanaged(lib.Invariant) = .empty;
     defer list.deinit(gpa);
     try list.appendSlice(gpa, &lib.all_invariants);
-    try parseInvariantList(gpa, "thread_arena,pass_identity", &list, .remove);
-    try std.testing.expectEqual(lib.all_invariants.len - 2, list.items.len);
-    try std.testing.expect(!containsInvariant(list.items, .thread_arena));
-    try std.testing.expect(!containsInvariant(list.items, .pass_identity));
+    try parseInvariantList(gpa, "arena_escape", &list, .remove);
+    try std.testing.expect(!containsInvariant(list.items, .arena_escape));
 }
 
 test "splitCsv: basic comma-separated" {
@@ -586,18 +480,9 @@ test "jsonEscapeToBuf: escapes quote, backslash, common control chars" {
 
 test "jsonEscapeToBuf: low control bytes become \\uXXXX" {
     const gpa = std.testing.allocator;
-    // 0x01 + 0x1f sit in the explicit \u-escape range; 0x09 is \t (above).
     const s = try jsonEscapeToBuf(gpa, &[_]u8{ 'x', 0x01, 'y', 0x1f, 'z' });
     defer gpa.free(s);
     try std.testing.expectEqualStrings("x\\u0001y\\u001fz", s);
-}
-
-test "parseInvariantList: whitespace tolerated" {
-    const gpa = std.testing.allocator;
-    var list: std.ArrayListUnmanaged(lib.Invariant) = .empty;
-    defer list.deinit(gpa);
-    try parseInvariantList(gpa, "  ast_identity ,  arena_escape  ", &list, .add);
-    try std.testing.expectEqual(@as(usize, 2), list.items.len);
 }
 
 test {

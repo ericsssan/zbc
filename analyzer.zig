@@ -1,12 +1,6 @@
 //! Worklist fixed-point over a CFG.  Computes a per-block in-state by
 //! repeatedly merging predecessors' out-states until nothing changes,
 //! emitting Problems along the way.
-//!
-//! v1 limitations:
-//!   - cfg.zig models if/else and while branching; for/switch/try still
-//!     lower as `.lowering_gap` (conservative collapse of locals to .plain).
-//!   - When more branching constructs land, the same algorithm naturally
-//!     extends — `join` handles convergence at merge points.
 
 const std = @import("std");
 const cfg_mod = @import("cfg.zig");
@@ -25,22 +19,16 @@ const JoinResult = state_mod.JoinResult;
 const Problem = problem_mod.Problem;
 
 pub const Options = struct {
-    /// Source file path for diagnostics.
     path: []const u8,
-    /// Invariant gating (phase 46).  Defaults to DefaultConfig
-    /// (all invariants enabled).
     config: *const config_mod.Config = &config_mod.Default,
 };
 
-/// Run escape analysis over `cfg`, appending Problems to `out`.
-/// Caller owns `out`; allocations within Problems also use `gpa`.
 pub fn check(
     gpa: std.mem.Allocator,
     cfg: *const Cfg,
     opts: Options,
     out: *std.ArrayListUnmanaged(Problem),
 ) !void {
-    // Per-block in-states; entry starts empty.
     var in_states = try gpa.alloc(AbstractState, cfg.blocks.len);
     defer {
         for (in_states) |*s| s.deinit(gpa);
@@ -48,39 +36,18 @@ pub fn check(
     }
     for (in_states) |*s| s.* = .{};
 
-    // ArenaId counter — minted by transferDecl on arena_init.
-    var next_arena: u32 = 0;
-    // AstId counter — minted by originOfInit on ast_init (Ast.parse(...)).
-    var next_ast: u32 = 0;
-    // Pass-name interner — first reference to a pass name mints a
-    // fresh PassId; subsequent references look up.  Keys borrow
-    // into source slices that outlive this analysis call.
-    var pass_ids: std.StringHashMapUnmanaged(state_mod.PassId) = .empty;
-    defer pass_ids.deinit(gpa);
-    var next_pass: u32 = 0;
 
-    // Worklist — process every reachable block until in-states stabilise.
     var worklist: std.ArrayListUnmanaged(BlockId) = .empty;
     defer worklist.deinit(gpa);
     try worklist.append(gpa, cfg.entry);
 
-    // Per-block done flag — guards against re-processing without state
-    // change.  Successor blocks only get re-pushed when their joined
-    // in-state actually moved.
     var iter_guard: u32 = 0;
-    // Generous safety net.  Genuine pathological CFGs (heavily nested
-    // loops + many locals) can take O(blocks · locals · arenas)
-    // iterations to stabilize; 200k handles real-codebase functions
-    // we've seen (~600 blocks × hundreds of locals).  Smaller bound
-    // bails on real code; lots higher risks editor-hang on a real bug.
     const MAX_ITERS: u32 = 200_000;
 
     while (worklist.pop()) |block_id| {
         iter_guard += 1;
         if (iter_guard > MAX_ITERS) {
-            // Safety net — convergence bug or pathological CFG.  Don't
-            // hang the developer's editor; just bail with a note.
-            std.debug.print("ez/escape-check: bailed after {} iterations on {s}\n", .{
+            std.debug.print("zbc/escape-check: bailed after {} iterations on {s}\n", .{
                 MAX_ITERS, opts.path,
             });
             return;
@@ -93,10 +60,6 @@ pub fn check(
         const ctx: transfer.Ctx = .{
             .gpa = gpa,
             .locals = cfg.locals,
-            .next_arena = &next_arena,
-            .next_ast = &next_ast,
-            .pass_ids = &pass_ids,
-            .next_pass = &next_pass,
             .problems = out,
             .path = opts.path,
             .config = opts.config,
@@ -106,7 +69,6 @@ pub fn check(
             try transfer.transfer(ctx, &state, stmt);
         }
 
-        // Propagate to successors; push them if their in-state changed.
         for (block.successors) |succ| {
             const succ_idx = @intFromEnum(succ);
             const result = try state_mod.join(&in_states[succ_idx], &state, gpa);
@@ -143,34 +105,6 @@ fn analyze(gpa: std.mem.Allocator, src: []const u8) !std.ArrayListUnmanaged(Prob
     return problems;
 }
 
-/// Same as analyze but consumes a Config — used by phase-46 opt-in
-/// tests to verify selective invariant disabling.
-fn analyzeWithConfig(
-    gpa: std.mem.Allocator,
-    src: []const u8,
-    config: *const config_mod.Config,
-) !std.ArrayListUnmanaged(Problem) {
-    const src_z = try gpa.dupeSentinel(u8, src, 0);
-    defer gpa.free(src_z);
-    var tree = try Ast.parse(gpa, src_z, .zig);
-    defer tree.deinit(gpa);
-
-    var db = try annotations.build(gpa, &tree);
-    defer db.deinit(gpa);
-
-    var problems: std.ArrayListUnmanaged(Problem) = .empty;
-
-    var node_idx: u32 = 1;
-    while (node_idx < tree.nodes.len) : (node_idx += 1) {
-        const node: Ast.Node.Index = @enumFromInt(node_idx);
-        if (tree.nodeTag(node) != .fn_decl) continue;
-        var cfg = (try cfg_mod.lowerFunctionFull(gpa, &tree, node, &db, null, config)) orelse continue;
-        defer cfg.deinit(gpa);
-        try check(gpa, &cfg, .{ .path = "<test>", .config = config }, &problems);
-    }
-    return problems;
-}
-
 fn freeProblems(gpa: std.mem.Allocator, p: *std.ArrayListUnmanaged(Problem)) void {
     for (p.items) |*item| item.deinit(gpa);
     p.deinit(gpa);
@@ -193,9 +127,6 @@ test "no escape — arena local, no return" {
 
 test "escape — return slice borrowed from a function-local arena" {
     const gpa = std.testing.allocator;
-    // The return TYPE must be borrowed-shape ([]const u8 here).
-    // Value-typed returns (struct, primitive) MOVE the value to the
-    // caller and don't need this check.
     var problems = try analyze(gpa,
         \\const std = @import("std");
         \\const Arena = struct {
@@ -218,9 +149,6 @@ test "escape — return slice borrowed from a function-local arena" {
 
 test "value-typed return owning an arena is OK (move, not borrow)" {
     const gpa = std.testing.allocator;
-    // Common Zig pattern: `init()` returns a struct value that owns
-    // its arena.  Caller takes ownership; no escape.  Without the
-    // return-type gate this used to false-positive on every init() fn.
     var problems = try analyze(gpa,
         \\const std = @import("std");
         \\const Self = struct { a: u32 };
@@ -267,40 +195,7 @@ test "defer arena.deinit() catches return-of-borrowed-from-dying-arena" {
         \\
     );
     defer freeProblems(gpa, &problems);
-    // Defer replays arena.deinit() before return; return checks slice()'s
-    // returned origin (.arena via annotation), arena is dead → flag.
     try std.testing.expect(problems.items.len >= 1);
-}
-
-test "annotated callee: borrow propagates through call, escapes via return" {
-    const gpa = std.testing.allocator;
-    var problems = try analyze(gpa,
-        \\const std = @import("std");
-        \\const Arena = struct {
-        \\    /// @returns borrowed_from(self)
-        \\    pub fn slice(self: *const Arena) []const u8 {
-        \\        _ = self; return "";
-        \\    }
-        \\};
-        \\pub fn foo() []const u8 {
-        \\    var arena = std.heap.ArenaAllocator.init(undefined);
-        \\    return arena.slice();
-        \\}
-        \\
-    );
-    defer freeProblems(gpa, &problems);
-    // arena.slice() carries `arena`'s origin (an ArenaId from the
-    // function-local arena_init), and `return` checks that the returned
-    // origin doesn't reference a function-local arena.  Should flag.
-    try std.testing.expect(problems.items.len >= 1);
-    var found = false;
-    for (problems.items) |p| {
-        if (std.mem.indexOf(u8, p.message, "function-local arena") != null) {
-            found = true;
-            break;
-        }
-    }
-    try std.testing.expect(found);
 }
 
 test "switch-case UAF: kill in one case, use after merge" {
@@ -327,37 +222,8 @@ test "switch-case UAF: kill in one case, use after merge" {
     try std.testing.expect(problems.items.len >= 1);
 }
 
-test "for-loop UAF: kill inside loop body, use after loop" {
-    const gpa = std.testing.allocator;
-    var problems = try analyze(gpa,
-        \\const std = @import("std");
-        \\const Arena = struct {
-        \\    /// @returns borrowed_from(self)
-        \\    pub fn slice(self: *const Arena) []const u8 {
-        \\        _ = self; return "";
-        \\    }
-        \\};
-        \\pub fn maybe(items: []const u32) []const u8 {
-        \\    var arena = std.heap.ArenaAllocator.init(undefined);
-        \\    for (items) |_| {
-        \\        arena.deinit();
-        \\    }
-        \\    return arena.slice();
-        \\}
-        \\
-    );
-    defer freeProblems(gpa, &problems);
-    // Body's arena_kill back-edges to header, and header forwards the
-    // dead state into merge.  Without for-loop modeling, this used to
-    // be a lowering_gap that silenced the check.
-    try std.testing.expect(problems.items.len >= 1);
-}
-
 test "branch-specific UAF: kill in one if-branch, use after merge" {
     const gpa = std.testing.allocator;
-    // The arena is killed in one branch of an if-statement.  After the
-    // merge, the arena is .dead on the joined state (dead-on-either-side
-    // wins in join).  Returning a borrow against it then escapes.
     var problems = try analyze(gpa,
         \\const std = @import("std");
         \\const Arena = struct {
@@ -374,886 +240,289 @@ test "branch-specific UAF: kill in one if-branch, use after merge" {
         \\
     );
     defer freeProblems(gpa, &problems);
-    // With real branching, the if-branch's arena_kill propagates through
-    // the merge join; the return sees a dead-or-alive arena.  Without
-    // branching support this would have been a lowering_gap, locals
-    // collapsed to .plain, and no escape detected.
     try std.testing.expect(problems.items.len >= 1);
 }
 
-test "invariant #1: NodeIndex from Ast A flowing into Ast B is flagged (phase 26)" {
-    // Two trees parsed separately get distinct AstIds.  A NodeIndex
-    // from tree_a, passed to a `@takes node_index_of(t)` fn alongside
-    // tree_b, must be flagged.  Uses `try` (not `catch`) so classifyExpr
-    // unwraps to the inner Ast.parse() call and ast_init fires.
+test "stack_escape: return &local is flagged" {
     const gpa = std.testing.allocator;
     var problems = try analyze(gpa,
-        \\pub fn foo() !void {
-        \\    var tree_a = try Ast.parse();
-        \\    var tree_b = try Ast.parse();
-        \\    const node = rootNode(tree_a);
-        \\    inspect(tree_b, node);
-        \\    return;
+        \\pub fn foo() *const u32 {
+        \\    var x: u32 = 7;
+        \\    return &x;
         \\}
-        \\const Ast = struct {
-        \\    pub fn parse() !Ast { return .{}; }
-        \\};
-        \\const NodeIndex = u32;
-        \\/// @returns node_index_of(ast)
-        \\pub fn rootNode(ast: Ast) NodeIndex { _ = ast; return 0; }
-        \\/// @takes node_index_of(t)
-        \\pub fn inspect(t: Ast, n: NodeIndex) void { _ = t; _ = n; }
-        \\
-    );
-    defer freeProblems(gpa, &problems);
-
-    var found = false;
-    for (problems.items) |p| {
-        if (std.mem.indexOf(u8, p.message, "invariant #1") != null) {
-            found = true;
-        }
-    }
-    try std.testing.expect(found);
-}
-
-test "invariant #1: matching Ast on both args — no false positive" {
-    const gpa = std.testing.allocator;
-    var problems = try analyze(gpa,
-        \\pub fn foo() !void {
-        \\    var tree = try Ast.parse();
-        \\    const node = rootNode(tree);
-        \\    inspect(tree, node);
-        \\    return;
-        \\}
-        \\const Ast = struct {
-        \\    pub fn parse() !Ast { return .{}; }
-        \\};
-        \\const NodeIndex = u32;
-        \\/// @returns node_index_of(ast)
-        \\pub fn rootNode(ast: Ast) NodeIndex { _ = ast; return 0; }
-        \\/// @takes node_index_of(t)
-        \\pub fn inspect(t: Ast, n: NodeIndex) void { _ = t; _ = n; }
-        \\
-    );
-    defer freeProblems(gpa, &problems);
-
-    for (problems.items) |p| {
-        try std.testing.expect(std.mem.indexOf(u8, p.message, "invariant #1") == null);
-    }
-}
-
-/// Cross-file test helper variant — pass an arbitrary set of
-/// `{filename, src}` files plus the main file under test.  Used by
-/// nested-namespace tests (phase 30) where we need foo.zig + lib.zig
-/// + inner.zig all on disk so the resolver can chase the chain.
-fn analyzeCrossFileMulti(
-    gpa: std.mem.Allocator,
-    main_src: []const u8,
-    extras: []const struct { name: []const u8, src: []const u8 },
-) !std.ArrayListUnmanaged(Problem) {
-    const tio = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    for (extras) |e| {
-        try tmp.dir.writeFile(tio, .{ .sub_path = e.name, .data = e.src });
-    }
-    try tmp.dir.writeFile(tio, .{ .sub_path = "foo.zig", .data = main_src });
-
-    const base_dir = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path });
-    defer gpa.free(base_dir);
-    const foo_path = try std.fs.path.join(gpa, &.{ base_dir, "foo.zig" });
-    defer gpa.free(foo_path);
-
-    const src_bytes = try std.Io.Dir.cwd().readFileAlloc(
-        tio,
-        foo_path,
-        gpa,
-        std.Io.Limit.limited(1 * 1024 * 1024),
-    );
-    defer gpa.free(src_bytes);
-    const src_z = try gpa.dupeSentinel(u8, src_bytes, 0);
-    defer gpa.free(src_z);
-    var tree = try std.zig.Ast.parse(gpa, src_z, .zig);
-    defer tree.deinit(gpa);
-
-    var db = try annotations.build(gpa, &tree);
-    defer db.deinit(gpa);
-    var imap = try imports_mod.build(gpa, &tree);
-    defer imap.deinit(gpa);
-
-    var rcache = remote_resolver_mod.Cache.init(gpa, tio);
-    defer rcache.deinit();
-
-    const remote_ctx = cfg_mod.RemoteCtx{
-        .imap = &imap,
-        .base_dir = base_dir,
-        .cache = &rcache,
-    };
-
-    var problems: std.ArrayListUnmanaged(Problem) = .empty;
-    var node_idx: u32 = 1;
-    while (node_idx < tree.nodes.len) : (node_idx += 1) {
-        const node: std.zig.Ast.Node.Index = @enumFromInt(node_idx);
-        if (tree.nodeTag(node) != .fn_decl) continue;
-        var cfg = (try cfg_mod.lowerFunctionWithRemote(gpa, &tree, node, &db, &remote_ctx)) orelse continue;
-        defer cfg.deinit(gpa);
-        try check(gpa, &cfg, .{ .path = foo_path }, &problems);
-    }
-    return problems;
-}
-
-/// Cross-file test helper: writes `main_src` and `import_src` to a
-/// fresh tmp dir as foo.zig and lib.zig respectively, then runs
-/// the full Layer-2 pipeline against foo.zig with cross-file
-/// resolution enabled.  Returns the collected problems (caller frees).
-fn analyzeCrossFile(
-    gpa: std.mem.Allocator,
-    main_src: []const u8,
-    import_src: []const u8,
-) !std.ArrayListUnmanaged(Problem) {
-    const tio = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try tmp.dir.writeFile(tio, .{ .sub_path = "lib.zig", .data = import_src });
-    try tmp.dir.writeFile(tio, .{ .sub_path = "foo.zig", .data = main_src });
-
-    // tmp.dir is std.Io.Dir which doesn't expose realpathAlloc.
-    // std.fs realpath APIs are also in flux on 0.17.  Sidestep:
-    // use the relative path; resolver + readFileAlloc handle relatives
-    // fine since cwd doesn't change during the test.
-    const base_dir = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path });
-    defer gpa.free(base_dir);
-    const foo_path = try std.fs.path.join(gpa, &.{ base_dir, "foo.zig" });
-    defer gpa.free(foo_path);
-
-    // Pipeline: read foo.zig, parse, build local DB + imports map,
-    // set up sweep-wide cache, lower each fn with remote context,
-    // run check on each CFG.
-    const src_bytes = try std.Io.Dir.cwd().readFileAlloc(
-        tio,
-        foo_path,
-        gpa,
-        std.Io.Limit.limited(1 * 1024 * 1024),
-    );
-    defer gpa.free(src_bytes);
-    const src_z = try gpa.dupeSentinel(u8, src_bytes, 0);
-    defer gpa.free(src_z);
-    var tree = try std.zig.Ast.parse(gpa, src_z, .zig);
-    defer tree.deinit(gpa);
-
-    var db = try annotations.build(gpa, &tree);
-    defer db.deinit(gpa);
-    var imap = try imports_mod.build(gpa, &tree);
-    defer imap.deinit(gpa);
-
-    var rcache = remote_resolver_mod.Cache.init(gpa, tio);
-    defer rcache.deinit();
-
-    const remote_ctx = cfg_mod.RemoteCtx{
-        .imap = &imap,
-        .base_dir = base_dir,
-        .cache = &rcache,
-    };
-
-    var problems: std.ArrayListUnmanaged(Problem) = .empty;
-    var node_idx: u32 = 1;
-    while (node_idx < tree.nodes.len) : (node_idx += 1) {
-        const node: std.zig.Ast.Node.Index = @enumFromInt(node_idx);
-        if (tree.nodeTag(node) != .fn_decl) continue;
-        var cfg = (try cfg_mod.lowerFunctionWithRemote(gpa, &tree, node, &db, &remote_ctx)) orelse continue;
-        defer cfg.deinit(gpa);
-        try check(gpa, &cfg, .{ .path = foo_path }, &problems);
-    }
-    return problems;
-}
-
-test "invariant #1 fires through CROSS-FILE @takes lookup (phase 28)" {
-    // foo.zig defines tree_a + tree_b and calls lib.inspect(tree_b, node)
-    // where node came from rootNode(tree_a).  inspect's @takes
-    // annotation lives in lib.zig — must be resolved via the remote
-    // cache for the check to fire.
-    const gpa = std.testing.allocator;
-    var problems = try analyzeCrossFile(gpa,
-        // foo.zig
-        \\const lib = @import("lib.zig");
-        \\const Ast = lib.Ast;
-        \\const NodeIndex = lib.NodeIndex;
-        \\pub fn foo() !void {
-        \\    var tree_a = try Ast.parse();
-        \\    var tree_b = try Ast.parse();
-        \\    const node = lib.rootNode(tree_a);
-        \\    lib.inspect(tree_b, node);
-        \\    return;
-        \\}
-        \\
-        ,
-        // lib.zig
-        \\pub const Ast = struct { pub fn parse() !Ast { return .{}; } };
-        \\pub const NodeIndex = u32;
-        \\/// @returns node_index_of(ast)
-        \\pub fn rootNode(ast: Ast) NodeIndex { _ = ast; return 0; }
-        \\/// @takes node_index_of(t)
-        \\pub fn inspect(t: Ast, n: NodeIndex) void { _ = t; _ = n; }
-        \\
-    );
-    defer freeProblems(gpa, &problems);
-
-    var found = false;
-    for (problems.items) |p| {
-        if (std.mem.indexOf(u8, p.message, "invariant #1") != null) found = true;
-    }
-    try std.testing.expect(found);
-}
-
-test "invariant #1 fires through NESTED-namespace dispatch (phase 30)" {
-    // foo.zig imports lib.zig; lib.zig re-exports inner.zig as
-    // `pub const Inner = @import("inner.zig");`.  The call shape
-    // `lib.Inner.inspect(tree_b, node)` requires chasing one extra
-    // hop through lib's own imap to land in inner.zig where
-    // `inspect`'s @takes lives.
-    const gpa = std.testing.allocator;
-    var problems = try analyzeCrossFileMulti(gpa,
-        // foo.zig (main)
-        \\const lib = @import("lib.zig");
-        \\const Ast = lib.Inner.Ast;
-        \\const NodeIndex = lib.Inner.NodeIndex;
-        \\pub fn foo() !void {
-        \\    var tree_a = try Ast.parse();
-        \\    var tree_b = try Ast.parse();
-        \\    const node = lib.Inner.rootNode(tree_a);
-        \\    lib.Inner.inspect(tree_b, node);
-        \\    return;
-        \\}
-        \\
-        ,
-        &.{
-            .{ .name = "lib.zig", .src =
-                \\pub const Inner = @import("inner.zig");
-                \\
-            },
-            .{ .name = "inner.zig", .src =
-                \\pub const Ast = struct { pub fn parse() !Ast { return .{}; } };
-                \\pub const NodeIndex = u32;
-                \\/// @returns node_index_of(ast)
-                \\pub fn rootNode(ast: Ast) NodeIndex { _ = ast; return 0; }
-                \\/// @takes node_index_of(t)
-                \\pub fn inspect(t: Ast, n: NodeIndex) void { _ = t; _ = n; }
-                \\
-            },
-        },
-    );
-    defer freeProblems(gpa, &problems);
-
-    var found = false;
-    for (problems.items) |p| {
-        if (std.mem.indexOf(u8, p.message, "invariant #1") != null) found = true;
-    }
-    try std.testing.expect(found);
-}
-
-test "invariant #1 fires through @import().Subfield re-export (phase 31)" {
-    // foo.zig does `const Inner = @import("lib.zig").Inner;` —
-    // pre-binding the nested member.  Subsequent calls use the
-    // alias directly: `Inner.inspect(tree_b, node)`.  Phase 31's
-    // subfield support chases the alias through lib's imap to
-    // land in inner.zig where the @takes annotation lives.
-    const gpa = std.testing.allocator;
-    var problems = try analyzeCrossFileMulti(gpa,
-        // foo.zig (main)
-        \\const Inner = @import("lib.zig").Inner;
-        \\const Ast = Inner.Ast;
-        \\const NodeIndex = Inner.NodeIndex;
-        \\pub fn foo() !void {
-        \\    var tree_a = try Ast.parse();
-        \\    var tree_b = try Ast.parse();
-        \\    const node = Inner.rootNode(tree_a);
-        \\    Inner.inspect(tree_b, node);
-        \\    return;
-        \\}
-        \\
-        ,
-        &.{
-            .{ .name = "lib.zig", .src =
-                \\pub const Inner = @import("inner.zig");
-                \\
-            },
-            .{ .name = "inner.zig", .src =
-                \\pub const Ast = struct { pub fn parse() !Ast { return .{}; } };
-                \\pub const NodeIndex = u32;
-                \\/// @returns node_index_of(ast)
-                \\pub fn rootNode(ast: Ast) NodeIndex { _ = ast; return 0; }
-                \\/// @takes node_index_of(t)
-                \\pub fn inspect(t: Ast, n: NodeIndex) void { _ = t; _ = n; }
-                \\
-            },
-        },
-    );
-    defer freeProblems(gpa, &problems);
-
-    var found = false;
-    for (problems.items) |p| {
-        if (std.mem.indexOf(u8, p.message, "invariant #1") != null) found = true;
-    }
-    try std.testing.expect(found);
-}
-
-test "invariant #1 fires through 2-hop subfield chain (phase 41)" {
-    // foo.zig:
-    //   const lib   = @import("lib.zig");
-    //   const Inner = lib.Inner;          ← 1-hop alias
-    //   const Foo   = Inner.Foo;          ← 2-hop alias of alias
-    //   ... Foo.inspect(...)              ← uses 2-hop alias
-    // lib.zig:   pub const Inner = @import("inner.zig");
-    // inner.zig: pub const Foo   = @import("foo_mod.zig");
-    // foo_mod.zig: has the annotated `inspect` fn.
-    // Resolver must chase both subfield hops in Foo's entry.
-    const gpa = std.testing.allocator;
-    var problems = try analyzeCrossFileMulti(gpa,
-        // foo.zig (main)
-        \\const lib = @import("lib.zig");
-        \\const Inner = lib.Inner;
-        \\const Foo = Inner.Foo;
-        \\const Ast = Foo.Ast;
-        \\const NodeIndex = Foo.NodeIndex;
-        \\pub fn foo() !void {
-        \\    var tree_a = try Ast.parse();
-        \\    var tree_b = try Ast.parse();
-        \\    const node = Foo.rootNode(tree_a);
-        \\    Foo.inspect(tree_b, node);
-        \\    return;
-        \\}
-        \\
-        ,
-        &.{
-            .{ .name = "lib.zig", .src =
-                \\pub const Inner = @import("inner.zig");
-                \\
-            },
-            .{ .name = "inner.zig", .src =
-                \\pub const Foo = @import("foo_mod.zig");
-                \\
-            },
-            .{ .name = "foo_mod.zig", .src =
-                \\pub const Ast = struct { pub fn parse() !Ast { return .{}; } };
-                \\pub const NodeIndex = u32;
-                \\/// @returns node_index_of(ast)
-                \\pub fn rootNode(ast: Ast) NodeIndex { _ = ast; return 0; }
-                \\/// @takes node_index_of(t)
-                \\pub fn inspect(t: Ast, n: NodeIndex) void { _ = t; _ = n; }
-                \\
-            },
-        },
-    );
-    defer freeProblems(gpa, &problems);
-
-    var found = false;
-    for (problems.items) |p| {
-        if (std.mem.indexOf(u8, p.message, "invariant #1") != null) found = true;
-    }
-    try std.testing.expect(found);
-}
-
-test "invariant #1 fires through local-alias-of-import (phase 32)" {
-    // foo.zig has:
-    //   const lib = @import("lib.zig");
-    //   const Inner = lib.Inner;          ← two-decl alias form
-    //   ... Inner.inspect(tree_b, node);  ← uses alias
-    // Phase 31 handled the wrapped one-liner `const Inner =
-    // @import("lib.zig").Inner;`.  Phase 32 handles the
-    // two-decl equivalent that's equally common.
-    const gpa = std.testing.allocator;
-    var problems = try analyzeCrossFileMulti(gpa,
-        // foo.zig
-        \\const lib = @import("lib.zig");
-        \\const Inner = lib.Inner;
-        \\const Ast = Inner.Ast;
-        \\const NodeIndex = Inner.NodeIndex;
-        \\pub fn foo() !void {
-        \\    var tree_a = try Ast.parse();
-        \\    var tree_b = try Ast.parse();
-        \\    const node = Inner.rootNode(tree_a);
-        \\    Inner.inspect(tree_b, node);
-        \\    return;
-        \\}
-        \\
-        ,
-        &.{
-            .{ .name = "lib.zig", .src =
-                \\pub const Inner = @import("inner.zig");
-                \\
-            },
-            .{ .name = "inner.zig", .src =
-                \\pub const Ast = struct { pub fn parse() !Ast { return .{}; } };
-                \\pub const NodeIndex = u32;
-                \\/// @returns node_index_of(ast)
-                \\pub fn rootNode(ast: Ast) NodeIndex { _ = ast; return 0; }
-                \\/// @takes node_index_of(t)
-                \\pub fn inspect(t: Ast, n: NodeIndex) void { _ = t; _ = n; }
-                \\
-            },
-        },
-    );
-    defer freeProblems(gpa, &problems);
-
-    var found = false;
-    for (problems.items) |p| {
-        if (std.mem.indexOf(u8, p.message, "invariant #1") != null) found = true;
-    }
-    try std.testing.expect(found);
-}
-
-test "invariant #5: @mutates_ast call on an Ast value flags (phase 37)" {
-    // foo receives an Ast param, then calls a @mutates_ast method on
-    // it.  Phase 37's invariant #5 enforcement fires regardless of
-    // whether the Ast was constructed locally or received — any
-    // tracked .ast origin is "post-parse" from the analyzer's view.
-    const gpa = std.testing.allocator;
-    var problems = try analyze(gpa,
-        \\const Ast = struct {};
-        \\pub fn foo(ast: Ast) void {
-        \\    ast.setNodeTag(0);
-        \\}
-        \\/// @mutates_ast
-        \\pub fn setNodeTag(self: Ast, _: u32) void { _ = self; }
-        \\
-    );
-    defer freeProblems(gpa, &problems);
-
-    var found = false;
-    for (problems.items) |p| {
-        if (std.mem.indexOf(u8, p.message, "invariant #5") != null) found = true;
-    }
-    try std.testing.expect(found);
-}
-
-test "invariant #5 fires through CROSS-FILE namespace call (phase 38)" {
-    // foo.zig holds an Origin.ast value and does
-    //   lib.setNodeTag(ast, 0);
-    // where lib.zig defines setNodeTag with `@mutates_ast`.  Phase 37
-    // only fired on method-call shape (`ast.setNodeTag(0)`); phase 38
-    // adds namespace-call detection (args[0] as the Ast).
-    const gpa = std.testing.allocator;
-    var problems = try analyzeCrossFile(gpa,
-        // foo.zig
-        \\const lib = @import("lib.zig");
-        \\const Ast = lib.Ast;
-        \\pub fn foo(ast: Ast) void {
-        \\    lib.setNodeTag(ast, 0);
-        \\}
-        \\
-        ,
-        // lib.zig
-        \\pub const Ast = struct {};
-        \\/// @mutates_ast
-        \\pub fn setNodeTag(self: Ast, _: u32) void { _ = self; }
-        \\
-    );
-    defer freeProblems(gpa, &problems);
-
-    var found = false;
-    for (problems.items) |p| {
-        if (std.mem.indexOf(u8, p.message, "invariant #5") != null) found = true;
-    }
-    try std.testing.expect(found);
-}
-
-test "invariant #5: @mutates_ast(<param>) fires on the right arg (phase 39)" {
-    // linkChild has TWO Ast args; only `child` (arg 1) is mutated.
-    // With `@mutates_ast(child)` the check targets args[1] specifically;
-    // ast_a (parent) is read-only at this call.  Pre-phase-39
-    // `@mutates_ast` would have unconditionally flagged args[0] (parent).
-    const gpa = std.testing.allocator;
-    var problems = try analyze(gpa,
-        \\const Ast = struct {};
-        \\pub fn foo(parent: Ast, child: Ast) void {
-        \\    linkChild(parent, child);
-        \\}
-        \\/// @mutates_ast(child)
-        \\pub fn linkChild(parent: Ast, child: Ast) void { _ = parent; _ = child; }
-        \\
-    );
-    defer freeProblems(gpa, &problems);
-
-    // Exactly one invariant #5 finding (about `child`), not two.
-    var count: u32 = 0;
-    var child_named = false;
-    for (problems.items) |p| {
-        if (std.mem.indexOf(u8, p.message, "invariant #5") != null) {
-            count += 1;
-            if (std.mem.indexOf(u8, p.message, "`child`") != null) child_named = true;
-        }
-    }
-    try std.testing.expectEqual(@as(u32, 1), count);
-    try std.testing.expect(child_named);
-}
-
-test "invariant #5: non-Ast receiver doesn't fire (regression guard)" {
-    // No Ast param — `obj` is untracked, its .none origin won't
-    // flag.  Pre-phase-37 there was no check at all; this guards
-    // against accidental over-firing on every method-call site.
-    const gpa = std.testing.allocator;
-    var problems = try analyze(gpa,
-        \\const NotAst = struct {};
-        \\pub fn foo(obj: NotAst) void {
-        \\    obj.setNodeTag(0);
-        \\}
-        \\/// @mutates_ast
-        \\pub fn setNodeTag(self: NotAst, _: u32) void { _ = self; }
-        \\
-    );
-    defer freeProblems(gpa, &problems);
-
-    for (problems.items) |p| {
-        try std.testing.expect(std.mem.indexOf(u8, p.message, "invariant #5") == null);
-    }
-}
-
-test "invariant #1 fires inside a RECEIVING function (phase 35 param origins)" {
-    // foo takes ast_a + ast_b as params.  Both get Origin.ast(aid)
-    // with distinct AstIds (seeded by phase 35 param walk).  A
-    // NodeIndex from ast_a passed to inspect(ast_b, node) flags
-    // invariant #1 — pre-phase-35 the params were untracked locals
-    // (.unknown classifications) and no check could fire.
-    const gpa = std.testing.allocator;
-    var problems = try analyze(gpa,
-        \\const Ast = struct {};
-        \\const NodeIndex = u32;
-        \\pub fn foo(ast_a: Ast, ast_b: Ast) void {
-        \\    const node = rootNode(ast_a);
-        \\    inspect(ast_b, node);
-        \\}
-        \\/// @returns node_index_of(ast)
-        \\pub fn rootNode(ast: Ast) NodeIndex { _ = ast; return 0; }
-        \\/// @takes node_index_of(t)
-        \\pub fn inspect(t: Ast, n: NodeIndex) void { _ = t; _ = n; }
-        \\
-    );
-    defer freeProblems(gpa, &problems);
-
-    var found = false;
-    for (problems.items) |p| {
-        if (std.mem.indexOf(u8, p.message, "invariant #1") != null) found = true;
-    }
-    try std.testing.expect(found);
-}
-
-test "@returns ast: custom constructor mints AstId like Ast.parse (phase 33)" {
-    // `customParse` returns Ast by annotation, not by name pattern.
-    // Two distinct calls produce two distinct AstIds — the invariant
-    // #1 check still fires when a NodeIndex from one's tree flows
-    // into a @takes-annotated fn alongside the other tree.
-    const gpa = std.testing.allocator;
-    var problems = try analyze(gpa,
-        \\pub fn foo() void {
-        \\    var tree_a = customParse();
-        \\    var tree_b = customParse();
-        \\    const node = rootNode(tree_a);
-        \\    inspect(tree_b, node);
-        \\    return;
-        \\}
-        \\const Ast = struct {};
-        \\const NodeIndex = u32;
-        \\/// @returns ast
-        \\pub fn customParse() Ast { return .{}; }
-        \\/// @returns node_index_of(ast)
-        \\pub fn rootNode(ast: Ast) NodeIndex { _ = ast; return 0; }
-        \\/// @takes node_index_of(t)
-        \\pub fn inspect(t: Ast, n: NodeIndex) void { _ = t; _ = n; }
-        \\
-    );
-    defer freeProblems(gpa, &problems);
-
-    var found = false;
-    for (problems.items) |p| {
-        if (std.mem.indexOf(u8, p.message, "invariant #1") != null) found = true;
-    }
-    try std.testing.expect(found);
-}
-
-test "node_index_any opts out: cross-Ast call passes without flag (phase 29)" {
-    // Same shape as the positive phase-26 test, but inspect now has
-    // `@takes node_index_any` instead of `node_index_of(t)`.  The
-    // analyzer must NOT flag — the opt-out tells us cross-Ast is OK.
-    const gpa = std.testing.allocator;
-    var problems = try analyze(gpa,
-        \\pub fn foo() !void {
-        \\    var tree_a = try Ast.parse();
-        \\    var tree_b = try Ast.parse();
-        \\    const node = rootNode(tree_a);
-        \\    inspect(tree_b, node);
-        \\    return;
-        \\}
-        \\const Ast = struct { pub fn parse() !Ast { return .{}; } };
-        \\const NodeIndex = u32;
-        \\/// @returns node_index_of(ast)
-        \\pub fn rootNode(ast: Ast) NodeIndex { _ = ast; return 0; }
-        \\/// @takes node_index_any
-        \\pub fn inspect(t: Ast, n: NodeIndex) void { _ = t; _ = n; }
-        \\
-    );
-    defer freeProblems(gpa, &problems);
-
-    for (problems.items) |p| {
-        try std.testing.expect(std.mem.indexOf(u8, p.message, "invariant #1") == null);
-    }
-}
-
-test "invariant #1 fires at var-decl init position (phase 27)" {
-    // `const t = inspect(tree_b, node);` — the call is in init
-    // position, NOT statement position.  Pre-phase-27 emitTakesChecks
-    // only fired from lowerCallStmt; this case was silent despite
-    // the same logical violation.  Phase 27 broadens to init position
-    // so this now flags.
-    const gpa = std.testing.allocator;
-    var problems = try analyze(gpa,
-        \\pub fn foo() !void {
-        \\    var tree_a = try Ast.parse();
-        \\    var tree_b = try Ast.parse();
-        \\    const node = rootNode(tree_a);
-        \\    const t = inspect(tree_b, node);
-        \\    _ = t;
-        \\    return;
-        \\}
-        \\const Ast = struct { pub fn parse() !Ast { return .{}; } };
-        \\const NodeIndex = u32;
-        \\/// @returns node_index_of(ast)
-        \\pub fn rootNode(ast: Ast) NodeIndex { _ = ast; return 0; }
-        \\/// @takes node_index_of(t)
-        \\pub fn inspect(t: Ast, n: NodeIndex) u32 { _ = t; _ = n; return 0; }
-        \\
-    );
-    defer freeProblems(gpa, &problems);
-
-    var found = false;
-    for (problems.items) |p| {
-        if (std.mem.indexOf(u8, p.message, "invariant #1") != null) found = true;
-    }
-    try std.testing.expect(found);
-}
-
-test "invariant #1 fires at return position (phase 27)" {
-    const gpa = std.testing.allocator;
-    var problems = try analyze(gpa,
-        \\pub fn foo() !u32 {
-        \\    var tree_a = try Ast.parse();
-        \\    var tree_b = try Ast.parse();
-        \\    const node = rootNode(tree_a);
-        \\    return inspect(tree_b, node);
-        \\}
-        \\const Ast = struct { pub fn parse() !Ast { return .{}; } };
-        \\const NodeIndex = u32;
-        \\/// @returns node_index_of(ast)
-        \\pub fn rootNode(ast: Ast) NodeIndex { _ = ast; return 0; }
-        \\/// @takes node_index_of(t)
-        \\pub fn inspect(t: Ast, n: NodeIndex) u32 { _ = t; _ = n; return 0; }
-        \\
-    );
-    defer freeProblems(gpa, &problems);
-
-    var found = false;
-    for (problems.items) |p| {
-        if (std.mem.indexOf(u8, p.message, "invariant #1") != null) found = true;
-    }
-    try std.testing.expect(found);
-}
-
-test "invariant #3: worker-arena pointer read before join is flagged" {
-    // spawnWorker returns worker_arena memory; consume reads it.
-    // No thread.join() between them → state.thread stays .main,
-    // consume fires invariant #3.
-    const gpa = std.testing.allocator;
-    var problems = try analyze(gpa,
-        \\pub fn foo() void {
-        \\    const buf = spawnWorker();
-        \\    consume(buf);
-        \\}
-        \\/// @returns worker_arena
-        \\pub fn spawnWorker() []u8 { return ""; }
-        \\/// @takes worker_arena(buf)
-        \\pub fn consume(buf: []u8) void { _ = buf; }
         \\
     );
     defer freeProblems(gpa, &problems);
     var found = false;
     for (problems.items) |p| {
-        if (std.mem.indexOf(u8, p.message, "invariant #3") != null) found = true;
+        if (std.mem.indexOf(u8, p.message, "stack variable") != null) found = true;
     }
     try std.testing.expect(found);
 }
 
-test "invariant #3: worker-arena pointer read AFTER thread.join() is OK" {
-    // .thread_join Stmt fires on `worker.join()` text pattern and
-    // transitions state.thread to .joined.  Subsequent consume()
-    // sees .joined and stays silent.
+test "stack_escape: return &local propagated through copy" {
     const gpa = std.testing.allocator;
     var problems = try analyze(gpa,
-        \\pub fn foo(worker: anytype) void {
-        \\    const buf = spawnWorker();
-        \\    worker.join();
-        \\    consume(buf);
+        \\pub fn foo() *const u32 {
+        \\    var x: u32 = 7;
+        \\    const p = &x;
+        \\    return p;
         \\}
-        \\/// @returns worker_arena
-        \\pub fn spawnWorker() []u8 { return ""; }
-        \\/// @takes worker_arena(buf)
-        \\pub fn consume(buf: []u8) void { _ = buf; }
         \\
     );
     defer freeProblems(gpa, &problems);
-    for (problems.items) |p| {
-        try std.testing.expect(std.mem.indexOf(u8, p.message, "invariant #3") == null);
-    }
-}
-
-test "invariant #3: untagged value silently passes (regression guard)" {
-    // consume is annotated @takes worker_arena but caller passes a
-    // value that doesn't have a tracked worker_arena origin.  Must
-    // NOT flag — we only validate tagged-vs-context, not arbitrary
-    // values that happen to flow into worker-typed slots.
-    const gpa = std.testing.allocator;
-    var problems = try analyze(gpa,
-        \\pub fn foo() void {
-        \\    var buf: []u8 = "";
-        \\    consume(buf);
-        \\}
-        \\/// @takes worker_arena(buf)
-        \\pub fn consume(buf: []u8) void { _ = buf; }
-        \\
-    );
-    defer freeProblems(gpa, &problems);
-    for (problems.items) |p| {
-        try std.testing.expect(std.mem.indexOf(u8, p.message, "invariant #3") == null);
-    }
-}
-
-test "invariant #4: scope ID from wrong pass is flagged" {
-    // mintA returns a scope_from(pass_a) ID; useB takes a
-    // scope_from(pass_b).  Passing A's ID into B must flag.
-    const gpa = std.testing.allocator;
-    var problems = try analyze(gpa,
-        \\const ScopeId = u32;
-        \\pub fn foo() void {
-        \\    const s = mintA();
-        \\    useB(s);
-        \\}
-        \\/// @returns scope_from(pass_a)
-        \\pub fn mintA() ScopeId { return 0; }
-        \\/// @takes scope_from(pass_b)
-        \\pub fn useB(s: ScopeId) void { _ = s; }
-        \\
-    );
-    defer freeProblems(gpa, &problems);
-
     var found = false;
     for (problems.items) |p| {
-        if (std.mem.indexOf(u8, p.message, "invariant #4") != null) found = true;
+        if (std.mem.indexOf(u8, p.message, "stack variable") != null) found = true;
     }
     try std.testing.expect(found);
 }
 
-test "invariant #4: matching pass on both sides — no false positive" {
+test "stack_escape: plain value return is OK" {
     const gpa = std.testing.allocator;
     var problems = try analyze(gpa,
-        \\const ScopeId = u32;
-        \\pub fn foo() void {
-        \\    const s = mintA();
-        \\    useA(s);
+        \\pub fn foo() u32 {
+        \\    var x: u32 = 7;
+        \\    return x;
         \\}
-        \\/// @returns scope_from(pass_a)
-        \\pub fn mintA() ScopeId { return 0; }
-        \\/// @takes scope_from(pass_a)
-        \\pub fn useA(s: ScopeId) void { _ = s; }
         \\
     );
     defer freeProblems(gpa, &problems);
-
-    for (problems.items) |p| {
-        try std.testing.expect(std.mem.indexOf(u8, p.message, "invariant #4") == null);
-    }
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
 }
 
-test "invariant #4: untagged origin silently passes (regression guard)" {
-    // useB takes scope_from(pass_b) but caller passes a literal —
-    // its origin is .plain, not .pass(_).  Must NOT flag — we only
-    // validate tagged-vs-tagged mismatches.
+test "use_undefined: return undefined directly is flagged" {
     const gpa = std.testing.allocator;
     var problems = try analyze(gpa,
-        \\const ScopeId = u32;
-        \\pub fn foo() void {
-        \\    var s: ScopeId = 0;
-        \\    useB(s);
+        \\pub fn foo() u32 {
+        \\    return undefined;
         \\}
-        \\/// @takes scope_from(pass_b)
-        \\pub fn useB(s: ScopeId) void { _ = s; }
         \\
     );
     defer freeProblems(gpa, &problems);
-
+    var found = false;
     for (problems.items) |p| {
-        try std.testing.expect(std.mem.indexOf(u8, p.message, "invariant #4") == null);
+        if (std.mem.indexOf(u8, p.message, "undefined") != null) found = true;
     }
+    try std.testing.expect(found);
 }
 
-test "Config.enabled opt-out: ast_mutation off → invariant #5 stays silent (phase 46)" {
-    // Same source that fires invariant #5 under DefaultConfig.  With
-    // only arena_escape enabled (ast_mutation OFF), the analyzer
-    // shouldn't emit the .ast_mutation_check stmts at all, and
-    // therefore no invariant #5 problem appears.
+test "use_undefined: return local that was set to undefined" {
     const gpa = std.testing.allocator;
-    const c: config_mod.Config = .{
-        .enabled = &.{.arena_escape},
-    };
-    var problems = try analyzeWithConfig(gpa,
-        \\const Ast = struct {};
-        \\pub fn foo(ast: Ast) void {
-        \\    ast.setNodeTag(0);
+    var problems = try analyze(gpa,
+        \\pub fn foo() u32 {
+        \\    var x: u32 = undefined;
+        \\    return x;
         \\}
-        \\/// @mutates_ast
-        \\pub fn setNodeTag(self: Ast, _: u32) void { _ = self; }
         \\
-        , &c);
+    );
     defer freeProblems(gpa, &problems);
-
+    var found = false;
     for (problems.items) |p| {
-        try std.testing.expect(std.mem.indexOf(u8, p.message, "invariant #5") == null);
+        if (std.mem.indexOf(u8, p.message, "undefined") != null) found = true;
     }
+    try std.testing.expect(found);
 }
 
-test "Config.enabled opt-out: arena_escape off → no escape findings (phase 46)" {
-    // Source that fires the arena-escape check under DefaultConfig.
-    // Disabling arena_escape (keeping ast_mutation as the only
-    // enabled invariant) → transfer.transferRet skips the check.
+test "use_undefined: reassign before return clears undef" {
     const gpa = std.testing.allocator;
-    const c: config_mod.Config = .{
-        .enabled = &.{.ast_mutation},
-    };
-    var problems = try analyzeWithConfig(gpa,
+    var problems = try analyze(gpa,
+        \\pub fn foo() u32 {
+        \\    var x: u32 = undefined;
+        \\    x = 7;
+        \\    return x;
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
+test "heap_double_free: free same pointer twice is flagged" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const std = @import("std");
+        \\pub fn foo(gpa_: std.mem.Allocator) void {
+        \\    const p = gpa_.alloc(u8, 16);
+        \\    gpa_.free(p);
+        \\    gpa_.free(p);
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    var found = false;
+    for (problems.items) |p| {
+        if (std.mem.indexOf(u8, p.message, "double-free") != null) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "heap_double_free: single free is clean" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const std = @import("std");
+        \\pub fn foo(gpa_: std.mem.Allocator) void {
+        \\    const p = gpa_.alloc(u8, 16);
+        \\    gpa_.free(p);
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
+test "heap_use_after_free: return after free is flagged" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const std = @import("std");
+        \\pub fn foo(gpa_: std.mem.Allocator) []u8 {
+        \\    const p = gpa_.alloc(u8, 16);
+        \\    gpa_.free(p);
+        \\    return p;
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    var found = false;
+    for (problems.items) |p| {
+        if (std.mem.indexOf(u8, p.message, "after free") != null) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "heap_use_after_free: return without freeing is OK (ownership transfer)" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const std = @import("std");
+        \\pub fn foo(gpa_: std.mem.Allocator) []u8 {
+        \\    return gpa_.alloc(u8, 16);
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
+test "heap_double_free: branch-specific double-free caught by join" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const std = @import("std");
+        \\pub fn foo(gpa_: std.mem.Allocator, cond: bool) void {
+        \\    const p = gpa_.alloc(u8, 16);
+        \\    if (cond) gpa_.free(p);
+        \\    gpa_.free(p);
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    var found = false;
+    for (problems.items) |p| {
+        if (std.mem.indexOf(u8, p.message, "double-free") != null) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "heap_use_after_free: read after free in arbitrary call args is flagged" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const std = @import("std");
+        \\pub fn consume(b: []u8) void { _ = b; }
+        \\pub fn foo(gpa_: std.mem.Allocator) void {
+        \\    const p = gpa_.alloc(u8, 16);
+        \\    gpa_.free(p);
+        \\    consume(p);
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    var found = false;
+    for (problems.items) |p| {
+        if (std.mem.indexOf(u8, p.message, "after free") != null) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "heap_use_after_free: assign rhs read of freed pointer is flagged" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const std = @import("std");
+        \\pub fn foo(gpa_: std.mem.Allocator) void {
+        \\    var p = gpa_.alloc(u8, 16);
+        \\    gpa_.free(p);
+        \\    var q: []u8 = undefined;
+        \\    q = p;
+        \\    _ = q;
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    var found = false;
+    for (problems.items) |p| {
+        if (std.mem.indexOf(u8, p.message, "after free") != null) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "arena_use_after_kill: read after deinit in call arg is flagged" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
         \\const std = @import("std");
         \\const Arena = struct {
         \\    /// @returns borrowed_from(self)
-        \\    pub fn slice(self: *const Arena) []const u8 {
-        \\        _ = self; return "";
-        \\    }
+        \\    pub fn text(self: *const Arena) []const u8 { _ = self; return ""; }
         \\};
-        \\pub fn foo() []const u8 {
+        \\pub fn consume(s: []const u8) void { _ = s; }
+        \\pub fn foo() void {
         \\    var arena = std.heap.ArenaAllocator.init(undefined);
-        \\    return arena.slice();
+        \\    const s = arena.text();
+        \\    arena.deinit();
+        \\    consume(s);
         \\}
         \\
-        , &c);
+    );
     defer freeProblems(gpa, &problems);
-
+    var found = false;
     for (problems.items) |p| {
-        try std.testing.expect(std.mem.indexOf(u8, p.message, "function-local arena") == null);
+        if (std.mem.indexOf(u8, p.message, "deinit'd") != null) found = true;
     }
+    try std.testing.expect(found);
+}
+
+test "use_undefined: read undef in call arg is flagged" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\pub fn consume(x: u32) void { _ = x; }
+        \\pub fn foo() void {
+        \\    var x: u32 = undefined;
+        \\    consume(x);
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    var found = false;
+    for (problems.items) |p| {
+        if (std.mem.indexOf(u8, p.message, "still `undefined`") != null) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "use_undefined: assign before use clears undef" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\pub fn consume(x: u32) void { _ = x; }
+        \\pub fn foo() void {
+        \\    var x: u32 = undefined;
+        \\    x = 7;
+        \\    consume(x);
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
 }
 
 test "lowering_gap collapses locals to plain — no spurious reports" {
     const gpa = std.testing.allocator;
-    // `if (x) return;` triggers a lowering_gap in cfg.zig today.  The
-    // transfer fn should collapse local origins to .plain so subsequent
-    // use checks don't reference stale origins.
     var problems = try analyze(gpa,
         \\const std = @import("std");
         \\pub fn foo(x: bool) void {
@@ -1265,7 +534,10 @@ test "lowering_gap collapses locals to plain — no spurious reports" {
         \\
     );
     defer freeProblems(gpa, &problems);
-    // Today this should be silent — no detected escapes (we lose
-    // precision through the gap but don't fabricate false positives).
     try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
+test {
+    _ = imports_mod;
+    _ = remote_resolver_mod;
 }

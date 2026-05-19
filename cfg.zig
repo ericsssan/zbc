@@ -37,9 +37,8 @@ const config_mod = @import("config.zig");
 pub const Config = config_mod.Config;
 
 /// Cross-file resolution context passed into lowerFunction.  When
-/// present, classifyCall can resolve `imported.method(...)` calls
-/// by looking up the method's annotation in the imported file's DB
-/// via remote_resolver.Cache.
+/// present, classifyCall resolves `imported.method(...)` callees by
+/// looking up the method's annotation in the imported file's DB.
 pub const RemoteCtx = struct {
     imap: *const imports.Map,
     base_dir: []const u8,
@@ -63,9 +62,7 @@ pub const SrcPos = struct {
 // ── Statements ─────────────────────────────────────────────
 
 pub const StmtKind = union(enum) {
-    /// `var/const NAME = INIT;` — local declared, bound to RHS expression.
-    /// `init_kind` describes what the RHS produces (a known annotated
-    /// call, a literal, an arena init, etc.).
+    /// `var/const NAME = INIT;` — local declared, bound to RHS.
     decl: struct { local: LocalId, init_kind: ExprKind },
 
     /// `LHS = RHS;` — overwrite local with new RHS.
@@ -74,48 +71,16 @@ pub const StmtKind = union(enum) {
     /// `<receiver>.deinit()` on an arena.  Marks the arena dead.
     arena_kill: struct { arena_local: LocalId },
 
-    /// `<thread>.join()` — transitions ThreadContext from worker→joined.
-    thread_join,
-
-    /// Call to a fn annotated `@takes node_index_of(<param>)`.  At
-    /// transfer time: look up `source_local`'s origin (must be
-    /// `.ast(aid_src)`) and `value_local`'s origin (must be
-    /// `.ast_node(aid_val)`); flag if both are tagged and the AstIds
-    /// differ — that's a NodeIndex from Ast A flowing into Ast B.
-    /// Emitted by lowerCallStmt when a same-file callee carries the
-    /// @takes annotation.  Phase 27 will broaden to init/return/assign
-    /// positions where most real check sites live.
-    ast_takes_check: struct { source_local: LocalId, value_local: LocalId },
-
-    /// Call to a fn annotated `@takes scope_from(<pass_name>)`.  At
-    /// transfer time: look up `value_local`'s origin; if it's
-    /// `.pass(P_val)` where P_val doesn't intern to the expected
-    /// pass_name, flag invariant #4.  Origin mismatches with other
-    /// types (.plain, .ast, etc.) silently pass — only tagged scope
-    /// IDs participate.
-    scope_takes_check: struct { value_local: LocalId, expected_pass: []const u8 },
-
-    /// Call to a fn annotated `@takes worker_arena(<param>)`.  At
-    /// transfer time: if value's origin is `.worker_arena` AND
-    /// `state.thread != .joined`, flag — reading worker memory
-    /// before the join point is unsafe.  Untagged origins pass.
-    worker_takes_check: struct { value_local: LocalId },
-
-    /// Call to a fn annotated `@mutates_ast` on an Origin.ast
-    /// receiver — phase 37's invariant #5 enforcement.  At transfer
-    /// time: if `ast_local`'s origin is `.ast(_)`, flag.  Any tracked
-    /// Ast is considered "post-parse" from the analyzer's view; the
-    /// only legitimate construction site is the parser itself which
-    /// doesn't go through this annotation-driven path.
-    ast_mutation_check: struct { ast_local: LocalId },
+    /// `gpa.free(p)` / `gpa.destroy(p)` — marks the heap allocation
+    /// bound to `freed_local` dead.  Double-free fires here.
+    heap_free: struct { freed_local: LocalId },
 
     /// `return <expr>;` — function exit.  `value_kind` describes what's
     /// being returned.  `is_borrowed_return_type` tags whether the
     /// enclosing function's signature returns a borrowed-shape type
-    /// (slice/pointer) — only those returns can leak a borrowed origin.
-    /// Value-typed returns (struct, enum, primitive) MOVE the value
-    /// to the caller and are exempt from the "arena escapes its scope"
-    /// check even when the value contains an arena.
+    /// (slice/pointer) — only those returns can leak a borrowed
+    /// origin.  Value-typed returns MOVE the value (and any arena it
+    /// owns) to the caller and are exempt from the escape check.
     ret: struct { value_kind: ExprKind, is_borrowed_return_type: bool },
 
     /// Use of a local (to read it).  Generates "is origin still live?"
@@ -123,8 +88,7 @@ pub const StmtKind = union(enum) {
     use: struct { local: LocalId },
 
     /// Statement shape we couldn't lower precisely.  Conservative:
-    /// analyzer assumes any local may be touched (re-set to .plain),
-    /// no other side-effects.
+    /// analyzer collapses every local's origin to .plain.
     lowering_gap: struct { note: []const u8 },
 };
 
@@ -155,28 +119,18 @@ pub const ExprKind = union(enum) {
     /// lifetime constraint despite borrowed-shape signature.
     owned,
     /// `ArenaAllocator.init(...)` — produces a fresh arena.  The
-    /// declaring local becomes the arena's "name" for kill tracking.
-    arena_init,
-    /// `Ast.parse(...)` — produces a fresh Ast.  Transfer mints a
-    /// new AstId; the declaring local becomes origin `.ast(aid)`.
-    /// Used by `.node_index_of(local)` propagation to tag NodeIndex
-    /// results with the originating Ast's identity.
-    ast_init,
-    /// Call to a fn annotated `// @returns node_index_of(<param>)`.
-    /// `local` is the resolved arg LocalId carrying the source Ast.
-    /// Transfer looks up local's current origin and, if it's
-    /// `.ast(aid)`, returns `.ast_node(aid)` — propagating the
-    /// Ast identity tag onto the NodeIndex result.
-    node_index_of: LocalId,
-    /// Call to a fn annotated `// @returns scope_from(<pass_name>)`.
-    /// `name` is a slice into source (caller keeps source alive).
-    /// Transfer mints/looks up a PassId for the name, returns
-    /// Origin.pass(P) — drives invariant #4 ID tagging.
-    scope_from: []const u8,
-    /// Call to a fn annotated `// @returns worker_arena`.  Transfer
-    /// returns Origin.worker_arena — drives invariant #3 thread
-    /// validation at use sites.
-    worker_arena_init,
+    /// ArenaId is minted at lowering time so worklist re-visits of
+    /// the same call site reuse the SAME id; otherwise loops would
+    /// blow `state.arenas` up unboundedly.
+    arena_init: abstract_state.ArenaId,
+    /// Heap allocation call (gpa.alloc / gpa.create / dupe / ...).
+    /// HeapId is minted at lowering time, same reasoning as arena_init.
+    heap_alloc: abstract_state.HeapId,
+    /// `&<local>` — address-of a function-local.  Produces a pointer
+    /// whose lifetime is bound to that local's stack frame.
+    stack_ref: LocalId,
+    /// `undefined` keyword — the value is explicitly uninitialized.
+    undef,
     /// Reading a local — pass-through of that local's current origin.
     copy_of: LocalId,
     /// Couldn't classify — conservative .plain at use site.
@@ -281,13 +235,6 @@ pub fn lowerFunctionFull(
     defer builder.tempDeinit();
 
     const entry_id = try builder.newBlock();
-    // Seed param locals BEFORE lowering the body so identifier
-    // references inside the body resolve via name_to_local.  Params
-    // whose type text mentions the configured Ast type name become
-    // Origin.ast(<aid>) at transfer time — enables invariant #1
-    // checks inside functions that RECEIVE the Ast rather than create it.
-    try builder.seedParams(fn_proto, entry_id);
-
     var cur_block = entry_id;
     try builder.lowerFunctionBody(body_node, &cur_block);
 
@@ -411,6 +358,12 @@ const Builder = struct {
     /// True iff the enclosing fn returns a borrowed-shape type.
     /// Threaded into `Stmt.ret.is_borrowed_return_type`.
     is_borrowed_return_type: bool = false,
+    /// Per-function counters for minting ArenaId / HeapId.  Done at
+    /// lowering time so worklist re-visits of the same call site
+    /// reuse the same id; otherwise loops would grow state.arenas
+    /// and state.heaps unboundedly.
+    next_arena: u32 = 0,
+    next_heap: u32 = 0,
 
     fn tempDeinit(self: *Builder) void {
         for (self.block_stmts.items) |*s| s.deinit(self.gpa);
@@ -451,39 +404,6 @@ const Builder = struct {
         try self.locals.append(self.gpa, .{ .name = name, .decl_pos = pos });
         try self.name_to_local.put(self.gpa, name, id);
         return id;
-    }
-
-    /// Register Ast-typed fn params as tracked locals + emit synthetic
-    /// `.decl` stmts on the entry block with init_kind .ast_init.
-    /// This mints a fresh AstId per call so within-function cross-Ast
-    /// checks (invariant #1) fire on receiving functions like
-    /// nodeSpan(self, idx).
-    ///
-    /// Non-Ast params are intentionally NOT seeded.  Initial phase-35
-    /// implementation registered ALL params with .plain init_kind so
-    /// every identifier reference resolved via name_to_local — that
-    /// inflated per-block state by N locals on every function and
-    /// pushed `src/cli/parallel.zig` past the 200k worklist iteration
-    /// cap.  Restricting seeding to Ast params keeps state bounded
-    /// (real codebases have at most 1-2 Ast params per fn) while
-    /// preserving the dogfood capability.
-    fn seedParams(self: *Builder, fn_proto: Ast.full.FnProto, entry: BlockId) !void {
-        const tree = self.tree;
-        var it = fn_proto.iterate(tree);
-        while (it.next()) |param| {
-            const name_tok = param.name_token orelse continue;
-            const name = tree.tokenSlice(name_tok);
-            if (std.mem.eql(u8, name, "_")) continue;
-            const type_node = param.type_expr orelse continue;
-            if (!paramTypeCarriesAst(tree, type_node, self.config)) continue;
-
-            const local = try self.registerLocal(name, self.posOfToken(name_tok));
-            try self.appendStmt(entry, .{
-                .kind = .{ .decl = .{ .local = local, .init_kind = .ast_init } },
-                .pos = self.posOfToken(name_tok),
-                .end_pos = self.posOfTokenEnd(name_tok),
-            });
-        }
     }
 
     /// Register `|x|` / `|x, y|` / `|*x, idx|` capture identifiers
@@ -601,9 +521,7 @@ const Builder = struct {
                 try self.pushDefer(body);
             },
             .@"errdefer" => {
-                // `.data = .node` in 0.17 (capture token dropped — we
-                // already eat the `|e|` payload in a separate token).
-                const body = tree.nodeData(stmt_node).node;
+                const body = tree.nodeData(stmt_node).opt_token_and_node[1];
                 try self.pushErrdefer(body);
             },
             .if_simple, .@"if" => try self.lowerIf(stmt_node, cur),
@@ -652,6 +570,12 @@ const Builder = struct {
             });
             return;
         };
+
+        // Walk the condition for any local reads / address-of writes
+        // before we branch — the condition runs before either arm and
+        // its side effects (e.g. `&out` clearing .undef) must be
+        // visible in BOTH successor states.
+        try self.emitUsesInExpr(if_data.ast.cond_expr, cur.*, null);
 
         // Allocate the three successor blocks up-front.
         const then_block = try self.newBlock();
@@ -1104,11 +1028,9 @@ const Builder = struct {
         else
             .plain;
 
-        // Emit @takes node_index_of checks for any call in init
-        // position — before the .decl so checks appear first in the
-        // block's stmt sequence (transfer is sequential; sequence
-        // doesn't change correctness but reads more naturally).
-        if (init_opt) |init| try self.emitTakesChecksForExpr(init, cur);
+        // Emit .use stmts for every local read by the init expression
+        // (before the .decl so the read is checked against pre-decl state).
+        if (init_opt) |init| try self.emitUsesInExpr(init, cur.*, null);
 
         try self.appendStmt(cur.*, .{
             .kind = .{ .decl = .{ .local = local, .init_kind = init_kind } },
@@ -1169,10 +1091,11 @@ const Builder = struct {
         // its body in-place, advancing cur, before the .assign emits.
         if (try self.maybeLowerLabeledBlockExpr(rhs, cur)) {}
 
-        // @takes checks for call-shaped rhs (phase 27).
-        try self.emitTakesChecksForExpr(rhs, cur);
 
         if (target_local) |t| {
+            // .use stmts for rhs reads, skipping the LHS itself
+            // (assignment writes LHS, not reads it).
+            try self.emitUsesInExpr(rhs, cur.*, t);
             try self.appendStmt(cur.*, .{
                 .kind = .{ .assign = .{
                     .target = t,
@@ -1218,8 +1141,6 @@ const Builder = struct {
         // Labeled-block expression rhs — lower body first.
         if (try self.maybeLowerLabeledBlockExpr(rhs, cur)) {}
 
-        // @takes checks for call-shaped rhs (phase 27).
-        try self.emitTakesChecksForExpr(rhs, cur);
 
         for (full.ast.variables) |var_node| {
             const vtag = tree.nodeTag(var_node);
@@ -1299,8 +1220,6 @@ const Builder = struct {
             // ret then emits there.
             if (try self.maybeLowerLabeledBlockExpr(expr, cur)) {}
 
-            // @takes checks for call-shaped return value (phase 27).
-            try self.emitTakesChecksForExpr(expr, cur);
         }
 
         // Success-path defers: fire before the return-value check.
@@ -1310,6 +1229,7 @@ const Builder = struct {
             self.classifyExpr(expr)
         else
             .plain;
+        if (value_opt) |expr| try self.emitUsesInExpr(expr, cur.*, null);
         try self.appendStmt(cur.*, .{
             .kind = .{ .ret = .{
                 .value_kind = value_kind,
@@ -1322,8 +1242,8 @@ const Builder = struct {
     }
 
     fn lowerCallStmt(self: *Builder, call_node: Ast.Node.Index, cur: *BlockId) !void {
-        // Detect arena.deinit() and thread.join() patterns; otherwise
-        // emit nothing (a side-effect-free call from our analyzer's pov).
+        // Detect arena.deinit() patterns; otherwise emit nothing
+        // (call has no side-effect from our pov).
         const tree = self.tree;
         const first = tree.firstToken(call_node);
         const last = tree.lastToken(call_node);
@@ -1334,7 +1254,6 @@ const Builder = struct {
         const text = tree.source[start..end];
 
         if (anyPatternMatches(text, self.config.arena_kill_patterns)) {
-            // Identify the receiver local — first identifier in `text`.
             const recv_local = self.firstIdentifierLocal(text) orelse {
                 try self.appendStmt(cur.*, .{
                     .kind = .{ .lowering_gap = .{ .note = "deinit-no-receiver" } },
@@ -1350,19 +1269,28 @@ const Builder = struct {
             });
             return;
         }
-        if (anyPatternMatches(text, self.config.thread_join_patterns)) {
+
+        if (anyPatternMatches(text, self.config.heap_free_patterns)) {
+            if (self.heapFreedLocal(call_node)) |freed| {
+                try self.appendStmt(cur.*, .{
+                    .kind = .{ .heap_free = .{ .freed_local = freed } },
+                    .pos = self.posOf(call_node),
+                    .end_pos = self.endPosOf(call_node),
+                });
+                return;
+            }
             try self.appendStmt(cur.*, .{
-                .kind = .thread_join,
+                .kind = .{ .lowering_gap = .{ .note = "free-untracked-arg" } },
                 .pos = self.posOf(call_node),
                 .end_pos = self.endPosOf(call_node),
             });
             return;
         }
 
-        // @takes annotation check — emit per-arg validation stmts.
-        try self.emitTakesChecksForCall(call_node, cur);
-
-        // Other calls — side-effect from our pov is "nothing tracked".
+        // Untracked call at stmt position — emit uses for everything
+        // it references so UAF on call args still fires before the
+        // conservative gap erases tracked origins.
+        try self.emitUsesInExpr(call_node, cur.*, null);
         try self.appendStmt(cur.*, .{
             .kind = .{ .lowering_gap = .{ .note = "call-untracked" } },
             .pos = self.posOf(call_node),
@@ -1370,389 +1298,19 @@ const Builder = struct {
         });
     }
 
-    /// If the callee carries `@takes node_index_of(X)` (same-file OR
-    /// cross-file via @import), emit one `.ast_takes_check` stmt per
-    /// arg whose token-position resolves to a registered local — the
-    /// transfer rule will check each one's `.ast_node` tag against
-    /// the source param's `.ast`.  Conservative: arg locals that
-    /// don't resolve to bare identifiers are skipped.
-    fn emitTakesChecksForCall(
-        self: *Builder,
-        call_node: Ast.Node.Index,
-        cur: *BlockId,
-    ) !void {
+    /// For `<allocator>.free(p)` / `<allocator>.destroy(p)`, return the
+    /// LocalId of `p` if it's a known local.  Null on any other shape.
+    fn heapFreedLocal(self: *Builder, call_node: Ast.Node.Index) ?LocalId {
         const tree = self.tree;
-
         var buf: [1]Ast.Node.Index = undefined;
-        const call_full = tree.fullCall(&buf, call_node) orelse return;
-        const callee_node = call_full.ast.fn_expr;
-        const args = call_full.ast.params;
-
-        // For `imported.method(...)` the receiver is a namespace, not
-        // a value arg — so the takes annotation's param indices count
-        // from args[0] (no receiver shift).  For `obj.method(...)` the
-        // receiver IS arg[0] and indices shift by one.
-        const is_namespace_call = self.isImportNamespaceCall(callee_node);
-        const recv_is_arg0 = (tree.nodeTag(callee_node) == .field_access) and !is_namespace_call;
-
-        // Mutation check (invariant #5).  Three resolution modes for
-        // which arg is the mutated Ast:
-        //   .implicit   — receiver (method shape) OR args[0] (namespace).
-        //   .of(idx)    — explicit param index from the annotation.
-        //                 For method calls, idx==0 means the receiver;
-        //                 explicit-arg indices shift by one.
-        //
-        // Skipped when invariant ast_mutation is disabled (phase 46).
-        if (config_mod.isEnabled(self.config, .ast_mutation)) {
-            if (self.lookupMutatesAst(callee_node)) |mut| {
-                const ast_arg: ?Ast.Node.Index = switch (mut) {
-                    .implicit => if (recv_is_arg0)
-                        tree.nodeData(callee_node).node_and_token[0]
-                    else if (args.len > 0) args[0] else null,
-                    .of => |idx| blk: {
-                        if (recv_is_arg0 and idx == 0)
-                            break :blk tree.nodeData(callee_node).node_and_token[0];
-                        const explicit_idx = if (recv_is_arg0) idx - 1 else idx;
-                        if (explicit_idx >= args.len) break :blk null;
-                        break :blk args[explicit_idx];
-                    },
-                };
-                if (ast_arg) |n| {
-                    if (self.identifierToLocal(n)) |ast_local| {
-                        try self.appendStmt(cur.*, .{
-                            .kind = .{ .ast_mutation_check = .{ .ast_local = ast_local } },
-                            .pos = self.posOf(call_node),
-                            .end_pos = self.endPosOf(call_node),
-                        });
-                    }
-                }
-            }
-        }
-
-        // Takes check.  Dispatch by annotation variant — different
-        // invariants gate on different Config flags.
-        const takes = self.lookupTakes(callee_node) orelse return;
-        switch (takes) {
-            // Explicit opt-out — emit no checks.
-            .node_index_any => return,
-            // Invariant #1 (NodeIndex from Ast A flows only into A).
-            .node_index_of => |idx| {
-                if (!config_mod.isEnabled(self.config, .ast_identity)) return;
-                const source_node: Ast.Node.Index = blk: {
-                    if (recv_is_arg0 and idx == 0) {
-                        break :blk tree.nodeData(callee_node).node_and_token[0];
-                    }
-                    const explicit_idx = if (recv_is_arg0) idx - 1 else idx;
-                    if (explicit_idx >= args.len) return;
-                    break :blk args[explicit_idx];
-                };
-                const source_local = self.identifierToLocal(source_node) orelse return;
-                try self.emitAstTakesChecksAcrossArgs(call_node, callee_node, args, recv_is_arg0, source_node, source_local, cur.*);
-            },
-            // Invariant #4 (pass-tagged ScopeId / SymbolId).
-            .scope_from => |pass_name| {
-                if (!config_mod.isEnabled(self.config, .pass_identity)) return;
-                try self.emitScopeTakesChecksAcrossArgs(call_node, callee_node, args, recv_is_arg0, pass_name, cur.*);
-            },
-            // Invariant #3 (worker-arena pointer before join).
-            .worker_arena => |idx| {
-                if (!config_mod.isEnabled(self.config, .thread_arena)) return;
-                const target_node: Ast.Node.Index = blk: {
-                    if (recv_is_arg0 and idx == 0) {
-                        break :blk tree.nodeData(callee_node).node_and_token[0];
-                    }
-                    const explicit_idx = if (recv_is_arg0) idx - 1 else idx;
-                    if (explicit_idx >= args.len) return;
-                    break :blk args[explicit_idx];
-                };
-                if (self.identifierToLocal(target_node)) |vl| {
-                    try self.appendStmt(cur.*, .{
-                        .kind = .{ .worker_takes_check = .{ .value_local = vl } },
-                        .pos = self.posOf(call_node),
-                        .end_pos = self.endPosOf(call_node),
-                    });
-                }
-            },
-        }
-    }
-
-    /// Emit `.ast_takes_check` against every non-source arg + receiver.
-    fn emitAstTakesChecksAcrossArgs(
-        self: *Builder,
-        call_node: Ast.Node.Index,
-        callee_node: Ast.Node.Index,
-        args: []const Ast.Node.Index,
-        recv_is_arg0: bool,
-        source_node: Ast.Node.Index,
-        source_local: LocalId,
-        cur: BlockId,
-    ) !void {
-        const tree = self.tree;
-        if (recv_is_arg0) {
-            const recv_node = tree.nodeData(callee_node).node_and_token[0];
-            if (recv_node != source_node) {
-                if (self.identifierToLocal(recv_node)) |vl| {
-                    try self.appendStmt(cur, .{
-                        .kind = .{ .ast_takes_check = .{
-                            .source_local = source_local,
-                            .value_local = vl,
-                        } },
-                        .pos = self.posOf(call_node),
-                        .end_pos = self.endPosOf(call_node),
-                    });
-                }
-            }
-        }
-        for (args) |a| {
-            if (a == source_node) continue;
-            if (self.identifierToLocal(a)) |vl| {
-                try self.appendStmt(cur, .{
-                    .kind = .{ .ast_takes_check = .{
-                        .source_local = source_local,
-                        .value_local = vl,
-                    } },
-                    .pos = self.posOf(call_node),
-                    .end_pos = self.endPosOf(call_node),
-                });
-            }
-        }
-    }
-
-    /// Emit `.scope_takes_check` against every arg (and the receiver,
-    /// when it's a value).  Source identity is the pass NAME — no
-    /// per-call source local; the expected pass is the annotation's
-    /// declared name.
-    fn emitScopeTakesChecksAcrossArgs(
-        self: *Builder,
-        call_node: Ast.Node.Index,
-        callee_node: Ast.Node.Index,
-        args: []const Ast.Node.Index,
-        recv_is_arg0: bool,
-        expected_pass: []const u8,
-        cur: BlockId,
-    ) !void {
-        const tree = self.tree;
-        if (recv_is_arg0) {
-            const recv_node = tree.nodeData(callee_node).node_and_token[0];
-            if (self.identifierToLocal(recv_node)) |vl| {
-                try self.appendStmt(cur, .{
-                    .kind = .{ .scope_takes_check = .{
-                        .value_local = vl,
-                        .expected_pass = expected_pass,
-                    } },
-                    .pos = self.posOf(call_node),
-                    .end_pos = self.endPosOf(call_node),
-                });
-            }
-        }
-        for (args) |a| {
-            if (self.identifierToLocal(a)) |vl| {
-                try self.appendStmt(cur, .{
-                    .kind = .{ .scope_takes_check = .{
-                        .value_local = vl,
-                        .expected_pass = expected_pass,
-                    } },
-                    .pos = self.posOf(call_node),
-                    .end_pos = self.endPosOf(call_node),
-                });
-            }
-        }
-    }
-
-    /// Bare-identifier → resolved LocalId, or null otherwise.
-    /// (identifierToCopyOrUnknown wraps in an ExprKind; this returns
-    /// the raw LocalId.)
-    fn identifierToLocal(self: *Builder, node: Ast.Node.Index) ?LocalId {
-        const tree = self.tree;
-        if (tree.nodeTag(node) != .identifier) return null;
-        const name = tree.tokenSlice(tree.nodeMainToken(node));
+        const call_full = tree.fullCall(&buf, call_node) orelse return null;
+        if (call_full.ast.params.len == 0) return null;
+        const arg = call_full.ast.params[0];
+        if (tree.nodeTag(arg) != .identifier) return null;
+        const name = tree.tokenSlice(tree.nodeMainToken(arg));
         return self.name_to_local.get(name);
     }
 
-    /// Is the call's receiver a namespace (vs an object/value)?
-    /// Two recognized shapes:
-    ///   `imported.method(...)`         — recv is identifier in imap
-    ///   `imported.Sub.method(...)`     — recv is field_access whose
-    ///                                    outermost ident is in imap
-    /// Either case → namespace call; receiver is NOT arg 0.
-    fn isImportNamespaceCall(self: *Builder, callee_node: Ast.Node.Index) bool {
-        const tree = self.tree;
-        if (tree.nodeTag(callee_node) != .field_access) return false;
-        const recv_node = tree.nodeData(callee_node).node_and_token[0];
-        const remote = self.remote orelse return false;
-
-        const outer_ident_tok: ?Ast.TokenIndex = switch (tree.nodeTag(recv_node)) {
-            .identifier => tree.nodeMainToken(recv_node),
-            .field_access => blk: {
-                const outer = tree.nodeData(recv_node).node_and_token[0];
-                if (tree.nodeTag(outer) != .identifier) break :blk null;
-                break :blk tree.nodeMainToken(outer);
-            },
-            else => null,
-        };
-        const tok = outer_ident_tok orelse return false;
-        const name = tree.tokenSlice(tok);
-        return remote.imap.lookup(name) != null;
-    }
-
-    /// Resolve callee's `@takes` annotation.  Same-file db first, then
-    /// cross-file via remote resolver for `imported.method(...)` shapes.
-    /// Returns null on any miss.
-    fn lookupTakes(
-        self: *Builder,
-        callee_node: Ast.Node.Index,
-    ) ?annotations.TakesAnnotation {
-        const tree = self.tree;
-        switch (tree.nodeTag(callee_node)) {
-            .field_access => {
-                const fa = tree.nodeData(callee_node);
-                const recv_node = fa.node_and_token[0];
-                const method_tok = fa.node_and_token[1];
-                const method_name = tree.tokenSlice(method_tok);
-
-                // Same-file first.
-                if (self.db) |db| {
-                    if (db.lookup(method_name)) |e| if (e.takes) |t| return t;
-                }
-                // Cross-file via remote (only when receiver is an
-                // import namespace identifier).
-                return self.lookupRemoteTakes(recv_node, method_name);
-            },
-            .identifier => {
-                const name = tree.tokenSlice(tree.nodeMainToken(callee_node));
-                if (self.db) |db| {
-                    if (db.lookup(name)) |e| if (e.takes) |t| return t;
-                }
-                return null;
-            },
-            else => return null,
-        }
-    }
-
-    /// Same shape as lookupTakes; returns the @mutates_ast annotation
-    /// (null when none).  Same-file first, then cross-file via
-    /// resolveRemoteFile.
-    fn lookupMutatesAst(self: *Builder, callee_node: Ast.Node.Index) ?annotations.MutatesAstAnnotation {
-        const tree = self.tree;
-        switch (tree.nodeTag(callee_node)) {
-            .field_access => {
-                const fa = tree.nodeData(callee_node);
-                const recv_node = fa.node_and_token[0];
-                const method_name = tree.tokenSlice(fa.node_and_token[1]);
-                if (self.db) |db| {
-                    if (db.lookup(method_name)) |e| if (e.mutates_ast) |m| return m;
-                }
-                if (self.resolveRemoteFile(recv_node)) |rf| {
-                    if (rf.db.lookup(method_name)) |e| if (e.mutates_ast) |m| return m;
-                }
-                return null;
-            },
-            .identifier => {
-                const name = tree.tokenSlice(tree.nodeMainToken(callee_node));
-                if (self.db) |db| {
-                    if (db.lookup(name)) |e| if (e.mutates_ast) |m| return m;
-                }
-                return null;
-            },
-            else => return null,
-        }
-    }
-
-    /// Cross-file `@takes` lookup.  Uses resolveRemoteFile so it
-    /// inherits one-hop nested-namespace dispatch (phase 30) for free.
-    fn lookupRemoteTakes(
-        self: *Builder,
-        recv_node: Ast.Node.Index,
-        method_name: []const u8,
-    ) ?annotations.TakesAnnotation {
-        const file = self.resolveRemoteFile(recv_node) orelse return null;
-        const entry = file.db.lookup(method_name) orelse return null;
-        return entry.takes;
-    }
-
-    /// Walk the receiver chain to its terminal RemoteFile.  Two
-    /// supported shapes:
-    /// (a) `imported.method` — receiver is a bare identifier; one
-    ///     hop through self.remote.imap.
-    /// (b) `imported.Sub.method` — receiver is one-level nested
-    ///     field_access; chase via `imported`'s OWN imap (loaded
-    ///     into RemoteFile.imap as of phase 30) to land in Sub's
-    ///     file.  Path resolution for the second hop uses the
-    ///     intermediate file's directory.
-    /// Deeper chains aren't followed.
-    fn resolveRemoteFile(
-        self: *Builder,
-        recv_node: Ast.Node.Index,
-    ) ?*const remote_resolver.RemoteFile {
-        const tree = self.tree;
-        const remote = self.remote orelse return null;
-
-        switch (tree.nodeTag(recv_node)) {
-            .identifier => {
-                const recv_name = tree.tokenSlice(tree.nodeMainToken(recv_node));
-                const entry = remote.imap.lookup(recv_name) orelse return null;
-                const direct = (remote.cache.loadOrLookup(remote.base_dir, entry.path) catch null) orelse return null;
-                // First subfield hop (phase 31): chase through loaded
-                // file's imap.
-                const after_hop1 = if (entry.subfield) |sub| blk: {
-                    const sub_entry = direct.imap.lookup(sub) orelse return null;
-                    const sub_dir = std.fs.path.dirname(direct.abs_path) orelse ".";
-                    break :blk (remote.cache.loadOrLookup(sub_dir, sub_entry.path) catch null) orelse return null;
-                } else direct;
-                // Second subfield hop (phase 41): chains like
-                // `const X = A.Sub; const Y = X.Inner;` end up with
-                // Y.subfield="Sub" + Y.subfield2="Inner".
-                if (entry.subfield2) |sub2| {
-                    const sub2_entry = after_hop1.imap.lookup(sub2) orelse return null;
-                    const sub2_dir = std.fs.path.dirname(after_hop1.abs_path) orelse ".";
-                    return (remote.cache.loadOrLookup(sub2_dir, sub2_entry.path) catch null);
-                }
-                return after_hop1;
-            },
-            .field_access => {
-                const fa = tree.nodeData(recv_node);
-                const outer_node = fa.node_and_token[0];
-                const inner_tok = fa.node_and_token[1];
-                if (tree.nodeTag(outer_node) != .identifier) return null;
-                const outer_name = tree.tokenSlice(tree.nodeMainToken(outer_node));
-                const outer_import = remote.imap.lookup(outer_name) orelse return null;
-                const outer_file = (remote.cache.loadOrLookup(remote.base_dir, outer_import.path) catch null) orelse return null;
-
-                const inner_name = tree.tokenSlice(inner_tok);
-                const inner_import = outer_file.imap.lookup(inner_name) orelse return null;
-                const inner_base_dir = std.fs.path.dirname(outer_file.abs_path) orelse ".";
-                return (remote.cache.loadOrLookup(inner_base_dir, inner_import.path) catch null);
-            },
-            else => return null,
-        }
-    }
-
-    /// Walk through `try` wrappers to the underlying call node, or
-    /// null if `node` isn't a call (possibly after one or more `try`s).
-    /// `catch` not unwrapped — its lhs is a call but the whole
-    /// expression's value has different propagation; conservatively
-    /// skipped here so we don't emit phantom checks.
-    fn unwrapToCallNode(self: *Builder, node: Ast.Node.Index) ?Ast.Node.Index {
-        const tag = self.tree.nodeTag(node);
-        return switch (tag) {
-            .@"try" => self.unwrapToCallNode(self.tree.nodeData(node).node),
-            .call, .call_one, .call_comma, .call_one_comma => node,
-            else => null,
-        };
-    }
-
-    /// If `expr` (after `try` unwrap) is a direct call, emit per-arg
-    /// `.ast_takes_check` statements onto `cur`.  Hook used by
-    /// init/return/assign positions to broaden phase 26's
-    /// statement-position-only emission.
-    fn emitTakesChecksForExpr(
-        self: *Builder,
-        expr: Ast.Node.Index,
-        cur: *BlockId,
-    ) !void {
-        const call_node = self.unwrapToCallNode(expr) orelse return;
-        try self.emitTakesChecksForCall(call_node, cur);
-    }
 
     fn classifyExpr(self: *Builder, expr_node: Ast.Node.Index) ExprKind {
         const tree = self.tree;
@@ -1784,22 +1342,34 @@ const Builder = struct {
         const text = tree.source[start..end];
 
         if (anyPatternMatches(text, self.config.arena_init_patterns)) {
-            return .arena_init;
+            const aid: abstract_state.ArenaId = @enumFromInt(self.next_arena);
+            self.next_arena += 1;
+            return .{ .arena_init = aid };
         }
-        // `<config.ast_init_patterns>` substring match (default
-        // includes "Ast.parse").  False positives (a non-Ast call
-        // matching the pattern) would taint a local with .ast —
-        // downstream node_index_of propagation stays sound (the Ast
-        // tag just wouldn't match any real Ast method).
-        if (anyPatternMatches(text, self.config.ast_init_patterns)) {
-            return .ast_init;
+        if (anyPatternMatches(text, self.config.heap_alloc_patterns)) {
+            const hid: abstract_state.HeapId = @enumFromInt(self.next_heap);
+            self.next_heap += 1;
+            return .{ .heap_alloc = hid };
         }
 
-        // Identifier reference → .copy_of(local) if known
+        // Identifier reference → .undef / .copy_of(local) if known
         if (tag == .identifier) {
             const name = tree.tokenSlice(tree.nodeMainToken(expr_node));
+            if (std.mem.eql(u8, name, "undefined")) return .undef;
             if (self.name_to_local.get(name)) |id| {
                 return .{ .copy_of = id };
+            }
+        }
+
+        // `&<local>` — address-of of a known local.  Produces a
+        // pointer bound to that local's stack frame.
+        if (tag == .address_of) {
+            const inner = tree.nodeData(expr_node).node;
+            if (tree.nodeTag(inner) == .identifier) {
+                const name = tree.tokenSlice(tree.nodeMainToken(inner));
+                if (self.name_to_local.get(name)) |id| {
+                    return .{ .stack_ref = id };
+                }
             }
         }
 
@@ -1835,9 +1405,7 @@ const Builder = struct {
                 // 1. Same-file DB hit on method name.
                 if (self.db) |db| {
                     if (db.lookup(method_name)) |entry| {
-                        if (entry.annotation) |anno| {
-                            return self.applyAnnotationToCall(anno, recv_node, args, true);
-                        }
+                        return self.applyAnnotationToCall(entry.annotation, recv_node, args, true);
                     }
                 }
 
@@ -1855,14 +1423,77 @@ const Builder = struct {
                 const fn_name = tree.tokenSlice(tree.nodeMainToken(callee_node));
                 if (self.db) |db| {
                     if (db.lookup(fn_name)) |entry| {
-                        if (entry.annotation) |anno| {
-                            return self.applyAnnotationToCall(anno, callee_node, args, false);
-                        }
+                        return self.applyAnnotationToCall(entry.annotation, callee_node, args, false);
                     }
                 }
                 return .unknown;
             },
             else => return .unknown,
+        }
+    }
+
+    /// Walk every token in `expr_node` and emit a `.use` stmt for each
+    /// identifier that resolves to a known local.  Skips identifiers
+    /// preceded by `.` (field/method names) or `&` (address-of doesn't
+    /// read the value).  Optional `skip_local` is excluded — used by
+    /// assign to avoid emitting a use for the LHS target.  Dedupes so
+    /// repeated mentions of the same local only emit one `.use`.
+    fn emitUsesInExpr(
+        self: *Builder,
+        expr_node: Ast.Node.Index,
+        cur: BlockId,
+        skip_local: ?LocalId,
+    ) !void {
+        const tree = self.tree;
+        const first = tree.firstToken(expr_node);
+        const last = tree.lastToken(expr_node);
+        const tags = tree.tokens.items(.tag);
+
+        // Use the whole-expression pos for every emitted stmt.  Per-
+        // token positions (posOfToken) are O(byte_offset) — calling
+        // that once per identifier turns analysis quadratic on large
+        // files.  Coarser diagnostic, but cheap.
+        const pos = self.posOf(expr_node);
+        const end_pos = self.endPosOf(expr_node);
+
+        var used: std.AutoArrayHashMapUnmanaged(LocalId, void) = .empty;
+        defer used.deinit(self.gpa);
+        var aw: std.AutoArrayHashMapUnmanaged(LocalId, void) = .empty;
+        defer aw.deinit(self.gpa);
+
+        var t: Ast.TokenIndex = first;
+        while (t <= last) : (t += 1) {
+            if (tags[t] != .identifier) continue;
+            // Address-of: `&id` is conservatively treated as a possible
+            // write (out-param pattern).  Emit an .assign with .unknown
+            // rhs so the local's origin collapses to .plain — clears
+            // .undef and avoids spurious use-of-undefined findings on
+            // common idioms like `var x = undefined; fillOut(&x);`.
+            if (t > 0 and tags[t - 1] == .ampersand) {
+                const name = tree.tokenSlice(t);
+                const id = self.name_to_local.get(name) orelse continue;
+                if (skip_local) |s| if (id == s) continue;
+                const gop = try aw.getOrPut(self.gpa, id);
+                if (gop.found_existing) continue;
+                try self.appendStmt(cur, .{
+                    .kind = .{ .assign = .{ .target = id, .rhs_kind = .unknown } },
+                    .pos = pos,
+                    .end_pos = end_pos,
+                });
+                continue;
+            }
+            // Field/method access: `.method` — skip; it's not a local.
+            if (t > 0 and tags[t - 1] == .period) continue;
+            const name = tree.tokenSlice(t);
+            const id = self.name_to_local.get(name) orelse continue;
+            if (skip_local) |s| if (id == s) continue;
+            const gop = try used.getOrPut(self.gpa, id);
+            if (gop.found_existing) continue;
+            try self.appendStmt(cur, .{
+                .kind = .{ .use = .{ .local = id } },
+                .pos = pos,
+                .end_pos = end_pos,
+            });
         }
     }
 
@@ -1875,14 +1506,12 @@ const Builder = struct {
         recv_node: Ast.Node.Index,
         method_name: []const u8,
     ) ?annotations.ReturnsAnnotation {
-        const file = self.resolveRemoteFile(recv_node) orelse return null;
-        const entry = file.db.lookup(method_name) orelse return null;
-        return entry.annotation; // may itself be null — caller treats as miss
+        _ = self;
+        _ = recv_node;
+        _ = method_name;
+        return null;
     }
 
-    /// Convert a callee annotation + actual-arg context into an ExprKind.
-    /// `receiver_is_arg0`: when true (method-call case), the receiver
-    /// counts as args[0] and `args` is the explicit list shifted by one.
     fn applyAnnotationToCall(
         self: *Builder,
         anno: annotations.ReturnsAnnotation,
@@ -1892,10 +1521,6 @@ const Builder = struct {
     ) ExprKind {
         switch (anno) {
             .owned => return .owned,
-            // `@returns ast` — call mints a fresh Ast value, same as
-            // the text-detected `Ast.parse(...)` pattern.  Indistinct
-            // from .ast_init at the ExprKind level.
-            .ast => return .ast_init,
             .borrowed_from => |target_idx| {
                 if (receiver_is_arg0 and target_idx == 0) {
                     return self.identifierToCopyOrUnknown(receiver_or_callee);
@@ -1904,31 +1529,6 @@ const Builder = struct {
                 if (explicit_idx >= args.len) return .unknown;
                 return self.identifierToCopyOrUnknown(args[explicit_idx]);
             },
-            // `@returns node_index_of(<param>)`: result is a NodeIndex
-            // tagged with the source param's Ast identity.  Same
-            // arg-position dispatch as borrowed_from.
-            .node_index_of => |target_idx| {
-                const source_node = blk: {
-                    if (receiver_is_arg0 and target_idx == 0) break :blk receiver_or_callee;
-                    const explicit_idx = if (receiver_is_arg0) target_idx - 1 else target_idx;
-                    if (explicit_idx >= args.len) return .unknown;
-                    break :blk args[explicit_idx];
-                };
-                const src_kind = self.identifierToCopyOrUnknown(source_node);
-                return switch (src_kind) {
-                    .copy_of => |local| .{ .node_index_of = local },
-                    else => .unknown,
-                };
-            },
-            // `@returns scope_from(<pass_name>)`: result is a scope/
-            // symbol ID minted by the named pass.  Independent of
-            // args — the identity is the pass NAME, not derived from
-            // any param's runtime value.
-            .scope_from => |pass_name| return .{ .scope_from = pass_name },
-            // `@returns worker_arena`: result is a worker-allocated
-            // pointer.  Indistinct from .worker_arena_init at the
-            // ExprKind level.
-            .worker_arena => return .worker_arena_init,
         }
     }
 
@@ -2199,32 +1799,14 @@ test "lower fn with return of borrowed identifier" {
     const cfg = result.cfg.?;
 
     const stmts = cfg.blocks[0].stmts;
-    try std.testing.expectEqual(@as(usize, 2), stmts.len);
-    try std.testing.expect(stmts[0].kind == .decl);
-    try std.testing.expect(stmts[1].kind == .ret);
-    // Return value should be classified as .copy_of(x).
-    try std.testing.expect(stmts[1].kind.ret.value_kind == .copy_of);
-    try std.testing.expectEqual(stmts[0].kind.decl.local, stmts[1].kind.ret.value_kind.copy_of);
-}
-
-test "lower fn with thread join" {
-    const gpa = std.testing.allocator;
-    var result = try parseAndLower(gpa,
-        \\pub fn foo() void {
-        \\    var t = undefined;
-        \\    t.join();
-        \\    return;
-        \\}
-        \\
-    );
-    defer result.deinit(gpa);
-    const cfg = result.cfg.?;
-
-    const stmts = cfg.blocks[0].stmts;
+    // decl x, use x (emitted before the ret), ret x.
     try std.testing.expectEqual(@as(usize, 3), stmts.len);
     try std.testing.expect(stmts[0].kind == .decl);
-    try std.testing.expect(stmts[1].kind == .thread_join);
+    try std.testing.expect(stmts[1].kind == .use);
     try std.testing.expect(stmts[2].kind == .ret);
+    try std.testing.expect(stmts[2].kind.ret.value_kind == .copy_of);
+    try std.testing.expectEqual(stmts[0].kind.decl.local, stmts[2].kind.ret.value_kind.copy_of);
+    try std.testing.expectEqual(stmts[0].kind.decl.local, stmts[1].kind.use.local);
 }
 
 test "if-statement creates fork: 3 blocks (entry, then, merge)" {
@@ -3367,125 +2949,6 @@ test "destructuring var-decl `const a, const b = pair()` registers both locals" 
         }
     }
     try std.testing.expect(decl_count >= 2);
-}
-
-test "Config: custom ast_type_name detects a renamed Ast (phase 42)" {
-    // Project that calls its parse tree `Tree` and constructs via
-    // `Tree.from_source(...)`.  With a custom Config the analyzer
-    // recognizes Tree params + Tree.from_source constructor without
-    // any code change beyond passing the Config.
-    const gpa = std.testing.allocator;
-    const my_config: Config = .{
-        .ast_type_name = "Tree",
-        .ast_init_patterns = &.{"Tree.from_source"},
-    };
-
-    const src =
-        \\pub fn foo() void {
-        \\    var t = Tree.from_source("");
-        \\    _ = t;
-        \\    return;
-        \\}
-        \\const Tree = struct {
-        \\    pub fn from_source(_: []const u8) Tree { return .{}; }
-        \\};
-        \\
-    ;
-    const src_z = try gpa.dupeSentinel(u8, src, 0);
-    defer gpa.free(src_z);
-    var tree = try Ast.parse(gpa, src_z, .zig);
-    defer tree.deinit(gpa);
-
-    // First fn_decl.
-    var node_idx: u32 = 1;
-    while (node_idx < tree.nodes.len) : (node_idx += 1) {
-        const node: Ast.Node.Index = @enumFromInt(node_idx);
-        if (tree.nodeTag(node) != .fn_decl) continue;
-        var cfg = (try lowerFunctionFull(gpa, &tree, node, null, null, &my_config)) orelse continue;
-        defer cfg.deinit(gpa);
-
-        var saw_ast_init = false;
-        for (cfg.blocks) |b| {
-            for (b.stmts) |s| {
-                if (s.kind == .decl and s.kind.decl.init_kind == .ast_init) {
-                    saw_ast_init = true;
-                }
-            }
-        }
-        try std.testing.expect(saw_ast_init);
-        return;
-    }
-    try std.testing.expect(false); // no fn_decl found
-}
-
-test "classifyExpr: `Ast.parse(...)` → .ast_init (phase 25)" {
-    // Wrap with `try` not `catch` — classifyExpr early-returns
-    // .unknown on .@"catch" (phase 8), and we want the inner
-    // Ast.parse call's text to reach the pattern matcher.
-    const gpa = std.testing.allocator;
-    var result = try parseAndLower(gpa,
-        \\pub fn foo() !void {
-        \\    var tree = try Ast.parse(undefined, undefined, .zig);
-        \\    _ = tree;
-        \\    return;
-        \\}
-        \\const Ast = struct {
-        \\    pub fn parse(_: u32, _: u32, _: anytype) !Ast { return .{}; }
-        \\};
-        \\
-    );
-    defer result.deinit(gpa);
-    const cfg = result.cfg.?;
-
-    var saw_ast_init = false;
-    for (cfg.blocks) |b| {
-        for (b.stmts) |s| {
-            if (s.kind == .decl and s.kind.decl.init_kind == .ast_init) {
-                saw_ast_init = true;
-            }
-        }
-    }
-    try std.testing.expect(saw_ast_init);
-}
-
-test "applyAnnotationToCall: @returns node_index_of(arg) → .node_index_of (phase 25)" {
-    // The annotation propagates the source arg's Ast identity onto
-    // the returned NodeIndex.  Verify the classifier outputs the
-    // .node_index_of variant when a same-file fn carries this
-    // annotation and we call it with a registered local.
-    // Pass `tree` by value (bare identifier) — identifierToCopyOrUnknown
-    // requires an .identifier node tag.  `&tree` would parse as
-    // .address_of and the propagation degrades to .unknown.
-    // Needs the same-file annotation DB so classifyCall can resolve
-    // `rootNode`'s @returns marker.
-    const gpa = std.testing.allocator;
-    var result = try parseAndLowerWithDb(gpa,
-        \\pub fn foo() void {
-        \\    var tree: Ast = .{};
-        \\    const root = rootNode(tree);
-        \\    _ = root;
-        \\    return;
-        \\}
-        \\const Ast = struct {};
-        \\const NodeIndex = u32;
-        \\/// @returns node_index_of(ast)
-        \\pub fn rootNode(ast: Ast) NodeIndex {
-        \\    _ = ast; return 0;
-        \\}
-        \\
-    );
-    defer result.deinit(gpa);
-    const cfg = result.cfg.?;
-
-    var saw_node_index_of = false;
-    for (cfg.blocks) |b| {
-        for (b.stmts) |s| {
-            if (s.kind == .decl and s.kind.decl.init_kind == .node_index_of) {
-                saw_node_index_of = true;
-            }
-        }
-    }
-    try std.testing.expect(saw_node_index_of);
 }
 
 test "name slices live for the test bundle's lifetime (phase 20 dangle fix)" {

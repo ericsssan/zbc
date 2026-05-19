@@ -1,19 +1,4 @@
-//! Public library API for the borrow-check / escape analyzer.
-//! Separates the analyzer kernel (parse + lower + check) from the
-//! CLI (main.zig: argparse + diagnostic formatting).  Downstream
-//! projects depend on this module via build.zig.zon; ez's own
-//! main.zig is one consumer.
-//!
-//! Two analysis modes:
-//!   - `analyzeEscape(...)` — Layer 2.  Full cross-file annotation
-//!     lookup, CFG lowering, abstract-interpretation worklist.
-//!     Returns problems found by the configured invariants
-//!     (currently: arena-escape, ast-identity, post-parse mutation).
-//!   - `analyzeHygiene(...)` — Layer 1.  Same-file lint rules
-//!     covering annotation-presence checks (the require_* rules).
-//!
-//! Both modes return an owned `[]Problem` slice; caller must call
-//! `freeProblems(gpa, slice)` to release.
+//! Public library API for the zbc escape analyzer.
 
 const std = @import("std");
 const Ast = std.zig.Ast;
@@ -27,10 +12,6 @@ const config_mod = @import("config.zig");
 const problem_mod = @import("problem.zig");
 
 const require_borrowed_from = @import("rules/require_borrowed_from.zig");
-const require_node_index_origin = @import("rules/require_node_index_origin.zig");
-const require_arena_kill_tag = @import("rules/require_arena_kill_tag.zig");
-
-// ── Public types — re-exported for caller convenience ───────────
 
 pub const Config = config_mod.Config;
 pub const DefaultConfig = config_mod.Default;
@@ -42,20 +23,6 @@ pub const Problem = problem_mod.Problem;
 pub const Severity = problem_mod.Severity;
 pub const Cache = remote_resolver_mod.Cache;
 
-// ── Public entry points ─────────────────────────────────────────
-
-/// Layer 2: run the escape analyzer on `path`.  Reads the file,
-/// parses it, lowers each top-level fn to a CFG, runs the abstract-
-/// interpretation worklist, and returns any reported Problems.
-///
-/// `cache` — sweep-wide remote-resolver cache, shared across multiple
-///   analyzeEscape calls in the same run for cross-file annotation
-///   lookup speed.  Pass null to disable cross-file resolution
-///   entirely (annotations only resolve same-file).
-/// `config` — project knobs (type names, text patterns).  Pass
-///   `&DefaultConfig` to use the historical ez defaults.
-///
-/// Returns an owned slice — caller must call `freeProblems(gpa, slice)`.
 pub fn analyzeEscape(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -81,7 +48,6 @@ pub fn analyzeEscape(
     var db = try annotations_mod.build(gpa, &tree);
     defer db.deinit(gpa);
 
-    // Construct remote context only if caller supplied a cache.
     var imap_storage: ?imports_mod.Map = null;
     defer if (imap_storage) |*m| m.deinit(gpa);
     var remote_ctx_storage: ?cfg_mod.RemoteCtx = null;
@@ -119,8 +85,6 @@ pub fn analyzeEscape(
     return problems.toOwnedSlice(gpa);
 }
 
-/// Layer 1: run the annotation-hygiene rules on `path`.  Same-file
-/// only; no cross-file lookup needed.  Caller owns the returned slice.
 pub fn analyzeHygiene(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -145,14 +109,10 @@ pub fn analyzeHygiene(
     errdefer freeProblemsArrayList(gpa, &problems);
 
     try require_borrowed_from.check(gpa, &tree, .{}, &problems);
-    try require_node_index_origin.check(gpa, &tree, .{}, &problems);
-    try require_arena_kill_tag.check(gpa, &tree, .{}, &problems);
 
     return problems.toOwnedSlice(gpa);
 }
 
-/// Free every Problem in `slice` (each owns its message + optional
-/// allocations) plus the slice itself.
 pub fn freeProblems(gpa: std.mem.Allocator, slice: []Problem) void {
     for (slice) |*p| p.deinit(gpa);
     gpa.free(slice);
@@ -165,24 +125,22 @@ fn freeProblemsArrayList(gpa: std.mem.Allocator, list: *std.ArrayListUnmanaged(P
 
 // ── Tests ───────────────────────────────────────────────────────
 
-test "lib API: analyzeEscape end-to-end with a tmpDir-written file" {
-    // Smoke test the full public surface: write a synthetic source
-    // with a known invariant-#5 violation, call analyzeEscape, expect
-    // one problem back.  Validates that the library API contract
-    // (caller frees, errdefer cleanup, optional cache, optional
-    // config) all hangs together.
+test "lib API: analyzeEscape end-to-end flags arena escape" {
     const gpa = std.testing.allocator;
     const tio = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     try tmp.dir.writeFile(tio, .{ .sub_path = "foo.zig", .data =
-        \\const Ast = struct {};
-        \\pub fn foo(ast: Ast) void {
-        \\    ast.setNodeTag(0);
+        \\const std = @import("std");
+        \\const Arena = struct {
+        \\    /// @returns borrowed_from(self)
+        \\    pub fn text(self: *const Arena) []const u8 { _ = self; return ""; }
+        \\};
+        \\pub fn foo() []const u8 {
+        \\    var arena = std.heap.ArenaAllocator.init(undefined);
+        \\    return arena.text();
         \\}
-        \\/// @mutates_ast
-        \\pub fn setNodeTag(self: Ast, _: u32) void { _ = self; }
         \\
     });
 
@@ -199,28 +157,27 @@ test "lib API: analyzeEscape end-to-end with a tmpDir-written file" {
 
     var found = false;
     for (problems) |p| {
-        if (std.mem.indexOf(u8, p.message, "invariant #5") != null) found = true;
+        if (std.mem.indexOf(u8, p.message, "function-local arena") != null) found = true;
     }
     try std.testing.expect(found);
 }
 
-test "lib API: analyzeEscape with null cache disables cross-file" {
-    // When cache=null, no remote-resolver context is built.  The
-    // analyzer still runs against same-file annotations; cross-file
-    // lookups just miss.  Synthetic file has only same-file
-    // annotations so analysis still fires.
+test "lib API: analyzeEscape with null cache still works on same-file annotations" {
     const gpa = std.testing.allocator;
     const tio = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     try tmp.dir.writeFile(tio, .{ .sub_path = "bar.zig", .data =
-        \\const Ast = struct {};
-        \\pub fn foo(ast: Ast) void {
-        \\    ast.setNodeTag(0);
+        \\const std = @import("std");
+        \\const Arena = struct {
+        \\    /// @returns borrowed_from(self)
+        \\    pub fn text(self: *const Arena) []const u8 { _ = self; return ""; }
+        \\};
+        \\pub fn foo() []const u8 {
+        \\    var arena = std.heap.ArenaAllocator.init(undefined);
+        \\    return arena.text();
         \\}
-        \\/// @mutates_ast
-        \\pub fn setNodeTag(self: Ast, _: u32) void { _ = self; }
         \\
     });
 
@@ -234,12 +191,10 @@ test "lib API: analyzeEscape with null cache disables cross-file" {
 
     var found = false;
     for (problems) |p| {
-        if (std.mem.indexOf(u8, p.message, "invariant #5") != null) found = true;
+        if (std.mem.indexOf(u8, p.message, "function-local arena") != null) found = true;
     }
     try std.testing.expect(found);
 }
-
-// ── Tests — pull every submodule's tests in via refAllDecls ─────
 
 test {
     _ = cfg_mod;
@@ -252,7 +207,5 @@ test {
     _ = @import("abstract_state.zig");
     _ = @import("transfer.zig");
     _ = require_borrowed_from;
-    _ = require_node_index_origin;
-    _ = require_arena_kill_tag;
     std.testing.refAllDecls(@This());
 }

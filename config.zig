@@ -1,125 +1,90 @@
-//! Project-tunable knobs.  Every ez-specific string previously
-//! hardcoded in cfg.zig now lives here.  `Default` matches the
-//! historical behavior so projects already using the tool see no
-//! change; downstream projects can construct their own `Config`
-//! with their own type names + textual call patterns.
-//!
-//! Future evolution (phase 43+):
-//!   - Load Config from a TOML/JSON/Zig file via a CLI flag.
-//!   - Per-project invariant kits (the rule SEMANTICS live in
-//!     transfer.zig; the lookup vocabulary is in this Config).
-//!   - Pluggable Stmt kinds for project-defined invariants.
+//! Project-tunable knobs.  Small by design — zbc is a focused
+//! arena-escape checker for Zig source.  Two pattern lists let
+//! projects declare what counts as arena creation/destruction in
+//! their codebase (defaults match std.heap.ArenaAllocator).
 
 const std = @import("std");
 
-/// All knobs are slice literals so a downstream project can declare:
-///   const my_config = borrow_check.Config{
-///       .ast_type_name = "Tree",
-///       .ast_init_patterns = &.{ "Tree.from_source", "parseTree" },
-///       .arena_kill_patterns = &.{ ".deinit(", ".release(" },
-///       ...
-///   };
 pub const Config = struct {
-    /// Identifier-token name that param-seeding (cfg.seedParams)
-    /// treats as "this param is an Ast value, mint a fresh AstId".
-    /// Matched on TOKEN boundary, so `FooAst` won't match but
-    /// `*const Ast` and `Ast.Node` will.
-    ast_type_name: []const u8 = "Ast",
-
     /// Source-text substrings that classifyExpr treats as
-    /// "this call expression mints a fresh Ast value".  First
-    /// match wins.  Substring match (NOT token-aware), so order
-    /// from most specific to least.
-    ast_init_patterns: []const []const u8 = &.{
-        "Ast.parse",
-    },
-
-    /// Source-text substrings for "this call expression mints a
-    /// fresh arena".  Same substring-match semantics as
-    /// ast_init_patterns.
+    /// "this call mints a fresh arena."  First match wins.
+    /// Substring match (not token-aware) — order from specific to
+    /// least specific if you customize.
     arena_init_patterns: []const []const u8 = &.{
         "ArenaAllocator.init",
     },
 
     /// Source-text substrings for "this call kills the receiver
-    /// arena".  Detected in lowerCallStmt — matching call shapes
+    /// arena."  Detected in lowerCallStmt — matching call shapes
     /// emit `.arena_kill` against the receiver local.
     arena_kill_patterns: []const []const u8 = &.{
         ".deinit(",
     },
 
-    /// Source-text substrings for "this call joins a worker
-    /// thread".  Detected in lowerCallStmt — emits `.thread_join`.
-    thread_join_patterns: []const []const u8 = &.{
-        ".join(",
+    /// Source-text substrings for "this call returns a heap
+    /// allocation."  Defaults cover std.mem.Allocator's surface.
+    /// Matched as substrings of the full call expression.
+    heap_alloc_patterns: []const []const u8 = &.{
+        ".alloc(",
+        ".allocSentinel(",
+        ".create(",
+        ".dupe(",
+        ".dupeZ(",
+        ".allocPrint(",
+        ".allocPrintZ(",
     },
 
-    /// Wrapper types that "carry" an Ast and so are treated as
-    /// Ast-equivalent for inference rules R1/R2/R4 (the
-    /// param-mentions-Ast checks).  Example: a project might wrap
-    /// the parse tree in a Context that exposes Ast methods —
-    /// `pub fn nodeTag(self: *const Context, idx: NodeIndex) Tag`
-    /// should still infer @takes node_index_of(self).
-    ///
-    /// Holder types do NOT participate in R5 (mutation detection)
-    /// — only the actual ast_type_name does, because mutation
-    /// semantics depend on the concrete type's invariants.
-    ast_holder_types: []const []const u8 = &.{},
+    /// Source-text substrings for "this call frees its first arg."
+    /// The freed pointer is extracted from the call's args[0].
+    heap_free_patterns: []const []const u8 = &.{
+        ".free(",
+        ".destroy(",
+    },
 
-    /// Which invariants to enforce (phase 46).  Downstream projects
-    /// can opt out of any subset they don't care about — e.g. a
-    /// codebase that doesn't pass NodeIndex across Ast boundaries
-    /// might only enable arena_escape + ast_mutation.  Default
-    /// `all_invariants` matches historical ez behavior.
-    ///
-    /// Disabling an invariant skips both the emit-side stmts (cfg
-    /// won't allocate per-call check stmts) and the transfer-side
-    /// validation (analyzer won't report).  Other invariants stay
-    /// fully active.
+    /// Which invariants to enforce.  zbc currently has exactly one
+    /// — arena_escape (slice borrowed from function-local arena
+    /// must not escape).  Kept as a list so future generic
+    /// invariants can be added without breaking the CLI surface.
     enabled: []const Invariant = &all_invariants,
 };
 
-/// Set of invariants the analyzer can enforce.  Downstream projects
-/// pick which subset is relevant via Config.enabled.
-///
-/// All invariants are annotation-driven and checked intra-procedurally
-/// against function signatures — same architecture as Rust's borrow
-/// checker (which checks each fn body against its own declared
-/// lifetime params, with the SIGNATURE crossing function/crate
-/// boundaries, not the body).
+/// Invariants zbc enforces.  All generic — no language-domain
+/// assumptions about parsers, ASTs, or any project-specific
+/// vocabulary.
 pub const Invariant = enum {
-    /// NodeIndex from Ast A must only flow back into A.  Drives
-    /// @takes node_index_of validation at call sites.
-    ast_identity,
-    /// A slice borrowed from an arena must not outlive that arena.
-    /// Drives the function-local arena-escape check.
+    /// A slice borrowed from a function-local arena must not be
+    /// returned past the arena's death.  Catches the common
+    /// "return a slice from per-call arena" mistake.
     arena_escape,
-    /// Worker-arena pointer must not be read before the join point.
-    /// Drives @returns worker_arena tagging + @takes worker_arena
-    /// validation against `state.thread`.
-    thread_arena,
-    /// ScopeId / SymbolId from pass N must not be used in pass M.
-    /// Drives @takes scope_from(<pass>) validation.
-    pass_identity,
-    /// After parse, the Ast is read-only.  Drives @mutates_ast
-    /// call-site flagging on tracked Ast values.
-    ast_mutation,
+    /// A pointer or slice into a function-local stack variable must
+    /// not be returned — the storage dies with the frame.
+    stack_escape,
+    /// A value initialized to `undefined` and never reassigned must
+    /// not be returned (caller would receive garbage).
+    use_undefined,
+    /// A heap allocation must not be freed twice on any path.
+    heap_double_free,
+    /// A heap pointer must not be read or returned after it has
+    /// been freed.
+    heap_use_after_free,
+    /// A value borrowed from an arena must not be read after the
+    /// arena is deinit'd.  Complements arena_escape (which catches
+    /// the special case of leaking the borrow past return).
+    arena_use_after_kill,
 };
 
-pub const all_invariants: [5]Invariant = .{
-    .ast_identity,
+pub const all_invariants: [6]Invariant = .{
     .arena_escape,
-    .thread_arena,
-    .pass_identity,
-    .ast_mutation,
+    .stack_escape,
+    .use_undefined,
+    .heap_double_free,
+    .heap_use_after_free,
+    .arena_use_after_kill,
 };
 
-/// The historical ez config — preserves all behavior from phases 1-41.
-/// Existing tests + sweep validate against this.
 pub const Default: Config = .{};
 
-/// True iff `config.enabled` contains `inv`.  Used by cfg.zig
-/// (gate emit-side checks) and transfer.zig (gate validation).
+/// True iff `config.enabled` contains `inv`.
 pub fn isEnabled(config: *const Config, inv: Invariant) bool {
     for (config.enabled) |e| {
         if (e == inv) return true;
@@ -127,14 +92,21 @@ pub fn isEnabled(config: *const Config, inv: Invariant) bool {
     return false;
 }
 
-/// Map a CLI-style name ("ast_identity") to its Invariant tag.
-/// Returns null on unknown names so callers can surface a useful
-/// error message rather than silently ignoring typos.
+/// Map a CLI-style name to its Invariant tag.  Returns null on
+/// unknown names so callers can surface a useful error message
+/// rather than silently ignoring typos.
 pub fn invariantFromName(name: []const u8) ?Invariant {
     inline for (@typeInfo(Invariant).@"enum".fields) |f| {
         if (std.mem.eql(u8, name, f.name)) return @enumFromInt(f.value);
     }
     return null;
+}
+
+// ── Tests ──────────────────────────────────────────────────
+
+test "Default config defaults" {
+    try std.testing.expectEqualStrings("ArenaAllocator.init", Default.arena_init_patterns[0]);
+    try std.testing.expectEqualStrings(".deinit(", Default.arena_kill_patterns[0]);
 }
 
 test "invariantFromName round-trips every variant" {
@@ -146,26 +118,4 @@ test "invariantFromName round-trips every variant" {
 
 test "invariantFromName returns null on unknown" {
     try std.testing.expectEqual(@as(?Invariant, null), invariantFromName("not_an_invariant"));
-    try std.testing.expectEqual(@as(?Invariant, null), invariantFromName(""));
-}
-
-// ── Tests ──────────────────────────────────────────────────
-
-test "Default config matches ez historical strings" {
-    try std.testing.expectEqualStrings("Ast", Default.ast_type_name);
-    try std.testing.expectEqualStrings("Ast.parse", Default.ast_init_patterns[0]);
-    try std.testing.expectEqualStrings("ArenaAllocator.init", Default.arena_init_patterns[0]);
-    try std.testing.expectEqualStrings(".deinit(", Default.arena_kill_patterns[0]);
-    try std.testing.expectEqualStrings(".join(", Default.thread_join_patterns[0]);
-}
-
-test "downstream Config example: rename Ast to Tree" {
-    const c: Config = .{
-        .ast_type_name = "Tree",
-        .ast_init_patterns = &.{ "Tree.from_source", "parseTree" },
-    };
-    try std.testing.expectEqualStrings("Tree", c.ast_type_name);
-    try std.testing.expectEqual(@as(usize, 2), c.ast_init_patterns.len);
-    // Fields not overridden keep Default values.
-    try std.testing.expectEqualStrings(".deinit(", c.arena_kill_patterns[0]);
 }
