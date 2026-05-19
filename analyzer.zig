@@ -1059,6 +1059,74 @@ test "invariant #1 fires at return position (phase 27)" {
     try std.testing.expect(found);
 }
 
+test "invariant #3: worker-arena pointer read before join is flagged" {
+    // spawnWorker returns worker_arena memory; consume reads it.
+    // No thread.join() between them → state.thread stays .main,
+    // consume fires invariant #3.
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\pub fn foo() void {
+        \\    const buf = spawnWorker();
+        \\    consume(buf);
+        \\}
+        \\/// @returns worker_arena
+        \\pub fn spawnWorker() []u8 { return ""; }
+        \\/// @takes worker_arena(buf)
+        \\pub fn consume(buf: []u8) void { _ = buf; }
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    var found = false;
+    for (problems.items) |p| {
+        if (std.mem.indexOf(u8, p.message, "invariant #3") != null) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "invariant #3: worker-arena pointer read AFTER thread.join() is OK" {
+    // .thread_join Stmt fires on `worker.join()` text pattern and
+    // transitions state.thread to .joined.  Subsequent consume()
+    // sees .joined and stays silent.
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\pub fn foo(worker: anytype) void {
+        \\    const buf = spawnWorker();
+        \\    worker.join();
+        \\    consume(buf);
+        \\}
+        \\/// @returns worker_arena
+        \\pub fn spawnWorker() []u8 { return ""; }
+        \\/// @takes worker_arena(buf)
+        \\pub fn consume(buf: []u8) void { _ = buf; }
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    for (problems.items) |p| {
+        try std.testing.expect(std.mem.indexOf(u8, p.message, "invariant #3") == null);
+    }
+}
+
+test "invariant #3: untagged value silently passes (regression guard)" {
+    // consume is annotated @takes worker_arena but caller passes a
+    // value that doesn't have a tracked worker_arena origin.  Must
+    // NOT flag — we only validate tagged-vs-context, not arbitrary
+    // values that happen to flow into worker-typed slots.
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\pub fn foo() void {
+        \\    var buf: []u8 = "";
+        \\    consume(buf);
+        \\}
+        \\/// @takes worker_arena(buf)
+        \\pub fn consume(buf: []u8) void { _ = buf; }
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    for (problems.items) |p| {
+        try std.testing.expect(std.mem.indexOf(u8, p.message, "invariant #3") == null);
+    }
+}
+
 test "invariant #4: scope ID from wrong pass is flagged" {
     // mintA returns a scope_from(pass_a) ID; useB takes a
     // scope_from(pass_b).  Passing A's ID into B must flag.

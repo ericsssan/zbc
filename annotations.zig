@@ -34,6 +34,10 @@ pub const ReturnsAnnotation = union(enum) {
     /// to a different pass is invalid (drives invariant #4).
     /// `pass_name` is a slice into source (caller keeps source alive).
     scope_from: []const u8,
+    /// `/// @returns worker_arena` — return is a pointer into a
+    /// worker-thread bump arena.  Reading from main thread before
+    /// the worker is joined is unsafe (drives invariant #3).
+    worker_arena,
 };
 
 /// Function-level `@mutates_ast ...` annotation.
@@ -63,6 +67,11 @@ pub const TakesAnnotation = union(enum) {
     /// pass.  Drives invariant #4 enforcement at call sites.
     /// `pass_name` is a slice into source (caller keeps source alive).
     scope_from: []const u8,
+    /// `/// @takes worker_arena(<param>)` — function reads from a
+    /// worker-arena pointer.  Caller must have joined the worker
+    /// thread before this call (state.thread must be `.joined`).
+    /// `param_index` is the 0-based position of the worker-arena arg.
+    worker_arena: u32,
 };
 
 pub const FnEntry = struct {
@@ -200,6 +209,9 @@ fn parseTakesAnnotation(tree: *const Ast, fn_proto: Ast.full.FnProto) ?TakesAnno
         if (parseParenNameForm(trimmed, "@takes scope_from(")) |name| {
             return .{ .scope_from = name };
         }
+        if (parseParenParamForm(trimmed, "@takes worker_arena(", tree, fn_proto)) |idx| {
+            return .{ .worker_arena = idx };
+        }
     }
     return null;
 }
@@ -304,10 +316,10 @@ fn parseReturnsAnnotation(tree: *const Ast, fn_proto: Ast.full.FnProto) ?Returns
         const trimmed = std.mem.trim(u8, body, " \t");
 
         if (std.mem.startsWith(u8, trimmed, "@returns owned")) return .owned;
-        // `@returns ast` must check BEFORE the paren forms so the
-        // bare keyword doesn't get matched against any parenthesized
-        // shape.  Whole-word check to keep things tight.
+        // Bare-keyword forms checked BEFORE paren forms so they
+        // don't get partial-matched against any parenthesized shape.
         if (std.mem.eql(u8, trimmed, "@returns ast")) return .ast;
+        if (std.mem.eql(u8, trimmed, "@returns worker_arena")) return .worker_arena;
 
         if (parseParenParamForm(trimmed, "@returns borrowed_from(", tree, fn_proto)) |idx| {
             return .{ .borrowed_from = idx };
@@ -649,6 +661,30 @@ test "inference: explicit annotation wins over would-be inferred" {
 
     const entry = r.db.lookup("debugDump").?;
     try std.testing.expect(entry.takes.? == .node_index_any);
+}
+
+test "extract @returns worker_arena annotation" {
+    const gpa = std.testing.allocator;
+    var r = try buildFromSrc(gpa,
+        \\/// @returns worker_arena
+        \\pub fn spawnWorker() []u8 { return ""; }
+        \\
+    );
+    defer r.deinit(gpa);
+    try std.testing.expect(r.db.lookup("spawnWorker").?.annotation.? == .worker_arena);
+}
+
+test "extract @takes worker_arena(<param>) annotation" {
+    const gpa = std.testing.allocator;
+    var r = try buildFromSrc(gpa,
+        \\/// @takes worker_arena(buf)
+        \\pub fn consume(buf: []u8) void { _ = buf; }
+        \\
+    );
+    defer r.deinit(gpa);
+    const entry = r.db.lookup("consume").?;
+    try std.testing.expect(entry.takes.? == .worker_arena);
+    try std.testing.expectEqual(@as(u32, 0), entry.takes.?.worker_arena);
 }
 
 test "extract @takes node_index_any annotation (phase 29)" {

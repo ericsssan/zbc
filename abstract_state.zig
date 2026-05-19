@@ -53,6 +53,11 @@ pub const Origin = union(enum) {
     /// ScopeId / SymbolId from a particular pass.  Use in a different
     /// pass is invalid.
     pass: PassId,
+    /// Pointer into a worker-thread bump arena.  Reads from main
+    /// thread before the worker is joined are unsafe (drives
+    /// invariant #3).  No payload — just a marker; the per-call
+    /// validation reads ThreadContext from AbstractState.thread.
+    worker_arena,
     /// Multiple origins (e.g. struct of borrows).  Conservative: any
     /// constituent dying makes the composite invalid.
     composite: []const Origin,
@@ -65,6 +70,7 @@ pub const Origin = union(enum) {
             .ast => |x| x == b.ast,
             .ast_node => |x| x == b.ast_node,
             .pass => |x| x == b.pass,
+            .worker_arena => true,
             .composite => |xs| blk: {
                 const ys = b.composite;
                 if (xs.len != ys.len) break :blk false;

@@ -95,6 +95,12 @@ pub const StmtKind = union(enum) {
     /// IDs participate.
     scope_takes_check: struct { value_local: LocalId, expected_pass: []const u8 },
 
+    /// Call to a fn annotated `@takes worker_arena(<param>)`.  At
+    /// transfer time: if value's origin is `.worker_arena` AND
+    /// `state.thread != .joined`, flag — reading worker memory
+    /// before the join point is unsafe.  Untagged origins pass.
+    worker_takes_check: struct { value_local: LocalId },
+
     /// Call to a fn annotated `@mutates_ast` on an Origin.ast
     /// receiver — phase 37's invariant #5 enforcement.  At transfer
     /// time: if `ast_local`'s origin is `.ast(_)`, flag.  Any tracked
@@ -159,6 +165,10 @@ pub const ExprKind = union(enum) {
     /// Transfer mints/looks up a PassId for the name, returns
     /// Origin.pass(P) — drives invariant #4 ID tagging.
     scope_from: []const u8,
+    /// Call to a fn annotated `// @returns worker_arena`.  Transfer
+    /// returns Origin.worker_arena — drives invariant #3 thread
+    /// validation at use sites.
+    worker_arena_init,
     /// Reading a local — pass-through of that local's current origin.
     copy_of: LocalId,
     /// Couldn't classify — conservative .plain at use site.
@@ -1396,6 +1406,24 @@ const Builder = struct {
                 if (!config_mod.isEnabled(self.config, .pass_identity)) return;
                 try self.emitScopeTakesChecksAcrossArgs(call_node, callee_node, args, recv_is_arg0, pass_name, cur.*);
             },
+            // Invariant #3 (worker-arena pointer before join).
+            .worker_arena => |idx| {
+                if (!config_mod.isEnabled(self.config, .thread_arena)) return;
+                const target_node: Ast.Node.Index = blk: {
+                    if (recv_is_arg0 and idx == 0) {
+                        break :blk tree.nodeData(callee_node).node_and_token[0];
+                    }
+                    const explicit_idx = if (recv_is_arg0) idx - 1 else idx;
+                    if (explicit_idx >= args.len) return;
+                    break :blk args[explicit_idx];
+                };
+                if (self.identifierToLocal(target_node)) |vl| {
+                    try self.appendStmt(cur.*, .{
+                        .kind = .{ .worker_takes_check = .{ .value_local = vl } },
+                        .pos = self.posOf(call_node),
+                    });
+                }
+            },
         }
     }
 
@@ -1844,6 +1872,10 @@ const Builder = struct {
             // args — the identity is the pass NAME, not derived from
             // any param's runtime value.
             .scope_from => |pass_name| return .{ .scope_from = pass_name },
+            // `@returns worker_arena`: result is a worker-allocated
+            // pointer.  Indistinct from .worker_arena_init at the
+            // ExprKind level.
+            .worker_arena => return .worker_arena_init,
         }
     }
 

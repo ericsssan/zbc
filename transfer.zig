@@ -76,8 +76,29 @@ pub fn transfer(ctx: Ctx, state: *AbstractState, stmt: Stmt) !void {
         .use => |u| try transferUse(ctx, state, u, stmt.pos),
         .ast_takes_check => |c| try transferAstTakesCheck(ctx, state, c, stmt.pos),
         .scope_takes_check => |c| try transferScopeTakesCheck(ctx, state, c, stmt.pos),
+        .worker_takes_check => |c| try transferWorkerTakesCheck(ctx, state, c, stmt.pos),
         .ast_mutation_check => |c| try transferAstMutationCheck(ctx, state, c, stmt.pos),
         .lowering_gap => |g| try transferGap(ctx, state, g, stmt.pos),
+    }
+}
+
+fn transferWorkerTakesCheck(
+    ctx: Ctx,
+    state: *AbstractState,
+    c: @TypeOf(@as(StmtKind, undefined).worker_takes_check),
+    pos: cfg.SrcPos,
+) !void {
+    const val_origin = state.locals.get(c.value_local) orelse return;
+    // Only worker-tagged values participate.  Untagged values pass —
+    // we don't fabricate identity for things we can't prove came from
+    // a worker arena.
+    if (val_origin != .worker_arena) return;
+    // Safe iff the thread has been joined; before that, reading
+    // worker memory from main is a data race.
+    if (state.thread != .joined) {
+        try report(ctx, pos, .@"error",
+            "`{s}` is a worker-arena pointer read before thread.join() (invariant #3: worker memory unsafe to read before join)",
+            .{ ctx.locals[@intFromEnum(c.value_local)].name });
     }
 }
 
@@ -308,6 +329,7 @@ fn originOfInit(
             const pid = internPassId(ctx, pass_name) catch break :blk .plain;
             break :blk .{ .pass = pid };
         },
+        .worker_arena_init => .worker_arena,
         .unknown => .plain,
     };
 }

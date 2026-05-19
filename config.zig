@@ -70,11 +70,11 @@ pub const Config = struct {
 /// Set of invariants the analyzer can enforce.  Downstream projects
 /// pick which subset is relevant via Config.enabled.
 ///
-/// The thread-arena boundary check (worker-allocated pointer read
-/// from main thread before join) was scaffolded but removed — it's
-/// fundamentally inter-procedural and our analyzer is intra-procedural.
-/// Bringing it back means a real story for cross-function origin
-/// propagation, which is a much bigger lift.
+/// All invariants are annotation-driven and checked intra-procedurally
+/// against function signatures — same architecture as Rust's borrow
+/// checker (which checks each fn body against its own declared
+/// lifetime params, with the SIGNATURE crossing function/crate
+/// boundaries, not the body).
 pub const Invariant = enum {
     /// NodeIndex from Ast A must only flow back into A.  Drives
     /// @takes node_index_of validation at call sites.
@@ -82,6 +82,10 @@ pub const Invariant = enum {
     /// A slice borrowed from an arena must not outlive that arena.
     /// Drives the function-local arena-escape check.
     arena_escape,
+    /// Worker-arena pointer must not be read before the join point.
+    /// Drives @returns worker_arena tagging + @takes worker_arena
+    /// validation against `state.thread`.
+    thread_arena,
     /// ScopeId / SymbolId from pass N must not be used in pass M.
     /// Drives @takes scope_from(<pass>) validation.
     pass_identity,
@@ -90,9 +94,10 @@ pub const Invariant = enum {
     ast_mutation,
 };
 
-pub const all_invariants: [4]Invariant = .{
+pub const all_invariants: [5]Invariant = .{
     .ast_identity,
     .arena_escape,
+    .thread_arena,
     .pass_identity,
     .ast_mutation,
 };
