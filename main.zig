@@ -106,6 +106,25 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(2);
     }
 
+    // Expand directory args into recursive .zig file lists.  Direct
+    // file paths pass through unchanged.  This + the new escape
+    // default + inference = `zbc src/` Just Works on any Zig codebase.
+    var expanded: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer {
+        for (expanded.items) |p| gpa.free(p);
+        expanded.deinit(gpa);
+    }
+    for (paths.items) |p| {
+        expandPath(gpa, io, p, &expanded) catch |err| {
+            std.debug.print("zbc: cannot expand {s}: {s}\n", .{ p, @errorName(err) });
+            std.process.exit(2);
+        };
+    }
+    if (expanded.items.len == 0) {
+        std.debug.print("zbc: no .zig files found in: {s}\n", .{paths.items[0]});
+        std.process.exit(0);
+    }
+
     const config: lib.Config = .{ .enabled = enabled.items };
 
     var cache_storage: ?lib.Cache = if (mode == .escape) lib.Cache.init(gpa, io) else null;
@@ -115,7 +134,7 @@ pub fn main(init: std.process.Init) !void {
     var json_first = true;
     if (format == .json) std.debug.print("[", .{});
 
-    for (paths.items) |path| {
+    for (expanded.items) |path| {
         const problems = if (mode == .escape)
             lib.analyzeEscape(gpa, io, path, &cache_storage.?, &config) catch |err| {
                 std.debug.print("zbc: cannot analyze {s}: {s}\n", .{ path, @errorName(err) });
@@ -140,6 +159,45 @@ pub fn main(init: std.process.Init) !void {
 
     if (format == .json) std.debug.print("{s}]\n", .{if (json_first) "" else "\n"});
     std.process.exit(if (any_problems) @as(u8, 1) else 0);
+}
+
+/// If `path` is a regular file, append (dupe'd) to `out`.
+/// If `path` is a directory, walk it recursively and append every
+/// `.zig` file found.  Skips hidden entries (.zig-cache/, .git/, etc.).
+/// Caller owns the duped paths in `out`.
+fn expandPath(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    out: *std.ArrayListUnmanaged([]const u8),
+) !void {
+    var dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch |err| switch (err) {
+        // .NotDir is what openDir returns when path is a file; the
+        // exact name varies by zig version, so we catch anything
+        // not-a-directory by re-trying as a file below.
+        else => {
+            // Not a directory — assume regular file, append as-is.
+            const duped = try gpa.dupe(u8, path);
+            errdefer gpa.free(duped);
+            try out.append(gpa, duped);
+            return;
+        },
+    };
+    defer dir.close(io);
+
+    var walker = try dir.walk(gpa);
+    defer walker.deinit();
+    while (try walker.next(io)) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.basename, ".zig")) continue;
+        // Skip anything under a hidden directory (.zig-cache, .git).
+        if (std.mem.indexOf(u8, entry.path, "/.") != null) continue;
+        if (std.mem.startsWith(u8, entry.path, ".")) continue;
+
+        const full = try std.fs.path.join(gpa, &.{ path, entry.path });
+        errdefer gpa.free(full);
+        try out.append(gpa, full);
+    }
 }
 
 const Mode = enum { escape, hygiene };
