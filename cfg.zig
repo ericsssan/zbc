@@ -669,12 +669,64 @@ const Builder = struct {
         }
     }
 
-    fn lowerAssign(self: *Builder, _: Ast.Node.Index, cur: *BlockId) !void {
-        // TODO: identify target local, classify RHS, emit a real .assign stmt.
-        try self.appendStmt(cur.*, .{
-            .kind = .{ .lowering_gap = .{ .note = "assign" } },
-            .pos = .{ .byte = 0, .line = 0, .column = 0 },
-        });
+    /// `LHS = RHS;` — when LHS is a known simple-identifier local, emit
+    /// a real `.assign` so the analyzer can update origin tracking.
+    /// Otherwise (field access, deref, destructuring) fall back to a
+    /// lowering_gap so locals collapse conservatively to .plain.
+    ///
+    /// Either way, if the RHS has a top-level `try` or `catch`, emit
+    /// the same error-exit / fork helpers we use in init/return
+    /// positions — those error-path CFG edges are independent of
+    /// whether we successfully tracked the target.
+    fn lowerAssign(self: *Builder, assign_node: Ast.Node.Index, cur: *BlockId) !void {
+        const tree = self.tree;
+        const tag = tree.nodeTag(assign_node);
+
+        // Destructuring (`a, b = pair`) — multi-target; not yet tracked.
+        if (tag == .assign_destructure) {
+            try self.appendStmt(cur.*, .{
+                .kind = .{ .lowering_gap = .{ .note = "assign_destructure" } },
+                .pos = self.posOf(assign_node),
+            });
+            return;
+        }
+
+        const data = tree.nodeData(assign_node).node_and_node;
+        const lhs = data[0];
+        const rhs = data[1];
+
+        // Resolve target: only simple identifier LHS for now.
+        const target_local: ?LocalId = if (tree.nodeTag(lhs) == .identifier)
+            self.name_to_local.get(tree.tokenSlice(tree.nodeMainToken(lhs)))
+        else
+            null;
+
+        if (target_local) |t| {
+            try self.appendStmt(cur.*, .{
+                .kind = .{ .assign = .{
+                    .target = t,
+                    .rhs_kind = self.classifyExpr(rhs),
+                } },
+                .pos = self.posOf(assign_node),
+            });
+        } else {
+            // Untracked target (e.g. `obj.field = X`) — emit gap so the
+            // analyzer stays conservative on any aliased locals.
+            try self.appendStmt(cur.*, .{
+                .kind = .{ .lowering_gap = .{ .note = "assign-target" } },
+                .pos = self.posOf(assign_node),
+            });
+        }
+
+        // Mirror the init-position try/catch dispatch.
+        switch (tree.nodeTag(rhs)) {
+            .@"try" => try self.emitTryErrorExit(cur.*, self.posOf(rhs)),
+            .@"catch" => {
+                const c = tree.nodeData(rhs).node_and_node;
+                try self.emitCatchFork(c[1], cur);
+            },
+            else => {},
+        }
     }
 
     fn lowerReturn(self: *Builder, ret_node: Ast.Node.Index, cur: *BlockId) !void {
@@ -1496,6 +1548,98 @@ test "return position `return foo() catch BODY` forks and merges into ret" {
     }
     try std.testing.expect(multi_succ);
     try std.testing.expect(has_ret_anywhere);
+}
+
+test "assign to known local emits .assign with classified rhs" {
+    // `x = src;` — must emit .assign (not lowering_gap) so the analyzer
+    // can update x's origin to copy_of(src).  Pre-phase-12 this was a
+    // stubbed gap, conservatively collapsing both locals to .plain.
+    const gpa = std.testing.allocator;
+    var result = try parseAndLower(gpa,
+        \\pub fn foo() void {
+        \\    var x: u32 = 0;
+        \\    var src: u32 = 1;
+        \\    x = src;
+        \\    return;
+        \\}
+        \\
+    );
+    defer result.tree.deinit(gpa);
+    var cfg = result.cfg.?;
+    defer cfg.deinit(gpa);
+
+    var found_assign_copy_of = false;
+    for (cfg.blocks) |b| {
+        for (b.stmts) |s| {
+            if (s.kind == .assign and s.kind.assign.rhs_kind == .copy_of) {
+                found_assign_copy_of = true;
+            }
+        }
+    }
+    try std.testing.expect(found_assign_copy_of);
+}
+
+test "assign rhs `try foo()` emits err-exit sink alongside .assign" {
+    const gpa = std.testing.allocator;
+    var result = try parseAndLower(gpa,
+        \\pub fn foo() !void {
+        \\    var arena = Arena.init(0);
+        \\    defer arena.deinit();
+        \\    var x: u32 = 0;
+        \\    x = try sideEffect();
+        \\    _ = x;
+        \\    return;
+        \\}
+        \\const Arena = struct {
+        \\    pub fn init(_: u32) Arena { return .{}; }
+        \\    pub fn deinit(_: *Arena) void {}
+        \\};
+        \\pub fn sideEffect() !u32 { return 0; }
+        \\
+    );
+    defer result.tree.deinit(gpa);
+    var cfg = result.cfg.?;
+    defer cfg.deinit(gpa);
+
+    var found_err_sink = false;
+    for (cfg.blocks) |b| {
+        var has_kill = false;
+        var has_ret = false;
+        for (b.stmts) |s| {
+            if (s.kind == .arena_kill) has_kill = true;
+            if (s.kind == .ret) has_ret = true;
+        }
+        if (has_kill and has_ret) found_err_sink = true;
+    }
+    try std.testing.expect(found_err_sink);
+}
+
+test "assign to field (obj.x = src) falls back to lowering_gap" {
+    // Field assignment isn't a tracked local — must stay conservative.
+    const gpa = std.testing.allocator;
+    var result = try parseAndLower(gpa,
+        \\pub fn foo() void {
+        \\    var obj: Obj = .{ .x = 0 };
+        \\    var src: u32 = 1;
+        \\    obj.x = src;
+        \\    return;
+        \\}
+        \\const Obj = struct { x: u32 };
+        \\
+    );
+    defer result.tree.deinit(gpa);
+    var cfg = result.cfg.?;
+    defer cfg.deinit(gpa);
+
+    var found_gap = false;
+    for (cfg.blocks) |b| {
+        for (b.stmts) |s| {
+            if (s.kind == .lowering_gap and
+                std.mem.eql(u8, s.kind.lowering_gap.note, "assign-target"))
+                found_gap = true;
+        }
+    }
+    try std.testing.expect(found_gap);
 }
 
 test "try unwraps inner expression: copy_of(src) preserved through try" {
