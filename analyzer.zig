@@ -470,6 +470,41 @@ test "heap_use_after_free: return without freeing is OK (ownership transfer)" {
     try std.testing.expectEqual(@as(usize, 0), problems.items.len);
 }
 
+test "heap_use_after_free: composite — return .{ .p = freed_buf } is flagged" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const std = @import("std");
+        \\const Wrapper = struct { ptr: []u8 };
+        \\pub fn foo(gpa_: std.mem.Allocator) !Wrapper {
+        \\    var buf = try gpa_.alloc(u8, 16);
+        \\    gpa_.free(buf);
+        \\    return .{ .ptr = buf };
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    var found = false;
+    for (problems.items) |p| {
+        if (std.mem.indexOf(u8, p.message, "after free") != null) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "heap_use_after_free: composite with live alloc is clean (ownership transfer)" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const std = @import("std");
+        \\const Wrapper = struct { ptr: []u8 };
+        \\pub fn foo(gpa_: std.mem.Allocator) !Wrapper {
+        \\    const buf = try gpa_.alloc(u8, 16);
+        \\    return .{ .ptr = buf };
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
 test "heap_double_free: catch-form alloc is tracked" {
     const gpa = std.testing.allocator;
     var problems = try analyze(gpa,
