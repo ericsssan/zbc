@@ -936,12 +936,13 @@ const Builder = struct {
         const tree = self.tree;
         const tag = tree.nodeTag(assign_node);
 
-        // Destructuring (`a, b = pair`) — multi-target; not yet tracked.
+        // Destructuring (`a, b = pair` / `const a, const b = pair()`).
+        // Multi-target — we can't classify per-slot, so each target
+        // gets .unknown.  But registering the locals (in the var-decl
+        // form) and emitting per-target .assign / .decl beats one big
+        // gap that collapsed everything to .plain.
         if (tag == .assign_destructure) {
-            try self.appendStmt(cur.*, .{
-                .kind = .{ .lowering_gap = .{ .note = "assign_destructure" } },
-                .pos = self.posOf(assign_node),
-            });
+            try self.lowerAssignDestructure(assign_node, cur);
             return;
         }
 
@@ -977,6 +978,76 @@ const Builder = struct {
         }
 
         // Mirror the init-position try/catch dispatch.
+        switch (tree.nodeTag(rhs)) {
+            .@"try" => try self.emitTryErrorExit(cur.*, self.posOf(rhs)),
+            .@"catch" => try self.emitCatchFork(rhs, cur),
+            else => {},
+        }
+    }
+
+    /// `a, b = pair()` or `const a, const b = pair()`.  Per-variable:
+    /// pure-identifier targets emit `.assign` against the resolved
+    /// local; var-decl targets (`const x`) register a new local and
+    /// emit `.decl`.  All rhs classifications are .unknown — we don't
+    /// match tuple slots to types.  The rhs's top-level try/catch /
+    /// labeled-block side-effects ARE lowered (once, before the
+    /// per-target emissions), matching plain-assign semantics.
+    fn lowerAssignDestructure(
+        self: *Builder,
+        assign_node: Ast.Node.Index,
+        cur: *BlockId,
+    ) !void {
+        const tree = self.tree;
+        const full = tree.assignDestructure(assign_node);
+        const rhs = full.ast.value_expr;
+
+        // Labeled-block expression rhs — lower body first.
+        if (try self.maybeLowerLabeledBlockExpr(rhs, cur)) {}
+
+        for (full.ast.variables) |var_node| {
+            const vtag = tree.nodeTag(var_node);
+            switch (vtag) {
+                .identifier => {
+                    const name = tree.tokenSlice(tree.nodeMainToken(var_node));
+                    if (self.name_to_local.get(name)) |t| {
+                        try self.appendStmt(cur.*, .{
+                            .kind = .{ .assign = .{ .target = t, .rhs_kind = .unknown } },
+                            .pos = self.posOf(var_node),
+                        });
+                    } else {
+                        try self.appendStmt(cur.*, .{
+                            .kind = .{ .lowering_gap = .{ .note = "destructure-unresolved" } },
+                            .pos = self.posOf(var_node),
+                        });
+                    }
+                },
+                .simple_var_decl,
+                .local_var_decl,
+                .aligned_var_decl,
+                .global_var_decl,
+                => {
+                    const vd = tree.fullVarDecl(var_node) orelse continue;
+                    const name_tok = vd.ast.mut_token + 1;
+                    if (tree.tokens.items(.tag)[name_tok] != .identifier) continue;
+                    const name = tree.tokenSlice(name_tok);
+                    const local = try self.registerLocal(name, self.posOfToken(name_tok));
+                    try self.appendStmt(cur.*, .{
+                        .kind = .{ .decl = .{ .local = local, .init_kind = .unknown } },
+                        .pos = self.posOf(var_node),
+                    });
+                },
+                else => {
+                    try self.appendStmt(cur.*, .{
+                        .kind = .{ .lowering_gap = .{ .note = "destructure-target" } },
+                        .pos = self.posOf(var_node),
+                    });
+                },
+            }
+        }
+
+        // Mirror plain assign: rhs try/catch dispatch comes after the
+        // per-target emissions (so the success path has the assigns
+        // visible before the error-exit / catch fork branches off).
         switch (tree.nodeTag(rhs)) {
             .@"try" => try self.emitTryErrorExit(cur.*, self.posOf(rhs)),
             .@"catch" => try self.emitCatchFork(rhs, cur),
@@ -2550,6 +2621,110 @@ test "expression-position labeled block: assign `x = blk: {...}` lowers body" {
         }
     }
     try std.testing.expect(saw_kill);
+}
+
+test "destructuring var-decl `const a, const b = pair()` registers both locals" {
+    const gpa = std.testing.allocator;
+    var result = try parseAndLower(gpa,
+        \\pub fn foo() void {
+        \\    const a, const b = pair();
+        \\    _ = a; _ = b;
+        \\    return;
+        \\}
+        \\pub fn pair() struct { u32, u32 } { return .{ 0, 1 }; }
+        \\
+    );
+    defer result.tree.deinit(gpa);
+    var cfg = result.cfg.?;
+    defer cfg.deinit(gpa);
+
+    // parseAndLower frees src_z before return, so local NAME slices
+    // dangle.  Check the structural invariant instead: both locals
+    // were registered (cfg.locals.len ≥ 2) AND each got its own
+    // .decl in the CFG.
+    try std.testing.expect(cfg.locals.len >= 2);
+    var decl_count: u32 = 0;
+    for (cfg.blocks) |b| {
+        for (b.stmts) |s| {
+            if (s.kind == .decl) decl_count += 1;
+        }
+    }
+    try std.testing.expect(decl_count >= 2);
+}
+
+test "destructuring assign `a, b = pair()` emits .assign for each target" {
+    const gpa = std.testing.allocator;
+    var result = try parseAndLower(gpa,
+        \\pub fn foo() void {
+        \\    var a: u32 = 0;
+        \\    var b: u32 = 0;
+        \\    a, b = pair();
+        \\    _ = a; _ = b;
+        \\    return;
+        \\}
+        \\pub fn pair() struct { u32, u32 } { return .{ 0, 1 }; }
+        \\
+    );
+    defer result.tree.deinit(gpa);
+    var cfg = result.cfg.?;
+    defer cfg.deinit(gpa);
+
+    var assign_count: u32 = 0;
+    for (cfg.blocks) |b| {
+        for (b.stmts) |s| {
+            if (s.kind == .assign) assign_count += 1;
+        }
+    }
+    // At least 2 from the destructure (could be more from the initial
+    // `var a: u32 = 0` decls, but those are .decl not .assign).
+    try std.testing.expect(assign_count >= 2);
+
+    // No leftover assign_destructure gap.
+    for (cfg.blocks) |b| {
+        for (b.stmts) |s| {
+            if (s.kind == .lowering_gap) {
+                try std.testing.expect(!std.mem.eql(
+                    u8,
+                    s.kind.lowering_gap.note,
+                    "assign_destructure",
+                ));
+            }
+        }
+    }
+}
+
+test "destructure rhs `try pair()` adds err-exit sink" {
+    const gpa = std.testing.allocator;
+    var result = try parseAndLower(gpa,
+        \\pub fn foo() !void {
+        \\    var arena = Arena.init(0);
+        \\    defer arena.deinit();
+        \\    const a, const b = try pair();
+        \\    _ = a; _ = b;
+        \\    return;
+        \\}
+        \\const Arena = struct {
+        \\    pub fn init(_: u32) Arena { return .{}; }
+        \\    pub fn deinit(_: *Arena) void {}
+        \\};
+        \\pub fn pair() !struct { u32, u32 } { return .{ 0, 1 }; }
+        \\
+    );
+    defer result.tree.deinit(gpa);
+    var cfg = result.cfg.?;
+    defer cfg.deinit(gpa);
+
+    var found_err_sink = false;
+    for (cfg.blocks) |b| {
+        var has_kill = false;
+        var has_ret = false;
+        for (b.stmts) |s| {
+            if (s.kind == .arena_kill) has_kill = true;
+            if (s.kind == .ret) has_ret = true;
+        }
+        if (has_kill and has_ret) found_err_sink = true;
+    }
+    try std.testing.expect(found_err_sink);
 }
 
 test "try unwraps inner expression: copy_of(src) preserved through try" {
