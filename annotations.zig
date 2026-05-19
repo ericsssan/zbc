@@ -23,6 +23,11 @@ pub const ReturnsAnnotation = union(enum) {
     /// position of the Ast-carrier arg.  Phase 24 parses only;
     /// classifyCall + transfer wiring lands in phase 25.
     node_index_of: u32,
+    /// `/// @returns ast` — return is a fresh Ast value.  Mints a new
+    /// AstId at transfer time, same effect as our text-detected
+    /// `Ast.parse(...)` pattern but explicit and works for any
+    /// constructor (custom parser entry points, factory fns, etc.).
+    ast,
 };
 
 /// Function-level `@takes ...` annotation.
@@ -141,6 +146,10 @@ fn parseReturnsAnnotation(tree: *const Ast, fn_proto: Ast.full.FnProto) ?Returns
         const trimmed = std.mem.trim(u8, body, " \t");
 
         if (std.mem.startsWith(u8, trimmed, "@returns owned")) return .owned;
+        // `@returns ast` must check BEFORE the paren forms so the
+        // bare keyword doesn't get matched against any parenthesized
+        // shape.  Whole-word check to keep things tight.
+        if (std.mem.eql(u8, trimmed, "@returns ast")) return .ast;
 
         if (parseParenParamForm(trimmed, "@returns borrowed_from(", tree, fn_proto)) |idx| {
             return .{ .borrowed_from = idx };
@@ -305,6 +314,22 @@ test "node_index_of param resolution: non-self position" {
     const entry = r.db.lookup("lookupNode").?;
     try std.testing.expect(entry.annotation.? == .node_index_of);
     try std.testing.expectEqual(@as(u32, 1), entry.annotation.?.node_index_of);
+}
+
+test "extract @returns ast annotation (phase 33)" {
+    const gpa = std.testing.allocator;
+    var r = try buildFromSrc(gpa,
+        \\const Ast = struct {};
+        \\/// @returns ast
+        \\pub fn customParse(src: []const u8) Ast {
+        \\    _ = src; return .{};
+        \\}
+        \\
+    );
+    defer r.deinit(gpa);
+
+    const entry = r.db.lookup("customParse").?;
+    try std.testing.expect(entry.annotation.? == .ast);
 }
 
 test "extract @takes node_index_any annotation (phase 29)" {

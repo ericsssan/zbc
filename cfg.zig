@@ -1575,6 +1575,10 @@ const Builder = struct {
     ) ExprKind {
         switch (anno) {
             .owned => return .owned,
+            // `@returns ast` — call mints a fresh Ast value, same as
+            // the text-detected `Ast.parse(...)` pattern.  Indistinct
+            // from .ast_init at the ExprKind level.
+            .ast => return .ast_init,
             .borrowed_from => |target_idx| {
                 if (receiver_is_arg0 and target_idx == 0) {
                     return self.identifierToCopyOrUnknown(receiver_or_callee);

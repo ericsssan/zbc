@@ -707,6 +707,39 @@ test "invariant #1 fires through local-alias-of-import (phase 32)" {
     try std.testing.expect(found);
 }
 
+test "@returns ast: custom constructor mints AstId like Ast.parse (phase 33)" {
+    // `customParse` returns Ast by annotation, not by name pattern.
+    // Two distinct calls produce two distinct AstIds — the invariant
+    // #1 check still fires when a NodeIndex from one's tree flows
+    // into a @takes-annotated fn alongside the other tree.
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\pub fn foo() void {
+        \\    var tree_a = customParse();
+        \\    var tree_b = customParse();
+        \\    const node = rootNode(tree_a);
+        \\    inspect(tree_b, node);
+        \\    return;
+        \\}
+        \\const Ast = struct {};
+        \\const NodeIndex = u32;
+        \\/// @returns ast
+        \\pub fn customParse() Ast { return .{}; }
+        \\/// @returns node_index_of(ast)
+        \\pub fn rootNode(ast: Ast) NodeIndex { _ = ast; return 0; }
+        \\/// @takes node_index_of(t)
+        \\pub fn inspect(t: Ast, n: NodeIndex) void { _ = t; _ = n; }
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+
+    var found = false;
+    for (problems.items) |p| {
+        if (std.mem.indexOf(u8, p.message, "invariant #1") != null) found = true;
+    }
+    try std.testing.expect(found);
+}
+
 test "node_index_any opts out: cross-Ast call passes without flag (phase 29)" {
     // Same shape as the positive phase-26 test, but inspect now has
     // `@takes node_index_any` instead of `node_index_of(t)`.  The
