@@ -1232,9 +1232,10 @@ const Builder = struct {
 
         const takes = self.lookupTakes(callee_node) orelse return;
 
-        // Resolve the source-Ast arg: the parameter referenced by
-        // node_index_of(X).  For method calls, arg 0 is the receiver.
+        // Resolve the source-Ast arg, or short-circuit on the opt-out.
         const source_node: Ast.Node.Index = switch (takes) {
+            // node_index_any: explicit opt-out — emit no checks.
+            .node_index_any => return,
             .node_index_of => |idx| blk: {
                 if (recv_is_arg0 and idx == 0) {
                     break :blk tree.nodeData(callee_node).node_and_token[0];

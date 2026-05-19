@@ -25,12 +25,16 @@ pub const ReturnsAnnotation = union(enum) {
     node_index_of: u32,
 };
 
-/// `/// @takes node_index_of(<param>)` — the function consumes
-/// NodeIndex args that must originate from the Ast carried by
-/// `<param>`.  Phase 26 enforces this at call sites by emitting
-/// `.ast_takes_check` statements that the transfer function validates.
+/// Function-level `@takes ...` annotation.
 pub const TakesAnnotation = union(enum) {
+    /// `/// @takes node_index_of(<param>)` — the function consumes
+    /// NodeIndex args that must originate from the Ast carried by
+    /// `<param>`.  Phase 26 emits `.ast_takes_check` per-arg stmts.
     node_index_of: u32,
+    /// `/// @takes node_index_any` — explicit opt-out.  The function
+    /// accepts NodeIndex args from any Ast; emission skips checks
+    /// entirely.  Matches the Layer-1 hygiene rule's vocabulary.
+    node_index_any,
 };
 
 pub const FnEntry = struct {
@@ -95,6 +99,9 @@ fn parseTakesAnnotation(tree: *const Ast, fn_proto: Ast.full.FnProto) ?TakesAnno
         const body = stripDocPrefix(raw);
         const trimmed = std.mem.trim(u8, body, " \t");
 
+        if (std.mem.startsWith(u8, trimmed, "@takes node_index_any")) {
+            return .node_index_any;
+        }
         if (parseParenParamForm(trimmed, "@takes node_index_of(", tree, fn_proto)) |idx| {
             return .{ .node_index_of = idx };
         }
@@ -298,6 +305,20 @@ test "node_index_of param resolution: non-self position" {
     const entry = r.db.lookup("lookupNode").?;
     try std.testing.expect(entry.annotation.? == .node_index_of);
     try std.testing.expectEqual(@as(u32, 1), entry.annotation.?.node_index_of);
+}
+
+test "extract @takes node_index_any annotation (phase 29)" {
+    const gpa = std.testing.allocator;
+    var r = try buildFromSrc(gpa,
+        \\const NodeIndex = u32;
+        \\/// @takes node_index_any
+        \\pub fn debugDump(n: NodeIndex) void { _ = n; }
+        \\
+    );
+    defer r.deinit(gpa);
+
+    const entry = r.db.lookup("debugDump").?;
+    try std.testing.expect(entry.takes.? == .node_index_any);
 }
 
 test "node_index_of with unknown param name → no entry" {

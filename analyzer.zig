@@ -505,6 +505,34 @@ test "invariant #1 fires through CROSS-FILE @takes lookup (phase 28)" {
     try std.testing.expect(found);
 }
 
+test "node_index_any opts out: cross-Ast call passes without flag (phase 29)" {
+    // Same shape as the positive phase-26 test, but inspect now has
+    // `@takes node_index_any` instead of `node_index_of(t)`.  The
+    // analyzer must NOT flag — the opt-out tells us cross-Ast is OK.
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\pub fn foo() !void {
+        \\    var tree_a = try Ast.parse();
+        \\    var tree_b = try Ast.parse();
+        \\    const node = rootNode(tree_a);
+        \\    inspect(tree_b, node);
+        \\    return;
+        \\}
+        \\const Ast = struct { pub fn parse() !Ast { return .{}; } };
+        \\const NodeIndex = u32;
+        \\/// @returns node_index_of(ast)
+        \\pub fn rootNode(ast: Ast) NodeIndex { _ = ast; return 0; }
+        \\/// @takes node_index_any
+        \\pub fn inspect(t: Ast, n: NodeIndex) void { _ = t; _ = n; }
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+
+    for (problems.items) |p| {
+        try std.testing.expect(std.mem.indexOf(u8, p.message, "invariant #1") == null);
+    }
+}
+
 test "invariant #1 fires at var-decl init position (phase 27)" {
     // `const t = inspect(tree_b, node);` — the call is in init
     // position, NOT statement position.  Pre-phase-27 emitTakesChecks
