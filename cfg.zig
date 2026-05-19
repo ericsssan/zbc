@@ -224,6 +224,13 @@ pub fn lowerFunctionWithRemote(
     defer builder.tempDeinit();
 
     const entry_id = try builder.newBlock();
+    // Seed param locals BEFORE lowering the body so identifier
+    // references inside the body resolve via name_to_local.  Params
+    // whose type text mentions "Ast" become Origin.ast(<aid>) at
+    // transfer time — enables invariant #1 checks inside functions
+    // that RECEIVE the Ast rather than create it.
+    try builder.seedParams(fn_proto, entry_id);
+
     var cur_block = entry_id;
     try builder.lowerFunctionBody(body_node, &cur_block);
 
@@ -241,6 +248,25 @@ fn fnProto(tree: *const Ast, buf: *[1]Ast.Node.Index, node: Ast.Node.Index) !?As
         },
         else => null,
     };
+}
+
+/// Heuristic: does the type expression's text contain a standalone
+/// "Ast" identifier token?  Matches `Ast`, `*Ast`, `*const Ast`,
+/// `?Ast`, `[]const Ast`, etc.  False positives (e.g. a type named
+/// `FooAst` would NOT match since we require an identifier-token
+/// boundary; but `Ast.Node` WOULD match) are bounded: extra params
+/// tagged as Origin.ast inflate the AstId counter but don't cause
+/// false-positive invariant findings.
+fn typeTextMentionsAst(tree: *const Ast, type_node: Ast.Node.Index) bool {
+    const first = tree.firstToken(type_node);
+    const last = tree.lastToken(type_node);
+    var t: Ast.TokenIndex = first;
+    while (t <= last) : (t += 1) {
+        if (tree.tokens.items(.tag)[t] == .identifier and
+            std.mem.eql(u8, tree.tokenSlice(t), "Ast"))
+            return true;
+    }
+    return false;
 }
 
 fn bodyOf(tree: *const Ast, node: Ast.Node.Index) ?Ast.Node.Index {
@@ -343,6 +369,38 @@ const Builder = struct {
         try self.locals.append(self.gpa, .{ .name = name, .decl_pos = pos });
         try self.name_to_local.put(self.gpa, name, id);
         return id;
+    }
+
+    /// Register Ast-typed fn params as tracked locals + emit synthetic
+    /// `.decl` stmts on the entry block with init_kind .ast_init.
+    /// This mints a fresh AstId per call so within-function cross-Ast
+    /// checks (invariant #1) fire on receiving functions like
+    /// nodeSpan(self, idx).
+    ///
+    /// Non-Ast params are intentionally NOT seeded.  Initial phase-35
+    /// implementation registered ALL params with .plain init_kind so
+    /// every identifier reference resolved via name_to_local — that
+    /// inflated per-block state by N locals on every function and
+    /// pushed `src/cli/parallel.zig` past the 200k worklist iteration
+    /// cap.  Restricting seeding to Ast params keeps state bounded
+    /// (real codebases have at most 1-2 Ast params per fn) while
+    /// preserving the dogfood capability.
+    fn seedParams(self: *Builder, fn_proto: Ast.full.FnProto, entry: BlockId) !void {
+        const tree = self.tree;
+        var it = fn_proto.iterate(tree);
+        while (it.next()) |param| {
+            const name_tok = param.name_token orelse continue;
+            const name = tree.tokenSlice(name_tok);
+            if (std.mem.eql(u8, name, "_")) continue;
+            const type_node = param.type_expr orelse continue;
+            if (!typeTextMentionsAst(tree, type_node)) continue;
+
+            const local = try self.registerLocal(name, self.posOfToken(name_tok));
+            try self.appendStmt(entry, .{
+                .kind = .{ .decl = .{ .local = local, .init_kind = .ast_init } },
+                .pos = self.posOfToken(name_tok),
+            });
+        }
     }
 
     /// Register `|x|` / `|x, y|` / `|*x, idx|` capture identifiers

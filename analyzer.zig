@@ -707,6 +707,35 @@ test "invariant #1 fires through local-alias-of-import (phase 32)" {
     try std.testing.expect(found);
 }
 
+test "invariant #1 fires inside a RECEIVING function (phase 35 param origins)" {
+    // foo takes ast_a + ast_b as params.  Both get Origin.ast(aid)
+    // with distinct AstIds (seeded by phase 35 param walk).  A
+    // NodeIndex from ast_a passed to inspect(ast_b, node) flags
+    // invariant #1 — pre-phase-35 the params were untracked locals
+    // (.unknown classifications) and no check could fire.
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const Ast = struct {};
+        \\const NodeIndex = u32;
+        \\pub fn foo(ast_a: Ast, ast_b: Ast) void {
+        \\    const node = rootNode(ast_a);
+        \\    inspect(ast_b, node);
+        \\}
+        \\/// @returns node_index_of(ast)
+        \\pub fn rootNode(ast: Ast) NodeIndex { _ = ast; return 0; }
+        \\/// @takes node_index_of(t)
+        \\pub fn inspect(t: Ast, n: NodeIndex) void { _ = t; _ = n; }
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+
+    var found = false;
+    for (problems.items) |p| {
+        if (std.mem.indexOf(u8, p.message, "invariant #1") != null) found = true;
+    }
+    try std.testing.expect(found);
+}
+
 test "@returns ast: custom constructor mints AstId like Ast.parse (phase 33)" {
     // `customParse` returns Ast by annotation, not by name pattern.
     // Two distinct calls produce two distinct AstIds — the invariant
