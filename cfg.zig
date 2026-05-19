@@ -84,6 +84,14 @@ pub const StmtKind = union(enum) {
     /// positions where most real check sites live.
     ast_takes_check: struct { source_local: LocalId, value_local: LocalId },
 
+    /// Call to a fn annotated `@mutates_ast` on an Origin.ast
+    /// receiver — phase 37's invariant #5 enforcement.  At transfer
+    /// time: if `ast_local`'s origin is `.ast(_)`, flag.  Any tracked
+    /// Ast is considered "post-parse" from the analyzer's view; the
+    /// only legitimate construction site is the parser itself which
+    /// doesn't go through this annotation-driven path.
+    ast_mutation_check: struct { ast_local: LocalId },
+
     /// `return <expr>;` — function exit.  `value_kind` describes what's
     /// being returned.  `is_borrowed_return_type` tags whether the
     /// enclosing function's signature returns a borrowed-shape type
@@ -1288,6 +1296,23 @@ const Builder = struct {
         const is_namespace_call = self.isImportNamespaceCall(callee_node);
         const recv_is_arg0 = (tree.nodeTag(callee_node) == .field_access) and !is_namespace_call;
 
+        // Mutation check (invariant #5): emit irrespective of takes.
+        // For method-call shape `obj.method(...)`, the receiver IS
+        // the Ast value; for namespace `Mod.method(ast, ...)` the
+        // first explicit arg plays that role.  We only handle the
+        // method-call case for now (where receiver is a local).
+        if (self.lookupMutatesAst(callee_node)) {
+            if (recv_is_arg0) {
+                const recv_node = tree.nodeData(callee_node).node_and_token[0];
+                if (self.identifierToLocal(recv_node)) |ast_local| {
+                    try self.appendStmt(cur.*, .{
+                        .kind = .{ .ast_mutation_check = .{ .ast_local = ast_local } },
+                        .pos = self.posOf(call_node),
+                    });
+                }
+            }
+        }
+
         const takes = self.lookupTakes(callee_node) orelse return;
 
         // Resolve the source-Ast arg, or short-circuit on the opt-out.
@@ -1403,6 +1428,34 @@ const Builder = struct {
                 return null;
             },
             else => return null,
+        }
+    }
+
+    /// Same shape as lookupTakes but reads the @mutates_ast bool.
+    /// Same-file first, then cross-file via remote resolver.
+    fn lookupMutatesAst(self: *Builder, callee_node: Ast.Node.Index) bool {
+        const tree = self.tree;
+        switch (tree.nodeTag(callee_node)) {
+            .field_access => {
+                const fa = tree.nodeData(callee_node);
+                const recv_node = fa.node_and_token[0];
+                const method_name = tree.tokenSlice(fa.node_and_token[1]);
+                if (self.db) |db| {
+                    if (db.lookup(method_name)) |e| if (e.mutates_ast) return true;
+                }
+                if (self.resolveRemoteFile(recv_node)) |rf| {
+                    if (rf.db.lookup(method_name)) |e| if (e.mutates_ast) return true;
+                }
+                return false;
+            },
+            .identifier => {
+                const name = tree.tokenSlice(tree.nodeMainToken(callee_node));
+                if (self.db) |db| {
+                    if (db.lookup(name)) |e| if (e.mutates_ast) return true;
+                }
+                return false;
+            },
+            else => return false,
         }
     }
 

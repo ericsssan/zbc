@@ -55,7 +55,25 @@ pub fn transfer(ctx: Ctx, state: *AbstractState, stmt: Stmt) !void {
         .ret => |r| try transferRet(ctx, state, r, stmt.pos),
         .use => |u| try transferUse(ctx, state, u, stmt.pos),
         .ast_takes_check => |c| try transferAstTakesCheck(ctx, state, c, stmt.pos),
+        .ast_mutation_check => |c| try transferAstMutationCheck(ctx, state, c, stmt.pos),
         .lowering_gap => |g| try transferGap(ctx, state, g, stmt.pos),
+    }
+}
+
+fn transferAstMutationCheck(
+    ctx: Ctx,
+    state: *AbstractState,
+    c: @TypeOf(@as(StmtKind, undefined).ast_mutation_check),
+    pos: cfg.SrcPos,
+) !void {
+    const origin = state.locals.get(c.ast_local) orelse return;
+    switch (origin) {
+        .ast => {
+            try report(ctx, pos, .@"error",
+                "calling a `@mutates_ast` method on `{s}` invalidates derived caches (invariant #5: Ast is read-only after parse)",
+                .{ ctx.locals[@intFromEnum(c.ast_local)].name });
+        },
+        else => {},
     }
 }
 

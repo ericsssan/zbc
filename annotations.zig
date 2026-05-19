@@ -49,6 +49,13 @@ pub const FnEntry = struct {
     annotation: ?ReturnsAnnotation = null,
     /// Optional `@takes ...`; null when none parsed.
     takes: ?TakesAnnotation = null,
+    /// `/// @mutates_ast` — method mutates its Ast receiver
+    /// (writes a field, rebuilds derived caches, etc.).  Used to
+    /// enforce invariant #5: any caller that holds an Origin.ast
+    /// value (constructed or received via param) flagged at the
+    /// call site since post-parse mutation invalidates the
+    /// parent_indices and tag CSRs that downstream passes rely on.
+    mutates_ast: bool = false,
 };
 
 pub const Db = struct {
@@ -79,15 +86,35 @@ pub fn build(gpa: std.mem.Allocator, tree: *const Ast) !Db {
 
         const annotation = parseReturnsAnnotation(tree, fn_proto);
         const takes = parseTakesAnnotation(tree, fn_proto);
-        if (annotation == null and takes == null) continue;
+        const mutates_ast = parseMutatesAstAnnotation(tree, fn_proto);
+        if (annotation == null and takes == null and !mutates_ast) continue;
         const name = tree.tokenSlice(name_tok);
         try db.fns.put(gpa, name, .{
             .name = name,
             .annotation = annotation,
             .takes = takes,
+            .mutates_ast = mutates_ast,
         });
     }
     return db;
+}
+
+fn parseMutatesAstAnnotation(tree: *const Ast, fn_proto: Ast.full.FnProto) bool {
+    const fn_first_tok: Ast.TokenIndex = fn_proto.visib_token orelse
+        fn_proto.extern_export_inline_token orelse
+        fn_proto.ast.fn_token;
+    if (fn_first_tok == 0) return false;
+
+    var t: i64 = @as(i64, @intCast(fn_first_tok)) - 1;
+    while (t >= 0) : (t -= 1) {
+        const tok_idx: Ast.TokenIndex = @intCast(t);
+        if (tree.tokens.items(.tag)[tok_idx] != .doc_comment) break;
+        const raw = tree.tokenSlice(tok_idx);
+        const body = stripDocPrefix(raw);
+        const trimmed = std.mem.trim(u8, body, " \t");
+        if (std.mem.eql(u8, trimmed, "@mutates_ast")) return true;
+    }
+    return false;
 }
 
 fn parseTakesAnnotation(tree: *const Ast, fn_proto: Ast.full.FnProto) ?TakesAnnotation {
@@ -314,6 +341,20 @@ test "node_index_of param resolution: non-self position" {
     const entry = r.db.lookup("lookupNode").?;
     try std.testing.expect(entry.annotation.? == .node_index_of);
     try std.testing.expectEqual(@as(u32, 1), entry.annotation.?.node_index_of);
+}
+
+test "extract @mutates_ast annotation (phase 37)" {
+    const gpa = std.testing.allocator;
+    var r = try buildFromSrc(gpa,
+        \\const Ast = struct {};
+        \\/// @mutates_ast
+        \\pub fn setNodeTag(self: *Ast, _: u32) void { _ = self; }
+        \\
+    );
+    defer r.deinit(gpa);
+
+    const entry = r.db.lookup("setNodeTag").?;
+    try std.testing.expect(entry.mutates_ast);
 }
 
 test "extract @returns ast annotation (phase 33)" {

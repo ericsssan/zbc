@@ -707,6 +707,51 @@ test "invariant #1 fires through local-alias-of-import (phase 32)" {
     try std.testing.expect(found);
 }
 
+test "invariant #5: @mutates_ast call on an Ast value flags (phase 37)" {
+    // foo receives an Ast param, then calls a @mutates_ast method on
+    // it.  Phase 37's invariant #5 enforcement fires regardless of
+    // whether the Ast was constructed locally or received — any
+    // tracked .ast origin is "post-parse" from the analyzer's view.
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const Ast = struct {};
+        \\pub fn foo(ast: Ast) void {
+        \\    ast.setNodeTag(0);
+        \\}
+        \\/// @mutates_ast
+        \\pub fn setNodeTag(self: Ast, _: u32) void { _ = self; }
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+
+    var found = false;
+    for (problems.items) |p| {
+        if (std.mem.indexOf(u8, p.message, "invariant #5") != null) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "invariant #5: non-Ast receiver doesn't fire (regression guard)" {
+    // No Ast param — `obj` is untracked, its .none origin won't
+    // flag.  Pre-phase-37 there was no check at all; this guards
+    // against accidental over-firing on every method-call site.
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const NotAst = struct {};
+        \\pub fn foo(obj: NotAst) void {
+        \\    obj.setNodeTag(0);
+        \\}
+        \\/// @mutates_ast
+        \\pub fn setNodeTag(self: NotAst, _: u32) void { _ = self; }
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+
+    for (problems.items) |p| {
+        try std.testing.expect(std.mem.indexOf(u8, p.message, "invariant #5") == null);
+    }
+}
+
 test "invariant #1 fires inside a RECEIVING function (phase 35 param origins)" {
     // foo takes ast_a + ast_b as params.  Both get Origin.ast(aid)
     // with distinct AstIds (seeded by phase 35 param walk).  A
