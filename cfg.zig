@@ -1105,8 +1105,15 @@ const Builder = struct {
                 .end_pos = self.endPosOf(assign_node),
             });
         } else {
-            // Untracked target (e.g. `obj.field = X`) — emit gap so the
-            // analyzer stays conservative on any aliased locals.
+            // Untracked target (e.g. `obj.field = X`, `@field(obj, ...) = X`,
+            // `arr[i] = X`).  For any known local mentioned anywhere in
+            // the LHS expression, treat the assignment as a write to
+            // that local — `obj.field = X` only type-checks if `obj` is
+            // initialized, so clearing its .undef state is sound.
+            // Without this, an inline-for `@field(result, ...) = ...`
+            // loop never clears `result`'s undef and `return result`
+            // spuriously flags.
+            try self.emitWritesInLhs(lhs, cur.*);
             try self.appendStmt(cur.*, .{
                 .kind = .{ .lowering_gap = .{ .note = "assign-target" } },
                 .pos = self.posOf(assign_node),
@@ -1238,7 +1245,14 @@ const Builder = struct {
             .pos = self.posOf(ret_node),
             .end_pos = self.endPosOf(ret_node),
         });
-        // Return terminates the block — no successor.
+        // Return terminates the block — advance cur to a fresh dead
+        // block so any addEdge our caller does (e.g. lowerIf wiring
+        // an else-branch into the merge) flows from an unreachable
+        // block, not the live ret block.  Without this, the pre-
+        // return state leaks into the merge join and causes false
+        // positives on locals that were only set on the non-return
+        // branches.
+        cur.* = try self.newBlock();
     }
 
     fn lowerCallStmt(self: *Builder, call_node: Ast.Node.Index, cur: *BlockId) !void {
@@ -1438,6 +1452,41 @@ const Builder = struct {
     /// read the value).  Optional `skip_local` is excluded — used by
     /// assign to avoid emitting a use for the LHS target.  Dedupes so
     /// repeated mentions of the same local only emit one `.use`.
+    /// Walk LHS tokens of an assignment with a non-identifier target
+    /// and emit one assign(id, .unknown) per distinct known-local
+    /// mentioned.  Used to clear .undef on locals written through
+    /// field access, indexing, or builtin pseudo-LHS like @field.
+    fn emitWritesInLhs(
+        self: *Builder,
+        lhs_node: Ast.Node.Index,
+        cur: BlockId,
+    ) !void {
+        const tree = self.tree;
+        const first = tree.firstToken(lhs_node);
+        const last = tree.lastToken(lhs_node);
+        const tags = tree.tokens.items(.tag);
+        const pos = self.posOf(lhs_node);
+        const end_pos = self.endPosOf(lhs_node);
+
+        var seen: std.AutoArrayHashMapUnmanaged(LocalId, void) = .empty;
+        defer seen.deinit(self.gpa);
+
+        var t: Ast.TokenIndex = first;
+        while (t <= last) : (t += 1) {
+            if (tags[t] != .identifier) continue;
+            if (t > 0 and tags[t - 1] == .period) continue;
+            const name = tree.tokenSlice(t);
+            const id = self.name_to_local.get(name) orelse continue;
+            const gop = try seen.getOrPut(self.gpa, id);
+            if (gop.found_existing) continue;
+            try self.appendStmt(cur, .{
+                .kind = .{ .assign = .{ .target = id, .rhs_kind = .unknown } },
+                .pos = pos,
+                .end_pos = end_pos,
+            });
+        }
+    }
+
     fn emitUsesInExpr(
         self: *Builder,
         expr_node: Ast.Node.Index,
@@ -1484,6 +1533,27 @@ const Builder = struct {
             }
             // Field/method access: `.method` — skip; it's not a local.
             if (t > 0 and tags[t - 1] == .period) continue;
+            // Structural / comptime access on the next token that
+            // doesn't actually read the local's contents:
+            //   `id[..]` `id[i]`  — slice / index (creates pointer)
+            //   `id.len`          — comptime length on an array
+            //   `id.ptr`          — pointer-of on a slice/array
+            //   `id: T`           — struct-field declaration shape;
+            //                       `id` is a NAME, not a value read.
+            //                       (Same for loop / block labels.)
+            // Treating these as value reads produces noisy false
+            // positives on stack buffers declared `= undefined` and
+            // on identifiers that shadow an outer local inside an
+            // anonymous struct type.
+            if (t + 1 <= last) {
+                const next = tags[t + 1];
+                if (next == .l_bracket) continue;
+                if (next == .colon) continue;
+                if (next == .period and t + 2 <= last and tags[t + 2] == .identifier) {
+                    const field = tree.tokenSlice(t + 2);
+                    if (std.mem.eql(u8, field, "len") or std.mem.eql(u8, field, "ptr")) continue;
+                }
+            }
             const name = tree.tokenSlice(t);
             const id = self.name_to_local.get(name) orelse continue;
             if (skip_local) |s| if (id == s) continue;
@@ -1751,7 +1821,8 @@ test "lower trivial fn — entry block + return" {
     defer result.deinit(gpa);
     const cfg = result.cfg.?;
 
-    try std.testing.expectEqual(@as(usize, 1), cfg.blocks.len);
+    // 2 blocks: entry (with ret) and the dead post-return block.
+    try std.testing.expectEqual(@as(usize, 2), cfg.blocks.len);
     try std.testing.expectEqual(@as(usize, 1), cfg.blocks[0].stmts.len);
     try std.testing.expect(cfg.blocks[0].stmts[0].kind == .ret);
 }
@@ -1770,8 +1841,9 @@ test "lower fn with var decl + arena init + deinit" {
     defer result.deinit(gpa);
     const cfg = result.cfg.?;
 
-    // One block, three statements: decl, arena_kill, ret.
-    try std.testing.expectEqual(@as(usize, 1), cfg.blocks.len);
+    // 2 blocks (entry + dead post-return); entry has 3 stmts: decl,
+    // arena_kill, ret.
+    try std.testing.expectEqual(@as(usize, 2), cfg.blocks.len);
     const stmts = cfg.blocks[0].stmts;
     try std.testing.expectEqual(@as(usize, 3), stmts.len);
 

@@ -36,6 +36,17 @@ pub fn check(
     }
     for (in_states) |*s| s.* = .{};
 
+    // Pass 1 — converge the per-block in-states without reporting.
+    // Worklist visits aren't predecessor-first, so during convergence
+    // a block can be transferred from a stale in-state and emit
+    // spurious problems that later iterations would refine away.
+    // Discard pass 1's problems entirely; we only trust the FINAL
+    // in-states.
+    var scratch: std.ArrayListUnmanaged(Problem) = .empty;
+    defer {
+        for (scratch.items) |*p| p.deinit(gpa);
+        scratch.deinit(gpa);
+    }
 
     var worklist: std.ArrayListUnmanaged(BlockId) = .empty;
     defer worklist.deinit(gpa);
@@ -60,7 +71,7 @@ pub fn check(
         const ctx: transfer.Ctx = .{
             .gpa = gpa,
             .locals = cfg.locals,
-            .problems = out,
+            .problems = &scratch,
             .path = opts.path,
             .config = opts.config,
         };
@@ -75,6 +86,27 @@ pub fn check(
             if (result == .changed) {
                 try worklist.append(gpa, succ);
             }
+        }
+    }
+
+    // Pass 2 — replay every block from its fixed-point in-state with
+    // reporting enabled.  Unreachable blocks have empty in-state and
+    // emit nothing because their stmt list either references no locals
+    // or all lookups miss.
+    for (cfg.blocks, 0..) |block, i| {
+        var state = try in_states[i].clone(gpa);
+        defer state.deinit(gpa);
+
+        const ctx: transfer.Ctx = .{
+            .gpa = gpa,
+            .locals = cfg.locals,
+            .problems = out,
+            .path = opts.path,
+            .config = opts.config,
+        };
+
+        for (block.stmts) |stmt| {
+            try transfer.transfer(ctx, &state, stmt);
         }
     }
 }
