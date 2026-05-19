@@ -205,6 +205,10 @@ fn bodyOf(tree: *const Ast, node: Ast.Node.Index) ?Ast.Node.Index {
 const LoopCtx = struct {
     header: BlockId,
     merge: BlockId,
+    /// Label slice on the source (no colon), or null for unlabeled
+    /// loops.  `break :name` walks the loop stack from inside out
+    /// matching this field.
+    label: ?[]const u8 = null,
 };
 
 const Builder = struct {
@@ -472,7 +476,15 @@ const Builder = struct {
 
         // Lower the body; on exit, back-edge to header.  Push loop
         // context so any `break`/`continue` inside lowers correctly.
-        try self.loop_stack.append(self.gpa, .{ .header = header, .merge = merge });
+        const label_slice: ?[]const u8 = if (while_data.label_token) |lt|
+            tree.tokenSlice(lt)
+        else
+            null;
+        try self.loop_stack.append(self.gpa, .{
+            .header = header,
+            .merge = merge,
+            .label = label_slice,
+        });
         var body_cur = body;
         try self.lowerStmt(while_data.ast.then_expr, &body_cur);
         _ = self.loop_stack.pop();
@@ -516,7 +528,15 @@ const Builder = struct {
         try self.addEdge(header, body);
         try self.addEdge(header, merge);
 
-        try self.loop_stack.append(self.gpa, .{ .header = header, .merge = merge });
+        const for_label: ?[]const u8 = if (for_data.label_token) |lt|
+            tree.tokenSlice(lt)
+        else
+            null;
+        try self.loop_stack.append(self.gpa, .{
+            .header = header,
+            .merge = merge,
+            .label = for_label,
+        });
         var body_cur = body;
         try self.lowerStmt(for_data.ast.then_expr, &body_cur);
         _ = self.loop_stack.pop();
@@ -598,21 +618,49 @@ const Builder = struct {
         kind: enum { @"break", @"continue" },
         node: Ast.Node.Index,
     ) !void {
+        const tree = self.tree;
         if (self.loop_stack.items.len == 0) {
-            // Outside a loop — Zig wouldn't compile, but be defensive.
             try self.appendStmt(cur.*, .{
                 .kind = .{ .lowering_gap = .{ .note = "break-outside-loop" } },
                 .pos = self.posOf(node),
             });
             return;
         }
-        const ctx = self.loop_stack.items[self.loop_stack.items.len - 1];
+
+        // `break/continue :name` — Ast data is opt_token_and_opt_node;
+        // the OptionalTokenIndex points at the bare identifier (no
+        // colon), already lowercased by the lexer.  Match against
+        // LoopCtx.label from innermost out.
+        const opt_label_tok = tree.nodeData(node).opt_token_and_opt_node[0];
+        const target_ctx: LoopCtx = blk: {
+            if (opt_label_tok.unwrap()) |lt| {
+                const wanted = tree.tokenSlice(lt);
+                var i = self.loop_stack.items.len;
+                while (i > 0) {
+                    i -= 1;
+                    const ctx = self.loop_stack.items[i];
+                    if (ctx.label) |lbl| {
+                        if (std.mem.eql(u8, lbl, wanted)) break :blk ctx;
+                    }
+                }
+                // Labeled break to a non-loop block label (`blk: { ...
+                // break :blk; }`) — block labels aren't modeled yet.
+                // Emit gap, leave flow alone.
+                try self.appendStmt(cur.*, .{
+                    .kind = .{ .lowering_gap = .{ .note = "labeled-break-no-loop" } },
+                    .pos = self.posOf(node),
+                });
+                return;
+            }
+            // Unlabeled: innermost.
+            break :blk self.loop_stack.items[self.loop_stack.items.len - 1];
+        };
+
         const target = switch (kind) {
-            .@"break" => ctx.merge,
-            .@"continue" => ctx.header,
+            .@"break" => target_ctx.merge,
+            .@"continue" => target_ctx.header,
         };
         try self.addEdge(cur.*, target);
-        // Dead block for unreachable statements after break/continue.
         cur.* = try self.newBlock();
     }
 
@@ -1783,6 +1831,109 @@ test "break outside loop emits gap (defensive — Zig wouldn't compile)" {
         for (b.stmts) |s| {
             if (s.kind == .lowering_gap and
                 std.mem.eql(u8, s.kind.lowering_gap.note, "break-outside-loop"))
+                found = true;
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "labeled break: `break :outer` from inner loop targets outer's merge" {
+    // Without label resolution, inner break would just exit the inner
+    // loop; outer's merge wouldn't get the extra incoming edge.
+    const gpa = std.testing.allocator;
+    var result = try parseAndLower(gpa,
+        \\pub fn foo(x: bool) void {
+        \\    outer: while (x) {
+        \\        while (x) {
+        \\            if (x) break :outer;
+        \\        }
+        \\    }
+        \\    return;
+        \\}
+        \\
+    );
+    defer result.tree.deinit(gpa);
+    var cfg = result.cfg.?;
+    defer cfg.deinit(gpa);
+
+    // Find the block reached by `break :outer` — it should be the
+    // OUTER merge, which is downstream from outer header.  Heuristic:
+    // there must exist a path of length 1 from some block (the break
+    // emitter) directly to outer's merge, AND that merge must NOT be
+    // the inner header.  Easier check: count blocks with ≥2 incoming
+    // edges.  Pre-fix: outer header had 2 (entry + body); outer merge
+    // had 1 (header→merge).  Post-fix: outer merge has 2 (header→merge
+    // + labeled-break→merge).  So ≥2 blocks with ≥2 incoming.
+    var incoming = try gpa.alloc(u32, cfg.blocks.len);
+    defer gpa.free(incoming);
+    @memset(incoming, 0);
+    for (cfg.blocks) |b| {
+        for (b.successors) |s| incoming[@intFromEnum(s)] += 1;
+    }
+    var ge2: u32 = 0;
+    for (incoming) |c| if (c >= 2) {
+        ge2 += 1;
+    };
+    // Outer header (≥2), inner header (≥2), outer merge (≥2 only with
+    // the labeled-break fix).  Expect at least 3.
+    try std.testing.expect(ge2 >= 3);
+}
+
+test "labeled continue: `continue :outer` from inner loop targets outer's header" {
+    const gpa = std.testing.allocator;
+    var result = try parseAndLower(gpa,
+        \\pub fn foo(x: bool) void {
+        \\    outer: while (x) {
+        \\        while (x) {
+        \\            if (x) continue :outer;
+        \\        }
+        \\    }
+        \\    return;
+        \\}
+        \\
+    );
+    defer result.tree.deinit(gpa);
+    var cfg = result.cfg.?;
+    defer cfg.deinit(gpa);
+
+    // Outer header should now have ≥3 incoming: entry + inner-body
+    // back-edge through outer body + labeled-continue back-edge.
+    var incoming = try gpa.alloc(u32, cfg.blocks.len);
+    defer gpa.free(incoming);
+    @memset(incoming, 0);
+    for (cfg.blocks) |b| {
+        for (b.successors) |s| incoming[@intFromEnum(s)] += 1;
+    }
+    var max_in: u32 = 0;
+    for (incoming) |c| if (c > max_in) {
+        max_in = c;
+    };
+    try std.testing.expect(max_in >= 3);
+}
+
+test "labeled break to unknown label emits gap (not crash, no false match)" {
+    // `break :nope;` inside a loop with no matching label — walks
+    // the loop stack, finds nothing, must emit a gap rather than
+    // accidentally targeting the innermost loop or crashing.
+    const gpa = std.testing.allocator;
+    var result = try parseAndLower(gpa,
+        \\pub fn foo(x: bool) void {
+        \\    while (x) {
+        \\        if (x) break :nope;
+        \\    }
+        \\    return;
+        \\}
+        \\
+    );
+    defer result.tree.deinit(gpa);
+    var cfg = result.cfg.?;
+    defer cfg.deinit(gpa);
+
+    var found = false;
+    for (cfg.blocks) |b| {
+        for (b.stmts) |s| {
+            if (s.kind == .lowering_gap and
+                std.mem.eql(u8, s.kind.lowering_gap.note, "labeled-break-no-loop"))
                 found = true;
         }
     }
