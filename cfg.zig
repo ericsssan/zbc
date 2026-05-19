@@ -1310,6 +1310,11 @@ const Builder = struct {
                 if (explicit_idx >= args.len) return .unknown;
                 return self.identifierToCopyOrUnknown(args[explicit_idx]);
             },
+            // Phase 24 lands annotation parsing; phase 25 wires the
+            // ExprKind + transfer that propagates the Ast identity
+            // tag.  Until then, return .unknown so call sites of
+            // node_index_of-annotated fns don't get a phantom origin.
+            .node_index_of => return .unknown,
         }
     }
 

@@ -16,6 +16,13 @@ pub const ReturnsAnnotation = union(enum) {
     /// param in the function signature (resolved at extraction time
     /// so call sites don't re-walk params).
     borrowed_from: u32,
+    /// `/// @returns node_index_of(<param>)` — return is a NodeIndex
+    /// tagged with the Ast that `<param>` carries.  Used to enforce
+    /// invariant #1 at call sites: a NodeIndex obtained from Ast A
+    /// must only flow back into A.  `param_index` is the 0-based
+    /// position of the Ast-carrier arg.  Phase 24 parses only;
+    /// classifyCall + transfer wiring lands in phase 25.
+    node_index_of: u32,
 };
 
 pub const FnEntry = struct {
@@ -90,16 +97,30 @@ fn parseReturnsAnnotation(tree: *const Ast, fn_proto: Ast.full.FnProto) ?Returns
 
         if (std.mem.startsWith(u8, trimmed, "@returns owned")) return .owned;
 
-        const prefix = "@returns borrowed_from(";
-        if (std.mem.startsWith(u8, trimmed, prefix)) {
-            const after = trimmed[prefix.len..];
-            const close = std.mem.indexOfScalar(u8, after, ')') orelse return null;
-            const param_name = std.mem.trim(u8, after[0..close], " \t");
-            const idx = resolveParamIndex(tree, fn_proto, param_name) orelse return null;
+        if (parseParenParamForm(trimmed, "@returns borrowed_from(", tree, fn_proto)) |idx| {
             return .{ .borrowed_from = idx };
+        }
+        if (parseParenParamForm(trimmed, "@returns node_index_of(", tree, fn_proto)) |idx| {
+            return .{ .node_index_of = idx };
         }
     }
     return null;
+}
+
+/// Match `<prefix><paramname>)` and resolve paramname to its 0-based
+/// position in the function signature.  Returns null on either a
+/// prefix miss, a malformed close-paren, or an unknown param.
+fn parseParenParamForm(
+    trimmed: []const u8,
+    prefix: []const u8,
+    tree: *const Ast,
+    fn_proto: Ast.full.FnProto,
+) ?u32 {
+    if (!std.mem.startsWith(u8, trimmed, prefix)) return null;
+    const after = trimmed[prefix.len..];
+    const close = std.mem.indexOfScalar(u8, after, ')') orelse return null;
+    const param_name = std.mem.trim(u8, after[0..close], " \t");
+    return resolveParamIndex(tree, fn_proto, param_name);
 }
 
 fn resolveParamIndex(tree: *const Ast, fn_proto: Ast.full.FnProto, name: []const u8) ?u32 {
@@ -203,5 +224,59 @@ test "param index resolves correctly for borrowed_from(non-self)" {
     const entry = r.db.lookup("extract").?;
     try std.testing.expect(entry.annotation == .borrowed_from);
     try std.testing.expectEqual(@as(u32, 1), entry.annotation.borrowed_from);
+}
+
+test "extract @returns node_index_of annotation (phase 24)" {
+    const gpa = std.testing.allocator;
+    var r = try buildFromSrc(gpa,
+        \\const Ast = struct {};
+        \\const NodeIndex = u32;
+        \\/// @returns node_index_of(ast)
+        \\pub fn rootNode(ast: *const Ast) NodeIndex {
+        \\    _ = ast; return 0;
+        \\}
+        \\
+    );
+    defer r.deinit(gpa);
+
+    const entry = r.db.lookup("rootNode").?;
+    try std.testing.expect(entry.annotation == .node_index_of);
+    try std.testing.expectEqual(@as(u32, 0), entry.annotation.node_index_of);
+}
+
+test "node_index_of param resolution: non-self position" {
+    const gpa = std.testing.allocator;
+    var r = try buildFromSrc(gpa,
+        \\const Ast = struct {};
+        \\const NodeIndex = u32;
+        \\/// @returns node_index_of(target)
+        \\pub fn lookupNode(gpa_: u32, target: *const Ast, name: []const u8) NodeIndex {
+        \\    _ = gpa_; _ = target; _ = name; return 0;
+        \\}
+        \\
+    );
+    defer r.deinit(gpa);
+
+    const entry = r.db.lookup("lookupNode").?;
+    try std.testing.expect(entry.annotation == .node_index_of);
+    try std.testing.expectEqual(@as(u32, 1), entry.annotation.node_index_of);
+}
+
+test "node_index_of with unknown param name → no entry" {
+    const gpa = std.testing.allocator;
+    var r = try buildFromSrc(gpa,
+        \\const Ast = struct {};
+        \\const NodeIndex = u32;
+        \\/// @returns node_index_of(typo)
+        \\pub fn rootNode(ast: *const Ast) NodeIndex {
+        \\    _ = ast; return 0;
+        \\}
+        \\
+    );
+    defer r.deinit(gpa);
+
+    // Malformed annotations skip entry creation — consistent with how
+    // borrowed_from handles param-resolution failure.
+    try std.testing.expect(r.db.lookup("rootNode") == null);
 }
 
