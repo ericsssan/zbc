@@ -36,16 +36,33 @@ pub const Ctx = struct {
     next_arena: *u32,
     /// Counter for minting fresh AstIds at ast_init sites.
     next_ast: *u32,
+    /// Per-analyzer-run string interner for pass names.  First use of
+    /// a name mints a fresh PassId; subsequent uses look up.  Keyed
+    /// by source-slice — the caller (analyzer.check) owns the map,
+    /// keys borrow into source which outlives the analysis call.
+    /// Drives invariant #4 identity comparisons.
+    pass_ids: *std.StringHashMapUnmanaged(state_mod.PassId),
+    /// Counter feeding `pass_ids` — also owned by analyzer.check.
+    next_pass: *u32,
     /// Where to push problems.
     problems: *std.ArrayListUnmanaged(Problem),
     /// Source file path for diagnostics.
     path: []const u8,
-    /// Invariant gating (phase 46).  Some checks happen in transfer
-    /// rather than cfg-emit (arena_escape fires inside transferRet,
-    /// not on a dedicated Stmt) — those consult the config to honor
+    /// Invariant gating.  Some checks happen in transfer rather than
+    /// cfg-emit (arena_escape fires inside transferRet, not on a
+    /// dedicated Stmt) — those consult the config to honor
     /// `Config.enabled`.  Defaults to all invariants enabled.
     config: *const config_mod.Config = &config_mod.Default,
 };
+
+/// Look up `name` in ctx.pass_ids; mint a fresh PassId if unseen.
+fn internPassId(ctx: Ctx, name: []const u8) !state_mod.PassId {
+    if (ctx.pass_ids.get(name)) |id| return id;
+    const id: state_mod.PassId = @enumFromInt(ctx.next_pass.*);
+    ctx.next_pass.* += 1;
+    try ctx.pass_ids.put(ctx.gpa, name, id);
+    return id;
+}
 
 /// Mutate `state` to reflect the effect of `stmt`.  Emit any problems
 /// (use-after-kill, missing-annotation issues) to `ctx.problems`.
@@ -58,8 +75,34 @@ pub fn transfer(ctx: Ctx, state: *AbstractState, stmt: Stmt) !void {
         .ret => |r| try transferRet(ctx, state, r, stmt.pos),
         .use => |u| try transferUse(ctx, state, u, stmt.pos),
         .ast_takes_check => |c| try transferAstTakesCheck(ctx, state, c, stmt.pos),
+        .scope_takes_check => |c| try transferScopeTakesCheck(ctx, state, c, stmt.pos),
         .ast_mutation_check => |c| try transferAstMutationCheck(ctx, state, c, stmt.pos),
         .lowering_gap => |g| try transferGap(ctx, state, g, stmt.pos),
+    }
+}
+
+fn transferScopeTakesCheck(
+    ctx: Ctx,
+    state: *AbstractState,
+    c: @TypeOf(@as(StmtKind, undefined).scope_takes_check),
+    pos: cfg.SrcPos,
+) !void {
+    const val_origin = state.locals.get(c.value_local) orelse return;
+    // Only tagged scope values participate.  Untracked values
+    // (Origin.plain, .ast, etc.) silently pass — we don't fabricate
+    // identity for things we can't prove came from a pass.
+    const aid_val: state_mod.PassId = switch (val_origin) {
+        .pass => |p| p,
+        else => return,
+    };
+    const expected = try internPassId(ctx, c.expected_pass);
+    if (aid_val != expected) {
+        try report(ctx, pos, .@"error",
+            "`{s}` is a ScopeId/SymbolId from a different pass than `{s}` (invariant #4: pass-tagged IDs must not cross pass boundaries)",
+            .{
+                ctx.locals[@intFromEnum(c.value_local)].name,
+                c.expected_pass,
+            });
     }
 }
 
@@ -259,6 +302,11 @@ fn originOfInit(
                 .ast => |aid| break :blk .{ .ast_node = aid },
                 else => break :blk .plain,
             }
+        },
+        .scope_from => |pass_name| blk: {
+            // Intern the pass name, tag with the resulting PassId.
+            const pid = internPassId(ctx, pass_name) catch break :blk .plain;
+            break :blk .{ .pass = pid };
         },
         .unknown => .plain,
     };

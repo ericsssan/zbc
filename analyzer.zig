@@ -52,6 +52,12 @@ pub fn check(
     var next_arena: u32 = 0;
     // AstId counter — minted by originOfInit on ast_init (Ast.parse(...)).
     var next_ast: u32 = 0;
+    // Pass-name interner — first reference to a pass name mints a
+    // fresh PassId; subsequent references look up.  Keys borrow
+    // into source slices that outlive this analysis call.
+    var pass_ids: std.StringHashMapUnmanaged(state_mod.PassId) = .empty;
+    defer pass_ids.deinit(gpa);
+    var next_pass: u32 = 0;
 
     // Worklist — process every reachable block until in-states stabilise.
     var worklist: std.ArrayListUnmanaged(BlockId) = .empty;
@@ -89,6 +95,8 @@ pub fn check(
             .locals = cfg.locals,
             .next_arena = &next_arena,
             .next_ast = &next_ast,
+            .pass_ids = &pass_ids,
+            .next_pass = &next_pass,
             .problems = out,
             .path = opts.path,
             .config = opts.config,
@@ -1049,6 +1057,74 @@ test "invariant #1 fires at return position (phase 27)" {
         if (std.mem.indexOf(u8, p.message, "invariant #1") != null) found = true;
     }
     try std.testing.expect(found);
+}
+
+test "invariant #4: scope ID from wrong pass is flagged" {
+    // mintA returns a scope_from(pass_a) ID; useB takes a
+    // scope_from(pass_b).  Passing A's ID into B must flag.
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const ScopeId = u32;
+        \\pub fn foo() void {
+        \\    const s = mintA();
+        \\    useB(s);
+        \\}
+        \\/// @returns scope_from(pass_a)
+        \\pub fn mintA() ScopeId { return 0; }
+        \\/// @takes scope_from(pass_b)
+        \\pub fn useB(s: ScopeId) void { _ = s; }
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+
+    var found = false;
+    for (problems.items) |p| {
+        if (std.mem.indexOf(u8, p.message, "invariant #4") != null) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "invariant #4: matching pass on both sides — no false positive" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const ScopeId = u32;
+        \\pub fn foo() void {
+        \\    const s = mintA();
+        \\    useA(s);
+        \\}
+        \\/// @returns scope_from(pass_a)
+        \\pub fn mintA() ScopeId { return 0; }
+        \\/// @takes scope_from(pass_a)
+        \\pub fn useA(s: ScopeId) void { _ = s; }
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+
+    for (problems.items) |p| {
+        try std.testing.expect(std.mem.indexOf(u8, p.message, "invariant #4") == null);
+    }
+}
+
+test "invariant #4: untagged origin silently passes (regression guard)" {
+    // useB takes scope_from(pass_b) but caller passes a literal —
+    // its origin is .plain, not .pass(_).  Must NOT flag — we only
+    // validate tagged-vs-tagged mismatches.
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const ScopeId = u32;
+        \\pub fn foo() void {
+        \\    var s: ScopeId = 0;
+        \\    useB(s);
+        \\}
+        \\/// @takes scope_from(pass_b)
+        \\pub fn useB(s: ScopeId) void { _ = s; }
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+
+    for (problems.items) |p| {
+        try std.testing.expect(std.mem.indexOf(u8, p.message, "invariant #4") == null);
+    }
 }
 
 test "Config.enabled opt-out: ast_mutation off → invariant #5 stays silent (phase 46)" {

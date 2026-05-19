@@ -28,6 +28,11 @@ pub const ReturnsAnnotation = union(enum) {
     /// `Ast.parse(...)` pattern but explicit and works for any
     /// constructor (custom parser entry points, factory fns, etc.).
     ast,
+    /// `/// @returns scope_from(<pass_name>)` — return is a ScopeId
+    /// or SymbolId minted by a specific analysis pass.  Use as input
+    /// to a different pass is invalid (drives invariant #4).
+    /// `pass_name` is a slice into source (caller keeps source alive).
+    scope_from: []const u8,
 };
 
 /// Function-level `@mutates_ast ...` annotation.
@@ -46,12 +51,17 @@ pub const MutatesAstAnnotation = union(enum) {
 pub const TakesAnnotation = union(enum) {
     /// `/// @takes node_index_of(<param>)` — the function consumes
     /// NodeIndex args that must originate from the Ast carried by
-    /// `<param>`.  Phase 26 emits `.ast_takes_check` per-arg stmts.
+    /// `<param>`.  Emits `.ast_takes_check` per-arg stmts.
     node_index_of: u32,
     /// `/// @takes node_index_any` — explicit opt-out.  The function
     /// accepts NodeIndex args from any Ast; emission skips checks
     /// entirely.  Matches the Layer-1 hygiene rule's vocabulary.
     node_index_any,
+    /// `/// @takes scope_from(<pass_name>)` — the function consumes
+    /// ScopeId / SymbolId args that must originate from the named
+    /// pass.  Drives invariant #4 enforcement at call sites.
+    /// `pass_name` is a slice into source (caller keeps source alive).
+    scope_from: []const u8,
 };
 
 pub const FnEntry = struct {
@@ -158,6 +168,9 @@ fn parseTakesAnnotation(tree: *const Ast, fn_proto: Ast.full.FnProto) ?TakesAnno
         if (parseParenParamForm(trimmed, "@takes node_index_of(", tree, fn_proto)) |idx| {
             return .{ .node_index_of = idx };
         }
+        if (parseParenNameForm(trimmed, "@takes scope_from(")) |name| {
+            return .{ .scope_from = name };
+        }
     }
     return null;
 }
@@ -205,8 +218,23 @@ fn parseReturnsAnnotation(tree: *const Ast, fn_proto: Ast.full.FnProto) ?Returns
         if (parseParenParamForm(trimmed, "@returns node_index_of(", tree, fn_proto)) |idx| {
             return .{ .node_index_of = idx };
         }
+        if (parseParenNameForm(trimmed, "@returns scope_from(")) |name| {
+            return .{ .scope_from = name };
+        }
     }
     return null;
+}
+
+/// Match `<prefix><name>)` and return `<name>` as a source slice.
+/// Used by annotations whose payload is an arbitrary identifier
+/// (pass name, etc.) rather than a function-param reference.
+/// Returns null on prefix miss, missing close-paren, or empty name.
+fn parseParenNameForm(trimmed: []const u8, prefix: []const u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, trimmed, prefix)) return null;
+    const after = trimmed[prefix.len..];
+    const close = std.mem.indexOfScalar(u8, after, ')') orelse return null;
+    const name = std.mem.trim(u8, after[0..close], " \t");
+    return if (name.len == 0) null else name;
 }
 
 /// Match `<prefix><paramname>)` and resolve paramname to its 0-based
@@ -407,6 +435,36 @@ test "extract @returns ast annotation (phase 33)" {
 
     const entry = r.db.lookup("customParse").?;
     try std.testing.expect(entry.annotation.? == .ast);
+}
+
+test "extract @returns scope_from(<pass>) annotation" {
+    const gpa = std.testing.allocator;
+    var r = try buildFromSrc(gpa,
+        \\const ScopeId = u32;
+        \\/// @returns scope_from(scope_resolve)
+        \\pub fn mintScope() ScopeId { return 0; }
+        \\
+    );
+    defer r.deinit(gpa);
+
+    const entry = r.db.lookup("mintScope").?;
+    try std.testing.expect(entry.annotation.? == .scope_from);
+    try std.testing.expectEqualStrings("scope_resolve", entry.annotation.?.scope_from);
+}
+
+test "extract @takes scope_from(<pass>) annotation" {
+    const gpa = std.testing.allocator;
+    var r = try buildFromSrc(gpa,
+        \\const ScopeId = u32;
+        \\/// @takes scope_from(type_check)
+        \\pub fn usesScope(s: ScopeId) void { _ = s; }
+        \\
+    );
+    defer r.deinit(gpa);
+
+    const entry = r.db.lookup("usesScope").?;
+    try std.testing.expect(entry.takes.? == .scope_from);
+    try std.testing.expectEqualStrings("type_check", entry.takes.?.scope_from);
 }
 
 test "extract @takes node_index_any annotation (phase 29)" {
