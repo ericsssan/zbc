@@ -30,6 +30,18 @@ pub const ReturnsAnnotation = union(enum) {
     ast,
 };
 
+/// Function-level `@mutates_ast ...` annotation.
+pub const MutatesAstAnnotation = union(enum) {
+    /// `/// @mutates_ast` (no parens) — implicit: receiver for method
+    /// calls, args[0] for namespace calls.  Phase 37 default.
+    implicit,
+    /// `/// @mutates_ast(<param>)` — explicit param-index resolution.
+    /// Author calls out which arg is the Ast being mutated.  Allows
+    /// annotating fns like `mutateChild(parent, child)` where the
+    /// SECOND arg is the mutated Ast.  Phase 39 refinement.
+    of: u32,
+};
+
 /// Function-level `@takes ...` annotation.
 pub const TakesAnnotation = union(enum) {
     /// `/// @takes node_index_of(<param>)` — the function consumes
@@ -49,13 +61,15 @@ pub const FnEntry = struct {
     annotation: ?ReturnsAnnotation = null,
     /// Optional `@takes ...`; null when none parsed.
     takes: ?TakesAnnotation = null,
-    /// `/// @mutates_ast` — method mutates its Ast receiver
-    /// (writes a field, rebuilds derived caches, etc.).  Used to
-    /// enforce invariant #5: any caller that holds an Origin.ast
-    /// value (constructed or received via param) flagged at the
-    /// call site since post-parse mutation invalidates the
-    /// parent_indices and tag CSRs that downstream passes rely on.
-    mutates_ast: bool = false,
+    /// `/// @mutates_ast` or `/// @mutates_ast(<param>)` — method
+    /// mutates an Ast value (writes a field, rebuilds derived caches,
+    /// etc.).  Used to enforce invariant #5: any caller that holds
+    /// an Origin.ast value (constructed or received via param)
+    /// flagged at the call site since post-parse mutation invalidates
+    /// the parent_indices and tag CSRs that downstream passes rely on.
+    /// Null when no annotation; .implicit for bare `@mutates_ast`;
+    /// .of(idx) when an explicit param is named.
+    mutates_ast: ?MutatesAstAnnotation = null,
 };
 
 pub const Db = struct {
@@ -87,7 +101,7 @@ pub fn build(gpa: std.mem.Allocator, tree: *const Ast) !Db {
         const annotation = parseReturnsAnnotation(tree, fn_proto);
         const takes = parseTakesAnnotation(tree, fn_proto);
         const mutates_ast = parseMutatesAstAnnotation(tree, fn_proto);
-        if (annotation == null and takes == null and !mutates_ast) continue;
+        if (annotation == null and takes == null and mutates_ast == null) continue;
         const name = tree.tokenSlice(name_tok);
         try db.fns.put(gpa, name, .{
             .name = name,
@@ -99,11 +113,11 @@ pub fn build(gpa: std.mem.Allocator, tree: *const Ast) !Db {
     return db;
 }
 
-fn parseMutatesAstAnnotation(tree: *const Ast, fn_proto: Ast.full.FnProto) bool {
+fn parseMutatesAstAnnotation(tree: *const Ast, fn_proto: Ast.full.FnProto) ?MutatesAstAnnotation {
     const fn_first_tok: Ast.TokenIndex = fn_proto.visib_token orelse
         fn_proto.extern_export_inline_token orelse
         fn_proto.ast.fn_token;
-    if (fn_first_tok == 0) return false;
+    if (fn_first_tok == 0) return null;
 
     var t: i64 = @as(i64, @intCast(fn_first_tok)) - 1;
     while (t >= 0) : (t -= 1) {
@@ -112,9 +126,16 @@ fn parseMutatesAstAnnotation(tree: *const Ast, fn_proto: Ast.full.FnProto) bool 
         const raw = tree.tokenSlice(tok_idx);
         const body = stripDocPrefix(raw);
         const trimmed = std.mem.trim(u8, body, " \t");
-        if (std.mem.eql(u8, trimmed, "@mutates_ast")) return true;
+
+        // Bare form first — whole-word check so `@mutates_ast(foo)`
+        // doesn't accidentally match here.
+        if (std.mem.eql(u8, trimmed, "@mutates_ast")) return .implicit;
+        // Parenthesized form: `@mutates_ast(<param>)`.
+        if (parseParenParamForm(trimmed, "@mutates_ast(", tree, fn_proto)) |idx| {
+            return .{ .of = idx };
+        }
     }
-    return false;
+    return null;
 }
 
 fn parseTakesAnnotation(tree: *const Ast, fn_proto: Ast.full.FnProto) ?TakesAnnotation {
@@ -354,7 +375,22 @@ test "extract @mutates_ast annotation (phase 37)" {
     defer r.deinit(gpa);
 
     const entry = r.db.lookup("setNodeTag").?;
-    try std.testing.expect(entry.mutates_ast);
+    try std.testing.expect(entry.mutates_ast.? == .implicit);
+}
+
+test "extract @mutates_ast(<param>) explicit form (phase 39)" {
+    const gpa = std.testing.allocator;
+    var r = try buildFromSrc(gpa,
+        \\const Ast = struct {};
+        \\/// @mutates_ast(child)
+        \\pub fn linkChild(parent: *Ast, child: *Ast) void { _ = parent; _ = child; }
+        \\
+    );
+    defer r.deinit(gpa);
+
+    const entry = r.db.lookup("linkChild").?;
+    try std.testing.expect(entry.mutates_ast.? == .of);
+    try std.testing.expectEqual(@as(u32, 1), entry.mutates_ast.?.of);
 }
 
 test "extract @returns ast annotation (phase 33)" {

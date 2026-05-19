@@ -762,6 +762,36 @@ test "invariant #5 fires through CROSS-FILE namespace call (phase 38)" {
     try std.testing.expect(found);
 }
 
+test "invariant #5: @mutates_ast(<param>) fires on the right arg (phase 39)" {
+    // linkChild has TWO Ast args; only `child` (arg 1) is mutated.
+    // With `@mutates_ast(child)` the check targets args[1] specifically;
+    // ast_a (parent) is read-only at this call.  Pre-phase-39
+    // `@mutates_ast` would have unconditionally flagged args[0] (parent).
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const Ast = struct {};
+        \\pub fn foo(parent: Ast, child: Ast) void {
+        \\    linkChild(parent, child);
+        \\}
+        \\/// @mutates_ast(child)
+        \\pub fn linkChild(parent: Ast, child: Ast) void { _ = parent; _ = child; }
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+
+    // Exactly one invariant #5 finding (about `child`), not two.
+    var count: u32 = 0;
+    var child_named = false;
+    for (problems.items) |p| {
+        if (std.mem.indexOf(u8, p.message, "invariant #5") != null) {
+            count += 1;
+            if (std.mem.indexOf(u8, p.message, "`child`") != null) child_named = true;
+        }
+    }
+    try std.testing.expectEqual(@as(u32, 1), count);
+    try std.testing.expect(child_named);
+}
+
 test "invariant #5: non-Ast receiver doesn't fire (regression guard)" {
     // No Ast param — `obj` is untracked, its .none origin won't
     // flag.  Pre-phase-37 there was no check at all; this guards

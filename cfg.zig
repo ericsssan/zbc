@@ -1296,21 +1296,25 @@ const Builder = struct {
         const is_namespace_call = self.isImportNamespaceCall(callee_node);
         const recv_is_arg0 = (tree.nodeTag(callee_node) == .field_access) and !is_namespace_call;
 
-        // Mutation check (invariant #5): emit irrespective of takes.
-        // Two call shapes:
-        //   `obj.method(...)`        — receiver IS the Ast (recv_is_arg0).
-        //   `Mod.method(ast, ...)`   — first explicit arg is the Ast
-        //                              (phase 38: namespace shape; we
-        //                              conservatively check args[0]
-        //                              without a per-arg @mutates_ast
-        //                              annotation refinement).
-        if (self.lookupMutatesAst(callee_node)) {
-            const ast_arg: ?Ast.Node.Index = if (recv_is_arg0)
-                tree.nodeData(callee_node).node_and_token[0]
-            else if (args.len > 0)
-                args[0]
-            else
-                null;
+        // Mutation check (invariant #5).  Three resolution modes for
+        // which arg is the mutated Ast:
+        //   .implicit   — receiver (method shape) OR args[0] (namespace).
+        //   .of(idx)    — explicit param index from the annotation.
+        //                 For method calls, idx==0 means the receiver;
+        //                 explicit-arg indices shift by one.
+        if (self.lookupMutatesAst(callee_node)) |mut| {
+            const ast_arg: ?Ast.Node.Index = switch (mut) {
+                .implicit => if (recv_is_arg0)
+                    tree.nodeData(callee_node).node_and_token[0]
+                else if (args.len > 0) args[0] else null,
+                .of => |idx| blk: {
+                    if (recv_is_arg0 and idx == 0)
+                        break :blk tree.nodeData(callee_node).node_and_token[0];
+                    const explicit_idx = if (recv_is_arg0) idx - 1 else idx;
+                    if (explicit_idx >= args.len) break :blk null;
+                    break :blk args[explicit_idx];
+                },
+            };
             if (ast_arg) |n| {
                 if (self.identifierToLocal(n)) |ast_local| {
                     try self.appendStmt(cur.*, .{
@@ -1439,9 +1443,10 @@ const Builder = struct {
         }
     }
 
-    /// Same shape as lookupTakes but reads the @mutates_ast bool.
-    /// Same-file first, then cross-file via remote resolver.
-    fn lookupMutatesAst(self: *Builder, callee_node: Ast.Node.Index) bool {
+    /// Same shape as lookupTakes; returns the @mutates_ast annotation
+    /// (null when none).  Same-file first, then cross-file via
+    /// resolveRemoteFile.
+    fn lookupMutatesAst(self: *Builder, callee_node: Ast.Node.Index) ?annotations.MutatesAstAnnotation {
         const tree = self.tree;
         switch (tree.nodeTag(callee_node)) {
             .field_access => {
@@ -1449,21 +1454,21 @@ const Builder = struct {
                 const recv_node = fa.node_and_token[0];
                 const method_name = tree.tokenSlice(fa.node_and_token[1]);
                 if (self.db) |db| {
-                    if (db.lookup(method_name)) |e| if (e.mutates_ast) return true;
+                    if (db.lookup(method_name)) |e| if (e.mutates_ast) |m| return m;
                 }
                 if (self.resolveRemoteFile(recv_node)) |rf| {
-                    if (rf.db.lookup(method_name)) |e| if (e.mutates_ast) return true;
+                    if (rf.db.lookup(method_name)) |e| if (e.mutates_ast) |m| return m;
                 }
-                return false;
+                return null;
             },
             .identifier => {
                 const name = tree.tokenSlice(tree.nodeMainToken(callee_node));
                 if (self.db) |db| {
-                    if (db.lookup(name)) |e| if (e.mutates_ast) return true;
+                    if (db.lookup(name)) |e| if (e.mutates_ast) |m| return m;
                 }
-                return false;
+                return null;
             },
-            else => return false,
+            else => return null,
         }
     }
 
