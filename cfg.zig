@@ -284,6 +284,33 @@ const Builder = struct {
         return id;
     }
 
+    /// Register `|x|` / `|x, y|` / `|*x, idx|` capture identifiers
+    /// starting at `payload_token` (which points at the first capture
+    /// after the opening `|`).  Stops at the closing `|`.  Each
+    /// capture becomes a tracked local with .unknown origin — we don't
+    /// model per-element borrow shape yet, but subsequent uses inside
+    /// the body now resolve via name_to_local rather than falling
+    /// through to .unknown identifier classification.
+    fn registerCaptures(self: *Builder, payload_token: Ast.TokenIndex) !void {
+        const tree = self.tree;
+        const tags = tree.tokens.items(.tag);
+        var t: Ast.TokenIndex = payload_token;
+        while (t < tags.len) : (t += 1) {
+            switch (tags[t]) {
+                .pipe => return, // closing `|`
+                .identifier => {
+                    const name = tree.tokenSlice(t);
+                    // `_` is the discard placeholder — don't track.
+                    if (std.mem.eql(u8, name, "_")) continue;
+                    // Zig forbids shadowing, so name_to_local can't
+                    // already hold this name — safe to register.
+                    _ = try self.registerLocal(name, self.posOfToken(t));
+                },
+                else => {}, // `,`, `*`, `|` (opening): skip
+            }
+        }
+    }
+
     /// Lower the contents of a Zig block node into `cur` (mutated to the
     /// last block reached — branches may have advanced past the original).
     /// Defer statements encountered are queued and replayed in reverse
@@ -485,6 +512,8 @@ const Builder = struct {
             .merge = merge,
             .label = label_slice,
         });
+        // `while (opt) |x|` payload capture — register before body.
+        if (while_data.payload_token) |pt| try self.registerCaptures(pt);
         var body_cur = body;
         try self.lowerStmt(while_data.ast.then_expr, &body_cur);
         _ = self.loop_stack.pop();
@@ -537,6 +566,8 @@ const Builder = struct {
             .merge = merge,
             .label = for_label,
         });
+        // For-loops always have a payload (`|x|` or `|x, idx|`).
+        try self.registerCaptures(for_data.payload_token);
         var body_cur = body;
         try self.lowerStmt(for_data.ast.then_expr, &body_cur);
         _ = self.loop_stack.pop();
@@ -1938,6 +1969,114 @@ test "labeled break to unknown label emits gap (not crash, no false match)" {
         }
     }
     try std.testing.expect(found);
+}
+
+test "for-loop capture registered: use of `item` resolves to a tracked local" {
+    // Pre-phase-15 `item` was an unknown identifier; the .assign rhs
+    // would classify as .unknown.  After capture registration, `item`
+    // is a known local and `x = item` should classify as copy_of.
+    const gpa = std.testing.allocator;
+    var result = try parseAndLower(gpa,
+        \\pub fn foo(xs: []const u32) void {
+        \\    var x: u32 = 0;
+        \\    for (xs) |item| {
+        \\        x = item;
+        \\    }
+        \\    _ = x;
+        \\    return;
+        \\}
+        \\
+    );
+    defer result.tree.deinit(gpa);
+    var cfg = result.cfg.?;
+    defer cfg.deinit(gpa);
+
+    var saw_copy_of = false;
+    for (cfg.blocks) |b| {
+        for (b.stmts) |s| {
+            if (s.kind == .assign and s.kind.assign.rhs_kind == .copy_of) {
+                saw_copy_of = true;
+            }
+        }
+    }
+    try std.testing.expect(saw_copy_of);
+}
+
+test "for-loop multiple captures `|item, idx|` both registered" {
+    const gpa = std.testing.allocator;
+    var result = try parseAndLower(gpa,
+        \\pub fn foo(xs: []const u32) void {
+        \\    var a: u32 = 0;
+        \\    var b: usize = 0;
+        \\    for (xs, 0..) |item, idx| {
+        \\        a = item;
+        \\        b = idx;
+        \\    }
+        \\    _ = a; _ = b;
+        \\    return;
+        \\}
+        \\
+    );
+    defer result.tree.deinit(gpa);
+    var cfg = result.cfg.?;
+    defer cfg.deinit(gpa);
+
+    var copy_of_count: u32 = 0;
+    for (cfg.blocks) |b| {
+        for (b.stmts) |s| {
+            if (s.kind == .assign and s.kind.assign.rhs_kind == .copy_of) {
+                copy_of_count += 1;
+            }
+        }
+    }
+    // Both `a = item` and `b = idx` should classify as copy_of.
+    try std.testing.expect(copy_of_count >= 2);
+}
+
+test "discard capture `|_|` is NOT registered as a local" {
+    const gpa = std.testing.allocator;
+    var result = try parseAndLower(gpa,
+        \\pub fn foo(xs: []const u32) void {
+        \\    for (xs) |_| {}
+        \\    return;
+        \\}
+        \\
+    );
+    defer result.tree.deinit(gpa);
+    var cfg = result.cfg.?;
+    defer cfg.deinit(gpa);
+
+    for (cfg.locals) |l| {
+        try std.testing.expect(!std.mem.eql(u8, l.name, "_"));
+    }
+}
+
+test "while-with-payload `while (opt) |val|` registers capture" {
+    const gpa = std.testing.allocator;
+    var result = try parseAndLower(gpa,
+        \\pub fn foo(it: anytype) void {
+        \\    var x: u32 = 0;
+        \\    while (it.next()) |val| {
+        \\        x = val;
+        \\    }
+        \\    _ = x;
+        \\    return;
+        \\}
+        \\
+    );
+    defer result.tree.deinit(gpa);
+    var cfg = result.cfg.?;
+    defer cfg.deinit(gpa);
+
+    var saw_copy_of = false;
+    for (cfg.blocks) |b| {
+        for (b.stmts) |s| {
+            if (s.kind == .assign and s.kind.assign.rhs_kind == .copy_of) {
+                saw_copy_of = true;
+            }
+        }
+    }
+    try std.testing.expect(saw_copy_of);
 }
 
 test "try unwraps inner expression: copy_of(src) preserved through try" {
