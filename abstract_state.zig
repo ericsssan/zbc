@@ -5,8 +5,8 @@
 //! arenas are still live and which thread we're in.  Use-validity is
 //! a lookup, not a borrow-graph traversal.
 //!
-//! Algorithm (week 4): standard worklist fixed-point over a CFG, with
-//! `join` conservatively combining states at merge points.
+//! Algorithm: standard worklist fixed-point over a CFG, with `join`
+//! conservatively combining states at merge points.
 
 const std = @import("std");
 

@@ -4,7 +4,7 @@
 //! subset of statement shapes that affect our abstract state.  Most
 //! Zig syntax doesn't change lifetime/identity; we collapse it into
 //! `.plain_expr` and only emit dedicated statement nodes for the ops
-//! we'll actually transfer over in week 4.
+//! the analyzer transfers over.
 //!
 //! What we DO model:
 //!   - `var/const NAME = INIT;` (local binding)
@@ -13,14 +13,14 @@
 //!   - `arena.deinit()` (arena death)
 //!   - `thread.join()` (thread join)
 //!   - `return EXPR;` (function exit)
-//!   - `if/else` and `while` branching (control flow only)
+//!   - `if/else` and `while` branching (real CFG edges)
+//!   - `defer` / `errdefer` (replayed at function-exit / return sites)
 //!
 //! What we DON'T model (yet):
-//!   - `for` loops (week 4)
-//!   - `switch` (week 4)
-//!   - `defer` / `errdefer` (week 4 — needs cleanup-block insertion)
-//!   - `try` / `catch` (week 5)
-//!   - generics / comptime (skip in v1)
+//!   - `for` loops (range + each form)
+//!   - `switch` statements
+//!   - `try` / `catch` (error-path forking)
+//!   - generics / comptime
 //!
 //! Errors during lowering are surfaced as `Stmt{.lowering_gap}` nodes
 //! rather than aborts — keeps the analyzer running on the rest of the
@@ -276,7 +276,7 @@ const Builder = struct {
         // before falling off the implicit-return edge (no explicit
         // ret_stmt at the tail).  v1 only: top-level block treated as
         // function body; nested blocks don't run defers at exit yet.
-        // TODO(week-6): per-block defer scoping for nested blocks.
+        // TODO: per-block defer scoping for nested blocks.
         try self.flushDefers(cur);
     }
 
@@ -326,7 +326,7 @@ const Builder = struct {
             },
             .if_simple, .@"if" => try self.lowerIf(stmt_node, cur),
             .while_simple, .while_cont, .@"while" => try self.lowerWhile(stmt_node, cur),
-            // TODO(week-7): for/switch branching.
+            // TODO: for/switch/try branching.
             else => {
                 try self.appendStmt(cur.*, .{
                     .kind = .{ .lowering_gap = .{ .note = @tagName(tag) } },
@@ -461,7 +461,7 @@ const Builder = struct {
     }
 
     fn lowerAssign(self: *Builder, _: Ast.Node.Index, cur: *BlockId) !void {
-        // TODO(week-4): identify target local, classify RHS, emit assign.
+        // TODO: identify target local, classify RHS, emit a real .assign stmt.
         try self.appendStmt(cur.*, .{
             .kind = .{ .lowering_gap = .{ .note = "assign" } },
             .pos = .{ .byte = 0, .line = 0, .column = 0 },

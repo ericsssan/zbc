@@ -17,8 +17,8 @@ const require_node_index_origin = @import("rules/require_node_index_origin.zig")
 const require_arena_kill_tag = @import("rules/require_arena_kill_tag.zig");
 
 // Layer 2 — pulled in via test entry so its tests run when we
-// `zig test main.zig`.  Not yet wired into the CLI default; can be
-// invoked via `--escape-check` flag (week 5 will polish UX).
+// `zig test main.zig`.  Not yet wired into the CLI default; invoke
+// via the `--escape` flag.
 const cfg_mod = @import("cfg.zig");
 const annotations_mod = @import("annotations.zig");
 const analyzer_mod = @import("analyzer.zig");

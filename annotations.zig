@@ -3,7 +3,7 @@
 //! consults this when it sees a method/function call.
 //!
 //! v1 scope: same-file lookup only.  Cross-file (and cross-module via
-//! @import resolution) is week 6+.
+//! @import resolution) is future work.
 
 const std = @import("std");
 const Ast = std.zig.Ast;

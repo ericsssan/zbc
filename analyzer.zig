@@ -3,9 +3,9 @@
 //! emitting Problems along the way.
 //!
 //! v1 limitations:
-//!   - cfg.zig currently produces linear blocks only (if/while → gap),
-//!     so the worklist usually terminates in one pass per block.
-//!   - When real branching lands (week 5), the same algorithm naturally
+//!   - cfg.zig models if/else and while branching; for/switch/try still
+//!     lower as `.lowering_gap` (conservative collapse of locals to .plain).
+//!   - When more branching constructs land, the same algorithm naturally
 //!     extends — `join` handles convergence at merge points.
 
 const std = @import("std");
@@ -51,8 +51,8 @@ pub fn check(
     try worklist.append(gpa, cfg.entry);
 
     // Per-block done flag — guards against re-processing without state
-    // change (v1: only succ states get pushed; for branches week 5 will
-    // need to re-process the join block on every change).
+    // change.  Successor blocks only get re-pushed when their joined
+    // in-state actually moved.
     var iter_guard: u32 = 0;
     const MAX_ITERS: u32 = 10_000;
 
@@ -274,9 +274,9 @@ test "branch-specific UAF: kill in one if-branch, use after merge" {
     );
     defer freeProblems(gpa, &problems);
     // With real branching, the if-branch's arena_kill propagates through
-    // the merge join; the return sees a dead-or-alive arena.  Pre-week-6
-    // this would have been a lowering_gap, locals collapsed to .plain,
-    // and no escape detected.
+    // the merge join; the return sees a dead-or-alive arena.  Without
+    // branching support this would have been a lowering_gap, locals
+    // collapsed to .plain, and no escape detected.
     try std.testing.expect(problems.items.len >= 1);
 }
 
