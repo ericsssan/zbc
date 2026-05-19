@@ -16,6 +16,12 @@ const require_borrowed_from = @import("rules/require_borrowed_from.zig");
 const require_node_index_origin = @import("rules/require_node_index_origin.zig");
 const require_arena_kill_tag = @import("rules/require_arena_kill_tag.zig");
 
+// Layer 2 — pulled in via refAllDecls so its tests run when we
+// `zig test main.zig`.  Not yet wired into the CLI: week 4 will add
+// transfer functions and a `--escape-check` subcommand.
+const _layer2_cfg = @import("cfg.zig");
+const _layer2_abstract_state = @import("abstract_state.zig");
+
 const Problem = problem_mod.Problem;
 
 pub fn main(init: std.process.Init) !void {
@@ -93,5 +99,12 @@ fn checkFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !bool {
 }
 
 test {
+    // refAllDecls doesn't recurse; explicitly pull in submodules so
+    // `zig test main.zig` runs every rule's + every layer's tests.
+    _ = require_borrowed_from;
+    _ = require_node_index_origin;
+    _ = require_arena_kill_tag;
+    _ = _layer2_cfg;
+    _ = _layer2_abstract_state;
     std.testing.refAllDecls(@This());
 }
