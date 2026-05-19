@@ -252,6 +252,34 @@ test "annotated callee: borrow propagates through call, escapes via return" {
     try std.testing.expect(found);
 }
 
+test "branch-specific UAF: kill in one if-branch, use after merge" {
+    const gpa = std.testing.allocator;
+    // The arena is killed in one branch of an if-statement.  After the
+    // merge, the arena is .dead on the joined state (dead-on-either-side
+    // wins in join).  Returning a borrow against it then escapes.
+    var problems = try analyze(gpa,
+        \\const std = @import("std");
+        \\const Arena = struct {
+        \\    /// @returns borrowed_from(self)
+        \\    pub fn slice(self: *const Arena) []const u8 {
+        \\        _ = self; return "";
+        \\    }
+        \\};
+        \\pub fn maybe(cond: bool) []const u8 {
+        \\    var arena = std.heap.ArenaAllocator.init(undefined);
+        \\    if (cond) arena.deinit();
+        \\    return arena.slice();
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    // With real branching, the if-branch's arena_kill propagates through
+    // the merge join; the return sees a dead-or-alive arena.  Pre-week-6
+    // this would have been a lowering_gap, locals collapsed to .plain,
+    // and no escape detected.
+    try std.testing.expect(problems.items.len >= 1);
+}
+
 test "lowering_gap collapses locals to plain — no spurious reports" {
     const gpa = std.testing.allocator;
     // `if (x) return;` triggers a lowering_gap in cfg.zig today.  The

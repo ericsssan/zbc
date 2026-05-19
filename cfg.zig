@@ -321,12 +321,12 @@ const Builder = struct {
             },
             .@"defer", .@"errdefer" => {
                 // Both share `.data = .{ .node = body }` in 0.17.
-                // (Earlier Zig versions had errdefer carry an optional
-                // capture token; that's gone now.)
                 const body = tree.nodeData(stmt_node).node;
                 try self.pushDefer(body);
             },
-            // TODO(week-6): if/while/for/switch branching.
+            .if_simple, .@"if" => try self.lowerIf(stmt_node, cur),
+            .while_simple, .while_cont, .@"while" => try self.lowerWhile(stmt_node, cur),
+            // TODO(week-7): for/switch branching.
             else => {
                 try self.appendStmt(cur.*, .{
                     .kind = .{ .lowering_gap = .{ .note = @tagName(tag) } },
@@ -334,6 +334,99 @@ const Builder = struct {
                 });
             },
         }
+    }
+
+    /// `if (cond) THEN [else ELSE]` → fork into two successor blocks,
+    /// lower each branch into its own block, then join into a fresh
+    /// merge block.  Subsequent statements emit into the merge block.
+    ///
+    /// We don't model the condition's truthiness — the abstract state
+    /// must be valid on BOTH branches (this is conservative and matches
+    /// our design: don't reason about branch-specific values).
+    fn lowerIf(self: *Builder, if_node: Ast.Node.Index, cur: *BlockId) !void {
+        const tree = self.tree;
+        const if_data = tree.fullIf(if_node) orelse {
+            try self.appendStmt(cur.*, .{
+                .kind = .{ .lowering_gap = .{ .note = "if-extract" } },
+                .pos = self.posOf(if_node),
+            });
+            return;
+        };
+
+        // Allocate the three successor blocks up-front.
+        const then_block = try self.newBlock();
+        const else_block = if (if_data.ast.else_expr.unwrap() != null) try self.newBlock() else null;
+        const merge_block = try self.newBlock();
+
+        // From `cur`: branch to then-block and (else-block OR merge directly
+        // if no else clause — falling through is the same as an empty else).
+        try self.addEdge(cur.*, then_block);
+        try self.addEdge(cur.*, else_block orelse merge_block);
+
+        // Lower the then branch.
+        var then_cur = then_block;
+        try self.lowerStmt(if_data.ast.then_expr, &then_cur);
+        // Then-branch exits flow into merge.
+        try self.addEdge(then_cur, merge_block);
+
+        // Lower the else branch if present.
+        if (else_block) |eb| {
+            var else_cur = eb;
+            try self.lowerStmt(if_data.ast.else_expr.unwrap().?, &else_cur);
+            try self.addEdge(else_cur, merge_block);
+        }
+
+        // Subsequent statements emit into the merge block.
+        cur.* = merge_block;
+    }
+
+    /// `while (cond) BODY [else ELSE]` → produces a header block (where
+    /// the condition is evaluated each iteration), a body block, and a
+    /// merge block (post-loop).  Back-edge from body → header creates
+    /// the loop — the analyzer's worklist iterates body's state into
+    /// header until fixed point.
+    ///
+    /// We model the simplest valid loop CFG:
+    ///   cur ─→ header ─→ body ─→ header (back-edge)
+    ///                  ↘ merge (loop exit / else)
+    fn lowerWhile(self: *Builder, while_node: Ast.Node.Index, cur: *BlockId) !void {
+        const tree = self.tree;
+        const while_data = tree.fullWhile(while_node) orelse {
+            try self.appendStmt(cur.*, .{
+                .kind = .{ .lowering_gap = .{ .note = "while-extract" } },
+                .pos = self.posOf(while_node),
+            });
+            return;
+        };
+
+        const header = try self.newBlock();
+        const body = try self.newBlock();
+        const merge = try self.newBlock();
+
+        // Edge: cur → header (loop entry)
+        try self.addEdge(cur.*, header);
+
+        // Header branches to body (when cond true) or merge (when false).
+        try self.addEdge(header, body);
+        try self.addEdge(header, merge);
+
+        // Lower the body; on exit, back-edge to header.
+        var body_cur = body;
+        try self.lowerStmt(while_data.ast.then_expr, &body_cur);
+        try self.addEdge(body_cur, header);
+
+        // Optional else block (runs once when cond becomes false).
+        // We don't model the "runs only on natural exit, not on break" —
+        // treat as falling through to merge.
+        if (while_data.ast.else_expr.unwrap()) |else_expr| {
+            const else_block = try self.newBlock();
+            try self.addEdge(header, else_block);
+            var else_cur = else_block;
+            try self.lowerStmt(else_expr, &else_cur);
+            try self.addEdge(else_cur, merge);
+        }
+
+        cur.* = merge;
     }
 
     fn lowerVarDecl(self: *Builder, decl_node: Ast.Node.Index, cur: *BlockId) !void {
@@ -758,7 +851,7 @@ test "lower fn with thread join" {
     try std.testing.expect(stmts[2].kind == .ret);
 }
 
-test "lowering_gap for unsupported statement (if/while)" {
+test "if-statement creates fork: 3 blocks (entry, then, merge)" {
     const gpa = std.testing.allocator;
     var result = try parseAndLower(gpa,
         \\pub fn foo(x: bool) void {
@@ -771,9 +864,44 @@ test "lowering_gap for unsupported statement (if/while)" {
     var cfg = result.cfg.?;
     defer cfg.deinit(gpa);
 
-    // v1 doesn't model if/else — emits a lowering_gap for the if_stmt.
-    const stmts = cfg.blocks[0].stmts;
-    try std.testing.expectEqual(@as(usize, 2), stmts.len);
-    try std.testing.expect(stmts[0].kind == .lowering_gap);
-    try std.testing.expect(stmts[1].kind == .ret);
+    // Entry, then-branch, merge.  No else (single-armed if).
+    try std.testing.expect(cfg.blocks.len >= 3);
+    // Entry block has 2 successors (then + merge).
+    try std.testing.expectEqual(@as(usize, 2), cfg.blocks[0].successors.len);
+}
+
+test "if-else creates fork: 4 blocks (entry, then, else, merge)" {
+    const gpa = std.testing.allocator;
+    var result = try parseAndLower(gpa,
+        \\pub fn foo(x: bool) void {
+        \\    if (x) return else return;
+        \\    return;
+        \\}
+        \\
+    );
+    defer result.tree.deinit(gpa);
+    var cfg = result.cfg.?;
+    defer cfg.deinit(gpa);
+
+    try std.testing.expect(cfg.blocks.len >= 4);
+    try std.testing.expectEqual(@as(usize, 2), cfg.blocks[0].successors.len);
+}
+
+test "while loop creates back-edge: body → header" {
+    const gpa = std.testing.allocator;
+    var result = try parseAndLower(gpa,
+        \\pub fn foo(x: bool) void {
+        \\    while (x) {}
+        \\    return;
+        \\}
+        \\
+    );
+    defer result.tree.deinit(gpa);
+    var cfg = result.cfg.?;
+    defer cfg.deinit(gpa);
+
+    // header block has 2 successors (body, merge); body block has 1
+    // successor (back to header).  At minimum we expect 4 blocks:
+    // entry, header, body, merge.
+    try std.testing.expect(cfg.blocks.len >= 4);
 }
