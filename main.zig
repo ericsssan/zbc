@@ -318,9 +318,9 @@ test "parseInvariantList: remove from a set" {
     var list: std.ArrayListUnmanaged(lib.Invariant) = .empty;
     defer list.deinit(gpa);
     try list.appendSlice(gpa, &lib.all_invariants);
-    try parseInvariantList(gpa, "thread_arena,pass_identity", &list, .remove);
-    try std.testing.expectEqual(@as(usize, 3), list.items.len);
-    try std.testing.expect(!containsInvariant(list.items, .thread_arena));
+    try parseInvariantList(gpa, "ast_mutation,pass_identity", &list, .remove);
+    try std.testing.expectEqual(@as(usize, 2), list.items.len);
+    try std.testing.expect(!containsInvariant(list.items, .ast_mutation));
     try std.testing.expect(!containsInvariant(list.items, .pass_identity));
 }
 

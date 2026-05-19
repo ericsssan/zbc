@@ -67,32 +67,32 @@ pub const Config = struct {
     enabled: []const Invariant = &all_invariants,
 };
 
-/// Set of invariants the analyzer can enforce.  Each maps to a
-/// specific check pattern documented in the design doc; downstream
-/// projects pick which subset is relevant.
+/// Set of invariants the analyzer can enforce.  Downstream projects
+/// pick which subset is relevant via Config.enabled.
+///
+/// The thread-arena boundary check (worker-allocated pointer read
+/// from main thread before join) was scaffolded but removed — it's
+/// fundamentally inter-procedural and our analyzer is intra-procedural.
+/// Bringing it back means a real story for cross-function origin
+/// propagation, which is a much bigger lift.
 pub const Invariant = enum {
-    /// #1: NodeIndex from Ast A must only flow back into A.
-    /// Drives @takes node_index_of validation at call sites.
+    /// NodeIndex from Ast A must only flow back into A.  Drives
+    /// @takes node_index_of validation at call sites.
     ast_identity,
-    /// #2: A slice borrowed from an arena must not outlive that
-    /// arena.  Drives the function-local arena-escape check.
+    /// A slice borrowed from an arena must not outlive that arena.
+    /// Drives the function-local arena-escape check.
     arena_escape,
-    /// #3: Worker-arena pointer must not be read by main thread
-    /// before the join point.  Scaffolded only — needs inter-
-    /// procedural propagation to fire.
-    thread_arena,
-    /// #4: ScopeId/SymbolId from pass N must not be used in
-    /// pass M.  Scaffolded only.
+    /// ScopeId / SymbolId from pass N must not be used in pass M.
+    /// Drives @takes scope_from(<pass>) validation.
     pass_identity,
-    /// #5: After parse, the Ast is read-only.  Drives
-    /// @mutates_ast call-site flagging.
+    /// After parse, the Ast is read-only.  Drives @mutates_ast
+    /// call-site flagging on tracked Ast values.
     ast_mutation,
 };
 
-pub const all_invariants: [5]Invariant = .{
+pub const all_invariants: [4]Invariant = .{
     .ast_identity,
     .arena_escape,
-    .thread_arena,
     .pass_identity,
     .ast_mutation,
 };
