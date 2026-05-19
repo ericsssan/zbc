@@ -314,6 +314,22 @@ const Builder = struct {
         }
     }
 
+    /// Error-path flush: errdefers LIFO first (they're closer to the
+    /// fail site and run before normal defers per Zig semantics), then
+    /// normal defers LIFO.  Used at synthetic try-error-exit blocks.
+    fn flushErrAndNormalDefers(self: *Builder, cur: *BlockId) (std.mem.Allocator.Error)!void {
+        var i = self.deferred_err.items.len;
+        while (i > 0) {
+            i -= 1;
+            try self.lowerStmt(self.deferred_err.items[i], cur);
+        }
+        i = self.deferred_normal.items.len;
+        while (i > 0) {
+            i -= 1;
+            try self.lowerStmt(self.deferred_normal.items[i], cur);
+        }
+    }
+
     /// Dispatch on statement node tag.  v1: handle decls, assigns,
     /// expression-statement calls, returns, if/while; everything else
     /// becomes a `.lowering_gap` placeholder.
@@ -351,13 +367,14 @@ const Builder = struct {
             .while_simple, .while_cont, .@"while" => try self.lowerWhile(stmt_node, cur),
             .for_simple, .@"for" => try self.lowerFor(stmt_node, cur),
             .@"switch", .switch_comma => try self.lowerSwitch(stmt_node, cur),
+            .@"try" => try self.lowerTryStmt(stmt_node, cur),
+            .@"catch" => try self.lowerCatchStmt(stmt_node, cur),
             // Nested blocks: recurse so empty blocks DON'T trigger
             // the conservative .plain collapse via lowering_gap.
             // (Empty switch arms `else => {}` are a common case.)
             .block, .block_semicolon, .block_two, .block_two_semicolon => {
                 try self.lowerBlock(stmt_node, cur);
             },
-            // TODO: try/catch (error-path forking + error-set tracking).
             else => {
                 try self.appendStmt(cur.*, .{
                     .kind = .{ .lowering_gap = .{ .note = @tagName(tag) } },
@@ -529,6 +546,64 @@ const Builder = struct {
             try self.lowerStmt(case_full.ast.target_expr, &case_cur);
             try self.addEdge(case_cur, merge);
         }
+
+        cur.* = merge;
+    }
+
+    /// `try expr` at statement position.  Lower `expr` on the success
+    /// path (cur continues forward); add an error-exit edge to a sink
+    /// block that replays errdefers + defers and terminates.  The sink
+    /// has no successor — it represents the implicit `return error.X`.
+    ///
+    /// Phase 9 v1: we DON'T attach this error-exit edge to every
+    /// `try` buried inside an expression (e.g. `const x = try foo()`).
+    /// That would require expression-tree walks and would explode the
+    /// CFG with sink blocks that don't enrich downstream analysis.
+    /// Statement-position try alone is enough to model the common
+    /// pattern `try foo();` for side-effect calls.
+    fn lowerTryStmt(self: *Builder, try_node: Ast.Node.Index, cur: *BlockId) !void {
+        const tree = self.tree;
+        const inner = tree.nodeData(try_node).node;
+        // Success path: side-effects of the wrapped expression.
+        try self.lowerStmt(inner, cur);
+
+        // Error path: synthetic sink with errdefer + defer flushed,
+        // then a terminating ret.
+        const err_exit = try self.newBlock();
+        try self.addEdge(cur.*, err_exit);
+        var err_cur = err_exit;
+        try self.flushErrAndNormalDefers(&err_cur);
+        try self.appendStmt(err_cur, .{
+            .kind = .{ .ret = .{
+                .value_kind = .unknown,
+                .is_borrowed_return_type = self.is_borrowed_return_type,
+            } },
+            .pos = self.posOf(try_node),
+        });
+    }
+
+    /// `lhs catch BODY` at statement position — forks into two paths:
+    /// success (lhs's side effects only) and error (BODY runs).  Both
+    /// join into a fresh merge block.  Unlike `try`, catch consumes
+    /// the error; errdefers do NOT fire on the error edge.
+    fn lowerCatchStmt(self: *Builder, catch_node: Ast.Node.Index, cur: *BlockId) !void {
+        const tree = self.tree;
+        const data = tree.nodeData(catch_node).node_and_node;
+        const lhs = data[0];
+        const rhs = data[1];
+
+        // Success path: lhs's side effects emit into cur.
+        try self.lowerStmt(lhs, cur);
+
+        const catch_block = try self.newBlock();
+        const merge = try self.newBlock();
+
+        try self.addEdge(cur.*, catch_block);
+        try self.addEdge(cur.*, merge);
+
+        var catch_cur = catch_block;
+        try self.lowerStmt(rhs, &catch_cur);
+        try self.addEdge(catch_cur, merge);
 
         cur.* = merge;
     }
@@ -1131,6 +1206,108 @@ test "plain defer DOES fire on return — kill visible before ret stmt" {
         }
     }
     try std.testing.expect(saw_kill);
+}
+
+test "try at statement position creates error-exit sink with defers replayed" {
+    // `try call();` — adds an error-exit block reachable from cur.
+    // The sink should contain whatever defers were active (here:
+    // arena.deinit() from `defer`) and a terminating ret.
+    const gpa = std.testing.allocator;
+    var result = try parseAndLower(gpa,
+        \\pub fn foo() !void {
+        \\    var arena = Arena.init(0);
+        \\    defer arena.deinit();
+        \\    try sideEffect();
+        \\    return;
+        \\}
+        \\const Arena = struct {
+        \\    pub fn init(_: u32) Arena { return .{}; }
+        \\    pub fn deinit(_: *Arena) void {}
+        \\};
+        \\pub fn sideEffect() !void {}
+        \\
+    );
+    defer result.tree.deinit(gpa);
+    var cfg = result.cfg.?;
+    defer cfg.deinit(gpa);
+
+    // After `try`, at least one block must have BOTH an arena_kill
+    // (the defer'd deinit) AND a ret — that's the err_exit sink.
+    var found_err_sink = false;
+    for (cfg.blocks) |b| {
+        var has_kill = false;
+        var has_ret = false;
+        for (b.stmts) |s| {
+            if (s.kind == .arena_kill) has_kill = true;
+            if (s.kind == .ret) has_ret = true;
+        }
+        if (has_kill and has_ret) found_err_sink = true;
+    }
+    try std.testing.expect(found_err_sink);
+}
+
+test "catch at statement position forks: success + catch body merge" {
+    // `expr catch BODY;` — two paths join at a merge block.  Minimum
+    // block count: entry + catch + merge = 3.  (entry also acts as
+    // the success-edge source via direct edge to merge.)
+    const gpa = std.testing.allocator;
+    var result = try parseAndLower(gpa,
+        \\pub fn foo() void {
+        \\    sideEffect() catch {};
+        \\    return;
+        \\}
+        \\pub fn sideEffect() !void {}
+        \\
+    );
+    defer result.tree.deinit(gpa);
+    var cfg = result.cfg.?;
+    defer cfg.deinit(gpa);
+
+    try std.testing.expect(cfg.blocks.len >= 3);
+
+    // The entry block must have ≥2 successors after catch lowering
+    // (one to catch_block, one to merge).
+    var multi_succ = false;
+    for (cfg.blocks) |b| {
+        if (b.successors.len >= 2) multi_succ = true;
+    }
+    try std.testing.expect(multi_succ);
+}
+
+test "catch body side effects visible at merge (kill in catch reaches downstream)" {
+    // Arena killed only inside the catch body — at the merge point
+    // it should be in the "either-killed-or-alive" state.  The
+    // analyzer's join semantics (dead-on-either-side wins) means
+    // downstream uses would be flagged.  Here we just verify the
+    // arena_kill ends up in some non-entry block.
+    const gpa = std.testing.allocator;
+    var result = try parseAndLower(gpa,
+        \\pub fn foo() void {
+        \\    var arena = Arena.init(0);
+        \\    sideEffect() catch { arena.deinit(); };
+        \\    return;
+        \\}
+        \\const Arena = struct {
+        \\    pub fn init(_: u32) Arena { return .{}; }
+        \\    pub fn deinit(_: *Arena) void {}
+        \\};
+        \\pub fn sideEffect() !void {}
+        \\
+    );
+    defer result.tree.deinit(gpa);
+    var cfg = result.cfg.?;
+    defer cfg.deinit(gpa);
+
+    // Find an arena_kill — should appear in a non-entry block (the
+    // catch_block specifically, but we don't care which).
+    var kill_in_non_entry = false;
+    for (cfg.blocks, 0..) |b, i| {
+        if (i == 0) continue;
+        for (b.stmts) |s| {
+            if (s.kind == .arena_kill) kill_in_non_entry = true;
+        }
+    }
+    try std.testing.expect(kill_in_non_entry);
 }
 
 test "try unwraps inner expression: copy_of(src) preserved through try" {
