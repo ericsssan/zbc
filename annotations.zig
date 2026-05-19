@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const Ast = std.zig.Ast;
+const config_mod = @import("config.zig");
 
 pub const ReturnsAnnotation = union(enum) {
     /// `/// @returns owned` — caller owns despite borrowed-shape sig.
@@ -94,10 +95,31 @@ pub const Db = struct {
     }
 };
 
-/// Walk every fn_decl in `tree`, extract its @returns annotation (if any),
-/// and build a name → entry map.  Duplicate names overwrite — Zig allows
-/// shadowing inside structs; conservative behaviour for our purposes.
+/// Build an annotation DB using the default config (drop-in path).
+/// Inference runs against `config.Default` — see `buildWithConfig`
+/// for the explicit-config form.
 pub fn build(gpa: std.mem.Allocator, tree: *const Ast) !Db {
+    return buildWithConfig(gpa, tree, &config_mod.Default);
+}
+
+/// Walk every fn_decl in `tree`, extract any explicit `///` annotations,
+/// then INFER annotations from signature shape (drop-in adoption path —
+/// most call sites work without authors writing annotations).
+///
+/// Inference rules — applied only when no explicit annotation present:
+///   R1: fn has exactly one param whose type mentions config.ast_type_name
+///       AND a NodeIndex-shaped param  → infer @takes node_index_of(<the_ast_param>).
+///   R2: fn has exactly one Ast param AND returns NodeIndex (token-named)
+///        → infer @returns node_index_of(<the_ast_param>).
+///   R3: fn returns config.ast_type_name (or `!Ast` etc.) → infer @returns ast.
+///
+/// Ambiguous cases (multiple Ast params + NodeIndex arg, custom borrow
+/// returns, mutation intent) still require explicit annotations.
+pub fn buildWithConfig(
+    gpa: std.mem.Allocator,
+    tree: *const Ast,
+    config: *const config_mod.Config,
+) !Db {
     var db: Db = .{ .fns = .empty };
     errdefer db.deinit(gpa);
 
@@ -108,9 +130,16 @@ pub fn build(gpa: std.mem.Allocator, tree: *const Ast) !Db {
         const fn_proto = fullFnProto(tree, &buf, node) orelse continue;
         const name_tok = fn_proto.name_token orelse continue;
 
-        const annotation = parseReturnsAnnotation(tree, fn_proto);
-        const takes = parseTakesAnnotation(tree, fn_proto);
+        var annotation = parseReturnsAnnotation(tree, fn_proto);
+        var takes = parseTakesAnnotation(tree, fn_proto);
         const mutates_ast = parseMutatesAstAnnotation(tree, fn_proto);
+
+        // Inference fills holes the author didn't annotate.  Each
+        // rule only fires when the corresponding slot is still null.
+        const inferred = inferAnnotations(tree, fn_proto, config);
+        if (annotation == null) annotation = inferred.returns;
+        if (takes == null) takes = inferred.takes;
+
         if (annotation == null and takes == null and mutates_ast == null) continue;
         const name = tree.tokenSlice(name_tok);
         try db.fns.put(gpa, name, .{
@@ -173,6 +202,74 @@ fn parseTakesAnnotation(tree: *const Ast, fn_proto: Ast.full.FnProto) ?TakesAnno
         }
     }
     return null;
+}
+
+const Inferred = struct {
+    returns: ?ReturnsAnnotation,
+    takes: ?TakesAnnotation,
+};
+
+/// Walk the fn signature, return inferred annotations (or null where
+/// inference can't decide).  Pure structural analysis — no body
+/// inspection, no cross-fn reasoning.
+fn inferAnnotations(
+    tree: *const Ast,
+    fn_proto: Ast.full.FnProto,
+    config: *const config_mod.Config,
+) Inferred {
+    // First pass: count Ast params, find the (unique) one's index,
+    // check for any NodeIndex param.
+    var ast_param_count: u32 = 0;
+    var ast_param_idx: u32 = 0;
+    var has_node_index_param: bool = false;
+    var idx: u32 = 0;
+    var it = fn_proto.iterate(tree);
+    while (it.next()) |param| : (idx += 1) {
+        const type_node = param.type_expr orelse continue;
+        if (typeMentionsIdentifier(tree, type_node, config.ast_type_name)) {
+            ast_param_count += 1;
+            ast_param_idx = idx;
+        }
+        if (typeMentionsIdentifier(tree, type_node, "NodeIndex")) {
+            has_node_index_param = true;
+        }
+    }
+
+    var inferred: Inferred = .{ .returns = null, .takes = null };
+
+    // R3: returns Ast (or !Ast etc.) → @returns ast.
+    if (fn_proto.ast.return_type.unwrap()) |rt| {
+        if (typeMentionsIdentifier(tree, rt, config.ast_type_name)) {
+            inferred.returns = .ast;
+        }
+        // R2: returns NodeIndex with exactly one Ast param → tag it.
+        if (typeMentionsIdentifier(tree, rt, "NodeIndex") and ast_param_count == 1) {
+            inferred.returns = .{ .node_index_of = ast_param_idx };
+        }
+    }
+
+    // R1: exactly one Ast param + at least one NodeIndex param →
+    //     @takes node_index_of(<the_ast_param>).
+    if (ast_param_count == 1 and has_node_index_param) {
+        inferred.takes = .{ .node_index_of = ast_param_idx };
+    }
+
+    return inferred;
+}
+
+/// Does the type expression's token span contain the bare identifier
+/// `name`?  Same shape as cfg.typeMentionsAst — duplicated here to
+/// keep annotations.zig free of cfg.zig dependencies.
+fn typeMentionsIdentifier(tree: *const Ast, type_node: Ast.Node.Index, name: []const u8) bool {
+    const first = tree.firstToken(type_node);
+    const last = tree.lastToken(type_node);
+    var t: Ast.TokenIndex = first;
+    while (t <= last) : (t += 1) {
+        if (tree.tokens.items(.tag)[t] == .identifier and
+            std.mem.eql(u8, tree.tokenSlice(t), name))
+            return true;
+    }
+    return false;
 }
 
 fn fullFnProto(tree: *const Ast, buf: *[1]Ast.Node.Index, node: Ast.Node.Index) ?Ast.full.FnProto {
@@ -467,6 +564,93 @@ test "extract @takes scope_from(<pass>) annotation" {
     try std.testing.expectEqualStrings("type_check", entry.takes.?.scope_from);
 }
 
+test "inference R1: single Ast param + NodeIndex param → @takes node_index_of inferred" {
+    const gpa = std.testing.allocator;
+    var r = try buildFromSrc(gpa,
+        \\const Ast = struct {};
+        \\const NodeIndex = u32;
+        \\pub fn nodeTag(self: *const Ast, idx: NodeIndex) u32 {
+        \\    _ = self; _ = idx; return 0;
+        \\}
+        \\
+    );
+    defer r.deinit(gpa);
+
+    const entry = r.db.lookup("nodeTag").?;
+    try std.testing.expect(entry.takes.? == .node_index_of);
+    try std.testing.expectEqual(@as(u32, 0), entry.takes.?.node_index_of);
+}
+
+test "inference R2: single Ast param + returns NodeIndex → @returns node_index_of inferred" {
+    const gpa = std.testing.allocator;
+    var r = try buildFromSrc(gpa,
+        \\const Ast = struct {};
+        \\const NodeIndex = u32;
+        \\pub fn rootNode(ast: *const Ast) NodeIndex {
+        \\    _ = ast; return 0;
+        \\}
+        \\
+    );
+    defer r.deinit(gpa);
+
+    const entry = r.db.lookup("rootNode").?;
+    try std.testing.expect(entry.annotation.? == .node_index_of);
+    try std.testing.expectEqual(@as(u32, 0), entry.annotation.?.node_index_of);
+}
+
+test "inference R3: returns Ast type → @returns ast inferred" {
+    const gpa = std.testing.allocator;
+    var r = try buildFromSrc(gpa,
+        \\const Ast = struct {};
+        \\pub fn customParse(src: []const u8) Ast {
+        \\    _ = src; return .{};
+        \\}
+        \\
+    );
+    defer r.deinit(gpa);
+
+    const entry = r.db.lookup("customParse").?;
+    try std.testing.expect(entry.annotation.? == .ast);
+}
+
+test "inference: multiple Ast params is ambiguous — no auto-takes" {
+    // Two Ast params + a NodeIndex arg → which Ast does it belong to?
+    // Inference refuses to guess; author must annotate explicitly.
+    const gpa = std.testing.allocator;
+    var r = try buildFromSrc(gpa,
+        \\const Ast = struct {};
+        \\const NodeIndex = u32;
+        \\pub fn ambiguous(a: *const Ast, b: *const Ast, n: NodeIndex) void {
+        \\    _ = a; _ = b; _ = n;
+        \\}
+        \\
+    );
+    defer r.deinit(gpa);
+
+    try std.testing.expect(r.db.lookup("ambiguous") == null);
+}
+
+test "inference: explicit annotation wins over would-be inferred" {
+    // Explicit @takes node_index_of(other_param) overrides the
+    // inference rule that would have picked the single Ast param.
+    // (Currently we only have one Ast param so inference WOULD set
+    // takes; explicit annotation already in place must remain.)
+    const gpa = std.testing.allocator;
+    var r = try buildFromSrc(gpa,
+        \\const Ast = struct {};
+        \\const NodeIndex = u32;
+        \\/// @takes node_index_any
+        \\pub fn debugDump(self: *const Ast, n: NodeIndex) void {
+        \\    _ = self; _ = n;
+        \\}
+        \\
+    );
+    defer r.deinit(gpa);
+
+    const entry = r.db.lookup("debugDump").?;
+    try std.testing.expect(entry.takes.? == .node_index_any);
+}
+
 test "extract @takes node_index_any annotation (phase 29)" {
     const gpa = std.testing.allocator;
     var r = try buildFromSrc(gpa,
@@ -481,7 +665,14 @@ test "extract @takes node_index_any annotation (phase 29)" {
     try std.testing.expect(entry.takes.? == .node_index_any);
 }
 
-test "node_index_of with unknown param name → no entry" {
+test "node_index_of with unknown param name falls back to inferred" {
+    // Previously: malformed annotation → no entry.  Now: explicit
+    // annotation fails to resolve, inference fills the hole.  The fn
+    // shape (one Ast param, returns NodeIndex) matches R2, so we get
+    // the correct inferred annotation despite the typo.
+    // (A diagnostic for unresolved annotation names is worth adding;
+    // for now silently falling back to inference matches the
+    // drop-in-adoption goal.)
     const gpa = std.testing.allocator;
     var r = try buildFromSrc(gpa,
         \\const Ast = struct {};
@@ -494,8 +685,8 @@ test "node_index_of with unknown param name → no entry" {
     );
     defer r.deinit(gpa);
 
-    // Malformed annotations skip entry creation — consistent with how
-    // borrowed_from handles param-resolution failure.
-    try std.testing.expect(r.db.lookup("rootNode") == null);
+    const entry = r.db.lookup("rootNode").?;
+    try std.testing.expect(entry.annotation.? == .node_index_of);
+    try std.testing.expectEqual(@as(u32, 0), entry.annotation.?.node_index_of);
 }
 
