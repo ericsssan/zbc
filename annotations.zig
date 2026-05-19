@@ -123,11 +123,14 @@ pub fn build(gpa: std.mem.Allocator, tree: *const Ast) !Db {
 ///   R3: fn returns config.ast_type_name (or `!Ast` etc.) → infer @returns ast.
 ///   R4: fn has exactly one *const-Ast param AND returns a slice type
 ///       (`[]const u8`, `[]u8`, etc.) → infer @returns borrowed_from(<param>).
-///       Read-only-pointer constraint keeps us conservative — `*Ast`
-///       (mutable) might be doing something more complex than reading.
+///   R5: fn's first Ast param is `*Ast` (NOT *const) AND the body
+///       actually mutates through it (field assignment or known
+///       mutating method call) → infer @mutates_ast.  Body scan
+///       confirms intent so functions that take *Ast purely for ABI
+///       consistency don't get spurious mutation annotations.
 ///
-/// Ambiguous cases (multiple Ast params + NodeIndex arg, mutation
-/// intent, custom pass IDs) still require explicit annotations.
+/// Genuinely ambiguous cases (multi-ast + NodeIndex arg, custom pass
+/// IDs, worker-arena producers) still require explicit annotations.
 pub fn buildWithConfig(
     gpa: std.mem.Allocator,
     tree: *const Ast,
@@ -145,13 +148,20 @@ pub fn buildWithConfig(
 
         var annotation = parseReturnsAnnotation(tree, fn_proto);
         var takes = parseTakesAnnotation(tree, fn_proto);
-        const mutates_ast = parseMutatesAstAnnotation(tree, fn_proto);
+        var mutates_ast = parseMutatesAstAnnotation(tree, fn_proto);
 
         // Inference fills holes the author didn't annotate.  Each
         // rule only fires when the corresponding slot is still null.
-        const inferred = inferAnnotations(tree, fn_proto, config);
+        // R5 needs the body too — fn_decl shape carries it as the
+        // second node_and_node component.
+        const body_node: ?Ast.Node.Index = if (tree.nodeTag(node) == .fn_decl)
+            tree.nodeData(node).node_and_node[1]
+        else
+            null;
+        const inferred = inferAnnotations(tree, fn_proto, body_node, config);
         if (annotation == null) annotation = inferred.returns;
         if (takes == null) takes = inferred.takes;
+        if (mutates_ast == null) mutates_ast = inferred.mutates_ast;
 
         if (annotation == null and takes == null and mutates_ast == null) continue;
         const name = tree.tokenSlice(name_tok);
@@ -223,14 +233,17 @@ fn parseTakesAnnotation(tree: *const Ast, fn_proto: Ast.full.FnProto) ?TakesAnno
 const Inferred = struct {
     returns: ?ReturnsAnnotation,
     takes: ?TakesAnnotation,
+    mutates_ast: ?MutatesAstAnnotation,
 };
 
-/// Walk the fn signature, return inferred annotations (or null where
-/// inference can't decide).  Pure structural analysis — no body
-/// inspection, no cross-fn reasoning.
+/// Walk the fn signature (+ body for R5), return inferred annotations
+/// or null where inference can't decide.  Intra-procedural — no cross
+/// function reasoning, but body scan IS used to confirm mutation
+/// intent before inferring @mutates_ast (R5).
 fn inferAnnotations(
     tree: *const Ast,
     fn_proto: Ast.full.FnProto,
+    body_node: ?Ast.Node.Index,
     config: *const config_mod.Config,
 ) Inferred {
     // First pass: count Ast params, find the (unique) one's index,
@@ -239,6 +252,7 @@ fn inferAnnotations(
     var ast_param_count: u32 = 0;
     var ast_param_idx: u32 = 0;
     var ast_param_is_const: bool = false;
+    var ast_param_name: ?[]const u8 = null;
     var has_node_index_param: bool = false;
     var idx: u32 = 0;
     var it = fn_proto.iterate(tree);
@@ -248,13 +262,28 @@ fn inferAnnotations(
             ast_param_count += 1;
             ast_param_idx = idx;
             ast_param_is_const = typeMentionsKeyword(tree, type_node, .keyword_const);
+            if (param.name_token) |nt| ast_param_name = tree.tokenSlice(nt);
         }
         if (typeMentionsIdentifier(tree, type_node, "NodeIndex")) {
             has_node_index_param = true;
         }
     }
 
-    var inferred: Inferred = .{ .returns = null, .takes = null };
+    var inferred: Inferred = .{ .returns = null, .takes = null, .mutates_ast = null };
+
+    // R5: receiver is `*<ast_type>` (NOT *const) AND body actually
+    // mutates through it → @mutates_ast.  Body scan filters out
+    // *Ast params that exist only for ABI shape but aren't written.
+    if (ast_param_count == 1 and
+        !ast_param_is_const and
+        ast_param_name != null and
+        body_node != null and
+        typeIsPointerTo(tree, paramTypeNode(fn_proto, tree, ast_param_idx), config.ast_type_name))
+    {
+        if (bodyMutatesReceiver(tree, body_node.?, ast_param_name.?)) {
+            inferred.mutates_ast = .implicit;
+        }
+    }
 
     // R3: returns Ast (or !Ast etc.) → @returns ast.
     if (fn_proto.ast.return_type.unwrap()) |rt| {
@@ -298,6 +327,101 @@ fn typeIsSliceShaped(tree: *const Ast, type_node: Ast.Node.Index) bool {
     var t: Ast.TokenIndex = first;
     while (t < last) : (t += 1) {
         if (tags[t] == .l_bracket) return true;
+    }
+    return false;
+}
+
+/// Look up the type-expression node of the param at `param_idx`
+/// (0-based).  Needed by R5 to distinguish `*Ast` from `Ast` (by-value).
+fn paramTypeNode(fn_proto: Ast.full.FnProto, tree: *const Ast, param_idx: u32) Ast.Node.Index {
+    var idx: u32 = 0;
+    var it = fn_proto.iterate(tree);
+    while (it.next()) |param| : (idx += 1) {
+        if (idx == param_idx) {
+            if (param.type_expr) |t| return t;
+            break;
+        }
+    }
+    // Caller already verified an Ast-typed param exists at this idx;
+    // a missing type_expr would mean caller was wrong — return root
+    // as a harmless fallback.
+    return @enumFromInt(0);
+}
+
+/// Does the type's token span START with a `*` (or `*const` etc.)
+/// followed by a token that mentions `name`?  Distinguishes `*Ast`
+/// from by-value `Ast`.  R5 uses this to skip by-value receivers.
+fn typeIsPointerTo(tree: *const Ast, type_node: Ast.Node.Index, name: []const u8) bool {
+    const first = tree.firstToken(type_node);
+    const tags = tree.tokens.items(.tag);
+    if (tags[first] != .asterisk) return false;
+    return typeMentionsIdentifier(tree, type_node, name);
+}
+
+/// Body scan for R5: does the function body contain a mutation
+/// THROUGH `recv_name`?  Two patterns count:
+///   1.  <recv> . field ... = expr;         (assignment)
+///   2.  <recv> . <method> (...);            where method is in the
+///       conservative "known mutating" list (append, put, insert,
+///       remove, clear, set, push, pop, resize, swap, sort).
+/// Walks the body's token span — no node-tree traversal needed.
+fn bodyMutatesReceiver(tree: *const Ast, body_node: Ast.Node.Index, recv_name: []const u8) bool {
+    const first = tree.firstToken(body_node);
+    const last = tree.lastToken(body_node);
+    const tags = tree.tokens.items(.tag);
+    var t: Ast.TokenIndex = first;
+    while (t + 2 <= last) : (t += 1) {
+        if (tags[t] != .identifier) continue;
+        if (!std.mem.eql(u8, tree.tokenSlice(t), recv_name)) continue;
+        if (tags[t + 1] != .period) continue;
+
+        // Walk forward through the dotted chain after `<recv>.`,
+        // tracking each identifier seen.  Two ways out flag mutation:
+        //   1. The chain ends at `<id>(` where <id> is a known mutator.
+        //   2. The chain ends at an `=` (not `==`/`!=`) before `;`/`{`.
+        //      Any field-access write through the receiver counts.
+        var j = t + 2;
+        var last_ident: ?Ast.TokenIndex = null;
+        while (j <= last) : (j += 1) {
+            switch (tags[j]) {
+                .identifier => last_ident = j,
+                .period => {}, // continue the chain
+                .l_paren => {
+                    if (last_ident) |li| {
+                        if (isMutatingMethodName(tree.tokenSlice(li))) return true;
+                    }
+                    break; // call args follow; not interested
+                },
+                .equal => return true,
+                .semicolon, .l_brace, .r_brace, .equal_equal, .bang_equal => break,
+                .l_bracket => {}, // indexing — continue (e.g. self.items.items[0])
+                .r_bracket => {},
+                else => continue,
+            }
+        }
+    }
+    return false;
+}
+
+/// Conservative list of method names whose presence on a receiver
+/// implies mutation.  Matches std container API + common verbs.
+fn isMutatingMethodName(name: []const u8) bool {
+    const mutators = [_][]const u8{
+        "append",   "appendSlice",   "appendAssumeCapacity",
+        "put",      "putAssumeCapacity",
+        "insert",   "insertSlice",
+        "remove",   "orderedRemove", "swapRemove",
+        "clear",    "clearAndFree",  "clearRetainingCapacity",
+        "set",      "setAndFree",
+        "push",     "pop",
+        "resize",   "ensureTotalCapacity",
+        "swap",
+        "sort",     "sortUnstable",
+        "deinit",
+        "writeAll", "writeByte", "writeInt",
+    };
+    for (mutators) |m| {
+        if (std.mem.eql(u8, name, m)) return true;
     }
     return false;
 }
@@ -718,6 +842,88 @@ test "inference R4: returns NodeIndex wins over slice — R2 takes precedence" {
 
     const entry = r.db.lookup("rootNode").?;
     try std.testing.expect(entry.annotation.? == .node_index_of);
+}
+
+test "inference R5: *Ast receiver + field write in body → @mutates_ast" {
+    const gpa = std.testing.allocator;
+    var r = try buildFromSrc(gpa,
+        \\const Ast = struct { tag: u32 = 0 };
+        \\pub fn setTag(self: *Ast, t: u32) void {
+        \\    self.tag = t;
+        \\}
+        \\
+    );
+    defer r.deinit(gpa);
+
+    const entry = r.db.lookup("setTag").?;
+    try std.testing.expect(entry.mutates_ast.? == .implicit);
+}
+
+test "inference R5: *Ast receiver + mutating method call → @mutates_ast" {
+    const gpa = std.testing.allocator;
+    var r = try buildFromSrc(gpa,
+        \\const Ast = struct { items: u32 = 0 };
+        \\pub fn pushItem(self: *Ast, x: u32) void {
+        \\    self.items.append(x);
+        \\}
+        \\
+    );
+    defer r.deinit(gpa);
+
+    const entry = r.db.lookup("pushItem").?;
+    try std.testing.expect(entry.mutates_ast.? == .implicit);
+}
+
+test "inference R5: *const Ast receiver — NOT inferred even with body access" {
+    // R5 filters on `*Ast` (mutable pointer); *const Ast can't
+    // mutate by type, so we skip even if the body has writes
+    // (which wouldn't compile anyway).
+    const gpa = std.testing.allocator;
+    var r = try buildFromSrc(gpa,
+        \\const Ast = struct {};
+        \\pub fn readOnly(self: *const Ast) u32 {
+        \\    _ = self;
+        \\    return 0;
+        \\}
+        \\
+    );
+    defer r.deinit(gpa);
+
+    const entry = r.db.lookup("readOnly") orelse return;
+    try std.testing.expect(entry.mutates_ast == null);
+}
+
+test "inference R5: *Ast receiver but body only reads — NOT inferred" {
+    // *Ast taken for ABI consistency but body has no mutation.
+    // Body-scan filter catches this correctly.
+    const gpa = std.testing.allocator;
+    var r = try buildFromSrc(gpa,
+        \\const Ast = struct { tag: u32 = 0 };
+        \\pub fn readTag(self: *Ast) u32 {
+        \\    return self.tag;
+        \\}
+        \\
+    );
+    defer r.deinit(gpa);
+
+    const entry = r.db.lookup("readTag") orelse return;
+    try std.testing.expect(entry.mutates_ast == null);
+}
+
+test "inference R5: comparison through receiver is NOT mutation" {
+    // `if (self.tag == 0)` mustn't trip the assignment scan.
+    const gpa = std.testing.allocator;
+    var r = try buildFromSrc(gpa,
+        \\const Ast = struct { tag: u32 = 0 };
+        \\pub fn isRoot(self: *Ast) bool {
+        \\    return self.tag == 0;
+        \\}
+        \\
+    );
+    defer r.deinit(gpa);
+
+    const entry = r.db.lookup("isRoot") orelse return;
+    try std.testing.expect(entry.mutates_ast == null);
 }
 
 test "inference: multiple Ast params is ambiguous — no auto-takes" {
