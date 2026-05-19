@@ -128,6 +128,11 @@ pub fn build(gpa: std.mem.Allocator, tree: *const Ast) !Db {
 ///       mutating method call) → infer @mutates_ast.  Body scan
 ///       confirms intent so functions that take *Ast purely for ABI
 ///       consistency don't get spurious mutation annotations.
+///   R6: fn returns a slice type, has NO Ast-carrying param (so R4
+///       doesn't claim it), AND body contains an allocation call
+///       (gpa.alloc / gpa.dupe / std.fmt.allocPrint / etc.)
+///       → infer @returns owned.  Caller doesn't need to worry
+///       about lifetime — the slice is freshly heap-allocated.
 ///
 /// Genuinely ambiguous cases (multi-ast + NodeIndex arg, custom pass
 /// IDs, worker-arena producers) still require explicit annotations.
@@ -304,6 +309,18 @@ fn inferAnnotations(
         {
             inferred.returns = .{ .borrowed_from = ast_param_idx };
         }
+        // R6: returns a slice + NO Ast-carrying param + body
+        // contains a known allocation call → @returns owned.  Skips
+        // when R4 already claimed (above) and when there's any Ast
+        // param (would either be borrowed_from or ambiguous).
+        if (inferred.returns == null and
+            ast_param_count == 0 and
+            typeIsSliceShaped(tree, rt) and
+            body_node != null and
+            bodyContainsAllocation(tree, body_node.?))
+        {
+            inferred.returns = .owned;
+        }
     }
 
     // R1: exactly one Ast param + at least one NodeIndex param →
@@ -436,6 +453,45 @@ fn bodyMutatesReceiver(tree: *const Ast, body_node: Ast.Node.Index, recv_name: [
                 else => continue,
             }
         }
+    }
+    return false;
+}
+
+/// R6 body scan: does the body contain a call to a known allocation
+/// function?  Walks every token in the body looking for one of
+/// `.<method>(` where method is in the conservative allocator list.
+/// Same scan shape as bodyMutatesReceiver but matches on a different
+/// name set and doesn't require a specific receiver.
+fn bodyContainsAllocation(tree: *const Ast, body_node: Ast.Node.Index) bool {
+    const first = tree.firstToken(body_node);
+    const last = tree.lastToken(body_node);
+    const tags = tree.tokens.items(.tag);
+    var t: Ast.TokenIndex = first;
+    while (t + 2 <= last) : (t += 1) {
+        if (tags[t] != .period) continue;
+        if (tags[t + 1] != .identifier) continue;
+        if (tags[t + 2] != .l_paren) continue;
+        if (isAllocatorMethodName(tree.tokenSlice(t + 1))) return true;
+    }
+    return false;
+}
+
+/// Conservative list of method names that allocate fresh memory the
+/// caller owns.  Matches std.mem.Allocator + std.fmt + std.ArrayList
+/// conventions.  False positives produce @returns owned which silences
+/// the escape check for that fn's call sites — harmless since the
+/// next inference layer (transfer) maps .owned → .plain origin.
+fn isAllocatorMethodName(name: []const u8) bool {
+    const allocators = [_][]const u8{
+        "alloc",          "allocSentinel",       "allocAdvanced",
+        "dupe",           "dupeZ",
+        "create",
+        "allocPrint",     "allocPrintZ",         "bufPrint", // bufPrint not strictly alloc but writes a fresh buffer
+        "toOwnedSlice",   "toOwnedSliceSentinel",
+        "fmt",
+    };
+    for (allocators) |a| {
+        if (std.mem.eql(u8, name, a)) return true;
     }
     return false;
 }
@@ -895,6 +951,71 @@ test "inference R4: returns NodeIndex wins over slice — R2 takes precedence" {
 
     const entry = r.db.lookup("rootNode").?;
     try std.testing.expect(entry.annotation.? == .node_index_of);
+}
+
+test "inference R6: slice return + body allocates → @returns owned" {
+    const gpa = std.testing.allocator;
+    var r = try buildFromSrc(gpa,
+        \\const std = @import("std");
+        \\pub fn dupString(gpa_: std.mem.Allocator, s: []const u8) ![]u8 {
+        \\    return gpa_.dupe(u8, s);
+        \\}
+        \\
+    );
+    defer r.deinit(gpa);
+
+    const entry = r.db.lookup("dupString").?;
+    try std.testing.expect(entry.annotation.? == .owned);
+}
+
+test "inference R6: allocPrint also counts" {
+    const gpa = std.testing.allocator;
+    var r = try buildFromSrc(gpa,
+        \\const std = @import("std");
+        \\pub fn fmtName(gpa_: std.mem.Allocator, n: u32) ![]u8 {
+        \\    return std.fmt.allocPrint(gpa_, "n={}", .{n});
+        \\}
+        \\
+    );
+    defer r.deinit(gpa);
+
+    const entry = r.db.lookup("fmtName").?;
+    try std.testing.expect(entry.annotation.? == .owned);
+}
+
+test "inference R6: R4 wins over R6 when fn has *const Ast param" {
+    // Returns slice + has *const Ast → R4 fires first
+    // (borrowed_from), so R6 doesn't get a chance even if the
+    // body happens to allocate elsewhere.
+    const gpa = std.testing.allocator;
+    var r = try buildFromSrc(gpa,
+        \\const std = @import("std");
+        \\const Ast = struct {};
+        \\pub fn tokenText(self: *const Ast, gpa_: std.mem.Allocator) ![]u8 {
+        \\    _ = self;
+        \\    return gpa_.alloc(u8, 0);
+        \\}
+        \\
+    );
+    defer r.deinit(gpa);
+
+    const entry = r.db.lookup("tokenText").?;
+    try std.testing.expect(entry.annotation.? == .borrowed_from);
+}
+
+test "inference R6: no allocation in body → no @returns owned" {
+    // Fn returns a slice but body just returns a literal — no
+    // allocation call → R6 doesn't fire.
+    const gpa = std.testing.allocator;
+    var r = try buildFromSrc(gpa,
+        \\pub fn greeting() []const u8 {
+        \\    return "hi";
+        \\}
+        \\
+    );
+    defer r.deinit(gpa);
+
+    try std.testing.expect(r.db.lookup("greeting") == null);
 }
 
 test "inference R5: *Ast receiver + field write in body → @mutates_ast" {
