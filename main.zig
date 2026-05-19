@@ -178,37 +178,71 @@ pub fn main(init: std.process.Init) !void {
         .enabled = enabled.items,
     };
 
-    var cache_storage: ?lib.Cache = if (mode == .escape) lib.Cache.init(gpa, io) else null;
-    defer if (cache_storage) |*c| c.deinit();
-
-    var any_problems = false;
-    var json_first = true;
-    if (format == .json) std.debug.print("[", .{});
-
-    for (expanded.items) |path| {
-        const problems = if (mode == .escape)
-            lib.analyzeEscape(gpa, io, path, &cache_storage.?, &config) catch |err| {
-                std.debug.print("zbc: cannot analyze {s}: {s}\n", .{ path, @errorName(err) });
-                any_problems = true;
-                continue;
-            }
-        else
-            lib.analyzeHygiene(gpa, io, path) catch |err| {
-                std.debug.print("zbc: cannot analyze {s}: {s}\n", .{ path, @errorName(err) });
-                any_problems = true;
-                continue;
-            };
-        defer lib.freeProblems(gpa, problems);
-
-        if (problems.len == 0) continue;
-        any_problems = true;
-        switch (format) {
-            .text => printProblemsText(path, problems),
-            .json => printProblemsJson(path, problems, &json_first),
-        }
+    // Parallel fan-out: one Task per file.  Each task owns its
+    // ephemeral Cache (one extra reparse of common imports per
+    // worker vs the old single shared cache, but parallelism is the
+    // bigger win).  std.Io.Group dispatches to worker threads via
+    // the Io.Threaded impl created in initIo().
+    const tasks = try gpa.alloc(Task, expanded.items.len);
+    defer gpa.free(tasks);
+    for (expanded.items, tasks) |path, *t| {
+        t.* = .{
+            .gpa = gpa,
+            .io = io,
+            .path = path,
+            .mode = mode,
+            .config = &config,
+            .problems = &.{},
+            .err = null,
+        };
     }
 
-    if (format == .json) std.debug.print("{s}]\n", .{if (json_first) "" else "\n"});
+    // Group.concurrent vs Group.async: .concurrent forces a worker
+    // thread for each task (up to concurrent_limit = unlimited by
+    // default on Io.Threaded), giving real CPU parallelism.  .async
+    // would let the scheduler decide and can serialize tasks when
+    // the async_limit is small.  We want real parallelism here.
+    // Fall back to .async if .concurrent isn't supported by the Io
+    // backend (e.g. single-threaded testing envs).
+    var group: std.Io.Group = .init;
+    for (tasks) |*t| {
+        group.concurrent(io, runOne, .{t}) catch
+            group.async(io, runOne, .{t});
+    }
+    group.await(io) catch {};
+
+    // Single-pass: collate problems, sort for deterministic output.
+    var all_problems: std.ArrayListUnmanaged(IndexedProblem) = .empty;
+    defer all_problems.deinit(gpa);
+    var any_problems = false;
+    for (tasks) |*t| {
+        if (t.err) |err| {
+            std.debug.print("zbc: cannot analyze {s}: {s}\n", .{ t.path, @errorName(err) });
+            any_problems = true;
+            continue;
+        }
+        for (t.problems) |p| {
+            try all_problems.append(gpa, .{ .path = t.path, .problem = p });
+        }
+    }
+    defer for (tasks) |*t| if (t.problems.len > 0) gpa.free(t.problems);
+    defer for (all_problems.items) |*ip| ip.problem.deinit(gpa);
+
+    std.mem.sort(IndexedProblem, all_problems.items, {}, indexedProblemLess);
+
+    if (all_problems.items.len > 0) any_problems = true;
+    if (format == .json) {
+        std.debug.print("[", .{});
+        var first = true;
+        for (all_problems.items) |ip| {
+            printOneProblemJson(ip.path, ip.problem, &first);
+        }
+        std.debug.print("{s}]\n", .{if (first) "" else "\n"});
+    } else {
+        for (all_problems.items) |ip| {
+            printOneProblemText(ip.path, ip.problem);
+        }
+    }
     std.process.exit(if (any_problems) @as(u8, 1) else 0);
 }
 
@@ -341,44 +375,85 @@ fn printUsage() void {
     , .{});
 }
 
-fn printProblemsText(path: []const u8, problems: []const lib.Problem) void {
-    for (problems) |p| {
-        std.debug.print("{s}:{}:{}: {s}: {s} [{s}]\n", .{
-            path,
-            p.start.line,
-            p.start.column,
-            severityName(p.severity),
-            p.message,
-            p.rule_id,
-        });
-    }
+// ── Parallel-fanout types + helpers ────────────────────────
+
+const Task = struct {
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    mode: Mode,
+    config: *const lib.Config,
+    /// Outputs.  Owned by the task; collated after Group.await.
+    problems: []lib.Problem,
+    err: ?anyerror,
+};
+
+const IndexedProblem = struct {
+    path: []const u8,
+    problem: lib.Problem,
+};
+
+fn indexedProblemLess(_: void, a: IndexedProblem, b: IndexedProblem) bool {
+    const path_cmp = std.mem.order(u8, a.path, b.path);
+    if (path_cmp != .eq) return path_cmp == .lt;
+    if (a.problem.start.line != b.problem.start.line)
+        return a.problem.start.line < b.problem.start.line;
+    return a.problem.start.column < b.problem.start.column;
 }
 
-fn printProblemsJson(path: []const u8, problems: []const lib.Problem, first: *bool) void {
-    for (problems) |p| {
-        if (first.*) {
-            std.debug.print("\n  ", .{});
-            first.* = false;
-        } else {
-            std.debug.print(",\n  ", .{});
+/// Worker body — analyzes one file with its own ephemeral Cache.
+/// Errors stashed on the task so a bad file doesn't abort the sweep.
+fn runOne(t: *Task) std.Io.Cancelable!void {
+    var cache_storage: ?lib.Cache = if (t.mode == .escape) lib.Cache.init(t.gpa, t.io) else null;
+    defer if (cache_storage) |*c| c.deinit();
+
+    const problems = if (t.mode == .escape)
+        lib.analyzeEscape(t.gpa, t.io, t.path, &cache_storage.?, t.config) catch |err| {
+            t.err = err;
+            return;
         }
-        std.debug.print("{{\"path\":\"", .{});
-        writeJsonEscaped(path);
-        std.debug.print(
-            "\",\"rule_id\":\"{s}\",\"severity\":\"{s}\"," ++
-                "\"start\":{{\"line\":{},\"column\":{},\"byte\":{}}}," ++
-                "\"end\":{{\"line\":{},\"column\":{},\"byte\":{}}}," ++
-                "\"message\":\"",
-            .{
-                p.rule_id,
-                severityName(p.severity),
-                p.start.line, p.start.column, p.start.byte,
-                p.end.line,   p.end.column,   p.end.byte,
-            },
-        );
-        writeJsonEscaped(p.message);
-        std.debug.print("\"}}", .{});
+    else
+        lib.analyzeHygiene(t.gpa, t.io, t.path) catch |err| {
+            t.err = err;
+            return;
+        };
+    t.problems = problems;
+}
+
+fn printOneProblemText(path: []const u8, p: lib.Problem) void {
+    std.debug.print("{s}:{}:{}: {s}: {s} [{s}]\n", .{
+        path,
+        p.start.line,
+        p.start.column,
+        severityName(p.severity),
+        p.message,
+        p.rule_id,
+    });
+}
+
+fn printOneProblemJson(path: []const u8, p: lib.Problem, first: *bool) void {
+    if (first.*) {
+        std.debug.print("\n  ", .{});
+        first.* = false;
+    } else {
+        std.debug.print(",\n  ", .{});
     }
+    std.debug.print("{{\"path\":\"", .{});
+    writeJsonEscaped(path);
+    std.debug.print(
+        "\",\"rule_id\":\"{s}\",\"severity\":\"{s}\"," ++
+            "\"start\":{{\"line\":{},\"column\":{},\"byte\":{}}}," ++
+            "\"end\":{{\"line\":{},\"column\":{},\"byte\":{}}}," ++
+            "\"message\":\"",
+        .{
+            p.rule_id,
+            severityName(p.severity),
+            p.start.line, p.start.column, p.start.byte,
+            p.end.line,   p.end.column,   p.end.byte,
+        },
+    );
+    writeJsonEscaped(p.message);
+    std.debug.print("\"}}", .{});
 }
 
 fn severityName(s: lib.Severity) []const u8 {
