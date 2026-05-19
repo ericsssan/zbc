@@ -74,6 +74,16 @@ pub const StmtKind = union(enum) {
     /// `<thread>.join()` — transitions ThreadContext from worker→joined.
     thread_join,
 
+    /// Call to a fn annotated `@takes node_index_of(<param>)`.  At
+    /// transfer time: look up `source_local`'s origin (must be
+    /// `.ast(aid_src)`) and `value_local`'s origin (must be
+    /// `.ast_node(aid_val)`); flag if both are tagged and the AstIds
+    /// differ — that's a NodeIndex from Ast A flowing into Ast B.
+    /// Emitted by lowerCallStmt when a same-file callee carries the
+    /// @takes annotation.  Phase 27 will broaden to init/return/assign
+    /// positions where most real check sites live.
+    ast_takes_check: struct { source_local: LocalId, value_local: LocalId },
+
     /// `return <expr>;` — function exit.  `value_kind` describes what's
     /// being returned.  `is_borrowed_return_type` tags whether the
     /// enclosing function's signature returns a borrowed-shape type
@@ -1169,11 +1179,102 @@ const Builder = struct {
             });
             return;
         }
+
+        // @takes annotation check — emit per-arg validation stmts.
+        try self.emitTakesChecksForCall(call_node, cur);
+
         // Other calls — side-effect from our pov is "nothing tracked".
         try self.appendStmt(cur.*, .{
             .kind = .{ .lowering_gap = .{ .note = "call-untracked" } },
             .pos = self.posOf(call_node),
         });
+    }
+
+    /// If the callee is a same-file fn carrying `@takes node_index_of(X)`,
+    /// emit one `.ast_takes_check` stmt per arg whose token-position
+    /// resolves to a registered local — the transfer rule will check
+    /// each one's `.ast_node` tag against the source param's `.ast`.
+    /// No-op when there's no db, no annotation, or the call shape
+    /// doesn't fit (e.g. non-identifier callee, receiver isn't a known
+    /// local).  Conservative: arg locals that don't resolve to bare
+    /// identifiers are skipped — we'd produce a false positive
+    /// otherwise.
+    fn emitTakesChecksForCall(
+        self: *Builder,
+        call_node: Ast.Node.Index,
+        cur: *BlockId,
+    ) !void {
+        const tree = self.tree;
+        const db = self.db orelse return;
+
+        var buf: [1]Ast.Node.Index = undefined;
+        const call_full = tree.fullCall(&buf, call_node) orelse return;
+        const callee_node = call_full.ast.fn_expr;
+        const args = call_full.ast.params;
+
+        const callee_name = switch (tree.nodeTag(callee_node)) {
+            .identifier => tree.tokenSlice(tree.nodeMainToken(callee_node)),
+            .field_access => tree.tokenSlice(tree.nodeData(callee_node).node_and_token[1]),
+            else => return,
+        };
+        const entry = db.lookup(callee_name) orelse return;
+        const takes = entry.takes orelse return;
+
+        const recv_is_arg0 = tree.nodeTag(callee_node) == .field_access;
+
+        // Resolve the source-Ast arg: the parameter referenced by
+        // node_index_of(X).  For method calls, arg 0 is the receiver.
+        const source_node: Ast.Node.Index = switch (takes) {
+            .node_index_of => |idx| blk: {
+                if (recv_is_arg0 and idx == 0) {
+                    break :blk tree.nodeData(callee_node).node_and_token[0];
+                }
+                const explicit_idx = if (recv_is_arg0) idx - 1 else idx;
+                if (explicit_idx >= args.len) return;
+                break :blk args[explicit_idx];
+            },
+        };
+        const source_local = self.identifierToLocal(source_node) orelse return;
+
+        // For every OTHER arg (including the receiver when it isn't the
+        // source), emit a check.  Args that don't resolve to bare
+        // identifiers are skipped.
+        if (recv_is_arg0) {
+            const recv_node = tree.nodeData(callee_node).node_and_token[0];
+            if (recv_node != source_node) {
+                if (self.identifierToLocal(recv_node)) |vl| {
+                    try self.appendStmt(cur.*, .{
+                        .kind = .{ .ast_takes_check = .{
+                            .source_local = source_local,
+                            .value_local = vl,
+                        } },
+                        .pos = self.posOf(call_node),
+                    });
+                }
+            }
+        }
+        for (args) |a| {
+            if (a == source_node) continue;
+            if (self.identifierToLocal(a)) |vl| {
+                try self.appendStmt(cur.*, .{
+                    .kind = .{ .ast_takes_check = .{
+                        .source_local = source_local,
+                        .value_local = vl,
+                    } },
+                    .pos = self.posOf(call_node),
+                });
+            }
+        }
+    }
+
+    /// Bare-identifier → resolved LocalId, or null otherwise.
+    /// (identifierToCopyOrUnknown wraps in an ExprKind; this returns
+    /// the raw LocalId.)
+    fn identifierToLocal(self: *Builder, node: Ast.Node.Index) ?LocalId {
+        const tree = self.tree;
+        if (tree.nodeTag(node) != .identifier) return null;
+        const name = tree.tokenSlice(tree.nodeMainToken(node));
+        return self.name_to_local.get(name);
     }
 
     fn classifyExpr(self: *Builder, expr_node: Ast.Node.Index) ExprKind {
@@ -1258,7 +1359,9 @@ const Builder = struct {
                 // 1. Same-file DB hit on method name.
                 if (self.db) |db| {
                     if (db.lookup(method_name)) |entry| {
-                        return self.applyAnnotationToCall(entry.annotation, recv_node, args, true);
+                        if (entry.annotation) |anno| {
+                            return self.applyAnnotationToCall(anno, recv_node, args, true);
+                        }
                     }
                 }
 
@@ -1276,7 +1379,9 @@ const Builder = struct {
                 const fn_name = tree.tokenSlice(tree.nodeMainToken(callee_node));
                 if (self.db) |db| {
                     if (db.lookup(fn_name)) |entry| {
-                        return self.applyAnnotationToCall(entry.annotation, callee_node, args, false);
+                        if (entry.annotation) |anno| {
+                            return self.applyAnnotationToCall(anno, callee_node, args, false);
+                        }
                     }
                 }
                 return .unknown;
@@ -1307,7 +1412,7 @@ const Builder = struct {
         const remote_file = (remote.cache.loadOrLookup(remote.base_dir, import_entry.path)
             catch null) orelse return null;
         const entry = remote_file.db.lookup(method_name) orelse return null;
-        return entry.annotation;
+        return entry.annotation; // may itself be null — caller treats as miss
     }
 
     /// Convert a callee annotation + actual-arg context into an ExprKind.

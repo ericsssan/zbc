@@ -25,10 +25,21 @@ pub const ReturnsAnnotation = union(enum) {
     node_index_of: u32,
 };
 
+/// `/// @takes node_index_of(<param>)` — the function consumes
+/// NodeIndex args that must originate from the Ast carried by
+/// `<param>`.  Phase 26 enforces this at call sites by emitting
+/// `.ast_takes_check` statements that the transfer function validates.
+pub const TakesAnnotation = union(enum) {
+    node_index_of: u32,
+};
+
 pub const FnEntry = struct {
     /// Function name (slice into the source — keep source alive).
     name: []const u8,
-    annotation: ReturnsAnnotation,
+    /// Optional `@returns ...`; null when none parsed.
+    annotation: ?ReturnsAnnotation = null,
+    /// Optional `@takes ...`; null when none parsed.
+    takes: ?TakesAnnotation = null,
 };
 
 pub const Db = struct {
@@ -57,11 +68,38 @@ pub fn build(gpa: std.mem.Allocator, tree: *const Ast) !Db {
         const fn_proto = fullFnProto(tree, &buf, node) orelse continue;
         const name_tok = fn_proto.name_token orelse continue;
 
-        const annotation = parseReturnsAnnotation(tree, fn_proto) orelse continue;
+        const annotation = parseReturnsAnnotation(tree, fn_proto);
+        const takes = parseTakesAnnotation(tree, fn_proto);
+        if (annotation == null and takes == null) continue;
         const name = tree.tokenSlice(name_tok);
-        try db.fns.put(gpa, name, .{ .name = name, .annotation = annotation });
+        try db.fns.put(gpa, name, .{
+            .name = name,
+            .annotation = annotation,
+            .takes = takes,
+        });
     }
     return db;
+}
+
+fn parseTakesAnnotation(tree: *const Ast, fn_proto: Ast.full.FnProto) ?TakesAnnotation {
+    const fn_first_tok: Ast.TokenIndex = fn_proto.visib_token orelse
+        fn_proto.extern_export_inline_token orelse
+        fn_proto.ast.fn_token;
+    if (fn_first_tok == 0) return null;
+
+    var t: i64 = @as(i64, @intCast(fn_first_tok)) - 1;
+    while (t >= 0) : (t -= 1) {
+        const tok_idx: Ast.TokenIndex = @intCast(t);
+        if (tree.tokens.items(.tag)[tok_idx] != .doc_comment) break;
+        const raw = tree.tokenSlice(tok_idx);
+        const body = stripDocPrefix(raw);
+        const trimmed = std.mem.trim(u8, body, " \t");
+
+        if (parseParenParamForm(trimmed, "@takes node_index_of(", tree, fn_proto)) |idx| {
+            return .{ .node_index_of = idx };
+        }
+    }
+    return null;
 }
 
 fn fullFnProto(tree: *const Ast, buf: *[1]Ast.Node.Index, node: Ast.Node.Index) ?Ast.full.FnProto {
@@ -179,8 +217,8 @@ test "extract @returns borrowed_from annotation" {
     defer r.deinit(gpa);
 
     const entry = r.db.lookup("tokenText").?;
-    try std.testing.expect(entry.annotation == .borrowed_from);
-    try std.testing.expectEqual(@as(u32, 0), entry.annotation.borrowed_from);
+    try std.testing.expect(entry.annotation.? == .borrowed_from);
+    try std.testing.expectEqual(@as(u32, 0), entry.annotation.?.borrowed_from);
 }
 
 test "extract @returns owned annotation" {
@@ -195,7 +233,7 @@ test "extract @returns owned annotation" {
     defer r.deinit(gpa);
 
     const entry = r.db.lookup("alloc").?;
-    try std.testing.expect(entry.annotation == .owned);
+    try std.testing.expect(entry.annotation.? == .owned);
 }
 
 test "no annotation → not in db" {
@@ -222,8 +260,8 @@ test "param index resolves correctly for borrowed_from(non-self)" {
     defer r.deinit(gpa);
 
     const entry = r.db.lookup("extract").?;
-    try std.testing.expect(entry.annotation == .borrowed_from);
-    try std.testing.expectEqual(@as(u32, 1), entry.annotation.borrowed_from);
+    try std.testing.expect(entry.annotation.? == .borrowed_from);
+    try std.testing.expectEqual(@as(u32, 1), entry.annotation.?.borrowed_from);
 }
 
 test "extract @returns node_index_of annotation (phase 24)" {
@@ -240,8 +278,8 @@ test "extract @returns node_index_of annotation (phase 24)" {
     defer r.deinit(gpa);
 
     const entry = r.db.lookup("rootNode").?;
-    try std.testing.expect(entry.annotation == .node_index_of);
-    try std.testing.expectEqual(@as(u32, 0), entry.annotation.node_index_of);
+    try std.testing.expect(entry.annotation.? == .node_index_of);
+    try std.testing.expectEqual(@as(u32, 0), entry.annotation.?.node_index_of);
 }
 
 test "node_index_of param resolution: non-self position" {
@@ -258,8 +296,8 @@ test "node_index_of param resolution: non-self position" {
     defer r.deinit(gpa);
 
     const entry = r.db.lookup("lookupNode").?;
-    try std.testing.expect(entry.annotation == .node_index_of);
-    try std.testing.expectEqual(@as(u32, 1), entry.annotation.node_index_of);
+    try std.testing.expect(entry.annotation.? == .node_index_of);
+    try std.testing.expectEqual(@as(u32, 1), entry.annotation.?.node_index_of);
 }
 
 test "node_index_of with unknown param name → no entry" {

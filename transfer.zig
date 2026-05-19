@@ -54,7 +54,37 @@ pub fn transfer(ctx: Ctx, state: *AbstractState, stmt: Stmt) !void {
         .thread_join => try transferThreadJoin(ctx, state, stmt.pos),
         .ret => |r| try transferRet(ctx, state, r, stmt.pos),
         .use => |u| try transferUse(ctx, state, u, stmt.pos),
+        .ast_takes_check => |c| try transferAstTakesCheck(ctx, state, c, stmt.pos),
         .lowering_gap => |g| try transferGap(ctx, state, g, stmt.pos),
+    }
+}
+
+fn transferAstTakesCheck(
+    ctx: Ctx,
+    state: *AbstractState,
+    c: @TypeOf(@as(StmtKind, undefined).ast_takes_check),
+    pos: cfg.SrcPos,
+) !void {
+    const src_origin = state.locals.get(c.source_local) orelse return;
+    const val_origin = state.locals.get(c.value_local) orelse return;
+    // We can only validate when BOTH sides are tagged.  If the source
+    // isn't .ast(aid_src) or the value isn't .ast_node(aid_val), one
+    // side's identity is unknown and we can't conclude mismatch.
+    const aid_src: state_mod.AstId = switch (src_origin) {
+        .ast => |a| a,
+        else => return,
+    };
+    const aid_val: state_mod.AstId = switch (val_origin) {
+        .ast_node => |a| a,
+        else => return,
+    };
+    if (aid_src != aid_val) {
+        try report(ctx, pos, .@"error",
+            "`{s}` is a NodeIndex from a different Ast than `{s}` (invariant #1: NodeIndex must only flow back into its source Ast)",
+            .{
+                ctx.locals[@intFromEnum(c.value_local)].name,
+                ctx.locals[@intFromEnum(c.source_local)].name,
+            });
     }
 }
 

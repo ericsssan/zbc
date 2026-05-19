@@ -338,6 +338,67 @@ test "branch-specific UAF: kill in one if-branch, use after merge" {
     try std.testing.expect(problems.items.len >= 1);
 }
 
+test "invariant #1: NodeIndex from Ast A flowing into Ast B is flagged (phase 26)" {
+    // Two trees parsed separately get distinct AstIds.  A NodeIndex
+    // from tree_a, passed to a `@takes node_index_of(t)` fn alongside
+    // tree_b, must be flagged.  Uses `try` (not `catch`) so classifyExpr
+    // unwraps to the inner Ast.parse() call and ast_init fires.
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\pub fn foo() !void {
+        \\    var tree_a = try Ast.parse();
+        \\    var tree_b = try Ast.parse();
+        \\    const node = rootNode(tree_a);
+        \\    inspect(tree_b, node);
+        \\    return;
+        \\}
+        \\const Ast = struct {
+        \\    pub fn parse() !Ast { return .{}; }
+        \\};
+        \\const NodeIndex = u32;
+        \\/// @returns node_index_of(ast)
+        \\pub fn rootNode(ast: Ast) NodeIndex { _ = ast; return 0; }
+        \\/// @takes node_index_of(t)
+        \\pub fn inspect(t: Ast, n: NodeIndex) void { _ = t; _ = n; }
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+
+    var found = false;
+    for (problems.items) |p| {
+        if (std.mem.indexOf(u8, p.message, "invariant #1") != null) {
+            found = true;
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "invariant #1: matching Ast on both args — no false positive" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\pub fn foo() !void {
+        \\    var tree = try Ast.parse();
+        \\    const node = rootNode(tree);
+        \\    inspect(tree, node);
+        \\    return;
+        \\}
+        \\const Ast = struct {
+        \\    pub fn parse() !Ast { return .{}; }
+        \\};
+        \\const NodeIndex = u32;
+        \\/// @returns node_index_of(ast)
+        \\pub fn rootNode(ast: Ast) NodeIndex { _ = ast; return 0; }
+        \\/// @takes node_index_of(t)
+        \\pub fn inspect(t: Ast, n: NodeIndex) void { _ = t; _ = n; }
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+
+    for (problems.items) |p| {
+        try std.testing.expect(std.mem.indexOf(u8, p.message, "invariant #1") == null);
+    }
+}
+
 test "lowering_gap collapses locals to plain — no spurious reports" {
     const gpa = std.testing.allocator;
     // `if (x) return;` triggers a lowering_gap in cfg.zig today.  The
