@@ -44,6 +44,8 @@ pub fn check(
 
     // ArenaId counter — minted by transferDecl on arena_init.
     var next_arena: u32 = 0;
+    // AstId counter — minted by originOfInit on ast_init (Ast.parse(...)).
+    var next_ast: u32 = 0;
 
     // Worklist — process every reachable block until in-states stabilise.
     var worklist: std.ArrayListUnmanaged(BlockId) = .empty;
@@ -80,6 +82,7 @@ pub fn check(
             .gpa = gpa,
             .locals = cfg.locals,
             .next_arena = &next_arena,
+            .next_ast = &next_ast,
             .problems = out,
             .path = opts.path,
         };

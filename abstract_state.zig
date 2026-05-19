@@ -41,8 +41,14 @@ pub const Origin = union(enum) {
     /// Pointer/slice into an arena's bump memory.  Use is invalid once
     /// the arena is dead.
     arena: ArenaId,
+    /// An Ast value itself, tagged with an AstId minted at parse-call
+    /// time.  Locals bound to `var tree = Ast.parse(...)` carry this.
+    /// Used as the source for `.ast_node` propagation when a function
+    /// annotated `@returns node_index_of(<param>)` is called with
+    /// this local as the arg.
+    ast: AstId,
     /// NodeIndex tagged with the Ast it came from.  Use as an arg to an
-    /// Ast method must check Ast identity.
+    /// Ast method must check Ast identity (enforcement: phase 26).
     ast_node: AstId,
     /// ScopeId / SymbolId from a particular pass.  Use in a different
     /// pass is invalid.
@@ -56,6 +62,7 @@ pub const Origin = union(enum) {
         return switch (a) {
             .plain => true,
             .arena => |x| x == b.arena,
+            .ast => |x| x == b.ast,
             .ast_node => |x| x == b.ast_node,
             .pass => |x| x == b.pass,
             .composite => |xs| blk: {

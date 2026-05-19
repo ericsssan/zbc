@@ -114,6 +114,17 @@ pub const ExprKind = union(enum) {
     /// `ArenaAllocator.init(...)` — produces a fresh arena.  The
     /// declaring local becomes the arena's "name" for kill tracking.
     arena_init,
+    /// `Ast.parse(...)` — produces a fresh Ast.  Transfer mints a
+    /// new AstId; the declaring local becomes origin `.ast(aid)`.
+    /// Used by `.node_index_of(local)` propagation to tag NodeIndex
+    /// results with the originating Ast's identity.
+    ast_init,
+    /// Call to a fn annotated `// @returns node_index_of(<param>)`.
+    /// `local` is the resolved arg LocalId carrying the source Ast.
+    /// Transfer looks up local's current origin and, if it's
+    /// `.ast(aid)`, returns `.ast_node(aid)` — propagating the
+    /// Ast identity tag onto the NodeIndex result.
+    node_index_of: LocalId,
     /// Reading a local — pass-through of that local's current origin.
     copy_of: LocalId,
     /// Couldn't classify — conservative .plain at use site.
@@ -1197,6 +1208,15 @@ const Builder = struct {
         if (std.mem.indexOf(u8, text, "ArenaAllocator.init") != null) {
             return .arena_init;
         }
+        // `Ast.parse(...)` — fresh Ast.  Pattern match on source text
+        // for robustness against `std.zig.Ast.parse`, `Ast.parse`, etc.
+        // False positives (a custom `.parse` named function on an
+        // Ast-shaped namespace) would taint a non-Ast local with
+        // .ast — downstream node_index_of propagation would still be
+        // sound (the Ast tag just wouldn't match real Ast methods).
+        if (std.mem.indexOf(u8, text, "Ast.parse") != null) {
+            return .ast_init;
+        }
 
         // Identifier reference → .copy_of(local) if known
         if (tag == .identifier) {
@@ -1310,11 +1330,22 @@ const Builder = struct {
                 if (explicit_idx >= args.len) return .unknown;
                 return self.identifierToCopyOrUnknown(args[explicit_idx]);
             },
-            // Phase 24 lands annotation parsing; phase 25 wires the
-            // ExprKind + transfer that propagates the Ast identity
-            // tag.  Until then, return .unknown so call sites of
-            // node_index_of-annotated fns don't get a phantom origin.
-            .node_index_of => return .unknown,
+            // `@returns node_index_of(<param>)`: result is a NodeIndex
+            // tagged with the source param's Ast identity.  Same
+            // arg-position dispatch as borrowed_from.
+            .node_index_of => |target_idx| {
+                const source_node = blk: {
+                    if (receiver_is_arg0 and target_idx == 0) break :blk receiver_or_callee;
+                    const explicit_idx = if (receiver_is_arg0) target_idx - 1 else target_idx;
+                    if (explicit_idx >= args.len) return .unknown;
+                    break :blk args[explicit_idx];
+                };
+                const src_kind = self.identifierToCopyOrUnknown(source_node);
+                return switch (src_kind) {
+                    .copy_of => |local| .{ .node_index_of = local },
+                    else => .unknown,
+                };
+            },
         }
     }
 
@@ -1456,17 +1487,38 @@ const TestBundle = struct {
 };
 
 fn parseAndLower(gpa: std.mem.Allocator, src: []const u8) !TestBundle {
+    return parseAndLowerCommon(gpa, src, false);
+}
+
+/// Same as parseAndLower but builds the same-file annotation DB and
+/// threads it through lowerFunction.  Use when tests exercise the
+/// annotated-call classification paths.  Db is intentionally leaked
+/// — its keys/values point into tree.source which the bundle owns.
+fn parseAndLowerWithDb(gpa: std.mem.Allocator, src: []const u8) !TestBundle {
+    return parseAndLowerCommon(gpa, src, true);
+}
+
+fn parseAndLowerCommon(gpa: std.mem.Allocator, src: []const u8, build_db: bool) !TestBundle {
     const src_z = try gpa.dupeSentinel(u8, src, 0);
     errdefer gpa.free(src_z);
     var tree = try Ast.parse(gpa, src_z, .zig);
     errdefer tree.deinit(gpa);
 
-    // Find first fn_decl in the file.
+    var db_storage: ?annotations.Db = if (build_db) try annotations.build(gpa, &tree) else null;
+    // Db owns only its map; deinit'd at bundle.deinit via leak-into-cfg
+    // pattern is wrong — we need to deinit it manually.  Easiest: free
+    // here on the success path too, since cfg only borrows annotation
+    // VALUES (which are small union types), not slice keys.  Wait — db
+    // is consulted DURING lowerFunction, then no longer needed once
+    // CFG emit completes.  Free immediately after lowerFunction returns.
+    defer if (db_storage) |*d| d.deinit(gpa);
+
     var node_idx: u32 = 1;
     while (node_idx < tree.nodes.len) : (node_idx += 1) {
         const node: Ast.Node.Index = @enumFromInt(node_idx);
         if (tree.nodeTag(node) == .fn_decl) {
-            const cfg = try lowerFunction(gpa, &tree, node, null);
+            const db_ptr: ?*const annotations.Db = if (db_storage) |*d| d else null;
+            const cfg = try lowerFunction(gpa, &tree, node, db_ptr);
             return .{ .src_z = src_z, .tree = tree, .cfg = cfg };
         }
     }
@@ -2700,6 +2752,76 @@ test "destructuring var-decl `const a, const b = pair()` registers both locals" 
         }
     }
     try std.testing.expect(decl_count >= 2);
+}
+
+test "classifyExpr: `Ast.parse(...)` → .ast_init (phase 25)" {
+    // Wrap with `try` not `catch` — classifyExpr early-returns
+    // .unknown on .@"catch" (phase 8), and we want the inner
+    // Ast.parse call's text to reach the pattern matcher.
+    const gpa = std.testing.allocator;
+    var result = try parseAndLower(gpa,
+        \\pub fn foo() !void {
+        \\    var tree = try Ast.parse(undefined, undefined, .zig);
+        \\    _ = tree;
+        \\    return;
+        \\}
+        \\const Ast = struct {
+        \\    pub fn parse(_: u32, _: u32, _: anytype) !Ast { return .{}; }
+        \\};
+        \\
+    );
+    defer result.deinit(gpa);
+    const cfg = result.cfg.?;
+
+    var saw_ast_init = false;
+    for (cfg.blocks) |b| {
+        for (b.stmts) |s| {
+            if (s.kind == .decl and s.kind.decl.init_kind == .ast_init) {
+                saw_ast_init = true;
+            }
+        }
+    }
+    try std.testing.expect(saw_ast_init);
+}
+
+test "applyAnnotationToCall: @returns node_index_of(arg) → .node_index_of (phase 25)" {
+    // The annotation propagates the source arg's Ast identity onto
+    // the returned NodeIndex.  Verify the classifier outputs the
+    // .node_index_of variant when a same-file fn carries this
+    // annotation and we call it with a registered local.
+    // Pass `tree` by value (bare identifier) — identifierToCopyOrUnknown
+    // requires an .identifier node tag.  `&tree` would parse as
+    // .address_of and the propagation degrades to .unknown.
+    // Needs the same-file annotation DB so classifyCall can resolve
+    // `rootNode`'s @returns marker.
+    const gpa = std.testing.allocator;
+    var result = try parseAndLowerWithDb(gpa,
+        \\pub fn foo() void {
+        \\    var tree: Ast = .{};
+        \\    const root = rootNode(tree);
+        \\    _ = root;
+        \\    return;
+        \\}
+        \\const Ast = struct {};
+        \\const NodeIndex = u32;
+        \\/// @returns node_index_of(ast)
+        \\pub fn rootNode(ast: Ast) NodeIndex {
+        \\    _ = ast; return 0;
+        \\}
+        \\
+    );
+    defer result.deinit(gpa);
+    const cfg = result.cfg.?;
+
+    var saw_node_index_of = false;
+    for (cfg.blocks) |b| {
+        for (b.stmts) |s| {
+            if (s.kind == .decl and s.kind.decl.init_kind == .node_index_of) {
+                saw_node_index_of = true;
+            }
+        }
+    }
+    try std.testing.expect(saw_node_index_of);
 }
 
 test "name slices live for the test bundle's lifetime (phase 20 dangle fix)" {

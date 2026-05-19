@@ -33,6 +33,11 @@ pub const Ctx = struct {
     /// Counter for minting fresh ArenaIds at arena_init sites.  One per
     /// function — distinct arena_init sites get distinct IDs.
     next_arena: *u32,
+    /// Counter for minting fresh AstIds at ast_init sites.  Parallel
+    /// to next_arena.  Each `var tree = Ast.parse(...)` site gets a
+    /// distinct AstId so that NodeIndex values tagged with that ID
+    /// can be cross-checked against the destination Ast at use sites.
+    next_ast: *u32,
     /// Where to push problems.
     problems: *std.ArrayListUnmanaged(Problem),
     /// Source file path for diagnostics.
@@ -185,6 +190,23 @@ fn originOfInit(
         },
         .borrowed_from => |src_local| state.locals.get(src_local) orelse .plain,
         .copy_of => |src_local| state.locals.get(src_local) orelse .plain,
+        .ast_init => blk: {
+            const aid = ctx.next_ast.*;
+            ctx.next_ast.* += 1;
+            break :blk .{ .ast = @enumFromInt(aid) };
+        },
+        .node_index_of => |src_local| blk: {
+            // Look up the source arg's Ast identity.  Only locals
+            // tagged `.ast(aid)` propagate a real ast_node tag.
+            // Other origins (.plain, .arena, etc.) mean we lost the
+            // Ast connection somewhere — return .plain so callers
+            // can't get false-positive AstId matches downstream.
+            const src_origin = state.locals.get(src_local) orelse break :blk .plain;
+            switch (src_origin) {
+                .ast => |aid| break :blk .{ .ast_node = aid },
+                else => break :blk .plain,
+            }
+        },
         .unknown => .plain,
     };
 }
