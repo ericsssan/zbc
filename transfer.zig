@@ -155,14 +155,25 @@ fn transferRet(
         return;
     }
 
-    // Borrow-escape checks only apply to borrowed-shape returns.
-    if (!r.is_borrowed_return_type) return;
+    // Composite-borrow returns: the embedded local is a borrow
+    // regardless of the outer return type, so apply escape checks
+    // unconditionally.  Direct borrow-shape returns (`return &x`,
+    // `return arena.text()`) still go through the existing
+    // is_borrowed_return_type gate.
+    const is_composite = r.value_kind == .composite_borrow;
+    const apply_check = r.is_borrowed_return_type or is_composite;
+    if (!apply_check) return;
     switch (origin) {
         .arena => |aid| {
             if (!config_mod.isEnabled(ctx.config, .arena_escape)) return;
             if (state.arenas.contains(aid)) {
-                try report(ctx, pos, end_pos, .@"error",
-                    "returning a value borrowed from a function-local arena (escapes its lifetime)", .{});
+                if (is_composite) {
+                    try report(ctx, pos, end_pos, .@"error",
+                        "returning a value that holds a borrow from function-local arena (escapes its lifetime)", .{});
+                } else {
+                    try report(ctx, pos, end_pos, .@"error",
+                        "returning a value borrowed from a function-local arena (escapes its lifetime)", .{});
+                }
             }
         },
         .heap => |hid| {
@@ -231,6 +242,7 @@ fn originOfInit(
             break :blk .{ .arena = aid };
         },
         .stack_ref => |src_local| .{ .stack = src_local },
+        .composite_borrow => |src_local| state.locals.get(src_local) orelse .plain,
         .heap_alloc => |hid| blk: {
             const mut_state: *AbstractState = @constCast(state);
             try mut_state.heaps.put(ctx.gpa, hid, .{ .state = .live });

@@ -129,6 +129,13 @@ pub const ExprKind = union(enum) {
     /// `&<local>` — address-of a function-local.  Produces a pointer
     /// whose lifetime is bound to that local's stack frame.
     stack_ref: LocalId,
+    /// A composite/aggregate expression (struct literal, array
+    /// literal, etc.) whose return-shape borrows from `local`.
+    /// Distinct from `.copy_of` so transferRet can fire escape
+    /// checks regardless of return type — the surrounding composite
+    /// makes this a borrow embedded in a value, not a move of the
+    /// resource itself.
+    composite_borrow: LocalId,
     /// `undefined` keyword — the value is explicitly uninitialized.
     undef,
     /// Reading a local — pass-through of that local's current origin.
@@ -177,7 +184,15 @@ pub const LocalInfo = struct {
     /// slice or pointer just produces another view of caller-owned
     /// storage, not an escape.
     is_array: bool = false,
+    /// Coarse classification of the init expression — lets the
+    /// composite-borrow walker decide at classify time whether a
+    /// bare reference to this local in a returned struct should be
+    /// treated as a borrow source.  Set at registerLocalFull from
+    /// the same classifier that produces the .decl's init_kind.
+    init_hint: InitHint = .other,
 };
+
+pub const InitHint = enum { other, arena_local, heap_local };
 
 // ── Lowering ───────────────────────────────────────────────
 
@@ -230,6 +245,16 @@ pub fn lowerFunctionFull(
     else
         false;
 
+    // Check whether THIS fn carries `@returns owns_locals` — if so,
+    // suppress composite-borrow detection inside its body.
+    const suppress_cb = blk: {
+        const d = db orelse break :blk false;
+        const name_tok = fn_proto.name_token orelse break :blk false;
+        const name = tree.tokenSlice(name_tok);
+        const entry = d.lookup(name) orelse break :blk false;
+        break :blk entry.annotation == .owns_locals;
+    };
+
     var builder: Builder = .{
         .gpa = gpa,
         .tree = tree,
@@ -237,6 +262,7 @@ pub fn lowerFunctionFull(
         .remote = remote,
         .config = config,
         .is_borrowed_return_type = is_borrowed_ret,
+        .suppress_composite_borrow = suppress_cb,
     };
     defer builder.tempDeinit();
 
@@ -364,6 +390,11 @@ const Builder = struct {
     /// True iff the enclosing fn returns a borrowed-shape type.
     /// Threaded into `Stmt.ret.is_borrowed_return_type`.
     is_borrowed_return_type: bool = false,
+    /// Set when the enclosing fn carries `@returns owns_locals`.
+    /// firstBorrowedLocal returns null when this is set, so the
+    /// composite-borrow check stays silent for explicit
+    /// ownership-transfer functions (the canonical init() pattern).
+    suppress_composite_borrow: bool = false,
     /// Per-function counters for minting ArenaId / HeapId.  Done at
     /// lowering time so worklist re-visits of the same call site
     /// reuse the same id; otherwise loops would grow state.arenas
@@ -406,15 +437,16 @@ const Builder = struct {
     }
 
     fn registerLocal(self: *Builder, name: []const u8, pos: SrcPos) !LocalId {
-        return self.registerLocalFull(name, pos, false);
+        return self.registerLocalFull(name, pos, false, .other);
     }
 
-    fn registerLocalFull(self: *Builder, name: []const u8, pos: SrcPos, is_array: bool) !LocalId {
+    fn registerLocalFull(self: *Builder, name: []const u8, pos: SrcPos, is_array: bool, init_hint: InitHint) !LocalId {
         const id: LocalId = @enumFromInt(self.locals.items.len);
         try self.locals.append(self.gpa, .{
             .name = name,
             .decl_pos = pos,
             .is_array = is_array,
+            .init_hint = init_hint,
         });
         try self.name_to_local.put(self.gpa, name, id);
         return id;
@@ -1055,7 +1087,6 @@ const Builder = struct {
             self.typeIsStackArray(tn)
         else
             false;
-        const local = try self.registerLocalFull(name, self.posOfToken(name_tok), is_array);
 
         const init_opt = var_decl.ast.init_node.unwrap();
 
@@ -1071,6 +1102,15 @@ const Builder = struct {
             self.classifyExpr(init)
         else
             .plain;
+
+        // Derive init_hint from the classification — avoids a second
+        // classifyExpr call (which would double-mint Arena/Heap ids).
+        const init_hint: InitHint = switch (init_kind) {
+            .arena_init => .arena_local,
+            .heap_alloc => .heap_local,
+            else => .other,
+        };
+        const local = try self.registerLocalFull(name, self.posOfToken(name_tok), is_array, init_hint);
 
         // Emit .use stmts for every local read by the init expression
         // (before the .decl so the read is checked against pre-decl state).
@@ -1471,16 +1511,27 @@ const Builder = struct {
 
         // Composite escape fallback — for shapes we didn't classify
         // above (struct literals, anonymous inits, etc.), scan tokens
-        // for any `&<bare_local>` and treat the whole expression as
-        // carrying that local's frame lifetime.  Catches patterns
-        // like `return .{ .p = &local }` and `return Wrapper{ .p =
-        // &local }` without modeling composite shapes explicitly.
-        // Conservative: yields false positives on calls that wrap
-        // but copy out (`fromPtr(&x)` stored by value), which can be
-        // suppressed by annotating the wrapper's `@returns` or by
-        // disabling stack_escape for the file.
+        // for borrow patterns and treat the whole expression as
+        // carrying that local's frame lifetime.  Two flavors:
+        //
+        //  - explicit borrows (`&local`, `local[..]`)  → .stack_ref
+        //    Fires stack_escape regardless of return type.
+        //
+        //  - resource-method borrows (`arena_local.text()` where
+        //    the method is annotated `@returns borrowed_from(self)`
+        //    and `arena_local` was declared via ArenaAllocator.init)
+        //                                              → .composite_borrow
+        //    Propagates the local's origin (.arena/.heap) and
+        //    transferRet fires arena_escape / heap UAF regardless
+        //    of return type.  Suppressed by `@returns owns_locals`
+        //    on the enclosing fn.
         if (self.firstAddressedLocal(expr_node)) |id| {
             return .{ .stack_ref = id };
+        }
+        if (!self.suppress_composite_borrow) {
+            if (self.firstResourceMethodBorrow(expr_node)) |id| {
+                return .{ .composite_borrow = id };
+            }
         }
 
         return .unknown;
@@ -1512,6 +1563,46 @@ const Builder = struct {
                 const name = tree.tokenSlice(t);
                 const local = self.name_to_local.get(name) orelse continue;
                 if (self.locals.items[@intFromEnum(local)].is_array) return local;
+            }
+        }
+        return null;
+    }
+
+    /// Walk `expr_node`'s tokens looking for `<local>.<method>(` shape
+    /// where `local` has an arena/heap init_hint AND `method` carries
+    /// `@returns borrowed_from(self)` in the local annotation DB.
+    /// Returns the first matching LocalId — caller propagates as
+    /// `.composite_borrow` so transferRet fires escape checks even
+    /// for value-shape returns.
+    fn firstResourceMethodBorrow(self: *Builder, expr_node: Ast.Node.Index) ?LocalId {
+        const tree = self.tree;
+        const db = self.db orelse return null;
+        const first = tree.firstToken(expr_node);
+        const last = tree.lastToken(expr_node);
+        const tags = tree.tokens.items(.tag);
+
+        var t: Ast.TokenIndex = first;
+        while (t + 3 <= last) : (t += 1) {
+            if (tags[t] != .identifier) continue;
+            // Receiver token must not itself be a field (preceded by `.`).
+            if (t > 0 and tags[t - 1] == .period) continue;
+            if (tags[t + 1] != .period) continue;
+            if (tags[t + 2] != .identifier) continue;
+            if (tags[t + 3] != .l_paren) continue;
+
+            const recv_name = tree.tokenSlice(t);
+            const local = self.name_to_local.get(recv_name) orelse continue;
+            const hint = self.locals.items[@intFromEnum(local)].init_hint;
+            if (hint == .other) continue;
+
+            const method_name = tree.tokenSlice(t + 2);
+            const entry = db.lookup(method_name) orelse continue;
+            // Only `@returns borrowed_from(receiver)` matters — that's
+            // the annotation that says "the result borrows from arg 0
+            // (= self when called as a method)".
+            switch (entry.annotation) {
+                .borrowed_from => |idx| if (idx == 0) return local,
+                else => {},
             }
         }
         return null;
@@ -1715,6 +1806,13 @@ const Builder = struct {
                 if (explicit_idx >= args.len) return .unknown;
                 return self.identifierToCopyOrUnknown(args[explicit_idx]);
             },
+            // owns_locals only affects the CALLEE's own analysis (it
+            // suppresses composite-borrow detection inside that fn's
+            // body).  At call sites it tells us nothing about the
+            // returned value's lifetime beyond "the callee took
+            // responsibility for whatever it embedded."  Treat as
+            // .owned — caller has no remaining liability.
+            .owns_locals => return .owned,
         }
     }
 

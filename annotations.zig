@@ -22,6 +22,13 @@ pub const ReturnsAnnotation = union(enum) {
     /// named param.  `param_index` is the 0-based position resolved at
     /// extraction time so call sites don't re-walk params.
     borrowed_from: u32,
+    /// `/// @returns owns_locals` — escape hatch for the canonical
+    /// init() pattern.  Suppresses the composite-borrow check in
+    /// this fn: any local arena/heap referenced in the returned
+    /// composite is treated as MOVED to the caller, not borrowed.
+    /// Use when zbc's pattern inference flags a value-shape return
+    /// that semantically transfers ownership.
+    owns_locals,
 };
 
 pub const FnEntry = struct {
@@ -108,6 +115,7 @@ fn parseReturnsAnnotation(tree: *const Ast, fn_proto: Ast.full.FnProto) ?Returns
         const trimmed = std.mem.trim(u8, body, " \t");
 
         if (std.mem.startsWith(u8, trimmed, "@returns owned")) return .owned;
+        if (std.mem.startsWith(u8, trimmed, "@returns owns_locals")) return .owns_locals;
 
         const prefix = "@returns borrowed_from(";
         if (std.mem.startsWith(u8, trimmed, prefix)) {

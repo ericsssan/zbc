@@ -310,6 +310,99 @@ test "stack_escape: return &local propagated through copy" {
     try std.testing.expect(found);
 }
 
+test "arena_escape: composite via direct arena_local.method() is flagged" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const std = @import("std");
+        \\const Wrapper = struct { s: []const u8 };
+        \\/// @returns borrowed_from(self)
+        \\pub fn arenaText(self: *std.heap.ArenaAllocator) []const u8 { _ = self; return ""; }
+        \\pub fn foo() Wrapper {
+        \\    var arena = std.heap.ArenaAllocator.init(undefined);
+        \\    return Wrapper{ .s = arena.arenaText() };
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    var found = false;
+    for (problems.items) |p| {
+        if (std.mem.indexOf(u8, p.message, "borrow from function-local arena") != null) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "arena_escape: composite via annotated method on arena local — chained access is a known gap" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const std = @import("std");
+        \\const Arena = struct {
+        \\    /// @returns borrowed_from(self)
+        \\    pub fn text(self: *const Arena) []const u8 { _ = self; return ""; }
+        \\};
+        \\const Wrapper = struct { s: []const u8 };
+        \\const Outer = struct { inner: std.heap.ArenaAllocator, a: Arena };
+        \\pub fn foo() Wrapper {
+        \\    var o = Outer{ .inner = std.heap.ArenaAllocator.init(undefined), .a = .{} };
+        \\    return Wrapper{ .s = o.a.text() };
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    // Documents the precision limit: `o.a.text()` involves a chain
+    // through a field before the method, which the simple
+    // `<local>.<method>(` walker doesn't match.  Acceptable v1.
+    var fired = false;
+    for (problems.items) |p| {
+        if (std.mem.indexOf(u8, p.message, "function-local arena") != null) fired = true;
+    }
+    try std.testing.expect(!fired);
+}
+
+test "arena_escape: composite — bare arena in composite is treated as move (no fire)" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const std = @import("std");
+        \\const Self = struct { arena: std.heap.ArenaAllocator };
+        \\pub fn init() Self {
+        \\    var arena = std.heap.ArenaAllocator.init(undefined);
+        \\    return Self{ .arena = arena };
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    // Move pattern — should NOT fire.  This was the false-positive
+    // risk we explicitly designed around in option E.
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
+test "arena_escape: @returns owns_locals suppresses composite-borrow check" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const std = @import("std");
+        \\const Arena = struct {
+        \\    /// @returns borrowed_from(self)
+        \\    pub fn text(self: *const Arena) []const u8 { _ = self; return ""; }
+        \\};
+        \\const Wrapper = struct { s: []const u8 };
+        \\const Holder = struct { arena: std.heap.ArenaAllocator };
+        \\/// @returns owns_locals
+        \\pub fn foo() Wrapper {
+        \\    var h = Holder{ .arena = std.heap.ArenaAllocator.init(undefined) };
+        \\    var a = Arena{};
+        \\    _ = h;
+        \\    return Wrapper{ .s = a.text() };
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    // Annotation suppresses any composite-borrow finding.
+    var any_arena = false;
+    for (problems.items) |p| {
+        if (std.mem.indexOf(u8, p.message, "borrow from function-local arena") != null) any_arena = true;
+    }
+    try std.testing.expect(!any_arena);
+}
+
 test "stack_escape: composite — return .{ .p = &local } is flagged" {
     const gpa = std.testing.allocator;
     var problems = try analyze(gpa,
