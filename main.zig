@@ -23,6 +23,7 @@ const cfg_mod = @import("cfg.zig");
 const annotations_mod = @import("annotations.zig");
 const analyzer_mod = @import("analyzer.zig");
 const imports_mod = @import("imports.zig");
+const remote_resolver_mod = @import("remote_resolver.zig");
 // Pulled in via test entry below so refAllDecls sees them.
 const _layer2_abstract_state = @import("abstract_state.zig");
 const _layer2_transfer = @import("transfer.zig");
@@ -136,11 +137,21 @@ fn checkFileEscape(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !bool {
 
     var db = try annotations_mod.build(gpa, &tree);
     defer db.deinit(gpa);
-    // Imports map — extracted but not yet consulted by classifyCall
-    // (phase 22 will wire it in for cross-file annotation lookup).
-    // Extracting now keeps the test path exercised on every sweep.
     var imap = try imports_mod.build(gpa, &tree);
     defer imap.deinit(gpa);
+
+    // Per-file remote-resolver cache.  Lives across every fn_decl in
+    // this file so the same imported file isn't reparsed for each
+    // function that touches it.  Sweep-wide promotion would cut more
+    // reparses but requires threading through main() — defer.
+    var rcache = remote_resolver_mod.Cache.init(gpa, io);
+    defer rcache.deinit();
+    const base_dir = std.fs.path.dirname(path) orelse ".";
+    const remote_ctx = cfg_mod.RemoteCtx{
+        .imap = &imap,
+        .base_dir = base_dir,
+        .cache = &rcache,
+    };
 
     var problems: std.ArrayListUnmanaged(Problem) = .empty;
     defer {
@@ -152,7 +163,7 @@ fn checkFileEscape(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !bool {
     while (node_idx < tree.nodes.len) : (node_idx += 1) {
         const node: Ast.Node.Index = @enumFromInt(node_idx);
         if (tree.nodeTag(node) != .fn_decl) continue;
-        var cfg = (try cfg_mod.lowerFunction(gpa, &tree, node, &db)) orelse continue;
+        var cfg = (try cfg_mod.lowerFunctionWithRemote(gpa, &tree, node, &db, &remote_ctx)) orelse continue;
         defer cfg.deinit(gpa);
         try analyzer_mod.check(gpa, &cfg, .{ .path = path }, &problems);
     }
@@ -188,6 +199,7 @@ test {
     _ = annotations_mod;
     _ = analyzer_mod;
     _ = imports_mod;
+    _ = remote_resolver_mod;
     _ = _layer2_abstract_state;
     _ = _layer2_transfer;
     std.testing.refAllDecls(@This());

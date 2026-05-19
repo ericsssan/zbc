@@ -30,6 +30,18 @@ const std = @import("std");
 const Ast = std.zig.Ast;
 const abstract_state = @import("abstract_state.zig");
 const annotations = @import("annotations.zig");
+const imports = @import("imports.zig");
+const remote_resolver = @import("remote_resolver.zig");
+
+/// Cross-file resolution context passed into lowerFunction.  When
+/// present, classifyCall can resolve `imported.method(...)` calls
+/// by looking up the method's annotation in the imported file's DB
+/// via remote_resolver.Cache.
+pub const RemoteCtx = struct {
+    imap: *const imports.Map,
+    base_dir: []const u8,
+    cache: *remote_resolver.Cache,
+};
 
 pub const BlockId = abstract_state.BlockId;
 pub const LocalId = abstract_state.LocalId;
@@ -155,6 +167,20 @@ pub fn lowerFunction(
     fn_decl: Ast.Node.Index,
     db: ?*const annotations.Db,
 ) !?Cfg {
+    return lowerFunctionWithRemote(gpa, tree, fn_decl, db, null);
+}
+
+/// Same as lowerFunction but accepts a cross-file resolution context.
+/// Use this from sweep entry points where you already have an imports
+/// map + cache built per-file; pass through so classifyCall can resolve
+/// `imported.method(...)` callees against the imported file's DB.
+pub fn lowerFunctionWithRemote(
+    gpa: std.mem.Allocator,
+    tree: *const Ast,
+    fn_decl: Ast.Node.Index,
+    db: ?*const annotations.Db,
+    remote: ?*const RemoteCtx,
+) !?Cfg {
     var buf: [1]Ast.Node.Index = undefined;
     const fn_proto = (try fnProto(tree, &buf, fn_decl)) orelse return null;
     const body_node = bodyOf(tree, fn_decl) orelse return null;
@@ -171,6 +197,7 @@ pub fn lowerFunction(
         .gpa = gpa,
         .tree = tree,
         .db = db,
+        .remote = remote,
         .is_borrowed_return_type = is_borrowed_ret,
     };
     defer builder.tempDeinit();
@@ -223,6 +250,7 @@ const Builder = struct {
     gpa: std.mem.Allocator,
     tree: *const Ast,
     db: ?*const annotations.Db = null,
+    remote: ?*const RemoteCtx = null,
     blocks: std.ArrayListUnmanaged(BasicBlock) = .empty,
     /// Per-block staging — stmts being appended.  Flushed to `blocks[i].stmts`
     /// in finalize().
@@ -1194,32 +1222,72 @@ const Builder = struct {
 
     fn classifyCall(self: *Builder, call_node: Ast.Node.Index) ExprKind {
         const tree = self.tree;
-        const db = self.db orelse return .unknown;
 
         var buf: [1]Ast.Node.Index = undefined;
         const call_full = tree.fullCall(&buf, call_node) orelse return .unknown;
         const callee_node = call_full.ast.fn_expr;
         const args = call_full.ast.params;
 
-        // Two callee shapes we handle:
-        //   1. <recv>.<method>(...)   → field_access (receiver is arg 0)
-        //   2. <ident>(...)           → identifier
         switch (tree.nodeTag(callee_node)) {
             .field_access => {
                 const fa_data = tree.nodeData(callee_node);
                 const recv_node = fa_data.node_and_token[0];
                 const method_tok = fa_data.node_and_token[1];
                 const method_name = tree.tokenSlice(method_tok);
-                const entry = db.lookup(method_name) orelse return .unknown;
-                return self.applyAnnotationToCall(entry.annotation, recv_node, args, true);
+
+                // 1. Same-file DB hit on method name.
+                if (self.db) |db| {
+                    if (db.lookup(method_name)) |entry| {
+                        return self.applyAnnotationToCall(entry.annotation, recv_node, args, true);
+                    }
+                }
+
+                // 2. Cross-file: receiver is a bare identifier (the
+                //    imported namespace), method lives in that file's DB.
+                if (self.lookupRemoteMethod(recv_node, method_name)) |annotation| {
+                    // For cross-file: there's no `recv` in the explicit
+                    // args list (since the receiver IS the namespace),
+                    // so treat as a non-method-style call.
+                    return self.applyAnnotationToCall(annotation, callee_node, args, false);
+                }
+                return .unknown;
             },
             .identifier => {
                 const fn_name = tree.tokenSlice(tree.nodeMainToken(callee_node));
-                const entry = db.lookup(fn_name) orelse return .unknown;
-                return self.applyAnnotationToCall(entry.annotation, callee_node, args, false);
+                if (self.db) |db| {
+                    if (db.lookup(fn_name)) |entry| {
+                        return self.applyAnnotationToCall(entry.annotation, callee_node, args, false);
+                    }
+                }
+                return .unknown;
             },
             else => return .unknown,
         }
+    }
+
+    /// Cross-file resolution.  Receiver must be a bare identifier;
+    /// look it up in the import map, resolve the file via the cache,
+    /// and look up `method_name` in the imported file's annotation DB.
+    /// Returns the annotation (a small value type — safe to copy
+    /// across file boundaries) or null on any miss.
+    fn lookupRemoteMethod(
+        self: *Builder,
+        recv_node: Ast.Node.Index,
+        method_name: []const u8,
+    ) ?annotations.ReturnsAnnotation {
+        const tree = self.tree;
+        const remote = self.remote orelse return null;
+        if (tree.nodeTag(recv_node) != .identifier) return null;
+        const recv_name = tree.tokenSlice(tree.nodeMainToken(recv_node));
+        const import_entry = remote.imap.lookup(recv_name) orelse return null;
+
+        // Cache loads can fail (allocator OOM, etc.); swallow as
+        // conservative miss.  Non-allocator failures (file missing,
+        // parse error) already return null from loadOrLookup.
+        const remote_file = (remote.cache.loadOrLookup(remote.base_dir, import_entry.path)
+            catch null) orelse return null;
+        const entry = remote_file.db.lookup(method_name) orelse return null;
+        return entry.annotation;
     }
 
     /// Convert a callee annotation + actual-arg context into an ExprKind.
