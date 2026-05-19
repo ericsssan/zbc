@@ -115,9 +115,15 @@ pub fn build(gpa: std.mem.Allocator, tree: *const Ast) !Db {
 /// then INFER annotations from signature shape (drop-in adoption path —
 /// most call sites work without authors writing annotations).
 ///
-/// Inference rules — applied only when no explicit annotation present:
-///   R1: fn has exactly one param whose type mentions config.ast_type_name
-///       AND a NodeIndex-shaped param  → infer @takes node_index_of(<the_ast_param>).
+/// Inference rules — applied only when no explicit annotation present.
+/// "Ast-carrying param" below means: the param's type mentions the
+/// configured ast_type_name OR any auto-detected wrapper struct that
+/// has an Ast field (e.g. a project's LintContext, AnalysisCtx, etc.).
+/// Auto-detection runs per-file via struct-declaration scan — no
+/// CLI/config opt-in needed for the common same-file case.
+///
+///   R1: fn has exactly one Ast-carrying param + a NodeIndex param
+///       → infer @takes node_index_of(<the_ast_param>).
 ///   R2: fn has exactly one Ast param AND returns NodeIndex (token-named)
 ///        → infer @returns node_index_of(<the_ast_param>).
 ///   R3: fn returns config.ast_type_name (or `!Ast` etc.) → infer @returns ast.
@@ -144,6 +150,12 @@ pub fn buildWithConfig(
     var db: Db = .{ .fns = .empty };
     errdefer db.deinit(gpa);
 
+    // Auto-detect Ast-holder structs in this file (e.g. a wrapper
+    // type with an `ast: Ast` field).  Replaces the need for
+    // --ast-holder=Name in the common same-file case.
+    const auto_holders = try detectAstHolders(gpa, tree, config.ast_type_name);
+    defer gpa.free(auto_holders);
+
     var node_idx: u32 = 1;
     while (node_idx < tree.nodes.len) : (node_idx += 1) {
         const node: Ast.Node.Index = @enumFromInt(node_idx);
@@ -163,7 +175,7 @@ pub fn buildWithConfig(
             tree.nodeData(node).node_and_node[1]
         else
             null;
-        const inferred = inferAnnotations(tree, fn_proto, body_node, config);
+        const inferred = inferAnnotations(tree, fn_proto, body_node, config, auto_holders);
         if (annotation == null) annotation = inferred.returns;
         if (takes == null) takes = inferred.takes;
         if (mutates_ast == null) mutates_ast = inferred.mutates_ast;
@@ -250,6 +262,7 @@ fn inferAnnotations(
     fn_proto: Ast.full.FnProto,
     body_node: ?Ast.Node.Index,
     config: *const config_mod.Config,
+    auto_holders: []const []const u8,
 ) Inferred {
     // First pass: count Ast params, find the (unique) one's index,
     // check for any NodeIndex param, and track whether the unique
@@ -265,7 +278,7 @@ fn inferAnnotations(
     var it = fn_proto.iterate(tree);
     while (it.next()) |param| : (idx += 1) {
         const type_node = param.type_expr orelse continue;
-        if (typeMentionsAstOrHolder(tree, type_node, config)) {
+        if (typeMentionsAstOrHolder(tree, type_node, config, auto_holders)) {
             ast_param_count += 1;
             ast_param_idx = idx;
             ast_param_is_const = typeMentionsKeyword(tree, type_node, .keyword_const);
@@ -532,20 +545,113 @@ fn typeMentionsKeyword(tree: *const Ast, type_node: Ast.Node.Index, tag: std.zig
     return false;
 }
 
-/// Does the type expression mention the Ast type OR any configured
-/// holder type?  Used by R1/R2/R4 so wrapper types (e.g.
-/// LintContext that carries an Ast) get the same Ast-carrying
-/// treatment as a direct *Ast.
+/// Does the type expression mention the Ast type OR any holder type
+/// (from config OR auto-detected from this file's struct decls)?
 fn typeMentionsAstOrHolder(
     tree: *const Ast,
     type_node: Ast.Node.Index,
     config: *const config_mod.Config,
+    auto_holders: []const []const u8,
 ) bool {
     if (typeMentionsIdentifier(tree, type_node, config.ast_type_name)) return true;
     for (config.ast_holder_types) |holder| {
         if (typeMentionsIdentifier(tree, type_node, holder)) return true;
     }
+    for (auto_holders) |holder| {
+        if (typeMentionsIdentifier(tree, type_node, holder)) return true;
+    }
     return false;
+}
+
+/// Walk top-level struct decls looking for ones with a field typed
+/// as the Ast type — those structs WRAP an Ast and should be
+/// treated as Ast-carrying for inference.
+///
+/// Replaces the need for users to write `--ast-holder=MyContext`
+/// in the common case where the holder is defined in the same file.
+/// Limitation: only detects holders DEFINED in `tree`.  Holders
+/// imported from another file aren't auto-propagated; the
+/// `--ast-holder` CLI flag remains the fallback for that case.
+///
+/// Token-level scan rather than node walking — handles the
+/// variations (pub, extern, struct with extras, packed struct,
+/// etc.) uniformly without per-tag dispatch.
+fn detectAstHolders(
+    gpa: std.mem.Allocator,
+    tree: *const Ast,
+    ast_type_name: []const u8,
+) ![]const []const u8 {
+    var out: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer out.deinit(gpa);
+
+    const tags = tree.tokens.items(.tag);
+    const last_tok: Ast.TokenIndex = @intCast(tags.len - 1);
+
+    var t: Ast.TokenIndex = 0;
+    while (t + 4 <= last_tok) : (t += 1) {
+        // Match `const IDENT = struct {` — optionally preceded by
+        // `pub` etc. but we don't care; just scan forward for the
+        // canonical anchor sequence.
+        if (tags[t] != .keyword_const) continue;
+        if (tags[t + 1] != .identifier) continue;
+        if (tags[t + 2] != .equal) continue;
+        // Skip optional `extern`, `packed` before `struct`.
+        var k: usize = t + 3;
+        while (k < last_tok and (tags[k] == .keyword_extern or tags[k] == .keyword_packed)) : (k += 1) {}
+        if (k >= last_tok or tags[k] != .keyword_struct) continue;
+        // Find the `{` opening the body.
+        while (k < last_tok and tags[k] != .l_brace) : (k += 1) {}
+        if (k >= last_tok) continue;
+        const open_brace = k;
+
+        const struct_name = tree.tokenSlice(t + 1);
+
+        // Walk the struct body with brace-depth tracking.  Inside,
+        // any `<ident>: <type-tokens-containing-ast_type_name>`
+        // shape marks the struct as a holder.
+        var depth: u32 = 1;
+        var j: usize = open_brace + 1;
+        while (j <= last_tok and depth > 0) : (j += 1) {
+            switch (tags[j]) {
+                .l_brace => depth += 1,
+                .r_brace => depth -= 1,
+                .colon => {
+                    // Look at the next few tokens for the Ast type name.
+                    // Stop at `,` or `=` (default value) or another `}`.
+                    var m: usize = j + 1;
+                    var found_ast = false;
+                    while (m <= last_tok) : (m += 1) {
+                        switch (tags[m]) {
+                            .comma, .equal, .r_brace => break,
+                            .identifier => {
+                                if (std.mem.eql(u8, tree.tokenSlice(@intCast(m)), ast_type_name)) {
+                                    found_ast = true;
+                                    break;
+                                }
+                            },
+                            else => continue,
+                        }
+                    }
+                    if (found_ast) {
+                        try out.append(gpa, struct_name);
+                        // Skip rest of this struct — we already
+                        // marked it.  Fast-forward to matching `}`.
+                        var skip_depth: u32 = depth;
+                        while (j < last_tok and skip_depth > 0) : (j += 1) {
+                            switch (tags[j]) {
+                                .l_brace => skip_depth += 1,
+                                .r_brace => skip_depth -= 1,
+                                else => {},
+                            }
+                        }
+                        depth = 0; // exit outer while
+                    }
+                },
+                else => {},
+            }
+        }
+    }
+    return out.toOwnedSlice(gpa);
 }
 
 /// Does the type expression's token span contain the bare identifier
@@ -951,6 +1057,42 @@ test "inference R4: returns NodeIndex wins over slice — R2 takes precedence" {
 
     const entry = r.db.lookup("rootNode").?;
     try std.testing.expect(entry.annotation.? == .node_index_of);
+}
+
+test "auto-detect: same-file struct with Ast field becomes holder" {
+    // No --ast-holder flag; the wrapper struct in the source itself
+    // declares its Ast-carrying role.  Inference then treats
+    // `*const Ctx` params the same as `*const Ast`.
+    const gpa = std.testing.allocator;
+    var r = try buildFromSrc(gpa,
+        \\const Ast = struct {};
+        \\pub const Ctx = struct { ast: Ast };
+        \\const NodeIndex = u32;
+        \\pub fn nodeTagViaCtx(c: *const Ctx, idx: NodeIndex) u32 {
+        \\    _ = c; _ = idx; return 0;
+        \\}
+        \\
+    );
+    defer r.deinit(gpa);
+
+    const entry = r.db.lookup("nodeTagViaCtx").?;
+    try std.testing.expect(entry.takes.? == .node_index_of);
+}
+
+test "auto-detect: struct WITHOUT Ast field is NOT a holder" {
+    const gpa = std.testing.allocator;
+    var r = try buildFromSrc(gpa,
+        \\const Ast = struct {};
+        \\pub const Unrelated = struct { count: u32 };
+        \\const NodeIndex = u32;
+        \\pub fn weird(u: *const Unrelated, idx: NodeIndex) u32 {
+        \\    _ = u; _ = idx; return 0;
+        \\}
+        \\
+    );
+    defer r.deinit(gpa);
+
+    try std.testing.expect(r.db.lookup("weird") == null);
 }
 
 test "inference R6: slice return + body allocates → @returns owned" {
