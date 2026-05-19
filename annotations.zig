@@ -121,9 +121,13 @@ pub fn build(gpa: std.mem.Allocator, tree: *const Ast) !Db {
 ///   R2: fn has exactly one Ast param AND returns NodeIndex (token-named)
 ///        → infer @returns node_index_of(<the_ast_param>).
 ///   R3: fn returns config.ast_type_name (or `!Ast` etc.) → infer @returns ast.
+///   R4: fn has exactly one *const-Ast param AND returns a slice type
+///       (`[]const u8`, `[]u8`, etc.) → infer @returns borrowed_from(<param>).
+///       Read-only-pointer constraint keeps us conservative — `*Ast`
+///       (mutable) might be doing something more complex than reading.
 ///
-/// Ambiguous cases (multiple Ast params + NodeIndex arg, custom borrow
-/// returns, mutation intent) still require explicit annotations.
+/// Ambiguous cases (multiple Ast params + NodeIndex arg, mutation
+/// intent, custom pass IDs) still require explicit annotations.
 pub fn buildWithConfig(
     gpa: std.mem.Allocator,
     tree: *const Ast,
@@ -230,9 +234,11 @@ fn inferAnnotations(
     config: *const config_mod.Config,
 ) Inferred {
     // First pass: count Ast params, find the (unique) one's index,
-    // check for any NodeIndex param.
+    // check for any NodeIndex param, and track whether the unique
+    // Ast param is read-only (`*const Ast`-shaped).
     var ast_param_count: u32 = 0;
     var ast_param_idx: u32 = 0;
+    var ast_param_is_const: bool = false;
     var has_node_index_param: bool = false;
     var idx: u32 = 0;
     var it = fn_proto.iterate(tree);
@@ -241,6 +247,7 @@ fn inferAnnotations(
         if (typeMentionsIdentifier(tree, type_node, config.ast_type_name)) {
             ast_param_count += 1;
             ast_param_idx = idx;
+            ast_param_is_const = typeMentionsKeyword(tree, type_node, .keyword_const);
         }
         if (typeMentionsIdentifier(tree, type_node, "NodeIndex")) {
             has_node_index_param = true;
@@ -258,6 +265,17 @@ fn inferAnnotations(
         if (typeMentionsIdentifier(tree, rt, "NodeIndex") and ast_param_count == 1) {
             inferred.returns = .{ .node_index_of = ast_param_idx };
         }
+        // R4: returns a slice type (`[]const u8` etc.) with exactly
+        // one *const-Ast param → @returns borrowed_from(<that_param>).
+        // The const constraint keeps us conservative: a mutable
+        // *Ast might be doing something other than reading source.
+        if (ast_param_count == 1 and
+            ast_param_is_const and
+            inferred.returns == null and
+            typeIsSliceShaped(tree, rt))
+        {
+            inferred.returns = .{ .borrowed_from = ast_param_idx };
+        }
     }
 
     // R1: exactly one Ast param + at least one NodeIndex param →
@@ -267,6 +285,34 @@ fn inferAnnotations(
     }
 
     return inferred;
+}
+
+/// Does the type expression's token span contain a `[` immediately
+/// followed by a `]`?  Catches `[]T`, `[]const T`, `[*]T`, `[:0]const T`,
+/// etc.  False positives bounded — extra borrowed_from inferences
+/// trigger the same escape check the author would have wanted anyway.
+fn typeIsSliceShaped(tree: *const Ast, type_node: Ast.Node.Index) bool {
+    const first = tree.firstToken(type_node);
+    const last = tree.lastToken(type_node);
+    const tags = tree.tokens.items(.tag);
+    var t: Ast.TokenIndex = first;
+    while (t < last) : (t += 1) {
+        if (tags[t] == .l_bracket) return true;
+    }
+    return false;
+}
+
+/// Does the type expression's token span include `tag`?  Used by R4
+/// to check for `const` keyword on Ast-pointer params.
+fn typeMentionsKeyword(tree: *const Ast, type_node: Ast.Node.Index, tag: std.zig.Token.Tag) bool {
+    const first = tree.firstToken(type_node);
+    const last = tree.lastToken(type_node);
+    const tags = tree.tokens.items(.tag);
+    var t: Ast.TokenIndex = first;
+    while (t <= last) : (t += 1) {
+        if (tags[t] == tag) return true;
+    }
+    return false;
 }
 
 /// Does the type expression's token span contain the bare identifier
@@ -623,6 +669,55 @@ test "inference R3: returns Ast type → @returns ast inferred" {
 
     const entry = r.db.lookup("customParse").?;
     try std.testing.expect(entry.annotation.? == .ast);
+}
+
+test "inference R4: *const Ast + slice return → @returns borrowed_from inferred" {
+    const gpa = std.testing.allocator;
+    var r = try buildFromSrc(gpa,
+        \\const Ast = struct {};
+        \\pub fn tokenText(self: *const Ast, idx: u32) []const u8 {
+        \\    _ = self; _ = idx; return "";
+        \\}
+        \\
+    );
+    defer r.deinit(gpa);
+
+    const entry = r.db.lookup("tokenText").?;
+    try std.testing.expect(entry.annotation.? == .borrowed_from);
+    try std.testing.expectEqual(@as(u32, 0), entry.annotation.?.borrowed_from);
+}
+
+test "inference R4: mutable *Ast NOT inferred (conservative)" {
+    // *Ast (no const) could be doing more than reading — R4 declines
+    // to guess.  Author must annotate explicitly if borrowed_from
+    // semantics are intended.
+    const gpa = std.testing.allocator;
+    var r = try buildFromSrc(gpa,
+        \\const Ast = struct {};
+        \\pub fn weird(self: *Ast, idx: u32) []const u8 {
+        \\    _ = self; _ = idx; return "";
+        \\}
+        \\
+    );
+    defer r.deinit(gpa);
+
+    try std.testing.expect(r.db.lookup("weird") == null);
+}
+
+test "inference R4: returns NodeIndex wins over slice — R2 takes precedence" {
+    // Returns NodeIndex (not a slice) — R2 fires first.  R4 only
+    // runs when inferred.returns is still null.
+    const gpa = std.testing.allocator;
+    var r = try buildFromSrc(gpa,
+        \\const Ast = struct {};
+        \\const NodeIndex = u32;
+        \\pub fn rootNode(ast: *const Ast) NodeIndex { _ = ast; return 0; }
+        \\
+    );
+    defer r.deinit(gpa);
+
+    const entry = r.db.lookup("rootNode").?;
+    try std.testing.expect(entry.annotation.? == .node_index_of);
 }
 
 test "inference: multiple Ast params is ambiguous — no auto-takes" {
