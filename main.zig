@@ -58,6 +58,7 @@ pub fn main(init: std.process.Init) !void {
     var arena_init_patterns: []const []const u8 = lib.DefaultConfig.arena_init_patterns;
     var arena_kill_patterns: []const []const u8 = lib.DefaultConfig.arena_kill_patterns;
     var thread_join_patterns: []const []const u8 = lib.DefaultConfig.thread_join_patterns;
+    var ast_holder_types: []const []const u8 = lib.DefaultConfig.ast_holder_types;
     var pattern_allocations: std.ArrayListUnmanaged([]const []const u8) = .empty;
     defer {
         for (pattern_allocations.items) |slice| gpa.free(slice);
@@ -125,6 +126,12 @@ pub fn main(init: std.process.Init) !void {
             thread_join_patterns = slice;
             continue;
         }
+        if (std.mem.startsWith(u8, a, "--ast-holder=")) {
+            const slice = try splitCsv(gpa, a["--ast-holder=".len..]);
+            try pattern_allocations.append(gpa, slice);
+            ast_holder_types = slice;
+            continue;
+        }
         if (std.mem.startsWith(u8, a, "--format=")) {
             const v = a["--format=".len..];
             if (std.mem.eql(u8, v, "text")) {
@@ -175,6 +182,7 @@ pub fn main(init: std.process.Init) !void {
         .arena_init_patterns = arena_init_patterns,
         .arena_kill_patterns = arena_kill_patterns,
         .thread_join_patterns = thread_join_patterns,
+        .ast_holder_types = ast_holder_types,
         .enabled = enabled.items,
     };
 
@@ -377,6 +385,8 @@ fn printUsage() void {
         \\                        (default: .deinit().
         \\  --thread-join=A,B     Patterns that join a worker thread
         \\                        (default: .join().
+        \\  --ast-holder=A,B      Wrapper types treated as Ast-carrying
+        \\                        for inference (e.g. LintContext).
         \\
     , .{});
 }

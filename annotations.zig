@@ -249,20 +249,21 @@ fn inferAnnotations(
     // First pass: count Ast params, find the (unique) one's index,
     // check for any NodeIndex param, and track whether the unique
     // Ast param is read-only (`*const Ast`-shaped).
+    // R1/R2/R4 treat both the Ast type AND any configured holder
+    // type as "carrying an Ast".  R5 stays strict (handled separately
+    // by inferMutatesAstFromBody using only ast_type_name).
     var ast_param_count: u32 = 0;
     var ast_param_idx: u32 = 0;
     var ast_param_is_const: bool = false;
-    var ast_param_name: ?[]const u8 = null;
     var has_node_index_param: bool = false;
     var idx: u32 = 0;
     var it = fn_proto.iterate(tree);
     while (it.next()) |param| : (idx += 1) {
         const type_node = param.type_expr orelse continue;
-        if (typeMentionsIdentifier(tree, type_node, config.ast_type_name)) {
+        if (typeMentionsAstOrHolder(tree, type_node, config)) {
             ast_param_count += 1;
             ast_param_idx = idx;
             ast_param_is_const = typeMentionsKeyword(tree, type_node, .keyword_const);
-            if (param.name_token) |nt| ast_param_name = tree.tokenSlice(nt);
         }
         if (typeMentionsIdentifier(tree, type_node, "NodeIndex")) {
             has_node_index_param = true;
@@ -471,6 +472,22 @@ fn typeMentionsKeyword(tree: *const Ast, type_node: Ast.Node.Index, tag: std.zig
     var t: Ast.TokenIndex = first;
     while (t <= last) : (t += 1) {
         if (tags[t] == tag) return true;
+    }
+    return false;
+}
+
+/// Does the type expression mention the Ast type OR any configured
+/// holder type?  Used by R1/R2/R4 so wrapper types (e.g.
+/// LintContext that carries an Ast) get the same Ast-carrying
+/// treatment as a direct *Ast.
+fn typeMentionsAstOrHolder(
+    tree: *const Ast,
+    type_node: Ast.Node.Index,
+    config: *const config_mod.Config,
+) bool {
+    if (typeMentionsIdentifier(tree, type_node, config.ast_type_name)) return true;
+    for (config.ast_holder_types) |holder| {
+        if (typeMentionsIdentifier(tree, type_node, holder)) return true;
     }
     return false;
 }

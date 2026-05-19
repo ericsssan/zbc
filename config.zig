@@ -54,6 +54,18 @@ pub const Config = struct {
         ".join(",
     },
 
+    /// Wrapper types that "carry" an Ast and so are treated as
+    /// Ast-equivalent for inference rules R1/R2/R4 (the
+    /// param-mentions-Ast checks).  Example: a project might wrap
+    /// the parse tree in a Context that exposes Ast methods —
+    /// `pub fn nodeTag(self: *const Context, idx: NodeIndex) Tag`
+    /// should still infer @takes node_index_of(self).
+    ///
+    /// Holder types do NOT participate in R5 (mutation detection)
+    /// — only the actual ast_type_name does, because mutation
+    /// semantics depend on the concrete type's invariants.
+    ast_holder_types: []const []const u8 = &.{},
+
     /// Which invariants to enforce (phase 46).  Downstream projects
     /// can opt out of any subset they don't care about — e.g. a
     /// codebase that doesn't pass NodeIndex across Ast boundaries
