@@ -171,6 +171,12 @@ pub const Cfg = struct {
 pub const LocalInfo = struct {
     name: []const u8, // borrowed from source — caller keeps source alive
     decl_pos: SrcPos,
+    /// True iff the local was declared with an array type annotation
+    /// like `var x: [N]T = ...`.  Set so slice-of-local classification
+    /// only flags real stack arrays — slicing a local that holds a
+    /// slice or pointer just produces another view of caller-owned
+    /// storage, not an escape.
+    is_array: bool = false,
 };
 
 // ── Lowering ───────────────────────────────────────────────
@@ -400,10 +406,30 @@ const Builder = struct {
     }
 
     fn registerLocal(self: *Builder, name: []const u8, pos: SrcPos) !LocalId {
+        return self.registerLocalFull(name, pos, false);
+    }
+
+    fn registerLocalFull(self: *Builder, name: []const u8, pos: SrcPos, is_array: bool) !LocalId {
         const id: LocalId = @enumFromInt(self.locals.items.len);
-        try self.locals.append(self.gpa, .{ .name = name, .decl_pos = pos });
+        try self.locals.append(self.gpa, .{
+            .name = name,
+            .decl_pos = pos,
+            .is_array = is_array,
+        });
         try self.name_to_local.put(self.gpa, name, id);
         return id;
+    }
+
+    /// True iff `type_node`'s first two tokens are `[<number>` —
+    /// the shape of `[N]T`.  Conservatively returns false for
+    /// `[*]T` (many-pointer), `[]T` (slice), `[*c]T` (C pointer).
+    fn typeIsStackArray(self: *Builder, type_node: Ast.Node.Index) bool {
+        const tree = self.tree;
+        const first = tree.firstToken(type_node);
+        const tags = tree.tokens.items(.tag);
+        if (tags[first] != .l_bracket) return false;
+        if (first + 1 >= tree.tokens.len) return false;
+        return tags[first + 1] == .number_literal;
     }
 
     /// Register `|x|` / `|x, y|` / `|*x, idx|` capture identifiers
@@ -1011,7 +1037,11 @@ const Builder = struct {
             return;
         }
         const name = tree.tokenSlice(name_tok);
-        const local = try self.registerLocal(name, self.posOfToken(name_tok));
+        const is_array = if (var_decl.ast.type_node.unwrap()) |tn|
+            self.typeIsStackArray(tn)
+        else
+            false;
+        const local = try self.registerLocalFull(name, self.posOfToken(name_tok), is_array);
 
         const init_opt = var_decl.ast.init_node.unwrap();
 
@@ -1386,6 +1416,30 @@ const Builder = struct {
                 const name = tree.tokenSlice(tree.nodeMainToken(inner));
                 if (self.name_to_local.get(name)) |id| {
                     return .{ .stack_ref = id };
+                }
+            }
+        }
+
+        // `<local>[..]` / `<local>[a..b]` / `<local>[a..b :s]` —
+        // slicing a `[N]T` local produces a fat pointer into the
+        // local's stack storage.  For escape purposes that's
+        // identical to &local: returning the slice past the frame
+        // is UB.  Only fires when the sliced local was declared
+        // with an array type — slicing a local that already holds
+        // a slice or pointer just makes another view of caller-
+        // owned storage.
+        const slicee_opt: ?Ast.Node.Index = switch (tag) {
+            .slice_open => tree.nodeData(expr_node).node_and_node[0],
+            .slice, .slice_sentinel => tree.nodeData(expr_node).node_and_extra[0],
+            else => null,
+        };
+        if (slicee_opt) |slicee| {
+            if (tree.nodeTag(slicee) == .identifier) {
+                const name = tree.tokenSlice(tree.nodeMainToken(slicee));
+                if (self.name_to_local.get(name)) |id| {
+                    if (self.locals.items[@intFromEnum(id)].is_array) {
+                        return .{ .stack_ref = id };
+                    }
                 }
             }
         }
