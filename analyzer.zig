@@ -435,6 +435,25 @@ test "heap_use_after_free: return without freeing is OK (ownership transfer)" {
     try std.testing.expectEqual(@as(usize, 0), problems.items.len);
 }
 
+test "heap_double_free: catch-form alloc is tracked" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const std = @import("std");
+        \\pub fn foo(gpa_: std.mem.Allocator) void {
+        \\    const p = gpa_.alloc(u8, 16) catch return;
+        \\    gpa_.free(p);
+        \\    gpa_.free(p);
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    var found = false;
+    for (problems.items) |p| {
+        if (std.mem.indexOf(u8, p.message, "double-free") != null) found = true;
+    }
+    try std.testing.expect(found);
+}
+
 test "heap_double_free: branch-specific double-free caught by join" {
     const gpa = std.testing.allocator;
     var problems = try analyze(gpa,

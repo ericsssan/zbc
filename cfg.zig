@@ -1338,12 +1338,15 @@ const Builder = struct {
             return self.classifyExpr(tree.nodeData(expr_node).node);
         }
 
-        // `lhs catch rhs` — success path uses lhs's value; error path
-        // uses rhs.  Without modeling forking yet, conservatively join
-        // by returning .unknown (caller must treat as opaque).  This
-        // beats classifying as either side and pretending the other
-        // doesn't exist.
-        if (tag == .@"catch") return .unknown;
+        // `lhs catch rhs` — the success-path value has the lhs's
+        // origin (e.g. `gpa.alloc(...) catch return &.{}` produces a
+        // heap allocation on success).  The error path is modeled
+        // separately via emitCatchFork at statement level; here we
+        // just unwrap to lhs so the origin propagates into the
+        // declaring local instead of collapsing to .unknown.
+        if (tag == .@"catch") {
+            return self.classifyExpr(tree.nodeData(expr_node).node_and_node[0]);
+        }
 
         // `ArenaAllocator.init(...)` → .arena_init
         // Source-text check, robust to nesting.
