@@ -48,6 +48,22 @@ pub fn main(init: std.process.Init) !void {
     var enabled_explicit = false;
     var format: Format = .text;
 
+    // Project-tunable patterns (default mirrors lib.DefaultConfig).
+    // Authors override via --ast-type / --ast-init / --arena-init /
+    // --arena-kill / --thread-join when their codebase uses different
+    // type names or constructor patterns.  Pattern lists are
+    // comma-separated.  Allocated slice-of-slice freed at exit.
+    var ast_type_name: []const u8 = lib.DefaultConfig.ast_type_name;
+    var ast_init_patterns: []const []const u8 = lib.DefaultConfig.ast_init_patterns;
+    var arena_init_patterns: []const []const u8 = lib.DefaultConfig.arena_init_patterns;
+    var arena_kill_patterns: []const []const u8 = lib.DefaultConfig.arena_kill_patterns;
+    var thread_join_patterns: []const []const u8 = lib.DefaultConfig.thread_join_patterns;
+    var pattern_allocations: std.ArrayListUnmanaged([]const []const u8) = .empty;
+    defer {
+        for (pattern_allocations.items) |slice| gpa.free(slice);
+        pattern_allocations.deinit(gpa);
+    }
+
     while (arg_it.next()) |a| {
         if (std.mem.eql(u8, a, "-h") or std.mem.eql(u8, a, "--help")) {
             printUsage();
@@ -79,6 +95,34 @@ pub fn main(init: std.process.Init) !void {
         }
         if (std.mem.startsWith(u8, a, "--disable=")) {
             try parseInvariantList(gpa, a["--disable=".len..], &enabled, .remove);
+            continue;
+        }
+        if (std.mem.startsWith(u8, a, "--ast-type=")) {
+            ast_type_name = a["--ast-type=".len..];
+            continue;
+        }
+        if (std.mem.startsWith(u8, a, "--ast-init=")) {
+            const slice = try splitCsv(gpa, a["--ast-init=".len..]);
+            try pattern_allocations.append(gpa, slice);
+            ast_init_patterns = slice;
+            continue;
+        }
+        if (std.mem.startsWith(u8, a, "--arena-init=")) {
+            const slice = try splitCsv(gpa, a["--arena-init=".len..]);
+            try pattern_allocations.append(gpa, slice);
+            arena_init_patterns = slice;
+            continue;
+        }
+        if (std.mem.startsWith(u8, a, "--arena-kill=")) {
+            const slice = try splitCsv(gpa, a["--arena-kill=".len..]);
+            try pattern_allocations.append(gpa, slice);
+            arena_kill_patterns = slice;
+            continue;
+        }
+        if (std.mem.startsWith(u8, a, "--thread-join=")) {
+            const slice = try splitCsv(gpa, a["--thread-join=".len..]);
+            try pattern_allocations.append(gpa, slice);
+            thread_join_patterns = slice;
             continue;
         }
         if (std.mem.startsWith(u8, a, "--format=")) {
@@ -125,7 +169,14 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(0);
     }
 
-    const config: lib.Config = .{ .enabled = enabled.items };
+    const config: lib.Config = .{
+        .ast_type_name = ast_type_name,
+        .ast_init_patterns = ast_init_patterns,
+        .arena_init_patterns = arena_init_patterns,
+        .arena_kill_patterns = arena_kill_patterns,
+        .thread_join_patterns = thread_join_patterns,
+        .enabled = enabled.items,
+    };
 
     var cache_storage: ?lib.Cache = if (mode == .escape) lib.Cache.init(gpa, io) else null;
     defer if (cache_storage) |*c| c.deinit();
@@ -159,6 +210,22 @@ pub fn main(init: std.process.Init) !void {
 
     if (format == .json) std.debug.print("{s}]\n", .{if (json_first) "" else "\n"});
     std.process.exit(if (any_problems) @as(u8, 1) else 0);
+}
+
+/// Split `csv` on commas, trim whitespace, drop empties.  Returns a
+/// gpa-owned slice-of-slices where each element points into `csv`
+/// (which lives for the process — argv strings are stable).  Caller
+/// frees only the outer slice; inner slices aren't separately allocated.
+fn splitCsv(gpa: std.mem.Allocator, csv: []const u8) ![]const []const u8 {
+    var out: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer out.deinit(gpa);
+    var it = std.mem.splitScalar(u8, csv, ',');
+    while (it.next()) |raw| {
+        const trimmed = std.mem.trim(u8, raw, " \t");
+        if (trimmed.len == 0) continue;
+        try out.append(gpa, trimmed);
+    }
+    return out.toOwnedSlice(gpa);
 }
 
 /// If `path` is a regular file, append (dupe'd) to `out`.
@@ -258,6 +325,18 @@ fn printUsage() void {
         \\  --format=text|json    Output format (default: text).
         \\  --list-invariants     Print known invariant names and exit.
         \\  -h, --help            Print this help.
+        \\
+        \\project-tunable patterns (defaults match the ez parser shape):
+        \\  --ast-type=NAME       Identifier name treated as the Ast type
+        \\                        (default: Ast).
+        \\  --ast-init=A,B,C      Source-text patterns that mint a fresh
+        \\                        Ast (default: Ast.parse).
+        \\  --arena-init=A,B      Patterns that mint a fresh arena
+        \\                        (default: ArenaAllocator.init).
+        \\  --arena-kill=A,B      Patterns that kill the receiver arena
+        \\                        (default: .deinit().
+        \\  --thread-join=A,B     Patterns that join a worker thread
+        \\                        (default: .join().
         \\
     , .{});
 }
@@ -380,6 +459,24 @@ test "parseInvariantList: remove from a set" {
     try std.testing.expectEqual(lib.all_invariants.len - 2, list.items.len);
     try std.testing.expect(!containsInvariant(list.items, .thread_arena));
     try std.testing.expect(!containsInvariant(list.items, .pass_identity));
+}
+
+test "splitCsv: basic comma-separated" {
+    const gpa = std.testing.allocator;
+    const out = try splitCsv(gpa, "a,b,c");
+    defer gpa.free(out);
+    try std.testing.expectEqual(@as(usize, 3), out.len);
+    try std.testing.expectEqualStrings("a", out[0]);
+    try std.testing.expectEqualStrings("c", out[2]);
+}
+
+test "splitCsv: trims whitespace, drops empties" {
+    const gpa = std.testing.allocator;
+    const out = try splitCsv(gpa, "  Foo.parse , , Bar.make ,");
+    defer gpa.free(out);
+    try std.testing.expectEqual(@as(usize, 2), out.len);
+    try std.testing.expectEqualStrings("Foo.parse", out[0]);
+    try std.testing.expectEqualStrings("Bar.make", out[1]);
 }
 
 test "jsonEscapeToBuf: passes ASCII through unchanged" {
