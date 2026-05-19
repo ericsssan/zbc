@@ -142,7 +142,6 @@ fn checkFileEscape(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !bool {
         problems.deinit(gpa);
     }
 
-    var fn_count: u32 = 0;
     var node_idx: u32 = 1;
     while (node_idx < tree.nodes.len) : (node_idx += 1) {
         const node: Ast.Node.Index = @enumFromInt(node_idx);
@@ -150,11 +149,10 @@ fn checkFileEscape(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !bool {
         var cfg = (try cfg_mod.lowerFunction(gpa, &tree, node, &db)) orelse continue;
         defer cfg.deinit(gpa);
         try analyzer_mod.check(gpa, &cfg, .{ .path = path }, &problems);
-        fn_count += 1;
     }
 
     if (problems.items.len == 0) {
-        std.debug.print("[ez-borrow-check --escape] {s}: {} fns analyzed, clean\n", .{ path, fn_count });
+        // Silent on clean — CI-friendly.
         return false;
     }
     for (problems.items) |p| {

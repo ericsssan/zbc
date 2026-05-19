@@ -253,7 +253,7 @@ const Expected = struct {
 };
 
 fn expectProblems(gpa: std.mem.Allocator, src: []const u8, expected: []const Expected) !void {
-    const src_z = try gpa.dupeZ(u8, src);
+    const src_z = try gpa.dupeSentinel(u8, src, 0);
     defer gpa.free(src_z);
 
     var tree = try Ast.parse(gpa, src_z, .zig);

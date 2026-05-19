@@ -137,7 +137,7 @@ const TestBundle = struct {
 };
 
 fn buildFromSrc(gpa: std.mem.Allocator, src: []const u8) !TestBundle {
-    const src_z = try gpa.dupeZ(u8, src);
+    const src_z = try gpa.dupeSentinel(u8, src, 0);
     errdefer gpa.free(src_z);
     var tree = try Ast.parse(gpa, src_z, .zig);
     errdefer tree.deinit(gpa);

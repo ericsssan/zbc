@@ -319,15 +319,11 @@ const Builder = struct {
             .call, .call_one, .call_comma, .call_one_comma => {
                 try self.lowerCallStmt(stmt_node, cur);
             },
-            .@"defer" => {
-                // `defer EXPR;` — data is .node = body.
+            .@"defer", .@"errdefer" => {
+                // Both share `.data = .{ .node = body }` in 0.17.
+                // (Earlier Zig versions had errdefer carry an optional
+                // capture token; that's gone now.)
                 const body = tree.nodeData(stmt_node).node;
-                try self.pushDefer(body);
-            },
-            .@"errdefer" => {
-                // `errdefer |x| EXPR;` — data is .opt_token_and_node;
-                // [0] = optional `|x|` capture token, [1] = body.
-                const body = tree.nodeData(stmt_node).opt_token_and_node[1];
                 try self.pushDefer(body);
             },
             // TODO(week-6): if/while/for/switch branching.
@@ -654,7 +650,7 @@ fn parseAndLower(gpa: std.mem.Allocator, src: []const u8) !struct {
     tree: Ast,
     cfg: ?Cfg,
 } {
-    const src_z = try gpa.dupeZ(u8, src);
+    const src_z = try gpa.dupeSentinel(u8, src, 0);
     defer gpa.free(src_z);
     var tree = try Ast.parse(gpa, src_z, .zig);
     errdefer tree.deinit(gpa);
