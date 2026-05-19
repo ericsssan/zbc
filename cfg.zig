@@ -1365,12 +1365,26 @@ fn blockStmts(
 
 // ── Tests ──────────────────────────────────────────────────
 
-fn parseAndLower(gpa: std.mem.Allocator, src: []const u8) !struct {
+/// Test bundle returned by `parseAndLower`.  Owns src_z so name
+/// slices in cfg.locals (which point into tree.source = src_z) stay
+/// valid for the bundle's lifetime.  Pre-phase-20 src_z was freed
+/// on parseAndLower's return, which dangled the names — tests that
+/// inspected names saw garbage.
+const TestBundle = struct {
+    src_z: [:0]u8,
     tree: Ast,
     cfg: ?Cfg,
-} {
+
+    fn deinit(self: *TestBundle, gpa: std.mem.Allocator) void {
+        if (self.cfg) |*c| c.deinit(gpa);
+        self.tree.deinit(gpa);
+        gpa.free(self.src_z);
+    }
+};
+
+fn parseAndLower(gpa: std.mem.Allocator, src: []const u8) !TestBundle {
     const src_z = try gpa.dupeSentinel(u8, src, 0);
-    defer gpa.free(src_z);
+    errdefer gpa.free(src_z);
     var tree = try Ast.parse(gpa, src_z, .zig);
     errdefer tree.deinit(gpa);
 
@@ -1380,10 +1394,10 @@ fn parseAndLower(gpa: std.mem.Allocator, src: []const u8) !struct {
         const node: Ast.Node.Index = @enumFromInt(node_idx);
         if (tree.nodeTag(node) == .fn_decl) {
             const cfg = try lowerFunction(gpa, &tree, node, null);
-            return .{ .tree = tree, .cfg = cfg };
+            return .{ .src_z = src_z, .tree = tree, .cfg = cfg };
         }
     }
-    return .{ .tree = tree, .cfg = null };
+    return .{ .src_z = src_z, .tree = tree, .cfg = null };
 }
 
 test "lower trivial fn — entry block + return" {
@@ -1394,9 +1408,8 @@ test "lower trivial fn — entry block + return" {
         \\}
         \\
     );
-    defer result.tree.deinit(gpa);
-    var cfg = result.cfg.?;
-    defer cfg.deinit(gpa);
+    defer result.deinit(gpa);
+    const cfg = result.cfg.?;
 
     try std.testing.expectEqual(@as(usize, 1), cfg.blocks.len);
     try std.testing.expectEqual(@as(usize, 1), cfg.blocks[0].stmts.len);
@@ -1414,9 +1427,8 @@ test "lower fn with var decl + arena init + deinit" {
         \\}
         \\
     );
-    defer result.tree.deinit(gpa);
-    var cfg = result.cfg.?;
-    defer cfg.deinit(gpa);
+    defer result.deinit(gpa);
+    const cfg = result.cfg.?;
 
     // One block, three statements: decl, arena_kill, ret.
     try std.testing.expectEqual(@as(usize, 1), cfg.blocks.len);
@@ -1443,9 +1455,8 @@ test "lower fn with return of borrowed identifier" {
         \\fn bar() u32 { return 0; }
         \\
     );
-    defer result.tree.deinit(gpa);
-    var cfg = result.cfg.?;
-    defer cfg.deinit(gpa);
+    defer result.deinit(gpa);
+    const cfg = result.cfg.?;
 
     const stmts = cfg.blocks[0].stmts;
     try std.testing.expectEqual(@as(usize, 2), stmts.len);
@@ -1466,9 +1477,8 @@ test "lower fn with thread join" {
         \\}
         \\
     );
-    defer result.tree.deinit(gpa);
-    var cfg = result.cfg.?;
-    defer cfg.deinit(gpa);
+    defer result.deinit(gpa);
+    const cfg = result.cfg.?;
 
     const stmts = cfg.blocks[0].stmts;
     try std.testing.expectEqual(@as(usize, 3), stmts.len);
@@ -1486,9 +1496,8 @@ test "if-statement creates fork: 3 blocks (entry, then, merge)" {
         \\}
         \\
     );
-    defer result.tree.deinit(gpa);
-    var cfg = result.cfg.?;
-    defer cfg.deinit(gpa);
+    defer result.deinit(gpa);
+    const cfg = result.cfg.?;
 
     // Entry, then-branch, merge.  No else (single-armed if).
     try std.testing.expect(cfg.blocks.len >= 3);
@@ -1505,9 +1514,8 @@ test "if-else creates fork: 4 blocks (entry, then, else, merge)" {
         \\}
         \\
     );
-    defer result.tree.deinit(gpa);
-    var cfg = result.cfg.?;
-    defer cfg.deinit(gpa);
+    defer result.deinit(gpa);
+    const cfg = result.cfg.?;
 
     try std.testing.expect(cfg.blocks.len >= 4);
     try std.testing.expectEqual(@as(usize, 2), cfg.blocks[0].successors.len);
@@ -1522,9 +1530,8 @@ test "for loop creates back-edge: body → header" {
         \\}
         \\
     );
-    defer result.tree.deinit(gpa);
-    var cfg = result.cfg.?;
-    defer cfg.deinit(gpa);
+    defer result.deinit(gpa);
+    const cfg = result.cfg.?;
     // entry, header, body, merge (minimum 4 blocks).
     try std.testing.expect(cfg.blocks.len >= 4);
 }
@@ -1541,9 +1548,8 @@ test "switch creates N-way fork (3 cases → 4+ blocks)" {
         \\}
         \\
     );
-    defer result.tree.deinit(gpa);
-    var cfg = result.cfg.?;
-    defer cfg.deinit(gpa);
+    defer result.deinit(gpa);
+    const cfg = result.cfg.?;
     // entry + 3 case-blocks + merge = 5 blocks min.
     try std.testing.expect(cfg.blocks.len >= 5);
     // entry has 3 successors (one per case).
@@ -1559,9 +1565,8 @@ test "while loop creates back-edge: body → header" {
         \\}
         \\
     );
-    defer result.tree.deinit(gpa);
-    var cfg = result.cfg.?;
-    defer cfg.deinit(gpa);
+    defer result.deinit(gpa);
+    const cfg = result.cfg.?;
 
     // header block has 2 successors (body, merge); body block has 1
     // successor (back to header).  At minimum we expect 4 blocks:
@@ -1588,9 +1593,8 @@ test "errdefer kill doesn't pollute success-return defer flush" {
         \\};
         \\
     );
-    defer result.tree.deinit(gpa);
-    var cfg = result.cfg.?;
-    defer cfg.deinit(gpa);
+    defer result.deinit(gpa);
+    const cfg = result.cfg.?;
 
     // Scan every block's stmts: no `.arena_kill` should appear before
     // the `.ret`.  (Without the defer/errdefer split, errdefer's kill
@@ -1627,9 +1631,8 @@ test "plain defer DOES fire on return — kill visible before ret stmt" {
         \\};
         \\
     );
-    defer result.tree.deinit(gpa);
-    var cfg = result.cfg.?;
-    defer cfg.deinit(gpa);
+    defer result.deinit(gpa);
+    const cfg = result.cfg.?;
 
     var saw_kill = false;
     for (cfg.blocks) |b| {
@@ -1659,9 +1662,8 @@ test "try at statement position creates error-exit sink with defers replayed" {
         \\pub fn sideEffect() !void {}
         \\
     );
-    defer result.tree.deinit(gpa);
-    var cfg = result.cfg.?;
-    defer cfg.deinit(gpa);
+    defer result.deinit(gpa);
+    const cfg = result.cfg.?;
 
     // After `try`, at least one block must have BOTH an arena_kill
     // (the defer'd deinit) AND a ret — that's the err_exit sink.
@@ -1691,9 +1693,8 @@ test "catch at statement position forks: success + catch body merge" {
         \\pub fn sideEffect() !void {}
         \\
     );
-    defer result.tree.deinit(gpa);
-    var cfg = result.cfg.?;
-    defer cfg.deinit(gpa);
+    defer result.deinit(gpa);
+    const cfg = result.cfg.?;
 
     try std.testing.expect(cfg.blocks.len >= 3);
 
@@ -1726,9 +1727,8 @@ test "catch body side effects visible at merge (kill in catch reaches downstream
         \\pub fn sideEffect() !void {}
         \\
     );
-    defer result.tree.deinit(gpa);
-    var cfg = result.cfg.?;
-    defer cfg.deinit(gpa);
+    defer result.deinit(gpa);
+    const cfg = result.cfg.?;
 
     // Find an arena_kill — should appear in a non-entry block (the
     // catch_block specifically, but we don't care which).
@@ -1762,9 +1762,8 @@ test "var-decl init `try foo()` adds error-exit sink with defer replayed" {
         \\pub fn sideEffect() !u32 { return 0; }
         \\
     );
-    defer result.tree.deinit(gpa);
-    var cfg = result.cfg.?;
-    defer cfg.deinit(gpa);
+    defer result.deinit(gpa);
+    const cfg = result.cfg.?;
 
     var found_err_sink = false;
     for (cfg.blocks) |b| {
@@ -1801,9 +1800,8 @@ test "var-decl init `foo() catch BODY` forks: catch body's kill visible downstre
         \\pub fn sideEffect() !u32 { return 0; }
         \\
     );
-    defer result.tree.deinit(gpa);
-    var cfg = result.cfg.?;
-    defer cfg.deinit(gpa);
+    defer result.deinit(gpa);
+    const cfg = result.cfg.?;
 
     var kill_in_non_entry = false;
     for (cfg.blocks, 0..) |b, i| {
@@ -1830,9 +1828,8 @@ test "return position `return try foo()` adds error-exit sink with defer replaye
         \\pub fn sideEffect() !u32 { return 0; }
         \\
     );
-    defer result.tree.deinit(gpa);
-    var cfg = result.cfg.?;
-    defer cfg.deinit(gpa);
+    defer result.deinit(gpa);
+    const cfg = result.cfg.?;
 
     // Two distinct blocks should each contain an arena_kill + ret:
     //   - the success-path return block (defer flushed inline)
@@ -1859,9 +1856,8 @@ test "return position `return foo() catch BODY` forks and merges into ret" {
         \\pub fn sideEffect() !u32 { return 0; }
         \\
     );
-    defer result.tree.deinit(gpa);
-    var cfg = result.cfg.?;
-    defer cfg.deinit(gpa);
+    defer result.deinit(gpa);
+    const cfg = result.cfg.?;
 
     // Catch fork: entry → catch_block + entry → merge; catch_block →
     // merge; merge contains the ret.  At least one block has ≥2
@@ -1892,9 +1888,8 @@ test "assign to known local emits .assign with classified rhs" {
         \\}
         \\
     );
-    defer result.tree.deinit(gpa);
-    var cfg = result.cfg.?;
-    defer cfg.deinit(gpa);
+    defer result.deinit(gpa);
+    const cfg = result.cfg.?;
 
     var found_assign_copy_of = false;
     for (cfg.blocks) |b| {
@@ -1925,9 +1920,8 @@ test "assign rhs `try foo()` emits err-exit sink alongside .assign" {
         \\pub fn sideEffect() !u32 { return 0; }
         \\
     );
-    defer result.tree.deinit(gpa);
-    var cfg = result.cfg.?;
-    defer cfg.deinit(gpa);
+    defer result.deinit(gpa);
+    const cfg = result.cfg.?;
 
     var found_err_sink = false;
     for (cfg.blocks) |b| {
@@ -1955,9 +1949,8 @@ test "assign to field (obj.x = src) falls back to lowering_gap" {
         \\const Obj = struct { x: u32 };
         \\
     );
-    defer result.tree.deinit(gpa);
-    var cfg = result.cfg.?;
-    defer cfg.deinit(gpa);
+    defer result.deinit(gpa);
+    const cfg = result.cfg.?;
 
     var found_gap = false;
     for (cfg.blocks) |b| {
@@ -1984,9 +1977,8 @@ test "break inside while adds edge from body to merge" {
         \\}
         \\
     );
-    defer result.tree.deinit(gpa);
-    var cfg = result.cfg.?;
-    defer cfg.deinit(gpa);
+    defer result.deinit(gpa);
+    const cfg = result.cfg.?;
 
     // The merge block exists.  Count how many blocks have an edge to
     // the merge block — pre-phase-13 it was 1 (header→merge only);
@@ -2028,9 +2020,8 @@ test "continue inside for adds back-edge from body-mid to header" {
         \\}
         \\
     );
-    defer result.tree.deinit(gpa);
-    var cfg = result.cfg.?;
-    defer cfg.deinit(gpa);
+    defer result.deinit(gpa);
+    const cfg = result.cfg.?;
 
     // Header should have ≥3 incoming edges now: entry, body back-edge,
     // continue back-edge.  Pre-phase-13 it was 2.
@@ -2055,9 +2046,8 @@ test "break outside loop emits gap (defensive — Zig wouldn't compile)" {
         \\}
         \\
     );
-    defer result.tree.deinit(gpa);
-    var cfg = result.cfg.?;
-    defer cfg.deinit(gpa);
+    defer result.deinit(gpa);
+    const cfg = result.cfg.?;
 
     var found = false;
     for (cfg.blocks) |b| {
@@ -2085,9 +2075,8 @@ test "labeled break: `break :outer` from inner loop targets outer's merge" {
         \\}
         \\
     );
-    defer result.tree.deinit(gpa);
-    var cfg = result.cfg.?;
-    defer cfg.deinit(gpa);
+    defer result.deinit(gpa);
+    const cfg = result.cfg.?;
 
     // Find the block reached by `break :outer` — it should be the
     // OUTER merge, which is downstream from outer header.  Heuristic:
@@ -2125,9 +2114,8 @@ test "labeled continue: `continue :outer` from inner loop targets outer's header
         \\}
         \\
     );
-    defer result.tree.deinit(gpa);
-    var cfg = result.cfg.?;
-    defer cfg.deinit(gpa);
+    defer result.deinit(gpa);
+    const cfg = result.cfg.?;
 
     // Outer header should now have ≥3 incoming: entry + inner-body
     // back-edge through outer body + labeled-continue back-edge.
@@ -2158,9 +2146,8 @@ test "labeled break to unknown label emits gap (not crash, no false match)" {
         \\}
         \\
     );
-    defer result.tree.deinit(gpa);
-    var cfg = result.cfg.?;
-    defer cfg.deinit(gpa);
+    defer result.deinit(gpa);
+    const cfg = result.cfg.?;
 
     var found = false;
     for (cfg.blocks) |b| {
@@ -2189,9 +2176,8 @@ test "for-loop capture registered: use of `item` resolves to a tracked local" {
         \\}
         \\
     );
-    defer result.tree.deinit(gpa);
-    var cfg = result.cfg.?;
-    defer cfg.deinit(gpa);
+    defer result.deinit(gpa);
+    const cfg = result.cfg.?;
 
     var saw_copy_of = false;
     for (cfg.blocks) |b| {
@@ -2219,9 +2205,8 @@ test "for-loop multiple captures `|item, idx|` both registered" {
         \\}
         \\
     );
-    defer result.tree.deinit(gpa);
-    var cfg = result.cfg.?;
-    defer cfg.deinit(gpa);
+    defer result.deinit(gpa);
+    const cfg = result.cfg.?;
 
     var copy_of_count: u32 = 0;
     for (cfg.blocks) |b| {
@@ -2244,9 +2229,8 @@ test "discard capture `|_|` is NOT registered as a local" {
         \\}
         \\
     );
-    defer result.tree.deinit(gpa);
-    var cfg = result.cfg.?;
-    defer cfg.deinit(gpa);
+    defer result.deinit(gpa);
+    const cfg = result.cfg.?;
 
     for (cfg.locals) |l| {
         try std.testing.expect(!std.mem.eql(u8, l.name, "_"));
@@ -2266,9 +2250,8 @@ test "while-with-payload `while (opt) |val|` registers capture" {
         \\}
         \\
     );
-    defer result.tree.deinit(gpa);
-    var cfg = result.cfg.?;
-    defer cfg.deinit(gpa);
+    defer result.deinit(gpa);
+    const cfg = result.cfg.?;
 
     var saw_copy_of = false;
     for (cfg.blocks) |b| {
@@ -2294,9 +2277,8 @@ test "if-optional payload `if (opt) |val|` registers capture" {
         \\}
         \\
     );
-    defer result.tree.deinit(gpa);
-    var cfg = result.cfg.?;
-    defer cfg.deinit(gpa);
+    defer result.deinit(gpa);
+    const cfg = result.cfg.?;
 
     var saw_copy_of = false;
     for (cfg.blocks) |b| {
@@ -2322,9 +2304,8 @@ test "if-error-union payload `else |err|` registers capture" {
         \\}
         \\
     );
-    defer result.tree.deinit(gpa);
-    var cfg = result.cfg.?;
-    defer cfg.deinit(gpa);
+    defer result.deinit(gpa);
+    const cfg = result.cfg.?;
 
     var saw_copy_of = false;
     for (cfg.blocks) |b| {
@@ -2352,9 +2333,8 @@ test "switch case payload `.tag => |val|` registers capture" {
         \\}
         \\
     );
-    defer result.tree.deinit(gpa);
-    var cfg = result.cfg.?;
-    defer cfg.deinit(gpa);
+    defer result.deinit(gpa);
+    const cfg = result.cfg.?;
 
     var copy_of_count: u32 = 0;
     for (cfg.blocks) |b| {
@@ -2379,9 +2359,8 @@ test "catch payload `catch |err|` registers capture (stmt position)" {
         \\pub fn sideEffect() !void {}
         \\
     );
-    defer result.tree.deinit(gpa);
-    var cfg = result.cfg.?;
-    defer cfg.deinit(gpa);
+    defer result.deinit(gpa);
+    const cfg = result.cfg.?;
 
     var saw_copy_of = false;
     for (cfg.blocks) |b| {
@@ -2410,9 +2389,8 @@ test "statement-position labeled block: `break :blk` resolves to block merge" {
         \\}
         \\
     );
-    defer result.tree.deinit(gpa);
-    var cfg = result.cfg.?;
-    defer cfg.deinit(gpa);
+    defer result.deinit(gpa);
+    const cfg = result.cfg.?;
 
     // The block merge should have ≥2 incoming edges: the break path
     // AND the natural fallthrough from end-of-body.  Pre-phase-17
@@ -2465,9 +2443,8 @@ test "labeled block inside loop: break :blk doesn't escape the loop" {
         \\}
         \\
     );
-    defer result.tree.deinit(gpa);
-    var cfg = result.cfg.?;
-    defer cfg.deinit(gpa);
+    defer result.deinit(gpa);
+    const cfg = result.cfg.?;
 
     // Confirm we built a non-trivial CFG and there's no leftover
     // labeled-break-no-loop gap.
@@ -2506,9 +2483,8 @@ test "expression-position labeled block: var-decl init `const x = blk: {...}` lo
         \\};
         \\
     );
-    defer result.tree.deinit(gpa);
-    var cfg = result.cfg.?;
-    defer cfg.deinit(gpa);
+    defer result.deinit(gpa);
+    const cfg = result.cfg.?;
 
     var saw_kill = false;
     for (cfg.blocks) |b| {
@@ -2535,9 +2511,8 @@ test "expression-position labeled block: return `return blk: {...}` lowers body"
         \\};
         \\
     );
-    defer result.tree.deinit(gpa);
-    var cfg = result.cfg.?;
-    defer cfg.deinit(gpa);
+    defer result.deinit(gpa);
+    const cfg = result.cfg.?;
 
     var saw_kill = false;
     for (cfg.blocks) |b| {
@@ -2562,9 +2537,8 @@ test "expression-position labeled block: `break :blk val` adds edge to merge" {
         \\}
         \\
     );
-    defer result.tree.deinit(gpa);
-    var cfg = result.cfg.?;
-    defer cfg.deinit(gpa);
+    defer result.deinit(gpa);
+    const cfg = result.cfg.?;
 
     var incoming = try gpa.alloc(u32, cfg.blocks.len);
     defer gpa.free(incoming);
@@ -2610,9 +2584,8 @@ test "expression-position labeled block: assign `x = blk: {...}` lowers body" {
         \\};
         \\
     );
-    defer result.tree.deinit(gpa);
-    var cfg = result.cfg.?;
-    defer cfg.deinit(gpa);
+    defer result.deinit(gpa);
+    const cfg = result.cfg.?;
 
     var saw_kill = false;
     for (cfg.blocks) |b| {
@@ -2634,15 +2607,19 @@ test "destructuring var-decl `const a, const b = pair()` registers both locals" 
         \\pub fn pair() struct { u32, u32 } { return .{ 0, 1 }; }
         \\
     );
-    defer result.tree.deinit(gpa);
-    var cfg = result.cfg.?;
-    defer cfg.deinit(gpa);
+    defer result.deinit(gpa);
+    const cfg = result.cfg.?;
 
-    // parseAndLower frees src_z before return, so local NAME slices
-    // dangle.  Check the structural invariant instead: both locals
-    // were registered (cfg.locals.len ≥ 2) AND each got its own
-    // .decl in the CFG.
-    try std.testing.expect(cfg.locals.len >= 2);
+    // TestBundle now owns src_z (phase 20 fix) — name slices stay
+    // valid until result.deinit, so we can assert on names directly.
+    var saw_a = false;
+    var saw_b = false;
+    for (cfg.locals) |l| {
+        if (std.mem.eql(u8, l.name, "a")) saw_a = true;
+        if (std.mem.eql(u8, l.name, "b")) saw_b = true;
+    }
+    try std.testing.expect(saw_a and saw_b);
+
     var decl_count: u32 = 0;
     for (cfg.blocks) |b| {
         for (b.stmts) |s| {
@@ -2650,6 +2627,29 @@ test "destructuring var-decl `const a, const b = pair()` registers both locals" 
         }
     }
     try std.testing.expect(decl_count >= 2);
+}
+
+test "name slices live for the test bundle's lifetime (phase 20 dangle fix)" {
+    // Regression guard for the parseAndLower → src_z dangle bug.
+    // Pre-phase-20, this assertion saw garbage UTF-8 because the
+    // helper freed src_z on return.  If TestBundle ever loses its
+    // src_z ownership, this will start printing `name=�...` again.
+    const gpa = std.testing.allocator;
+    var result = try parseAndLower(gpa,
+        \\pub fn foo() void {
+        \\    var unique_local_name_xyz: u32 = 0;
+        \\    _ = unique_local_name_xyz;
+        \\}
+        \\
+    );
+    defer result.deinit(gpa);
+    const cfg = result.cfg.?;
+
+    var found = false;
+    for (cfg.locals) |l| {
+        if (std.mem.eql(u8, l.name, "unique_local_name_xyz")) found = true;
+    }
+    try std.testing.expect(found);
 }
 
 test "destructuring assign `a, b = pair()` emits .assign for each target" {
@@ -2665,9 +2665,8 @@ test "destructuring assign `a, b = pair()` emits .assign for each target" {
         \\pub fn pair() struct { u32, u32 } { return .{ 0, 1 }; }
         \\
     );
-    defer result.tree.deinit(gpa);
-    var cfg = result.cfg.?;
-    defer cfg.deinit(gpa);
+    defer result.deinit(gpa);
+    const cfg = result.cfg.?;
 
     var assign_count: u32 = 0;
     for (cfg.blocks) |b| {
@@ -2710,9 +2709,8 @@ test "destructure rhs `try pair()` adds err-exit sink" {
         \\pub fn pair() !struct { u32, u32 } { return .{ 0, 1 }; }
         \\
     );
-    defer result.tree.deinit(gpa);
-    var cfg = result.cfg.?;
-    defer cfg.deinit(gpa);
+    defer result.deinit(gpa);
+    const cfg = result.cfg.?;
 
     var found_err_sink = false;
     for (cfg.blocks) |b| {
@@ -2740,9 +2738,8 @@ test "try unwraps inner expression: copy_of(src) preserved through try" {
         \\}
         \\
     );
-    defer result.tree.deinit(gpa);
-    var cfg = result.cfg.?;
-    defer cfg.deinit(gpa);
+    defer result.deinit(gpa);
+    const cfg = result.cfg.?;
 
     // Find the decl for `y` and assert its init_kind is .copy_of.
     var found_copy_of = false;
