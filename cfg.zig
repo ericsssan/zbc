@@ -215,10 +215,17 @@ const Builder = struct {
     /// name → LocalId for current scope.  v1 doesn't handle nested scopes;
     /// names are flat per-function.
     name_to_local: std.StringHashMapUnmanaged(LocalId) = .empty,
-    /// Stack of deferred statement source nodes, LIFO.  Pushed by
-    /// `lowerStmt` when it sees a `defer` / `errdefer`; popped + replayed
-    /// at every `return` site and at function exit.
-    deferred: std.ArrayListUnmanaged(Ast.Node.Index) = .empty,
+    /// Stack of `defer` bodies, LIFO.  Replayed at every `return` exit
+    /// (always fires) and at function-fallthrough.
+    deferred_normal: std.ArrayListUnmanaged(Ast.Node.Index) = .empty,
+    deferred_err: std.ArrayListUnmanaged(Ast.Node.Index) = .empty,
+    /// Stack of `errdefer` bodies, LIFO.  Replayed on error-exit paths
+    /// only (try/catch — phase 9+).  At a plain `return X` Zig only fires
+    /// these when X is an error value, but we can't always tell from
+    /// AST, so for now we conservatively SKIP errdefers at returns; this
+    /// trades one false-negative class (errdefer killing an arena before
+    /// an error return uses it) for elimination of the converse false-
+    /// positive class (errdefer kills polluting success returns).
     /// True iff the enclosing fn returns a borrowed-shape type.
     /// Threaded into `Stmt.ret.is_borrowed_return_type`.
     is_borrowed_return_type: bool = false,
@@ -231,7 +238,8 @@ const Builder = struct {
         self.blocks.deinit(self.gpa);
         self.locals.deinit(self.gpa);
         self.name_to_local.deinit(self.gpa);
-        self.deferred.deinit(self.gpa);
+        self.deferred_normal.deinit(self.gpa);
+        self.deferred_err.deinit(self.gpa);
     }
 
     fn newBlock(self: *Builder) !BlockId {
@@ -286,18 +294,23 @@ const Builder = struct {
     }
 
     fn pushDefer(self: *Builder, body_node: Ast.Node.Index) !void {
-        try self.deferred.append(self.gpa, body_node);
+        try self.deferred_normal.append(self.gpa, body_node);
     }
 
-    /// Replay all deferred statements (LIFO) into `cur`.  Doesn't pop —
-    /// returns happen mid-function and we want subsequent code to still
-    /// see the same defer set.  Called at function-exit (in lowerBlock)
-    /// and at every return (in lowerReturn).
+    fn pushErrdefer(self: *Builder, body_node: Ast.Node.Index) !void {
+        try self.deferred_err.append(self.gpa, body_node);
+    }
+
+    /// Replay `defer` bodies (LIFO) into `cur`.  Doesn't pop — returns
+    /// happen mid-function and subsequent code in the same lexical
+    /// scope must still see the same defer set.  Called at function-
+    /// fallthrough exit and at every `return`.  Does NOT replay
+    /// errdefers — see `deferred_err` doc-block for rationale.
     fn flushDefers(self: *Builder, cur: *BlockId) (std.mem.Allocator.Error)!void {
-        var i = self.deferred.items.len;
+        var i = self.deferred_normal.items.len;
         while (i > 0) {
             i -= 1;
-            try self.lowerStmt(self.deferred.items[i], cur);
+            try self.lowerStmt(self.deferred_normal.items[i], cur);
         }
     }
 
@@ -324,10 +337,15 @@ const Builder = struct {
             .call, .call_one, .call_comma, .call_one_comma => {
                 try self.lowerCallStmt(stmt_node, cur);
             },
-            .@"defer", .@"errdefer" => {
-                // Both share `.data = .{ .node = body }` in 0.17.
+            .@"defer" => {
                 const body = tree.nodeData(stmt_node).node;
                 try self.pushDefer(body);
+            },
+            .@"errdefer" => {
+                // `.data = .node` in 0.17 (capture token dropped — we
+                // already eat the `|e|` payload in a separate token).
+                const body = tree.nodeData(stmt_node).node;
+                try self.pushErrdefer(body);
             },
             .if_simple, .@"if" => try self.lowerIf(stmt_node, cur),
             .while_simple, .while_cont, .@"while" => try self.lowerWhile(stmt_node, cur),
@@ -615,6 +633,21 @@ const Builder = struct {
     fn classifyExpr(self: *Builder, expr_node: Ast.Node.Index) ExprKind {
         const tree = self.tree;
         const tag = tree.nodeTag(expr_node);
+
+        // `try expr` — unwrap and classify the inner expression.  The
+        // error-exit edge isn't modeled yet (phase 9); for success-path
+        // analysis the wrapped value has the same origin as the inner
+        // call's return.
+        if (tag == .@"try") {
+            return self.classifyExpr(tree.nodeData(expr_node).node);
+        }
+
+        // `lhs catch rhs` — success path uses lhs's value; error path
+        // uses rhs.  Without modeling forking yet, conservatively join
+        // by returning .unknown (caller must treat as opaque).  This
+        // beats classifying as either side and pretending the other
+        // doesn't exist.
+        if (tag == .@"catch") return .unknown;
 
         // `ArenaAllocator.init(...)` → .arena_init
         // Source-text check, robust to nesting.
@@ -1027,4 +1060,104 @@ test "while loop creates back-edge: body → header" {
     // successor (back to header).  At minimum we expect 4 blocks:
     // entry, header, body, merge.
     try std.testing.expect(cfg.blocks.len >= 4);
+}
+
+test "errdefer kill doesn't pollute success-return defer flush" {
+    // errdefer arena.deinit() must NOT fire on a plain `return` —
+    // otherwise the (returned-value) origin check would see arena
+    // already-killed and wrongly flag the return.
+    //
+    // NOTE: parseAndLower picks the FIRST fn_decl, so `foo` must lead.
+    const gpa = std.testing.allocator;
+    var result = try parseAndLower(gpa,
+        \\pub fn foo() void {
+        \\    var arena = Arena.init(0);
+        \\    errdefer arena.deinit();
+        \\    return;
+        \\}
+        \\const Arena = struct {
+        \\    pub fn init(_: u32) Arena { return .{}; }
+        \\    pub fn deinit(_: *Arena) void {}
+        \\};
+        \\
+    );
+    defer result.tree.deinit(gpa);
+    var cfg = result.cfg.?;
+    defer cfg.deinit(gpa);
+
+    // Scan every block's stmts: no `.arena_kill` should appear before
+    // the `.ret`.  (Without the defer/errdefer split, errdefer's kill
+    // would have been replayed at the return site.)
+    var saw_kill_before_ret = false;
+    var saw_ret = false;
+    for (cfg.blocks) |b| {
+        for (b.stmts) |s| {
+            switch (s.kind) {
+                .arena_kill => if (!saw_ret) {
+                    saw_kill_before_ret = true;
+                },
+                .ret => saw_ret = true,
+                else => {},
+            }
+        }
+    }
+    try std.testing.expect(!saw_kill_before_ret);
+}
+
+test "plain defer DOES fire on return — kill visible before ret stmt" {
+    // Symmetric to the errdefer test: a normal `defer` must still
+    // replay at every return so the analyzer sees its side effects.
+    const gpa = std.testing.allocator;
+    var result = try parseAndLower(gpa,
+        \\pub fn foo() void {
+        \\    var arena = Arena.init(0);
+        \\    defer arena.deinit();
+        \\    return;
+        \\}
+        \\const Arena = struct {
+        \\    pub fn init(_: u32) Arena { return .{}; }
+        \\    pub fn deinit(_: *Arena) void {}
+        \\};
+        \\
+    );
+    defer result.tree.deinit(gpa);
+    var cfg = result.cfg.?;
+    defer cfg.deinit(gpa);
+
+    var saw_kill = false;
+    for (cfg.blocks) |b| {
+        for (b.stmts) |s| {
+            if (s.kind == .arena_kill) saw_kill = true;
+        }
+    }
+    try std.testing.expect(saw_kill);
+}
+
+test "try unwraps inner expression: copy_of(src) preserved through try" {
+    // `const y = try src;` — y's origin should be copy_of(src), not
+    // .unknown.  Validates classifyExpr's .@\"try\" recursion.
+    // (Use a local — fn params aren't registered in name_to_local.)
+    const gpa = std.testing.allocator;
+    var result = try parseAndLower(gpa,
+        \\pub fn foo() anyerror!u32 {
+        \\    const src: anyerror!u32 = 1;
+        \\    const y = try src;
+        \\    return y;
+        \\}
+        \\
+    );
+    defer result.tree.deinit(gpa);
+    var cfg = result.cfg.?;
+    defer cfg.deinit(gpa);
+
+    // Find the decl for `y` and assert its init_kind is .copy_of.
+    var found_copy_of = false;
+    for (cfg.blocks) |b| {
+        for (b.stmts) |s| {
+            if (s.kind == .decl and s.kind.decl.init_kind == .copy_of) {
+                found_copy_of = true;
+            }
+        }
+    }
+    try std.testing.expect(found_copy_of);
 }
