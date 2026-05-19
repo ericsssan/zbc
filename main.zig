@@ -1,35 +1,17 @@
-//! ez-borrow-check — Layer 1 lint runner.
+//! ez-borrow-check CLI — thin shell over the lib.zig library API.
+//! Walks the .zig files passed on argv, runs the requested analysis
+//! mode, prints any Problems found in a grep-friendly format, and
+//! exits 0 if all-clean / 1 if any problems.
 //!
-//! Walks the .zig files passed on the CLI, runs the Layer-1 annotation-
-//! hygiene rules on each, prints problems in a grep-friendly format.
-//!
-//! Exits 0 if no problems, 1 if any rule reported.
+//! Modes:
+//!   default     Layer-1 annotation hygiene (require_* rules)
+//!   --escape    Layer-2 escape analysis with cross-file resolution
 //!
 //! Usage:
-//!   zig run tools/ez-borrow-check/main.zig -- src/parser/ast.zig src/linter/lint_context.zig
+//!   zig run main.zig -- [--escape] <file.zig>...
 
 const std = @import("std");
-const Ast = std.zig.Ast;
-
-const problem_mod = @import("problem.zig");
-const require_borrowed_from = @import("rules/require_borrowed_from.zig");
-const require_node_index_origin = @import("rules/require_node_index_origin.zig");
-const require_arena_kill_tag = @import("rules/require_arena_kill_tag.zig");
-
-// Layer 2 — pulled in via test entry so its tests run when we
-// `zig test main.zig`.  Not yet wired into the CLI default; invoke
-// via the `--escape` flag.
-const cfg_mod = @import("cfg.zig");
-const annotations_mod = @import("annotations.zig");
-const analyzer_mod = @import("analyzer.zig");
-const imports_mod = @import("imports.zig");
-const remote_resolver_mod = @import("remote_resolver.zig");
-const config_mod = @import("config.zig");
-// Pulled in via test entry below so refAllDecls sees them.
-const _layer2_abstract_state = @import("abstract_state.zig");
-const _layer2_transfer = @import("transfer.zig");
-
-const Problem = problem_mod.Problem;
+const lib = @import("lib.zig");
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
@@ -54,62 +36,36 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(2);
     }
 
-    // Sweep-wide remote-resolver cache: built once, used across every
-    // file checked.  A typical src/ sweep imports ast.zig from 30+
-    // sites — promoting the cache out of checkFileEscape avoids
-    // re-parsing it once per importer.  Only allocated when
-    // escape_mode is on (Layer-1 mode doesn't need it).
-    var rcache_storage: ?remote_resolver_mod.Cache = if (escape_mode)
-        remote_resolver_mod.Cache.init(gpa, io)
-    else
-        null;
-    defer if (rcache_storage) |*c| c.deinit();
+    // Sweep-wide remote-resolver cache, only needed in escape mode.
+    var cache_storage: ?lib.Cache = if (escape_mode) lib.Cache.init(gpa, io) else null;
+    defer if (cache_storage) |*c| c.deinit();
 
     var any_problems = false;
     for (paths.items) |path| {
-        const had = if (escape_mode)
-            try checkFileEscape(gpa, io, path, &rcache_storage.?)
+        const problems = if (escape_mode)
+            lib.analyzeEscape(gpa, io, path, &cache_storage.?, &lib.DefaultConfig) catch |err| {
+                std.debug.print("ez-borrow-check: cannot analyze {s}: {s}\n", .{ path, @errorName(err) });
+                any_problems = true;
+                continue;
+            }
         else
-            try checkFile(gpa, io, path);
-        any_problems = any_problems or had;
+            lib.analyzeHygiene(gpa, io, path) catch |err| {
+                std.debug.print("ez-borrow-check: cannot analyze {s}: {s}\n", .{ path, @errorName(err) });
+                any_problems = true;
+                continue;
+            };
+        defer lib.freeProblems(gpa, problems);
+
+        if (problems.len == 0) continue;
+        any_problems = true;
+        printProblems(path, problems);
     }
 
     std.process.exit(if (any_problems) @as(u8, 1) else 0);
 }
 
-fn checkFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !bool {
-    const src_bytes = std.Io.Dir.cwd().readFileAlloc(
-        io,
-        path,
-        gpa,
-        std.Io.Limit.limited(16 * 1024 * 1024),
-    ) catch |err| {
-        std.debug.print("ez-borrow-check: cannot read {s}: {s}\n", .{ path, @errorName(err) });
-        return true;
-    };
-    defer gpa.free(src_bytes);
-
-    // Ast.parse needs a null-terminated source.
-    const src = try gpa.allocSentinel(u8, src_bytes.len, 0);
-    defer gpa.free(src);
-    @memcpy(src[0..src_bytes.len], src_bytes);
-
-    var tree = try Ast.parse(gpa, src, .zig);
-    defer tree.deinit(gpa);
-
-    var problems: std.ArrayListUnmanaged(Problem) = .empty;
-    defer {
-        for (problems.items) |*p| p.deinit(gpa);
-        problems.deinit(gpa);
-    }
-
-    try require_borrowed_from.check(gpa, &tree, .{}, &problems);
-    try require_node_index_origin.check(gpa, &tree, .{}, &problems);
-    try require_arena_kill_tag.check(gpa, &tree, .{}, &problems);
-
-    if (problems.items.len == 0) return false;
-
-    for (problems.items) |p| {
+fn printProblems(path: []const u8, problems: []const lib.Problem) void {
+    for (problems) |p| {
         std.debug.print("{s}:{}:{}: {s}: {s} [{s}]\n", .{
             path,
             p.start.line,
@@ -123,98 +79,9 @@ fn checkFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !bool {
             p.rule_id,
         });
     }
-    return true;
-}
-
-/// Layer 2 entry point: parse file, build annotation DB, lower each
-/// function to a CFG, run escape analysis, print problems.
-fn checkFileEscape(
-    gpa: std.mem.Allocator,
-    io: std.Io,
-    path: []const u8,
-    rcache: *remote_resolver_mod.Cache,
-) !bool {
-    const src_bytes = std.Io.Dir.cwd().readFileAlloc(
-        io,
-        path,
-        gpa,
-        std.Io.Limit.limited(16 * 1024 * 1024),
-    ) catch |err| {
-        std.debug.print("ez-borrow-check: cannot read {s}: {s}\n", .{ path, @errorName(err) });
-        return true;
-    };
-    defer gpa.free(src_bytes);
-
-    const src = try gpa.allocSentinel(u8, src_bytes.len, 0);
-    defer gpa.free(src);
-    @memcpy(src[0..src_bytes.len], src_bytes);
-
-    var tree = try Ast.parse(gpa, src, .zig);
-    defer tree.deinit(gpa);
-
-    var db = try annotations_mod.build(gpa, &tree);
-    defer db.deinit(gpa);
-    var imap = try imports_mod.build(gpa, &tree);
-    defer imap.deinit(gpa);
-
-    // Remote-resolver cache is sweep-wide (phase 23) — passed in
-    // from main() so common imports parse once per CLI invocation.
-    const base_dir = std.fs.path.dirname(path) orelse ".";
-    const remote_ctx = cfg_mod.RemoteCtx{
-        .imap = &imap,
-        .base_dir = base_dir,
-        .cache = rcache,
-    };
-
-    var problems: std.ArrayListUnmanaged(Problem) = .empty;
-    defer {
-        for (problems.items) |*p| p.deinit(gpa);
-        problems.deinit(gpa);
-    }
-
-    var node_idx: u32 = 1;
-    while (node_idx < tree.nodes.len) : (node_idx += 1) {
-        const node: Ast.Node.Index = @enumFromInt(node_idx);
-        if (tree.nodeTag(node) != .fn_decl) continue;
-        var cfg = (try cfg_mod.lowerFunctionWithRemote(gpa, &tree, node, &db, &remote_ctx)) orelse continue;
-        defer cfg.deinit(gpa);
-        try analyzer_mod.check(gpa, &cfg, .{ .path = path }, &problems);
-    }
-
-    if (problems.items.len == 0) {
-        // Silent on clean — CI-friendly.
-        return false;
-    }
-    for (problems.items) |p| {
-        std.debug.print("{s}:{}:{}: {s}: {s} [{s}]\n", .{
-            path,
-            p.start.line,
-            p.start.column,
-            switch (p.severity) {
-                .@"error" => "error",
-                .warning => "warning",
-                .off => "off",
-            },
-            p.message,
-            p.rule_id,
-        });
-    }
-    return true;
 }
 
 test {
-    // refAllDecls doesn't recurse; explicitly pull in submodules so
-    // `zig test main.zig` runs every rule's + every layer's tests.
-    _ = require_borrowed_from;
-    _ = require_node_index_origin;
-    _ = require_arena_kill_tag;
-    _ = cfg_mod;
-    _ = annotations_mod;
-    _ = analyzer_mod;
-    _ = imports_mod;
-    _ = remote_resolver_mod;
-    _ = config_mod;
-    _ = _layer2_abstract_state;
-    _ = _layer2_transfer;
+    _ = lib;
     std.testing.refAllDecls(@This());
 }
