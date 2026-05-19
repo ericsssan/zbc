@@ -566,11 +566,17 @@ const Builder = struct {
         const inner = tree.nodeData(try_node).node;
         // Success path: side-effects of the wrapped expression.
         try self.lowerStmt(inner, cur);
+        // Error path: synthetic sink.
+        try self.emitTryErrorExit(cur.*, self.posOf(try_node));
+    }
 
-        // Error path: synthetic sink with errdefer + defer flushed,
-        // then a terminating ret.
+    /// Build the synthetic error-exit sink for an in-expression `try`.
+    /// Used by both `lowerTryStmt` and `lowerVarDecl` (when init is a
+    /// top-level `.@"try"`).  The sink is a new block reachable from
+    /// `from` with errdefer + defer replayed, terminated by a ret.
+    fn emitTryErrorExit(self: *Builder, from: BlockId, pos: SrcPos) !void {
         const err_exit = try self.newBlock();
-        try self.addEdge(cur.*, err_exit);
+        try self.addEdge(from, err_exit);
         var err_cur = err_exit;
         try self.flushErrAndNormalDefers(&err_cur);
         try self.appendStmt(err_cur, .{
@@ -578,7 +584,7 @@ const Builder = struct {
                 .value_kind = .unknown,
                 .is_borrowed_return_type = self.is_borrowed_return_type,
             } },
-            .pos = self.posOf(try_node),
+            .pos = pos,
         });
     }
 
@@ -589,12 +595,18 @@ const Builder = struct {
     fn lowerCatchStmt(self: *Builder, catch_node: Ast.Node.Index, cur: *BlockId) !void {
         const tree = self.tree;
         const data = tree.nodeData(catch_node).node_and_node;
-        const lhs = data[0];
-        const rhs = data[1];
-
         // Success path: lhs's side effects emit into cur.
-        try self.lowerStmt(lhs, cur);
+        try self.lowerStmt(data[0], cur);
+        try self.emitCatchFork(data[1], cur);
+    }
 
+    /// Append a catch-body fork to `cur`: one edge straight to merge
+    /// (success), one through a new block where `body_node` lowers
+    /// (catch body), then both join.  `cur` advances to merge.
+    /// Used by `lowerCatchStmt` and `lowerVarDecl` (when init is a
+    /// top-level `.@"catch"` — the body's side effects then become
+    /// visible at the post-decl merge point).
+    fn emitCatchFork(self: *Builder, body_node: Ast.Node.Index, cur: *BlockId) !void {
         const catch_block = try self.newBlock();
         const merge = try self.newBlock();
 
@@ -602,7 +614,7 @@ const Builder = struct {
         try self.addEdge(cur.*, merge);
 
         var catch_cur = catch_block;
-        try self.lowerStmt(rhs, &catch_cur);
+        try self.lowerStmt(body_node, &catch_cur);
         try self.addEdge(catch_cur, merge);
 
         cur.* = merge;
@@ -628,7 +640,8 @@ const Builder = struct {
         const name = tree.tokenSlice(name_tok);
         const local = try self.registerLocal(name, self.posOfToken(name_tok));
 
-        const init_kind: ExprKind = if (var_decl.ast.init_node.unwrap()) |init|
+        const init_opt = var_decl.ast.init_node.unwrap();
+        const init_kind: ExprKind = if (init_opt) |init|
             self.classifyExpr(init)
         else
             .plain;
@@ -637,6 +650,24 @@ const Builder = struct {
             .kind = .{ .decl = .{ .local = local, .init_kind = init_kind } },
             .pos = self.posOf(decl_node),
         });
+
+        // Init-position try/catch: now that the decl has emitted, model
+        // the same CFG side-effects we'd get if the init had appeared
+        // at statement position.  We don't walk arbitrarily-nested try
+        // inside larger expressions — only top-level forms.  These
+        // cover the common cases (`const x = try foo()`, `const x =
+        // foo() catch ...`); buried try inside arithmetic etc. is rare
+        // and unmodeled (yields a sink-less success-only path).
+        if (init_opt) |init| {
+            switch (tree.nodeTag(init)) {
+                .@"try" => try self.emitTryErrorExit(cur.*, self.posOf(init)),
+                .@"catch" => {
+                    const data = tree.nodeData(init).node_and_node;
+                    try self.emitCatchFork(data[1], cur);
+                },
+                else => {},
+            }
+        }
     }
 
     fn lowerAssign(self: *Builder, _: Ast.Node.Index, cur: *BlockId) !void {
@@ -1300,6 +1331,79 @@ test "catch body side effects visible at merge (kill in catch reaches downstream
 
     // Find an arena_kill — should appear in a non-entry block (the
     // catch_block specifically, but we don't care which).
+    var kill_in_non_entry = false;
+    for (cfg.blocks, 0..) |b, i| {
+        if (i == 0) continue;
+        for (b.stmts) |s| {
+            if (s.kind == .arena_kill) kill_in_non_entry = true;
+        }
+    }
+    try std.testing.expect(kill_in_non_entry);
+}
+
+test "var-decl init `try foo()` adds error-exit sink with defer replayed" {
+    // Same shape as the statement-position try test, but the `try`
+    // hides inside a var-decl init.  Pre-phase-10 the sink wasn't
+    // emitted in this position.
+    const gpa = std.testing.allocator;
+    var result = try parseAndLower(gpa,
+        \\pub fn foo() !void {
+        \\    var arena = Arena.init(0);
+        \\    defer arena.deinit();
+        \\    const x = try sideEffect();
+        \\    _ = x;
+        \\    return;
+        \\}
+        \\const Arena = struct {
+        \\    pub fn init(_: u32) Arena { return .{}; }
+        \\    pub fn deinit(_: *Arena) void {}
+        \\};
+        \\pub fn sideEffect() !u32 { return 0; }
+        \\
+    );
+    defer result.tree.deinit(gpa);
+    var cfg = result.cfg.?;
+    defer cfg.deinit(gpa);
+
+    var found_err_sink = false;
+    for (cfg.blocks) |b| {
+        var has_kill = false;
+        var has_ret = false;
+        for (b.stmts) |s| {
+            if (s.kind == .arena_kill) has_kill = true;
+            if (s.kind == .ret) has_ret = true;
+        }
+        if (has_kill and has_ret) found_err_sink = true;
+    }
+    try std.testing.expect(found_err_sink);
+}
+
+test "var-decl init `foo() catch BODY` forks: catch body's kill visible downstream" {
+    // `const x = foo() catch { arena.deinit(); 0 };` — the catch
+    // body's arena_kill must reach a non-entry block so the join at
+    // the post-decl merge sees the kill on one incoming edge.
+    const gpa = std.testing.allocator;
+    var result = try parseAndLower(gpa,
+        \\pub fn foo() void {
+        \\    var arena = Arena.init(0);
+        \\    const x = sideEffect() catch blk: {
+        \\        arena.deinit();
+        \\        break :blk 0;
+        \\    };
+        \\    _ = x;
+        \\    return;
+        \\}
+        \\const Arena = struct {
+        \\    pub fn init(_: u32) Arena { return .{}; }
+        \\    pub fn deinit(_: *Arena) void {}
+        \\};
+        \\pub fn sideEffect() !u32 { return 0; }
+        \\
+    );
+    defer result.tree.deinit(gpa);
+    var cfg = result.cfg.?;
+    defer cfg.deinit(gpa);
+
     var kill_in_non_entry = false;
     for (cfg.blocks, 0..) |b, i| {
         if (i == 0) continue;
