@@ -324,6 +324,20 @@ fn anyPatternMatches(text: []const u8, patterns: []const []const u8) bool {
 /// but `Ast.Node` would.  False positives are bounded — extra params
 /// tagged as Origin.ast inflate the AstId counter but don't cause
 /// false-positive invariant findings.
+/// True if the param's type mentions the ast_type_name OR any
+/// configured ast_holder_types.  Same logic as annotations.zig's
+/// inference, duplicated to keep cfg free of annotation dependencies.
+/// Used by seedParams to give holder-typed params Origin.ast so the
+/// flow-side checks fire on call sites inside fns that receive a
+/// wrapped Ast (e.g. *const LintContext).
+fn paramTypeCarriesAst(tree: *const Ast, type_node: Ast.Node.Index, config: *const Config) bool {
+    if (typeMentionsAst(tree, type_node, config.ast_type_name)) return true;
+    for (config.ast_holder_types) |holder| {
+        if (typeMentionsAst(tree, type_node, holder)) return true;
+    }
+    return false;
+}
+
 fn typeMentionsAst(tree: *const Ast, type_node: Ast.Node.Index, name: []const u8) bool {
     const first = tree.firstToken(type_node);
     const last = tree.lastToken(type_node);
@@ -461,7 +475,7 @@ const Builder = struct {
             const name = tree.tokenSlice(name_tok);
             if (std.mem.eql(u8, name, "_")) continue;
             const type_node = param.type_expr orelse continue;
-            if (!typeMentionsAst(tree, type_node, self.config.ast_type_name)) continue;
+            if (!paramTypeCarriesAst(tree, type_node, self.config)) continue;
 
             const local = try self.registerLocal(name, self.posOfToken(name_tok));
             try self.appendStmt(entry, .{
