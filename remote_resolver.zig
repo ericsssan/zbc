@@ -48,12 +48,25 @@ pub const RemoteFile = struct {
 pub const Cache = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
+    /// Mutex protecting `files`.  The map check + insert are short;
+    /// the slow part (file read + parse + DB build) runs OUTSIDE the
+    /// lock so concurrent loads of DIFFERENT paths parallelize.
+    /// Concurrent loads of the SAME path can race past the first
+    /// `get` and both parse — the second to finish discards its
+    /// duplicate via the re-check.  In practice this happens only at
+    /// sweep startup before any cache entries exist.
+    ///
+    /// std.Io.Mutex (rather than std.Thread.Mutex, which doesn't
+    /// exist on 0.17) — we already thread `io` through everywhere
+    /// and use lockUncancelable since the critical sections never
+    /// yield.
+    mutex: std.Io.Mutex,
     /// abs-path → loaded file.  Keys are gpa-owned (heap-duped from
     /// std.fs.path.resolve output); values are heap-allocated boxes.
     files: std.StringHashMapUnmanaged(*RemoteFile),
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io) Cache {
-        return .{ .gpa = gpa, .io = io, .files = .empty };
+        return .{ .gpa = gpa, .io = io, .mutex = .init, .files = .empty };
     }
 
     pub fn deinit(self: *Cache) void {
@@ -72,6 +85,12 @@ pub const Cache = struct {
     ///   - The path isn't a `.zig` file (std/builtin/package names).
     ///   - The file can't be opened or read.
     ///   - The file can't be parsed.
+    ///
+    /// Thread-safe: the mutex guards map check and insert; the parse
+    /// itself runs outside the lock so distinct files parse in
+    /// parallel.  Same-file concurrent loads at sweep startup may
+    /// duplicate the parse work; the second to finish discards the
+    /// dup via re-check.
     pub fn loadOrLookup(
         self: *Cache,
         base_dir: []const u8,
@@ -85,9 +104,14 @@ pub const Cache = struct {
         const abs = try std.fs.path.resolve(self.gpa, &.{ base_dir, import_path });
         errdefer self.gpa.free(abs);
 
-        if (self.files.get(abs)) |hit| {
-            self.gpa.free(abs);
-            return hit;
+        // Fast path: lock just long enough to check + return on hit.
+        {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            if (self.files.get(abs)) |hit| {
+                self.gpa.free(abs);
+                return hit;
+            }
         }
 
         const src_bytes = std.Io.Dir.cwd().readFileAlloc(
@@ -144,6 +168,17 @@ pub const Cache = struct {
             .imap = imap,
         };
 
+        // Re-check under lock: another worker may have inserted the
+        // same path while we were parsing.  If so, discard our
+        // duplicate and return the winner.
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (self.files.get(abs)) |hit| {
+            box.deinit(self.gpa);
+            self.gpa.destroy(box);
+            self.gpa.free(abs);
+            return hit;
+        }
         try self.files.put(self.gpa, abs, box);
         return box;
     }

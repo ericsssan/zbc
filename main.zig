@@ -178,11 +178,16 @@ pub fn main(init: std.process.Init) !void {
         .enabled = enabled.items,
     };
 
-    // Parallel fan-out: one Task per file.  Each task owns its
-    // ephemeral Cache (one extra reparse of common imports per
-    // worker vs the old single shared cache, but parallelism is the
-    // bigger win).  std.Io.Group dispatches to worker threads via
-    // the Io.Threaded impl created in initIo().
+    // Sweep-wide remote-resolver cache, shared across all workers.
+    // Thread-safe (mutex + double-checked locking inside Cache); the
+    // slow parse work runs OUTSIDE the lock so distinct files still
+    // parallelize.  Cuts redundant reparses of common imports
+    // (e.g. ast.zig imported from 30+ src/ files = parsed once
+    // total instead of once per worker that touches it).
+    var shared_cache: ?lib.Cache = if (mode == .escape) lib.Cache.init(gpa, io) else null;
+    defer if (shared_cache) |*c| c.deinit();
+
+    // Parallel fan-out: one Task per file, sharing the cache.
     const tasks = try gpa.alloc(Task, expanded.items.len);
     defer gpa.free(tasks);
     for (expanded.items, tasks) |path, *t| {
@@ -192,6 +197,7 @@ pub fn main(init: std.process.Init) !void {
             .path = path,
             .mode = mode,
             .config = &config,
+            .cache = if (shared_cache) |*c| c else null,
             .problems = &.{},
             .err = null,
         };
@@ -383,6 +389,9 @@ const Task = struct {
     path: []const u8,
     mode: Mode,
     config: *const lib.Config,
+    /// Sweep-wide shared cache (null in hygiene mode where remote
+    /// resolution isn't needed).  Thread-safe via internal mutex.
+    cache: ?*lib.Cache,
     /// Outputs.  Owned by the task; collated after Group.await.
     problems: []lib.Problem,
     err: ?anyerror,
@@ -401,14 +410,11 @@ fn indexedProblemLess(_: void, a: IndexedProblem, b: IndexedProblem) bool {
     return a.problem.start.column < b.problem.start.column;
 }
 
-/// Worker body — analyzes one file with its own ephemeral Cache.
+/// Worker body — analyzes one file against the sweep-wide Cache.
 /// Errors stashed on the task so a bad file doesn't abort the sweep.
 fn runOne(t: *Task) std.Io.Cancelable!void {
-    var cache_storage: ?lib.Cache = if (t.mode == .escape) lib.Cache.init(t.gpa, t.io) else null;
-    defer if (cache_storage) |*c| c.deinit();
-
     const problems = if (t.mode == .escape)
-        lib.analyzeEscape(t.gpa, t.io, t.path, &cache_storage.?, t.config) catch |err| {
+        lib.analyzeEscape(t.gpa, t.io, t.path, t.cache.?, t.config) catch |err| {
             t.err = err;
             return;
         }
