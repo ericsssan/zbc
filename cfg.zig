@@ -1205,37 +1205,32 @@ const Builder = struct {
         });
     }
 
-    /// If the callee is a same-file fn carrying `@takes node_index_of(X)`,
-    /// emit one `.ast_takes_check` stmt per arg whose token-position
-    /// resolves to a registered local — the transfer rule will check
-    /// each one's `.ast_node` tag against the source param's `.ast`.
-    /// No-op when there's no db, no annotation, or the call shape
-    /// doesn't fit (e.g. non-identifier callee, receiver isn't a known
-    /// local).  Conservative: arg locals that don't resolve to bare
-    /// identifiers are skipped — we'd produce a false positive
-    /// otherwise.
+    /// If the callee carries `@takes node_index_of(X)` (same-file OR
+    /// cross-file via @import), emit one `.ast_takes_check` stmt per
+    /// arg whose token-position resolves to a registered local — the
+    /// transfer rule will check each one's `.ast_node` tag against
+    /// the source param's `.ast`.  Conservative: arg locals that
+    /// don't resolve to bare identifiers are skipped.
     fn emitTakesChecksForCall(
         self: *Builder,
         call_node: Ast.Node.Index,
         cur: *BlockId,
     ) !void {
         const tree = self.tree;
-        const db = self.db orelse return;
 
         var buf: [1]Ast.Node.Index = undefined;
         const call_full = tree.fullCall(&buf, call_node) orelse return;
         const callee_node = call_full.ast.fn_expr;
         const args = call_full.ast.params;
 
-        const callee_name = switch (tree.nodeTag(callee_node)) {
-            .identifier => tree.tokenSlice(tree.nodeMainToken(callee_node)),
-            .field_access => tree.tokenSlice(tree.nodeData(callee_node).node_and_token[1]),
-            else => return,
-        };
-        const entry = db.lookup(callee_name) orelse return;
-        const takes = entry.takes orelse return;
+        // For `imported.method(...)` the receiver is a namespace, not
+        // a value arg — so the takes annotation's param indices count
+        // from args[0] (no receiver shift).  For `obj.method(...)` the
+        // receiver IS arg[0] and indices shift by one.
+        const is_namespace_call = self.isImportNamespaceCall(callee_node);
+        const recv_is_arg0 = (tree.nodeTag(callee_node) == .field_access) and !is_namespace_call;
 
-        const recv_is_arg0 = tree.nodeTag(callee_node) == .field_access;
+        const takes = self.lookupTakes(callee_node) orelse return;
 
         // Resolve the source-Ast arg: the parameter referenced by
         // node_index_of(X).  For method calls, arg 0 is the receiver.
@@ -1290,6 +1285,74 @@ const Builder = struct {
         if (tree.nodeTag(node) != .identifier) return null;
         const name = tree.tokenSlice(tree.nodeMainToken(node));
         return self.name_to_local.get(name);
+    }
+
+    /// Is this call's receiver a bare identifier matching an entry
+    /// in the imports map?  Used to differentiate `imported.foo(...)`
+    /// (namespace call — receiver is NOT arg 0) from `obj.method(...)`
+    /// (method call — receiver IS arg 0).
+    fn isImportNamespaceCall(self: *Builder, callee_node: Ast.Node.Index) bool {
+        const tree = self.tree;
+        if (tree.nodeTag(callee_node) != .field_access) return false;
+        const recv_node = tree.nodeData(callee_node).node_and_token[0];
+        if (tree.nodeTag(recv_node) != .identifier) return false;
+        const remote = self.remote orelse return false;
+        const recv_name = tree.tokenSlice(tree.nodeMainToken(recv_node));
+        return remote.imap.lookup(recv_name) != null;
+    }
+
+    /// Resolve callee's `@takes` annotation.  Same-file db first, then
+    /// cross-file via remote resolver for `imported.method(...)` shapes.
+    /// Returns null on any miss.
+    fn lookupTakes(
+        self: *Builder,
+        callee_node: Ast.Node.Index,
+    ) ?annotations.TakesAnnotation {
+        const tree = self.tree;
+        switch (tree.nodeTag(callee_node)) {
+            .field_access => {
+                const fa = tree.nodeData(callee_node);
+                const recv_node = fa.node_and_token[0];
+                const method_tok = fa.node_and_token[1];
+                const method_name = tree.tokenSlice(method_tok);
+
+                // Same-file first.
+                if (self.db) |db| {
+                    if (db.lookup(method_name)) |e| if (e.takes) |t| return t;
+                }
+                // Cross-file via remote (only when receiver is an
+                // import namespace identifier).
+                return self.lookupRemoteTakes(recv_node, method_name);
+            },
+            .identifier => {
+                const name = tree.tokenSlice(tree.nodeMainToken(callee_node));
+                if (self.db) |db| {
+                    if (db.lookup(name)) |e| if (e.takes) |t| return t;
+                }
+                return null;
+            },
+            else => return null,
+        }
+    }
+
+    /// Cross-file `@takes` lookup.  Mirrors lookupRemoteMethod's
+    /// shape — receiver must be an import-namespace identifier;
+    /// resolve via cache, look up method in remote DB, return
+    /// takes annotation if present.
+    fn lookupRemoteTakes(
+        self: *Builder,
+        recv_node: Ast.Node.Index,
+        method_name: []const u8,
+    ) ?annotations.TakesAnnotation {
+        const tree = self.tree;
+        const remote = self.remote orelse return null;
+        if (tree.nodeTag(recv_node) != .identifier) return null;
+        const recv_name = tree.tokenSlice(tree.nodeMainToken(recv_node));
+        const import_entry = remote.imap.lookup(recv_name) orelse return null;
+        const remote_file = (remote.cache.loadOrLookup(remote.base_dir, import_entry.path)
+            catch null) orelse return null;
+        const entry = remote_file.db.lookup(method_name) orelse return null;
+        return entry.takes;
     }
 
     /// Walk through `try` wrappers to the underlying call node, or

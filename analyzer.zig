@@ -14,6 +14,8 @@ const state_mod = @import("abstract_state.zig");
 const transfer = @import("transfer.zig");
 const problem_mod = @import("problem.zig");
 const annotations = @import("annotations.zig");
+const imports_mod = @import("imports.zig");
+const remote_resolver_mod = @import("remote_resolver.zig");
 
 const Cfg = cfg_mod.Cfg;
 const BlockId = cfg_mod.BlockId;
@@ -397,6 +399,110 @@ test "invariant #1: matching Ast on both args — no false positive" {
     for (problems.items) |p| {
         try std.testing.expect(std.mem.indexOf(u8, p.message, "invariant #1") == null);
     }
+}
+
+/// Cross-file test helper: writes `main_src` and `import_src` to a
+/// fresh tmp dir as foo.zig and lib.zig respectively, then runs
+/// the full Layer-2 pipeline against foo.zig with cross-file
+/// resolution enabled.  Returns the collected problems (caller frees).
+fn analyzeCrossFile(
+    gpa: std.mem.Allocator,
+    main_src: []const u8,
+    import_src: []const u8,
+) !std.ArrayListUnmanaged(Problem) {
+    const tio = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(tio, .{ .sub_path = "lib.zig", .data = import_src });
+    try tmp.dir.writeFile(tio, .{ .sub_path = "foo.zig", .data = main_src });
+
+    // tmp.dir is std.Io.Dir which doesn't expose realpathAlloc.
+    // std.fs realpath APIs are also in flux on 0.17.  Sidestep:
+    // use the relative path; resolver + readFileAlloc handle relatives
+    // fine since cwd doesn't change during the test.
+    const base_dir = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer gpa.free(base_dir);
+    const foo_path = try std.fs.path.join(gpa, &.{ base_dir, "foo.zig" });
+    defer gpa.free(foo_path);
+
+    // Pipeline: read foo.zig, parse, build local DB + imports map,
+    // set up sweep-wide cache, lower each fn with remote context,
+    // run check on each CFG.
+    const src_bytes = try std.Io.Dir.cwd().readFileAlloc(
+        tio,
+        foo_path,
+        gpa,
+        std.Io.Limit.limited(1 * 1024 * 1024),
+    );
+    defer gpa.free(src_bytes);
+    const src_z = try gpa.dupeSentinel(u8, src_bytes, 0);
+    defer gpa.free(src_z);
+    var tree = try std.zig.Ast.parse(gpa, src_z, .zig);
+    defer tree.deinit(gpa);
+
+    var db = try annotations.build(gpa, &tree);
+    defer db.deinit(gpa);
+    var imap = try imports_mod.build(gpa, &tree);
+    defer imap.deinit(gpa);
+
+    var rcache = remote_resolver_mod.Cache.init(gpa, tio);
+    defer rcache.deinit();
+
+    const remote_ctx = cfg_mod.RemoteCtx{
+        .imap = &imap,
+        .base_dir = base_dir,
+        .cache = &rcache,
+    };
+
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    var node_idx: u32 = 1;
+    while (node_idx < tree.nodes.len) : (node_idx += 1) {
+        const node: std.zig.Ast.Node.Index = @enumFromInt(node_idx);
+        if (tree.nodeTag(node) != .fn_decl) continue;
+        var cfg = (try cfg_mod.lowerFunctionWithRemote(gpa, &tree, node, &db, &remote_ctx)) orelse continue;
+        defer cfg.deinit(gpa);
+        try check(gpa, &cfg, .{ .path = foo_path }, &problems);
+    }
+    return problems;
+}
+
+test "invariant #1 fires through CROSS-FILE @takes lookup (phase 28)" {
+    // foo.zig defines tree_a + tree_b and calls lib.inspect(tree_b, node)
+    // where node came from rootNode(tree_a).  inspect's @takes
+    // annotation lives in lib.zig — must be resolved via the remote
+    // cache for the check to fire.
+    const gpa = std.testing.allocator;
+    var problems = try analyzeCrossFile(gpa,
+        // foo.zig
+        \\const lib = @import("lib.zig");
+        \\const Ast = lib.Ast;
+        \\const NodeIndex = lib.NodeIndex;
+        \\pub fn foo() !void {
+        \\    var tree_a = try Ast.parse();
+        \\    var tree_b = try Ast.parse();
+        \\    const node = lib.rootNode(tree_a);
+        \\    lib.inspect(tree_b, node);
+        \\    return;
+        \\}
+        \\
+        ,
+        // lib.zig
+        \\pub const Ast = struct { pub fn parse() !Ast { return .{}; } };
+        \\pub const NodeIndex = u32;
+        \\/// @returns node_index_of(ast)
+        \\pub fn rootNode(ast: Ast) NodeIndex { _ = ast; return 0; }
+        \\/// @takes node_index_of(t)
+        \\pub fn inspect(t: Ast, n: NodeIndex) void { _ = t; _ = n; }
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+
+    var found = false;
+    for (problems.items) |p| {
+        if (std.mem.indexOf(u8, p.message, "invariant #1") != null) found = true;
+    }
+    try std.testing.expect(found);
 }
 
 test "invariant #1 fires at var-decl init position (phase 27)" {
