@@ -271,18 +271,16 @@ fn inferAnnotations(
 
     var inferred: Inferred = .{ .returns = null, .takes = null, .mutates_ast = null };
 
-    // R5: receiver is `*<ast_type>` (NOT *const) AND body actually
-    // mutates through it → @mutates_ast.  Body scan filters out
-    // *Ast params that exist only for ABI shape but aren't written.
-    if (ast_param_count == 1 and
-        !ast_param_is_const and
-        ast_param_name != null and
-        body_node != null and
-        typeIsPointerTo(tree, paramTypeNode(fn_proto, tree, ast_param_idx), config.ast_type_name))
-    {
-        if (bodyMutatesReceiver(tree, body_node.?, ast_param_name.?)) {
-            inferred.mutates_ast = .implicit;
-        }
+    // R5: body-scan inference for @mutates_ast.
+    //
+    // Single-Ast-param case → .implicit (when *Ast & body mutates).
+    // Multi-Ast-param case  → .of(idx) (when EXACTLY ONE param is
+    //                        mutated in the body).  Lets fns like
+    //                        `linkChild(parent: *Ast, child: *Ast)`
+    //                        get the right precision without an
+    //                        explicit annotation.
+    if (body_node) |body| {
+        inferred.mutates_ast = inferMutatesAstFromBody(tree, fn_proto, body, config);
     }
 
     // R3: returns Ast (or !Ast etc.) → @returns ast.
@@ -329,6 +327,44 @@ fn typeIsSliceShaped(tree: *const Ast, type_node: Ast.Node.Index) bool {
         if (tags[t] == .l_bracket) return true;
     }
     return false;
+}
+
+/// R5 driver — walks every Ast-typed *Ast param, asks whether the
+/// body mutates through it, returns the appropriate MutatesAstAnnotation:
+///   - no mutation in any param      → null
+///   - exactly one param mutated     → .implicit if that's the only
+///                                     Ast param; .of(idx) otherwise
+///                                     (multi-param disambiguation)
+///   - multiple params mutated       → null (ambiguous, author must
+///                                     annotate)
+fn inferMutatesAstFromBody(
+    tree: *const Ast,
+    fn_proto: Ast.full.FnProto,
+    body: Ast.Node.Index,
+    config: *const config_mod.Config,
+) ?MutatesAstAnnotation {
+    var mutated_count: u32 = 0;
+    var mutated_idx: u32 = 0;
+    var total_ast_params: u32 = 0;
+    var idx: u32 = 0;
+    var it = fn_proto.iterate(tree);
+    while (it.next()) |param| : (idx += 1) {
+        const type_node = param.type_expr orelse continue;
+        if (!typeMentionsIdentifier(tree, type_node, config.ast_type_name)) continue;
+        total_ast_params += 1;
+        // Filter: only mutable pointers can mutate the caller's Ast.
+        if (!typeIsPointerTo(tree, type_node, config.ast_type_name)) continue;
+        if (typeMentionsKeyword(tree, type_node, .keyword_const)) continue;
+        const name_tok = param.name_token orelse continue;
+        const name = tree.tokenSlice(name_tok);
+        if (bodyMutatesReceiver(tree, body, name)) {
+            mutated_count += 1;
+            mutated_idx = idx;
+        }
+    }
+    if (mutated_count == 0) return null;
+    if (mutated_count > 1) return null; // ambiguous
+    return if (total_ast_params == 1) .implicit else .{ .of = mutated_idx };
 }
 
 /// Look up the type-expression node of the param at `param_idx`
@@ -907,6 +943,43 @@ test "inference R5: *Ast receiver but body only reads — NOT inferred" {
     defer r.deinit(gpa);
 
     const entry = r.db.lookup("readTag") orelse return;
+    try std.testing.expect(entry.mutates_ast == null);
+}
+
+test "inference R5: multi-Ast-param disambiguates → @mutates_ast(<param>)" {
+    // Two *Ast params; only `parent` is written.  Inference picks
+    // the right one and emits .of(0).
+    const gpa = std.testing.allocator;
+    var r = try buildFromSrc(gpa,
+        \\const Ast = struct { children: u32 = 0 };
+        \\pub fn linkChild(parent: *Ast, child: *Ast) void {
+        \\    _ = child;
+        \\    parent.children = 1;
+        \\}
+        \\
+    );
+    defer r.deinit(gpa);
+
+    const entry = r.db.lookup("linkChild").?;
+    try std.testing.expect(entry.mutates_ast.? == .of);
+    try std.testing.expectEqual(@as(u32, 0), entry.mutates_ast.?.of);
+}
+
+test "inference R5: multi-Ast-param both mutated → ambiguous, not inferred" {
+    // Both params written → can't disambiguate.  Author must
+    // annotate explicitly.
+    const gpa = std.testing.allocator;
+    var r = try buildFromSrc(gpa,
+        \\const Ast = struct { x: u32 = 0 };
+        \\pub fn swapBoth(a: *Ast, b: *Ast) void {
+        \\    a.x = 1;
+        \\    b.x = 2;
+        \\}
+        \\
+    );
+    defer r.deinit(gpa);
+
+    const entry = r.db.lookup("swapBoth") orelse return;
     try std.testing.expect(entry.mutates_ast == null);
 }
 
