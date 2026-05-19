@@ -654,6 +654,12 @@ const Builder = struct {
             return;
         };
 
+        // Walk the loop condition for .use/.assign side effects
+        // before any branching.  Skip rules in emitUsesInExpr now
+        // tolerate `arr.len` / `arr[..]` so this no longer drowns in
+        // false positives.
+        try self.emitUsesInExpr(while_data.ast.cond_expr, cur.*, null);
+
         const header = try self.newBlock();
         const body = try self.newBlock();
         const merge = try self.newBlock();
@@ -714,6 +720,11 @@ const Builder = struct {
             return;
         };
 
+        // Walk every input expression before any branching.
+        for (for_data.ast.inputs) |input| {
+            try self.emitUsesInExpr(input, cur.*, null);
+        }
+
         const header = try self.newBlock();
         const body = try self.newBlock();
         const merge = try self.newBlock();
@@ -763,6 +774,9 @@ const Builder = struct {
             });
             return;
         };
+
+        // Walk the discriminant expression before any case branch.
+        try self.emitUsesInExpr(sw.ast.condition, cur.*, null);
 
         const merge = try self.newBlock();
 
