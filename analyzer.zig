@@ -658,6 +658,62 @@ test "invariant #1 fires through @import().Subfield re-export (phase 31)" {
     try std.testing.expect(found);
 }
 
+test "invariant #1 fires through 2-hop subfield chain (phase 41)" {
+    // foo.zig:
+    //   const lib   = @import("lib.zig");
+    //   const Inner = lib.Inner;          ← 1-hop alias
+    //   const Foo   = Inner.Foo;          ← 2-hop alias of alias
+    //   ... Foo.inspect(...)              ← uses 2-hop alias
+    // lib.zig:   pub const Inner = @import("inner.zig");
+    // inner.zig: pub const Foo   = @import("foo_mod.zig");
+    // foo_mod.zig: has the annotated `inspect` fn.
+    // Resolver must chase both subfield hops in Foo's entry.
+    const gpa = std.testing.allocator;
+    var problems = try analyzeCrossFileMulti(gpa,
+        // foo.zig (main)
+        \\const lib = @import("lib.zig");
+        \\const Inner = lib.Inner;
+        \\const Foo = Inner.Foo;
+        \\const Ast = Foo.Ast;
+        \\const NodeIndex = Foo.NodeIndex;
+        \\pub fn foo() !void {
+        \\    var tree_a = try Ast.parse();
+        \\    var tree_b = try Ast.parse();
+        \\    const node = Foo.rootNode(tree_a);
+        \\    Foo.inspect(tree_b, node);
+        \\    return;
+        \\}
+        \\
+        ,
+        &.{
+            .{ .name = "lib.zig", .src =
+                \\pub const Inner = @import("inner.zig");
+                \\
+            },
+            .{ .name = "inner.zig", .src =
+                \\pub const Foo = @import("foo_mod.zig");
+                \\
+            },
+            .{ .name = "foo_mod.zig", .src =
+                \\pub const Ast = struct { pub fn parse() !Ast { return .{}; } };
+                \\pub const NodeIndex = u32;
+                \\/// @returns node_index_of(ast)
+                \\pub fn rootNode(ast: Ast) NodeIndex { _ = ast; return 0; }
+                \\/// @takes node_index_of(t)
+                \\pub fn inspect(t: Ast, n: NodeIndex) void { _ = t; _ = n; }
+                \\
+            },
+        },
+    );
+    defer freeProblems(gpa, &problems);
+
+    var found = false;
+    for (problems.items) |p| {
+        if (std.mem.indexOf(u8, p.message, "invariant #1") != null) found = true;
+    }
+    try std.testing.expect(found);
+}
+
 test "invariant #1 fires through local-alias-of-import (phase 32)" {
     // foo.zig has:
     //   const lib = @import("lib.zig");

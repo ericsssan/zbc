@@ -29,6 +29,14 @@ pub const Entry = struct {
     /// at resolve time, after loading `path`, look up `subfield` in
     /// that file's own imap to chase one more level.
     subfield: ?[]const u8 = null,
+    /// Second-level subfield for 2-hop chains (phase 41).  E.g.:
+    ///   const A   = @import("a.zig");
+    ///   const B   = A.Sub;            ← B.subfield = "Sub"
+    ///   const Inner = B.Other;        ← Inner.subfield = "Sub", subfield2 = "Other"
+    /// At resolve time: load A's path, look up "Sub" in A's imap to
+    /// get B's actual file, then look up "Other" in B's imap.
+    /// Deeper chains (3+) still skip — practical cases stop at 2.
+    subfield2: ?[]const u8 = null,
 };
 
 pub const Map = struct {
@@ -97,15 +105,24 @@ pub fn build(gpa: std.mem.Allocator, tree: *const Ast) !Map {
 
         const hit = extractIdentFieldAccess(tree, init_node) orelse continue;
         const lhs_entry = m.entries.get(hit.lhs_name) orelse continue;
-        // Only inherit when the lhs is itself a bare import (no
-        // subfield).  Aliasing already-subfielded aliases would need
-        // recursive resolution; still deferred (phase 41+).
-        if (lhs_entry.subfield != null) continue;
-        try m.entries.put(gpa, name, .{
-            .name = name,
-            .path = lhs_entry.path,
-            .subfield = hit.subfield,
-        });
+        if (lhs_entry.subfield == null) {
+            // Bare-import LHS (phase 32 shape).
+            try m.entries.put(gpa, name, .{
+                .name = name,
+                .path = lhs_entry.path,
+                .subfield = hit.subfield,
+            });
+        } else if (lhs_entry.subfield2 == null) {
+            // One-hop subfielded LHS (phase 41) — chain into subfield2.
+            try m.entries.put(gpa, name, .{
+                .name = name,
+                .path = lhs_entry.path,
+                .subfield = lhs_entry.subfield,
+                .subfield2 = hit.subfield,
+            });
+        }
+        // Else: 2-hop LHS — would need a 3rd subfield slot.  Deeper
+        // chains rare in practice; skip.
     }
     return m;
 }
@@ -319,6 +336,30 @@ test "forward-reference alias resolves via 2-pass extraction (phase 40)" {
     const x = r.map.lookup("X").?;
     try std.testing.expectEqualStrings("foo.zig", x.path);
     try std.testing.expectEqualStrings("Sub", x.subfield.?);
+}
+
+test "extract 2-hop subfielded-alias chain (phase 41)" {
+    // const lib = @import("lib.zig");
+    // const Inner = lib.Inner;       ← subfield = "Inner"
+    // const Foo = Inner.Foo;         ← subfield = "Inner", subfield2 = "Foo"
+    const gpa = std.testing.allocator;
+    var r = try buildFromSrc(gpa,
+        \\const lib = @import("lib.zig");
+        \\const Inner = lib.Inner;
+        \\const Foo = Inner.Foo;
+        \\
+    );
+    defer r.deinit(gpa);
+
+    const inner = r.map.lookup("Inner").?;
+    try std.testing.expectEqualStrings("lib.zig", inner.path);
+    try std.testing.expectEqualStrings("Inner", inner.subfield.?);
+    try std.testing.expect(inner.subfield2 == null);
+
+    const foo = r.map.lookup("Foo").?;
+    try std.testing.expectEqualStrings("lib.zig", foo.path);
+    try std.testing.expectEqualStrings("Inner", foo.subfield.?);
+    try std.testing.expectEqualStrings("Foo", foo.subfield2.?);
 }
 
 test "non-string-literal @import arg ignored" {

@@ -1506,14 +1506,22 @@ const Builder = struct {
                 const recv_name = tree.tokenSlice(tree.nodeMainToken(recv_node));
                 const entry = remote.imap.lookup(recv_name) orelse return null;
                 const direct = (remote.cache.loadOrLookup(remote.base_dir, entry.path) catch null) orelse return null;
-                // Pre-bound subfield: `const X = @import("...").Sub;`
-                // chase one more hop through the loaded file's imap.
-                if (entry.subfield) |sub| {
+                // First subfield hop (phase 31): chase through loaded
+                // file's imap.
+                const after_hop1 = if (entry.subfield) |sub| blk: {
                     const sub_entry = direct.imap.lookup(sub) orelse return null;
                     const sub_dir = std.fs.path.dirname(direct.abs_path) orelse ".";
-                    return (remote.cache.loadOrLookup(sub_dir, sub_entry.path) catch null);
+                    break :blk (remote.cache.loadOrLookup(sub_dir, sub_entry.path) catch null) orelse return null;
+                } else direct;
+                // Second subfield hop (phase 41): chains like
+                // `const X = A.Sub; const Y = X.Inner;` end up with
+                // Y.subfield="Sub" + Y.subfield2="Inner".
+                if (entry.subfield2) |sub2| {
+                    const sub2_entry = after_hop1.imap.lookup(sub2) orelse return null;
+                    const sub2_dir = std.fs.path.dirname(after_hop1.abs_path) orelse ".";
+                    return (remote.cache.loadOrLookup(sub2_dir, sub2_entry.path) catch null);
                 }
-                return direct;
+                return after_hop1;
             },
             .field_access => {
                 const fa = tree.nodeData(recv_node);
