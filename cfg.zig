@@ -29,6 +29,7 @@
 const std = @import("std");
 const Ast = std.zig.Ast;
 const abstract_state = @import("abstract_state.zig");
+const annotations = @import("annotations.zig");
 
 pub const BlockId = abstract_state.BlockId;
 pub const LocalId = abstract_state.LocalId;
@@ -62,8 +63,13 @@ pub const StmtKind = union(enum) {
     thread_join,
 
     /// `return <expr>;` — function exit.  `value_kind` describes what's
-    /// being returned (for checking it doesn't borrow from a dying scope).
-    ret: struct { value_kind: ExprKind },
+    /// being returned.  `is_borrowed_return_type` tags whether the
+    /// enclosing function's signature returns a borrowed-shape type
+    /// (slice/pointer) — only those returns can leak a borrowed origin.
+    /// Value-typed returns (struct, enum, primitive) MOVE the value
+    /// to the caller and are exempt from the "arena escapes its scope"
+    /// check even when the value contains an arena.
+    ret: struct { value_kind: ExprKind, is_borrowed_return_type: bool },
 
     /// Use of a local (to read it).  Generates "is origin still live?"
     /// checks in the analyzer.
@@ -147,16 +153,27 @@ pub fn lowerFunction(
     gpa: std.mem.Allocator,
     tree: *const Ast,
     fn_decl: Ast.Node.Index,
+    db: ?*const annotations.Db,
 ) !?Cfg {
-    var builder: Builder = .{ .gpa = gpa, .tree = tree };
-    defer builder.tempDeinit();
-
-    // Find the fn body (block node).  fn_decl.data layout depends on
-    // exact tag.  fullFnProto + node_and_node[1] = body for fn_decl.
     var buf: [1]Ast.Node.Index = undefined;
     const fn_proto = (try fnProto(tree, &buf, fn_decl)) orelse return null;
     const body_node = bodyOf(tree, fn_decl) orelse return null;
-    _ = fn_proto;
+
+    // Pre-classify the fn's return type.  Only borrowed-shape returns
+    // (slice/pointer) can leak a borrowed origin to the caller; value
+    // returns move the value and are exempt from the escape check.
+    const is_borrowed_ret = if (fn_proto.ast.return_type.unwrap()) |rt|
+        returnTypeIsBorrowed(tree, rt)
+    else
+        false;
+
+    var builder: Builder = .{
+        .gpa = gpa,
+        .tree = tree,
+        .db = db,
+        .is_borrowed_return_type = is_borrowed_ret,
+    };
+    defer builder.tempDeinit();
 
     const entry_id = try builder.newBlock();
     var cur_block = entry_id;
@@ -188,6 +205,7 @@ fn bodyOf(tree: *const Ast, node: Ast.Node.Index) ?Ast.Node.Index {
 const Builder = struct {
     gpa: std.mem.Allocator,
     tree: *const Ast,
+    db: ?*const annotations.Db = null,
     blocks: std.ArrayListUnmanaged(BasicBlock) = .empty,
     /// Per-block staging — stmts being appended.  Flushed to `blocks[i].stmts`
     /// in finalize().
@@ -197,6 +215,13 @@ const Builder = struct {
     /// name → LocalId for current scope.  v1 doesn't handle nested scopes;
     /// names are flat per-function.
     name_to_local: std.StringHashMapUnmanaged(LocalId) = .empty,
+    /// Stack of deferred statement source nodes, LIFO.  Pushed by
+    /// `lowerStmt` when it sees a `defer` / `errdefer`; popped + replayed
+    /// at every `return` site and at function exit.
+    deferred: std.ArrayListUnmanaged(Ast.Node.Index) = .empty,
+    /// True iff the enclosing fn returns a borrowed-shape type.
+    /// Threaded into `Stmt.ret.is_borrowed_return_type`.
+    is_borrowed_return_type: bool = false,
 
     fn tempDeinit(self: *Builder) void {
         for (self.block_stmts.items) |*s| s.deinit(self.gpa);
@@ -206,6 +231,7 @@ const Builder = struct {
         self.blocks.deinit(self.gpa);
         self.locals.deinit(self.gpa);
         self.name_to_local.deinit(self.gpa);
+        self.deferred.deinit(self.gpa);
     }
 
     fn newBlock(self: *Builder) !BlockId {
@@ -237,6 +263,8 @@ const Builder = struct {
 
     /// Lower the contents of a Zig block node into `cur` (mutated to the
     /// last block reached — branches may have advanced past the original).
+    /// Defer statements encountered are queued and replayed in reverse
+    /// order at every `return` exit point.
     fn lowerBlock(self: *Builder, block_node: Ast.Node.Index, cur: *BlockId) !void {
         const tree = self.tree;
         var stmt_buf: [2]Ast.Node.Index = undefined;
@@ -244,12 +272,34 @@ const Builder = struct {
         for (stmts) |stmt_idx| {
             try self.lowerStmt(stmt_idx, cur);
         }
+        // End-of-function — replay deferred statements in LIFO order
+        // before falling off the implicit-return edge (no explicit
+        // ret_stmt at the tail).  v1 only: top-level block treated as
+        // function body; nested blocks don't run defers at exit yet.
+        // TODO(week-6): per-block defer scoping for nested blocks.
+        try self.flushDefers(cur);
+    }
+
+    fn pushDefer(self: *Builder, body_node: Ast.Node.Index) !void {
+        try self.deferred.append(self.gpa, body_node);
+    }
+
+    /// Replay all deferred statements (LIFO) into `cur`.  Doesn't pop —
+    /// returns happen mid-function and we want subsequent code to still
+    /// see the same defer set.  Called at function-exit (in lowerBlock)
+    /// and at every return (in lowerReturn).
+    fn flushDefers(self: *Builder, cur: *BlockId) (std.mem.Allocator.Error)!void {
+        var i = self.deferred.items.len;
+        while (i > 0) {
+            i -= 1;
+            try self.lowerStmt(self.deferred.items[i], cur);
+        }
     }
 
     /// Dispatch on statement node tag.  v1: handle decls, assigns,
     /// expression-statement calls, returns, if/while; everything else
     /// becomes a `.lowering_gap` placeholder.
-    fn lowerStmt(self: *Builder, stmt_node: Ast.Node.Index, cur: *BlockId) !void {
+    fn lowerStmt(self: *Builder, stmt_node: Ast.Node.Index, cur: *BlockId) std.mem.Allocator.Error!void {
         const tree = self.tree;
         const tag = tree.nodeTag(stmt_node);
         switch (tag) {
@@ -260,12 +310,27 @@ const Builder = struct {
                 try self.lowerAssign(stmt_node, cur);
             },
             .@"return" => {
+                // Replay defers BEFORE the return so any arena-kills
+                // they perform show up in state before we check the
+                // returned value's origin.
+                try self.flushDefers(cur);
                 try self.lowerReturn(stmt_node, cur);
             },
             .call, .call_one, .call_comma, .call_one_comma => {
                 try self.lowerCallStmt(stmt_node, cur);
             },
-            // TODO(week-4): if/while/for/switch branching, defer, errdefer.
+            .@"defer" => {
+                // `defer EXPR;` — data is .node = body.
+                const body = tree.nodeData(stmt_node).node;
+                try self.pushDefer(body);
+            },
+            .@"errdefer" => {
+                // `errdefer |x| EXPR;` — data is .opt_token_and_node;
+                // [0] = optional `|x|` capture token, [1] = body.
+                const body = tree.nodeData(stmt_node).opt_token_and_node[1];
+                try self.pushDefer(body);
+            },
+            // TODO(week-6): if/while/for/switch branching.
             else => {
                 try self.appendStmt(cur.*, .{
                     .kind = .{ .lowering_gap = .{ .note = @tagName(tag) } },
@@ -322,7 +387,10 @@ const Builder = struct {
         else
             .plain;
         try self.appendStmt(cur.*, .{
-            .kind = .{ .ret = .{ .value_kind = value_kind } },
+            .kind = .{ .ret = .{
+                .value_kind = value_kind,
+                .is_borrowed_return_type = self.is_borrowed_return_type,
+            } },
             .pos = self.posOf(ret_node),
         });
         // Return terminates the block — no successor.
@@ -395,10 +463,80 @@ const Builder = struct {
             }
         }
 
-        // TODO(week-4): annotated-call detection — look up callee's
-        // `/// @returns borrowed_from(<param>)` / `/// @returns owned`
-        // and resolve <param> to a LocalId in scope.
+        // Annotated method/function call: `<recv>.<method>(args)` or
+        // bare `<fn>(args)`.  Look up the callee in the annotation DB
+        // and use its @returns to classify the result.
+        const is_call = switch (tag) {
+            .call, .call_one, .call_comma, .call_one_comma => true,
+            else => false,
+        };
+        if (is_call) {
+            return self.classifyCall(expr_node);
+        }
 
+        return .unknown;
+    }
+
+    fn classifyCall(self: *Builder, call_node: Ast.Node.Index) ExprKind {
+        const tree = self.tree;
+        const db = self.db orelse return .unknown;
+
+        var buf: [1]Ast.Node.Index = undefined;
+        const call_full = tree.fullCall(&buf, call_node) orelse return .unknown;
+        const callee_node = call_full.ast.fn_expr;
+        const args = call_full.ast.params;
+
+        // Two callee shapes we handle:
+        //   1. <recv>.<method>(...)   → field_access (receiver is arg 0)
+        //   2. <ident>(...)           → identifier
+        switch (tree.nodeTag(callee_node)) {
+            .field_access => {
+                const fa_data = tree.nodeData(callee_node);
+                const recv_node = fa_data.node_and_token[0];
+                const method_tok = fa_data.node_and_token[1];
+                const method_name = tree.tokenSlice(method_tok);
+                const entry = db.lookup(method_name) orelse return .unknown;
+                return self.applyAnnotationToCall(entry.annotation, recv_node, args, true);
+            },
+            .identifier => {
+                const fn_name = tree.tokenSlice(tree.nodeMainToken(callee_node));
+                const entry = db.lookup(fn_name) orelse return .unknown;
+                return self.applyAnnotationToCall(entry.annotation, callee_node, args, false);
+            },
+            else => return .unknown,
+        }
+    }
+
+    /// Convert a callee annotation + actual-arg context into an ExprKind.
+    /// `receiver_is_arg0`: when true (method-call case), the receiver
+    /// counts as args[0] and `args` is the explicit list shifted by one.
+    fn applyAnnotationToCall(
+        self: *Builder,
+        anno: annotations.ReturnsAnnotation,
+        receiver_or_callee: Ast.Node.Index,
+        args: []const Ast.Node.Index,
+        receiver_is_arg0: bool,
+    ) ExprKind {
+        switch (anno) {
+            .owned => return .owned,
+            .borrowed_from => |target_idx| {
+                if (receiver_is_arg0 and target_idx == 0) {
+                    return self.identifierToCopyOrUnknown(receiver_or_callee);
+                }
+                const explicit_idx = if (receiver_is_arg0) target_idx - 1 else target_idx;
+                if (explicit_idx >= args.len) return .unknown;
+                return self.identifierToCopyOrUnknown(args[explicit_idx]);
+            },
+        }
+    }
+
+    /// If `node` is a bare identifier matching a known local, return
+    /// .copy_of(that local) — otherwise .unknown.
+    fn identifierToCopyOrUnknown(self: *Builder, node: Ast.Node.Index) ExprKind {
+        const tree = self.tree;
+        if (tree.nodeTag(node) != .identifier) return .unknown;
+        const name = tree.tokenSlice(tree.nodeMainToken(node));
+        if (self.name_to_local.get(name)) |id| return .{ .copy_of = id };
         return .unknown;
     }
 
@@ -463,6 +601,31 @@ const Builder = struct {
     }
 };
 
+/// True iff the return-type node text starts with `*` or `[` after
+/// stripping leading `?` / `E!`.  Same heuristic the Layer-1 rule uses
+/// (require_borrowed_from.zig) — Node.Data variant churn between Zig
+/// versions makes source-text inspection more robust than the typed
+/// API.
+fn returnTypeIsBorrowed(tree: *const Ast, node: Ast.Node.Index) bool {
+    const first = tree.firstToken(node);
+    const last = tree.lastToken(node);
+    const start = tree.tokens.items(.start)[first];
+    const last_start = tree.tokens.items(.start)[last];
+    const last_len = tree.tokenSlice(last).len;
+    const end: usize = last_start + last_len;
+    var text = tree.source[start..end];
+    while (text.len > 0) {
+        switch (text[0]) {
+            '?', '!', ' ', '\t' => text = text[1..],
+            else => break,
+        }
+    }
+    if (std.mem.indexOfScalar(u8, text, '!')) |bang| {
+        text = std.mem.trimStart(u8, text[bang + 1 ..], " \t");
+    }
+    return text.len > 0 and (text[0] == '*' or text[0] == '[');
+}
+
 /// Returns the statements of a block node.  Zig's AST has 4 block variants
 /// depending on statement count + trailing semicolon.
 fn blockStmts(
@@ -501,7 +664,7 @@ fn parseAndLower(gpa: std.mem.Allocator, src: []const u8) !struct {
     while (node_idx < tree.nodes.len) : (node_idx += 1) {
         const node: Ast.Node.Index = @enumFromInt(node_idx);
         if (tree.nodeTag(node) == .fn_decl) {
-            const cfg = try lowerFunction(gpa, &tree, node);
+            const cfg = try lowerFunction(gpa, &tree, node, null);
             return .{ .tree = tree, .cfg = cfg };
         }
     }

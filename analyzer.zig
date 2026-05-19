@@ -13,6 +13,7 @@ const cfg_mod = @import("cfg.zig");
 const state_mod = @import("abstract_state.zig");
 const transfer = @import("transfer.zig");
 const problem_mod = @import("problem.zig");
+const annotations = @import("annotations.zig");
 
 const Cfg = cfg_mod.Cfg;
 const BlockId = cfg_mod.BlockId;
@@ -103,13 +104,16 @@ fn analyze(gpa: std.mem.Allocator, src: []const u8) !std.ArrayListUnmanaged(Prob
     var tree = try Ast.parse(gpa, src_z, .zig);
     defer tree.deinit(gpa);
 
+    var db = try annotations.build(gpa, &tree);
+    defer db.deinit(gpa);
+
     var problems: std.ArrayListUnmanaged(Problem) = .empty;
 
     var node_idx: u32 = 1;
     while (node_idx < tree.nodes.len) : (node_idx += 1) {
         const node: Ast.Node.Index = @enumFromInt(node_idx);
         if (tree.nodeTag(node) != .fn_decl) continue;
-        var cfg = (try cfg_mod.lowerFunction(gpa, &tree, node)) orelse continue;
+        var cfg = (try cfg_mod.lowerFunction(gpa, &tree, node, &db)) orelse continue;
         defer cfg.deinit(gpa);
         try check(gpa, &cfg, .{ .path = "<test>" }, &problems);
     }
@@ -136,13 +140,22 @@ test "no escape — arena local, no return" {
     try std.testing.expectEqual(@as(usize, 0), problems.items.len);
 }
 
-test "escape — return a value borrowed from a function-local arena" {
+test "escape — return slice borrowed from a function-local arena" {
     const gpa = std.testing.allocator;
+    // The return TYPE must be borrowed-shape ([]const u8 here).
+    // Value-typed returns (struct, primitive) MOVE the value to the
+    // caller and don't need this check.
     var problems = try analyze(gpa,
         \\const std = @import("std");
-        \\pub fn foo() u32 {
+        \\const Arena = struct {
+        \\    /// @returns borrowed_from(self)
+        \\    pub fn text(self: *const Arena) []const u8 {
+        \\        _ = self; return "";
+        \\    }
+        \\};
+        \\pub fn foo() []const u8 {
         \\    var arena = std.heap.ArenaAllocator.init(undefined);
-        \\    return arena;
+        \\    return arena.text();
         \\}
         \\
     );
@@ -152,33 +165,91 @@ test "escape — return a value borrowed from a function-local arena" {
         "function-local arena") != null);
 }
 
-test "UAF — use of arena-borrowed local after arena.deinit()" {
+test "value-typed return owning an arena is OK (move, not borrow)" {
     const gpa = std.testing.allocator;
-    // Without a borrowed_from annotation in scope yet (week 5 wires the
-    // annotation lookup), we model the borrow by reading the arena
-    // local directly — its origin IS .arena, so the use checks alive.
-    //
-    // After arena.deinit(), the arena is marked dead.  Reading the same
-    // local in a way that triggers a `use` stmt should report UAF.
-    //
-    // cfg.zig today doesn't emit `use` for identifier-expression
-    // statements (would need an additional lowering rule).  Simplest
-    // demo: the return-of-identifier case carries the arena origin
-    // through to the return, which transferRet already checks.
+    // Common Zig pattern: `init()` returns a struct value that owns
+    // its arena.  Caller takes ownership; no escape.  Without the
+    // return-type gate this used to false-positive on every init() fn.
     var problems = try analyze(gpa,
         \\const std = @import("std");
-        \\pub fn foo() u32 {
+        \\const Self = struct { a: u32 };
+        \\pub fn init() Self {
         \\    var arena = std.heap.ArenaAllocator.init(undefined);
-        \\    arena.deinit();
-        \\    return arena;
+        \\    return .{ .a = 0 };
         \\}
         \\
     );
     defer freeProblems(gpa, &problems);
-    // The arena origin is in `state.arenas` (registered at init), the
-    // arena is dead by the return, and `return arena` flows that origin
-    // out — flagged as a function-local arena escape.
-    try std.testing.expectEqual(@as(usize, 1), problems.items.len);
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
+test "defer arena.deinit() kills arena before fallthrough — clean" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const std = @import("std");
+        \\pub fn foo() void {
+        \\    var arena = std.heap.ArenaAllocator.init(undefined);
+        \\    defer arena.deinit();
+        \\    return;
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
+test "defer arena.deinit() catches return-of-borrowed-from-dying-arena" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const std = @import("std");
+        \\const Arena = struct {
+        \\    /// @returns borrowed_from(self)
+        \\    pub fn slice(self: *const Arena) []const u8 {
+        \\        _ = self; return "";
+        \\    }
+        \\};
+        \\pub fn foo() []const u8 {
+        \\    var arena = std.heap.ArenaAllocator.init(undefined);
+        \\    defer arena.deinit();
+        \\    return arena.slice();
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    // Defer replays arena.deinit() before return; return checks slice()'s
+    // returned origin (.arena via annotation), arena is dead → flag.
+    try std.testing.expect(problems.items.len >= 1);
+}
+
+test "annotated callee: borrow propagates through call, escapes via return" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const std = @import("std");
+        \\const Arena = struct {
+        \\    /// @returns borrowed_from(self)
+        \\    pub fn slice(self: *const Arena) []const u8 {
+        \\        _ = self; return "";
+        \\    }
+        \\};
+        \\pub fn foo() []const u8 {
+        \\    var arena = std.heap.ArenaAllocator.init(undefined);
+        \\    return arena.slice();
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    // arena.slice() carries `arena`'s origin (an ArenaId from the
+    // function-local arena_init), and `return` checks that the returned
+    // origin doesn't reference a function-local arena.  Should flag.
+    try std.testing.expect(problems.items.len >= 1);
+    var found = false;
+    for (problems.items) |p| {
+        if (std.mem.indexOf(u8, p.message, "function-local arena") != null) {
+            found = true;
+            break;
+        }
+    }
+    try std.testing.expect(found);
 }
 
 test "lowering_gap collapses locals to plain — no spurious reports" {

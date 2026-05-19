@@ -109,15 +109,15 @@ fn transferRet(
     r: @TypeOf(@as(StmtKind, undefined).ret),
     pos: cfg.SrcPos,
 ) !void {
-    // Check that the returned value's origin would outlive the caller.
-    // For an arena-borrowed return: the arena must still be alive AND
-    // the arena must not be a function-local one (would die at our exit).
+    // Only borrowed-shape return types can leak a borrowed origin.
+    // Value-typed returns MOVE the value (and any arena it owns) to
+    // the caller — that's idiomatic, not a bug.  Skip the check.
+    if (!r.is_borrowed_return_type) return;
+
     const origin = try originOfInit(ctx, state, r.value_kind, pos);
     switch (origin) {
         .arena => |aid| {
             // Function-local arena that's about to die at exit — flag.
-            // (For now we treat all arenas in `state.arenas` as
-            // function-local since callers can't see them.)
             if (state.arenas.contains(aid)) {
                 try report(ctx, pos, .@"error",
                     "returning a value borrowed from a function-local arena (escapes its lifetime)", .{});
