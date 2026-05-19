@@ -6,12 +6,18 @@
 //! Usage:
 //!   zbc [options] <file.zig>...
 //!
+//! Default mode is escape analysis — drop-in: run zbc on any Zig
+//! source and signature-driven inference fills in the annotations
+//! needed for invariant checks (see lib.zig for the rules).
+//!
 //! Options:
-//!   --escape             Layer-2 escape analysis (default: Layer-1
-//!                        annotation hygiene only).
+//!   --hygiene            Run Layer-1 annotation-presence rules
+//!                        instead of escape analysis.  Useful for
+//!                        projects that want to enforce explicit
+//!                        annotations everywhere.
 //!   --enable=<list>      Comma-separated invariant names to enable
 //!                        (e.g. --enable=ast_identity,arena_escape).
-//!                        Default is all invariants.  Implies --escape.
+//!                        Default is all invariants.
 //!   --disable=<list>     Comma-separated invariant names to disable.
 //!                        Subtracted from the enabled set.
 //!   --format=text|json   Output format (default: text).  JSON emits
@@ -36,7 +42,9 @@ pub fn main(init: std.process.Init) !void {
     var enabled: std.ArrayListUnmanaged(lib.Invariant) = .empty;
     defer enabled.deinit(gpa);
     try enabled.appendSlice(gpa, &lib.all_invariants);
-    var escape_mode = false;
+    // Default mode is escape analysis (drop-in adoption).  --hygiene
+    // opts into the older Layer-1 annotation-presence rules.
+    var mode: Mode = .escape;
     var enabled_explicit = false;
     var format: Format = .text;
 
@@ -51,8 +59,14 @@ pub fn main(init: std.process.Init) !void {
             }
             std.process.exit(0);
         }
+        if (std.mem.eql(u8, a, "--hygiene")) {
+            mode = .hygiene;
+            continue;
+        }
         if (std.mem.eql(u8, a, "--escape")) {
-            escape_mode = true;
+            // Kept for backward compatibility — escape is now the
+            // default.  Silent accept; document in --help comment.
+            mode = .escape;
             continue;
         }
         if (std.mem.startsWith(u8, a, "--enable=")) {
@@ -60,7 +74,6 @@ pub fn main(init: std.process.Init) !void {
                 enabled.clearRetainingCapacity();
                 enabled_explicit = true;
             }
-            escape_mode = true; // invariants only matter in escape mode
             try parseInvariantList(gpa, a["--enable=".len..], &enabled, .add);
             continue;
         }
@@ -95,7 +108,7 @@ pub fn main(init: std.process.Init) !void {
 
     const config: lib.Config = .{ .enabled = enabled.items };
 
-    var cache_storage: ?lib.Cache = if (escape_mode) lib.Cache.init(gpa, io) else null;
+    var cache_storage: ?lib.Cache = if (mode == .escape) lib.Cache.init(gpa, io) else null;
     defer if (cache_storage) |*c| c.deinit();
 
     var any_problems = false;
@@ -103,7 +116,7 @@ pub fn main(init: std.process.Init) !void {
     if (format == .json) std.debug.print("[", .{});
 
     for (paths.items) |path| {
-        const problems = if (escape_mode)
+        const problems = if (mode == .escape)
             lib.analyzeEscape(gpa, io, path, &cache_storage.?, &config) catch |err| {
                 std.debug.print("zbc: cannot analyze {s}: {s}\n", .{ path, @errorName(err) });
                 any_problems = true;
@@ -128,6 +141,8 @@ pub fn main(init: std.process.Init) !void {
     if (format == .json) std.debug.print("{s}]\n", .{if (json_first) "" else "\n"});
     std.process.exit(if (any_problems) @as(u8, 1) else 0);
 }
+
+const Mode = enum { escape, hygiene };
 
 const Format = enum { text, json };
 
@@ -172,10 +187,16 @@ fn printUsage() void {
     std.debug.print(
         \\usage: zbc [options] <file.zig>...
         \\
+        \\Default mode is escape analysis — signature-driven inference
+        \\fills in annotations needed for invariant checks, so most code
+        \\just works without authors writing `///` annotations.
+        \\
         \\options:
-        \\  --escape              Run Layer-2 escape analysis (default: Layer-1 only).
-        \\  --enable=a,b,c        Enable only these invariants (implies --escape).
-        \\  --disable=a,b         Disable these invariants from the enabled set.
+        \\  --hygiene             Run annotation-presence rules instead
+        \\                        of escape analysis.  For projects that
+        \\                        want to enforce explicit annotations.
+        \\  --enable=a,b,c        Enable only these invariants.
+        \\  --disable=a,b         Disable these invariants from the set.
         \\  --format=text|json    Output format (default: text).
         \\  --list-invariants     Print known invariant names and exit.
         \\  -h, --help            Print this help.
