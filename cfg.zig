@@ -13,14 +13,14 @@
 //!   - `arena.deinit()` (arena death)
 //!   - `thread.join()` (thread join)
 //!   - `return EXPR;` (function exit)
-//!   - `if/else` and `while` branching (real CFG edges)
+//!   - `if/else`, `while`, `for`, `switch` branching (real CFG edges)
 //!   - `defer` / `errdefer` (replayed at function-exit / return sites)
 //!
 //! What we DON'T model (yet):
-//!   - `for` loops (range + each form)
-//!   - `switch` statements
-//!   - `try` / `catch` (error-path forking)
+//!   - `try` / `catch` (error-path forking + error-set tracking)
 //!   - generics / comptime
+//!   - for-loop iteration variable origin (treated as .plain)
+//!   - switch-case pattern bindings (treated as .plain)
 //!
 //! Errors during lowering are surfaced as `Stmt{.lowering_gap}` nodes
 //! rather than aborts — keeps the analyzer running on the rest of the
@@ -177,7 +177,7 @@ pub fn lowerFunction(
 
     const entry_id = try builder.newBlock();
     var cur_block = entry_id;
-    try builder.lowerBlock(body_node, &cur_block);
+    try builder.lowerFunctionBody(body_node, &cur_block);
 
     return try builder.finalize(tree, fn_decl, entry_id);
 }
@@ -264,7 +264,9 @@ const Builder = struct {
     /// Lower the contents of a Zig block node into `cur` (mutated to the
     /// last block reached — branches may have advanced past the original).
     /// Defer statements encountered are queued and replayed in reverse
-    /// order at every `return` exit point.
+    /// order at every `return` exit point.  Does NOT flush defers at
+    /// block exit — only the top-level function body does that, via
+    /// `lowerFunctionBody`.
     fn lowerBlock(self: *Builder, block_node: Ast.Node.Index, cur: *BlockId) !void {
         const tree = self.tree;
         var stmt_buf: [2]Ast.Node.Index = undefined;
@@ -272,11 +274,14 @@ const Builder = struct {
         for (stmts) |stmt_idx| {
             try self.lowerStmt(stmt_idx, cur);
         }
-        // End-of-function — replay deferred statements in LIFO order
-        // before falling off the implicit-return edge (no explicit
-        // ret_stmt at the tail).  v1 only: top-level block treated as
-        // function body; nested blocks don't run defers at exit yet.
-        // TODO: per-block defer scoping for nested blocks.
+    }
+
+    /// Lower the top-level function body — same as lowerBlock but flushes
+    /// pending defers at the end (implicit-fallthrough return).  Only the
+    /// outermost block of a function does this; nested blocks defer to
+    /// their enclosing return statements.
+    fn lowerFunctionBody(self: *Builder, body_node: Ast.Node.Index, cur: *BlockId) !void {
+        try self.lowerBlock(body_node, cur);
         try self.flushDefers(cur);
     }
 
@@ -326,7 +331,15 @@ const Builder = struct {
             },
             .if_simple, .@"if" => try self.lowerIf(stmt_node, cur),
             .while_simple, .while_cont, .@"while" => try self.lowerWhile(stmt_node, cur),
-            // TODO: for/switch/try branching.
+            .for_simple, .@"for" => try self.lowerFor(stmt_node, cur),
+            .@"switch", .switch_comma => try self.lowerSwitch(stmt_node, cur),
+            // Nested blocks: recurse so empty blocks DON'T trigger
+            // the conservative .plain collapse via lowering_gap.
+            // (Empty switch arms `else => {}` are a common case.)
+            .block, .block_semicolon, .block_two, .block_two_semicolon => {
+                try self.lowerBlock(stmt_node, cur);
+            },
+            // TODO: try/catch (error-path forking + error-set tracking).
             else => {
                 try self.appendStmt(cur.*, .{
                     .kind = .{ .lowering_gap = .{ .note = @tagName(tag) } },
@@ -424,6 +437,79 @@ const Builder = struct {
             var else_cur = else_block;
             try self.lowerStmt(else_expr, &else_cur);
             try self.addEdge(else_cur, merge);
+        }
+
+        cur.* = merge;
+    }
+
+    /// `for (input) |x| BODY [else ELSE]` — structurally identical to a
+    /// while loop for our purposes (header decides each iteration, body
+    /// back-edges to header).  We don't model the iteration variable's
+    /// origin (would need to track input's element-lifetime per item);
+    /// the iterator binding gets registered as a fresh local with .plain
+    /// init so subsequent uses are conservative.
+    fn lowerFor(self: *Builder, for_node: Ast.Node.Index, cur: *BlockId) !void {
+        const tree = self.tree;
+        const for_data = tree.fullFor(for_node) orelse {
+            try self.appendStmt(cur.*, .{
+                .kind = .{ .lowering_gap = .{ .note = "for-extract" } },
+                .pos = self.posOf(for_node),
+            });
+            return;
+        };
+
+        const header = try self.newBlock();
+        const body = try self.newBlock();
+        const merge = try self.newBlock();
+
+        try self.addEdge(cur.*, header);
+        try self.addEdge(header, body);
+        try self.addEdge(header, merge);
+
+        var body_cur = body;
+        try self.lowerStmt(for_data.ast.then_expr, &body_cur);
+        try self.addEdge(body_cur, header); // back-edge for fixed-point iteration
+
+        if (for_data.ast.else_expr.unwrap()) |else_expr| {
+            const else_block = try self.newBlock();
+            try self.addEdge(header, else_block);
+            var else_cur = else_block;
+            try self.lowerStmt(else_expr, &else_cur);
+            try self.addEdge(else_cur, merge);
+        }
+
+        cur.* = merge;
+    }
+
+    /// `switch (cond) { CASE => EXPR, ... }` — N-way fork.  Each case
+    /// becomes a successor of `cur`; all cases join into a fresh merge
+    /// block.  We don't model case-pattern matching or exhaustiveness;
+    /// every case is treated as reachable from cur.
+    fn lowerSwitch(self: *Builder, sw_node: Ast.Node.Index, cur: *BlockId) !void {
+        const tree = self.tree;
+        const sw = tree.fullSwitch(sw_node) orelse {
+            try self.appendStmt(cur.*, .{
+                .kind = .{ .lowering_gap = .{ .note = "switch-extract" } },
+                .pos = self.posOf(sw_node),
+            });
+            return;
+        };
+
+        const merge = try self.newBlock();
+
+        if (sw.ast.cases.len == 0) {
+            try self.addEdge(cur.*, merge);
+            cur.* = merge;
+            return;
+        }
+
+        for (sw.ast.cases) |case_node| {
+            const case_full = tree.fullSwitchCase(case_node) orelse continue;
+            const case_block = try self.newBlock();
+            try self.addEdge(cur.*, case_block);
+            var case_cur = case_block;
+            try self.lowerStmt(case_full.ast.target_expr, &case_cur);
+            try self.addEdge(case_cur, merge);
         }
 
         cur.* = merge;
@@ -885,6 +971,43 @@ test "if-else creates fork: 4 blocks (entry, then, else, merge)" {
 
     try std.testing.expect(cfg.blocks.len >= 4);
     try std.testing.expectEqual(@as(usize, 2), cfg.blocks[0].successors.len);
+}
+
+test "for loop creates back-edge: body → header" {
+    const gpa = std.testing.allocator;
+    var result = try parseAndLower(gpa,
+        \\pub fn foo(items: []const u32) void {
+        \\    for (items) |x| { _ = x; }
+        \\    return;
+        \\}
+        \\
+    );
+    defer result.tree.deinit(gpa);
+    var cfg = result.cfg.?;
+    defer cfg.deinit(gpa);
+    // entry, header, body, merge (minimum 4 blocks).
+    try std.testing.expect(cfg.blocks.len >= 4);
+}
+
+test "switch creates N-way fork (3 cases → 4+ blocks)" {
+    const gpa = std.testing.allocator;
+    var result = try parseAndLower(gpa,
+        \\pub fn foo(x: u32) void {
+        \\    switch (x) {
+        \\        0 => return,
+        \\        1 => return,
+        \\        else => return,
+        \\    }
+        \\}
+        \\
+    );
+    defer result.tree.deinit(gpa);
+    var cfg = result.cfg.?;
+    defer cfg.deinit(gpa);
+    // entry + 3 case-blocks + merge = 5 blocks min.
+    try std.testing.expect(cfg.blocks.len >= 5);
+    // entry has 3 successors (one per case).
+    try std.testing.expectEqual(@as(usize, 3), cfg.blocks[0].successors.len);
 }
 
 test "while loop creates back-edge: body → header" {

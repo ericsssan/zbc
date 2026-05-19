@@ -54,7 +54,12 @@ pub fn check(
     // change.  Successor blocks only get re-pushed when their joined
     // in-state actually moved.
     var iter_guard: u32 = 0;
-    const MAX_ITERS: u32 = 10_000;
+    // Generous safety net.  Genuine pathological CFGs (heavily nested
+    // loops + many locals) can take O(blocks · locals · arenas)
+    // iterations to stabilize; 200k handles real-codebase functions
+    // we've seen (~600 blocks × hundreds of locals).  Smaller bound
+    // bails on real code; lots higher risks editor-hang on a real bug.
+    const MAX_ITERS: u32 = 200_000;
 
     while (worklist.pop()) |block_id| {
         iter_guard += 1;
@@ -250,6 +255,56 @@ test "annotated callee: borrow propagates through call, escapes via return" {
         }
     }
     try std.testing.expect(found);
+}
+
+test "switch-case UAF: kill in one case, use after merge" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const std = @import("std");
+        \\const Arena = struct {
+        \\    /// @returns borrowed_from(self)
+        \\    pub fn slice(self: *const Arena) []const u8 {
+        \\        _ = self; return "";
+        \\    }
+        \\};
+        \\pub fn maybe(tag: u32) []const u8 {
+        \\    var arena = std.heap.ArenaAllocator.init(undefined);
+        \\    switch (tag) {
+        \\        0 => arena.deinit(),
+        \\        else => {},
+        \\    }
+        \\    return arena.slice();
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expect(problems.items.len >= 1);
+}
+
+test "for-loop UAF: kill inside loop body, use after loop" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const std = @import("std");
+        \\const Arena = struct {
+        \\    /// @returns borrowed_from(self)
+        \\    pub fn slice(self: *const Arena) []const u8 {
+        \\        _ = self; return "";
+        \\    }
+        \\};
+        \\pub fn maybe(items: []const u32) []const u8 {
+        \\    var arena = std.heap.ArenaAllocator.init(undefined);
+        \\    for (items) |_| {
+        \\        arena.deinit();
+        \\    }
+        \\    return arena.slice();
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    // Body's arena_kill back-edges to header, and header forwards the
+    // dead state into merge.  Without for-loop modeling, this used to
+    // be a lowering_gap that silenced the check.
+    try std.testing.expect(problems.items.len >= 1);
 }
 
 test "branch-specific UAF: kill in one if-branch, use after merge" {
