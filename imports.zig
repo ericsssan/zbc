@@ -69,6 +69,30 @@ pub fn build(gpa: std.mem.Allocator, tree: *const Ast) !Map {
                 .path = hit.path,
                 .subfield = hit.subfield,
             });
+            continue;
+        }
+        // Phase 32: alias of an already-imported namespace.
+        //   const lib = @import("foo.zig");
+        //   const X   = lib.Sub;          ← extract X with path="foo.zig",
+        //                                   subfield="Sub" (inherits lib's
+        //                                   path).
+        // Single-pass: we look up the LHS in the partially-built map,
+        // so forward references (alias declared before the @import it
+        // depends on) are skipped.  In real Zig, imports come at the
+        // top of the file in declaration order; the limitation is fine.
+        if (extractIdentFieldAccess(tree, init_node)) |hit| {
+            if (m.entries.get(hit.lhs_name)) |lhs_entry| {
+                // Only inherit when the lhs is itself a bare import
+                // (no subfield).  Aliasing already-subfielded aliases
+                // would need recursive resolution; deferred.
+                if (lhs_entry.subfield == null) {
+                    try m.entries.put(gpa, name, .{
+                        .name = name,
+                        .path = lhs_entry.path,
+                        .subfield = hit.subfield,
+                    });
+                }
+            }
         }
     }
     return m;
@@ -100,6 +124,26 @@ fn extractImportFieldAccess(tree: *const Ast, init_node: Ast.Node.Index) ?struct
     const path = extractImportPath(tree, lhs) orelse return null;
     if (tree.tokens.items(.tag)[sub_tok] != .identifier) return null;
     return .{ .path = path, .subfield = tree.tokenSlice(sub_tok) };
+}
+
+/// Match `<ident>.<subfield>` — field_access whose lhs is a bare
+/// identifier.  Returns both name slices.  The caller resolves the
+/// lhs name against the in-progress imports map to decide whether
+/// the alias inherits an import path.
+fn extractIdentFieldAccess(tree: *const Ast, init_node: Ast.Node.Index) ?struct {
+    lhs_name: []const u8,
+    subfield: []const u8,
+} {
+    if (tree.nodeTag(init_node) != .field_access) return null;
+    const fa = tree.nodeData(init_node);
+    const lhs = fa.node_and_token[0];
+    const sub_tok = fa.node_and_token[1];
+    if (tree.nodeTag(lhs) != .identifier) return null;
+    if (tree.tokens.items(.tag)[sub_tok] != .identifier) return null;
+    return .{
+        .lhs_name = tree.tokenSlice(tree.nodeMainToken(lhs)),
+        .subfield = tree.tokenSlice(sub_tok),
+    };
 }
 
 // ── Tests ──────────────────────────────────────────────────
@@ -215,6 +259,51 @@ test "bare @import has subfield = null (phase 31 regression)" {
 
     const entry = r.map.lookup("ast").?;
     try std.testing.expect(entry.subfield == null);
+}
+
+test "extract local-alias-of-import (phase 32)" {
+    // `const lib = @import("foo.zig"); const X = lib.Sub;`
+    // → X entry carries lib's path AND "Sub" as subfield.
+    const gpa = std.testing.allocator;
+    var r = try buildFromSrc(gpa,
+        \\const lib = @import("foo.zig");
+        \\const X = lib.Sub;
+        \\
+    );
+    defer r.deinit(gpa);
+
+    const x = r.map.lookup("X").?;
+    try std.testing.expectEqualStrings("foo.zig", x.path);
+    try std.testing.expectEqualStrings("Sub", x.subfield.?);
+}
+
+test "alias of non-import identifier is NOT extracted (phase 32 guard)" {
+    // `const X = obj.Sub;` where `obj` is not an import → no entry.
+    const gpa = std.testing.allocator;
+    var r = try buildFromSrc(gpa,
+        \\const obj = struct { pub const Sub = u32; }{};
+        \\const X = obj.Sub;
+        \\
+    );
+    defer r.deinit(gpa);
+
+    try std.testing.expect(r.map.lookup("X") == null);
+}
+
+test "forward-reference alias is silently skipped (phase 32 limitation)" {
+    // Alias declared BEFORE the import it depends on.  Single-pass
+    // extraction means this misses — intentional limitation,
+    // documented in build()'s comment.
+    const gpa = std.testing.allocator;
+    var r = try buildFromSrc(gpa,
+        \\const X = lib.Sub;
+        \\const lib = @import("foo.zig");
+        \\
+    );
+    defer r.deinit(gpa);
+
+    try std.testing.expectEqualStrings("foo.zig", r.map.lookup("lib").?.path);
+    try std.testing.expect(r.map.lookup("X") == null);
 }
 
 test "non-string-literal @import arg ignored" {

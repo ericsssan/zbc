@@ -658,6 +658,55 @@ test "invariant #1 fires through @import().Subfield re-export (phase 31)" {
     try std.testing.expect(found);
 }
 
+test "invariant #1 fires through local-alias-of-import (phase 32)" {
+    // foo.zig has:
+    //   const lib = @import("lib.zig");
+    //   const Inner = lib.Inner;          ← two-decl alias form
+    //   ... Inner.inspect(tree_b, node);  ← uses alias
+    // Phase 31 handled the wrapped one-liner `const Inner =
+    // @import("lib.zig").Inner;`.  Phase 32 handles the
+    // two-decl equivalent that's equally common.
+    const gpa = std.testing.allocator;
+    var problems = try analyzeCrossFileMulti(gpa,
+        // foo.zig
+        \\const lib = @import("lib.zig");
+        \\const Inner = lib.Inner;
+        \\const Ast = Inner.Ast;
+        \\const NodeIndex = Inner.NodeIndex;
+        \\pub fn foo() !void {
+        \\    var tree_a = try Ast.parse();
+        \\    var tree_b = try Ast.parse();
+        \\    const node = Inner.rootNode(tree_a);
+        \\    Inner.inspect(tree_b, node);
+        \\    return;
+        \\}
+        \\
+        ,
+        &.{
+            .{ .name = "lib.zig", .src =
+                \\pub const Inner = @import("inner.zig");
+                \\
+            },
+            .{ .name = "inner.zig", .src =
+                \\pub const Ast = struct { pub fn parse() !Ast { return .{}; } };
+                \\pub const NodeIndex = u32;
+                \\/// @returns node_index_of(ast)
+                \\pub fn rootNode(ast: Ast) NodeIndex { _ = ast; return 0; }
+                \\/// @takes node_index_of(t)
+                \\pub fn inspect(t: Ast, n: NodeIndex) void { _ = t; _ = n; }
+                \\
+            },
+        },
+    );
+    defer freeProblems(gpa, &problems);
+
+    var found = false;
+    for (problems.items) |p| {
+        if (std.mem.indexOf(u8, p.message, "invariant #1") != null) found = true;
+    }
+    try std.testing.expect(found);
+}
+
 test "node_index_any opts out: cross-Ast call passes without flag (phase 29)" {
     // Same shape as the positive phase-26 test, but inspect now has
     // `@takes node_index_any` instead of `node_index_of(t)`.  The
