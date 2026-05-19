@@ -138,6 +138,23 @@ fn transferRet(
         return;
     }
 
+    // Stack escape isn't gated on return type — a value-shape return
+    // can still embed a pointer to a stack local (e.g. `return .{
+    // .p = &x }`).  Unlike arenas (which can move), stack storage
+    // always dies with the frame, so any .stack origin reaching ret
+    // is wrong regardless of the outer return type.
+    if (origin == .stack and config_mod.isEnabled(ctx.config, .stack_escape)) {
+        const name = ctx.locals[@intFromEnum(origin.stack)].name;
+        if (r.is_borrowed_return_type) {
+            try report(ctx, pos, end_pos, .@"error",
+                "returning a pointer to a function-local stack variable `{s}` (escapes its frame)", .{name});
+        } else {
+            try report(ctx, pos, end_pos, .@"error",
+                "returning a value that holds a pointer to function-local stack variable `{s}` (escapes its frame)", .{name});
+        }
+        return;
+    }
+
     // Borrow-escape checks only apply to borrowed-shape returns.
     if (!r.is_borrowed_return_type) return;
     switch (origin) {
@@ -147,12 +164,6 @@ fn transferRet(
                 try report(ctx, pos, end_pos, .@"error",
                     "returning a value borrowed from a function-local arena (escapes its lifetime)", .{});
             }
-        },
-        .stack => |local| {
-            if (!config_mod.isEnabled(ctx.config, .stack_escape)) return;
-            const name = ctx.locals[@intFromEnum(local)].name;
-            try report(ctx, pos, end_pos, .@"error",
-                "returning a pointer to a function-local stack variable `{s}` (escapes its frame)", .{name});
         },
         .heap => |hid| {
             if (!config_mod.isEnabled(ctx.config, .heap_use_after_free)) return;

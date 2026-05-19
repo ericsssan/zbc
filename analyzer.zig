@@ -310,6 +310,41 @@ test "stack_escape: return &local propagated through copy" {
     try std.testing.expect(found);
 }
 
+test "stack_escape: composite — return .{ .p = &local } is flagged" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const Wrapper = struct { p: *const u32 };
+        \\pub fn foo() Wrapper {
+        \\    var x: u32 = 7;
+        \\    return .{ .p = &x };
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    var found = false;
+    for (problems.items) |p| {
+        if (std.mem.indexOf(u8, p.message, "stack variable `x`") != null) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "stack_escape: composite — return .{ .s = local_array[0..] } is flagged" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\pub fn foo() struct { s: []const u8 } {
+        \\    var buf: [16]u8 = undefined;
+        \\    return .{ .s = buf[0..] };
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    var found = false;
+    for (problems.items) |p| {
+        if (std.mem.indexOf(u8, p.message, "stack variable `buf`") != null) found = true;
+    }
+    try std.testing.expect(found);
+}
+
 test "stack_escape: plain value return is OK" {
     const gpa = std.testing.allocator;
     var problems = try analyze(gpa,

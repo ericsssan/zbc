@@ -1455,7 +1455,52 @@ const Builder = struct {
             return self.classifyCall(expr_node);
         }
 
+        // Composite escape fallback — for shapes we didn't classify
+        // above (struct literals, anonymous inits, etc.), scan tokens
+        // for any `&<bare_local>` and treat the whole expression as
+        // carrying that local's frame lifetime.  Catches patterns
+        // like `return .{ .p = &local }` and `return Wrapper{ .p =
+        // &local }` without modeling composite shapes explicitly.
+        // Conservative: yields false positives on calls that wrap
+        // but copy out (`fromPtr(&x)` stored by value), which can be
+        // suppressed by annotating the wrapper's `@returns` or by
+        // disabling stack_escape for the file.
+        if (self.firstAddressedLocal(expr_node)) |id| {
+            return .{ .stack_ref = id };
+        }
+
         return .unknown;
+    }
+
+    /// Walk `expr_node`'s tokens looking for either:
+    ///   `&<ident>`         — address-of a known local, OR
+    ///   `<array_local>[`   — slice/index of a known `[N]T` local.
+    /// Returns the first such LocalId — caller propagates as
+    /// `.stack_ref` so transferRet can flag the escape.
+    fn firstAddressedLocal(self: *Builder, expr_node: Ast.Node.Index) ?LocalId {
+        const tree = self.tree;
+        const first = tree.firstToken(expr_node);
+        const last = tree.lastToken(expr_node);
+        const tags = tree.tokens.items(.tag);
+
+        var t: Ast.TokenIndex = first;
+        while (t <= last) : (t += 1) {
+            // Address-of pattern: `& <ident>`
+            if (tags[t] == .ampersand and t + 1 <= last and tags[t + 1] == .identifier) {
+                const name = tree.tokenSlice(t + 1);
+                if (self.name_to_local.get(name)) |local| return local;
+                continue;
+            }
+            // Slice/index of a stack array: `<ident> [`
+            if (tags[t] == .identifier and t + 1 <= last and tags[t + 1] == .l_bracket) {
+                // Skip if preceded by `.` (struct field access on something).
+                if (t > 0 and tags[t - 1] == .period) continue;
+                const name = tree.tokenSlice(t);
+                const local = self.name_to_local.get(name) orelse continue;
+                if (self.locals.items[@intFromEnum(local)].is_array) return local;
+            }
+        }
+        return null;
     }
 
     fn classifyCall(self: *Builder, call_node: Ast.Node.Index) ExprKind {
