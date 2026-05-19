@@ -401,6 +401,67 @@ test "invariant #1: matching Ast on both args — no false positive" {
     }
 }
 
+/// Cross-file test helper variant — pass an arbitrary set of
+/// `{filename, src}` files plus the main file under test.  Used by
+/// nested-namespace tests (phase 30) where we need foo.zig + lib.zig
+/// + inner.zig all on disk so the resolver can chase the chain.
+fn analyzeCrossFileMulti(
+    gpa: std.mem.Allocator,
+    main_src: []const u8,
+    extras: []const struct { name: []const u8, src: []const u8 },
+) !std.ArrayListUnmanaged(Problem) {
+    const tio = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    for (extras) |e| {
+        try tmp.dir.writeFile(tio, .{ .sub_path = e.name, .data = e.src });
+    }
+    try tmp.dir.writeFile(tio, .{ .sub_path = "foo.zig", .data = main_src });
+
+    const base_dir = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer gpa.free(base_dir);
+    const foo_path = try std.fs.path.join(gpa, &.{ base_dir, "foo.zig" });
+    defer gpa.free(foo_path);
+
+    const src_bytes = try std.Io.Dir.cwd().readFileAlloc(
+        tio,
+        foo_path,
+        gpa,
+        std.Io.Limit.limited(1 * 1024 * 1024),
+    );
+    defer gpa.free(src_bytes);
+    const src_z = try gpa.dupeSentinel(u8, src_bytes, 0);
+    defer gpa.free(src_z);
+    var tree = try std.zig.Ast.parse(gpa, src_z, .zig);
+    defer tree.deinit(gpa);
+
+    var db = try annotations.build(gpa, &tree);
+    defer db.deinit(gpa);
+    var imap = try imports_mod.build(gpa, &tree);
+    defer imap.deinit(gpa);
+
+    var rcache = remote_resolver_mod.Cache.init(gpa, tio);
+    defer rcache.deinit();
+
+    const remote_ctx = cfg_mod.RemoteCtx{
+        .imap = &imap,
+        .base_dir = base_dir,
+        .cache = &rcache,
+    };
+
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    var node_idx: u32 = 1;
+    while (node_idx < tree.nodes.len) : (node_idx += 1) {
+        const node: std.zig.Ast.Node.Index = @enumFromInt(node_idx);
+        if (tree.nodeTag(node) != .fn_decl) continue;
+        var cfg = (try cfg_mod.lowerFunctionWithRemote(gpa, &tree, node, &db, &remote_ctx)) orelse continue;
+        defer cfg.deinit(gpa);
+        try check(gpa, &cfg, .{ .path = foo_path }, &problems);
+    }
+    return problems;
+}
+
 /// Cross-file test helper: writes `main_src` and `import_src` to a
 /// fresh tmp dir as foo.zig and lib.zig respectively, then runs
 /// the full Layer-2 pipeline against foo.zig with cross-file
@@ -495,6 +556,52 @@ test "invariant #1 fires through CROSS-FILE @takes lookup (phase 28)" {
         \\/// @takes node_index_of(t)
         \\pub fn inspect(t: Ast, n: NodeIndex) void { _ = t; _ = n; }
         \\
+    );
+    defer freeProblems(gpa, &problems);
+
+    var found = false;
+    for (problems.items) |p| {
+        if (std.mem.indexOf(u8, p.message, "invariant #1") != null) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "invariant #1 fires through NESTED-namespace dispatch (phase 30)" {
+    // foo.zig imports lib.zig; lib.zig re-exports inner.zig as
+    // `pub const Inner = @import("inner.zig");`.  The call shape
+    // `lib.Inner.inspect(tree_b, node)` requires chasing one extra
+    // hop through lib's own imap to land in inner.zig where
+    // `inspect`'s @takes lives.
+    const gpa = std.testing.allocator;
+    var problems = try analyzeCrossFileMulti(gpa,
+        // foo.zig (main)
+        \\const lib = @import("lib.zig");
+        \\const Ast = lib.Inner.Ast;
+        \\const NodeIndex = lib.Inner.NodeIndex;
+        \\pub fn foo() !void {
+        \\    var tree_a = try Ast.parse();
+        \\    var tree_b = try Ast.parse();
+        \\    const node = lib.Inner.rootNode(tree_a);
+        \\    lib.Inner.inspect(tree_b, node);
+        \\    return;
+        \\}
+        \\
+        ,
+        &.{
+            .{ .name = "lib.zig", .src =
+                \\pub const Inner = @import("inner.zig");
+                \\
+            },
+            .{ .name = "inner.zig", .src =
+                \\pub const Ast = struct { pub fn parse() !Ast { return .{}; } };
+                \\pub const NodeIndex = u32;
+                \\/// @returns node_index_of(ast)
+                \\pub fn rootNode(ast: Ast) NodeIndex { _ = ast; return 0; }
+                \\/// @takes node_index_of(t)
+                \\pub fn inspect(t: Ast, n: NodeIndex) void { _ = t; _ = n; }
+                \\
+            },
+        },
     );
     defer freeProblems(gpa, &problems);
 

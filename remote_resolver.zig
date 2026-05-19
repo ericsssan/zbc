@@ -22,13 +22,23 @@ const std = @import("std");
 const Ast = std.zig.Ast;
 
 const annotations = @import("annotations.zig");
+const imports_mod = @import("imports.zig");
 
 pub const RemoteFile = struct {
+    /// Borrowed view of the cache's key for this file.  Used by
+    /// callers to resolve nested @imports relative to this file's
+    /// directory (`std.fs.path.dirname(abs_path)`).  NOT freed by
+    /// deinit — the cache owns the underlying allocation.
+    abs_path: []const u8,
     src_z: [:0]u8,
     tree: Ast,
     db: annotations.Db,
+    /// This file's own @import extractions, used to chase one extra
+    /// level when callers see `lib.Submodule.method(...)`.
+    imap: imports_mod.Map,
 
     pub fn deinit(self: *RemoteFile, gpa: std.mem.Allocator) void {
+        self.imap.deinit(gpa);
         self.db.deinit(gpa);
         self.tree.deinit(gpa);
         gpa.free(self.src_z);
@@ -116,8 +126,23 @@ pub const Cache = struct {
         };
         errdefer db.deinit(self.gpa);
 
+        var imap = imports_mod.build(self.gpa, &tree) catch {
+            db.deinit(self.gpa);
+            tree.deinit(self.gpa);
+            self.gpa.free(src_z);
+            self.gpa.free(abs);
+            return null;
+        };
+        errdefer imap.deinit(self.gpa);
+
         const box = try self.gpa.create(RemoteFile);
-        box.* = .{ .src_z = src_z, .tree = tree, .db = db };
+        box.* = .{
+            .abs_path = abs,
+            .src_z = src_z,
+            .tree = tree,
+            .db = db,
+            .imap = imap,
+        };
 
         try self.files.put(self.gpa, abs, box);
         return box;

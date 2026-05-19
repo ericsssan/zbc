@@ -1288,18 +1288,30 @@ const Builder = struct {
         return self.name_to_local.get(name);
     }
 
-    /// Is this call's receiver a bare identifier matching an entry
-    /// in the imports map?  Used to differentiate `imported.foo(...)`
-    /// (namespace call — receiver is NOT arg 0) from `obj.method(...)`
-    /// (method call — receiver IS arg 0).
+    /// Is the call's receiver a namespace (vs an object/value)?
+    /// Two recognized shapes:
+    ///   `imported.method(...)`         — recv is identifier in imap
+    ///   `imported.Sub.method(...)`     — recv is field_access whose
+    ///                                    outermost ident is in imap
+    /// Either case → namespace call; receiver is NOT arg 0.
     fn isImportNamespaceCall(self: *Builder, callee_node: Ast.Node.Index) bool {
         const tree = self.tree;
         if (tree.nodeTag(callee_node) != .field_access) return false;
         const recv_node = tree.nodeData(callee_node).node_and_token[0];
-        if (tree.nodeTag(recv_node) != .identifier) return false;
         const remote = self.remote orelse return false;
-        const recv_name = tree.tokenSlice(tree.nodeMainToken(recv_node));
-        return remote.imap.lookup(recv_name) != null;
+
+        const outer_ident_tok: ?Ast.TokenIndex = switch (tree.nodeTag(recv_node)) {
+            .identifier => tree.nodeMainToken(recv_node),
+            .field_access => blk: {
+                const outer = tree.nodeData(recv_node).node_and_token[0];
+                if (tree.nodeTag(outer) != .identifier) break :blk null;
+                break :blk tree.nodeMainToken(outer);
+            },
+            else => null,
+        };
+        const tok = outer_ident_tok orelse return false;
+        const name = tree.tokenSlice(tok);
+        return remote.imap.lookup(name) != null;
     }
 
     /// Resolve callee's `@takes` annotation.  Same-file db first, then
@@ -1336,24 +1348,57 @@ const Builder = struct {
         }
     }
 
-    /// Cross-file `@takes` lookup.  Mirrors lookupRemoteMethod's
-    /// shape — receiver must be an import-namespace identifier;
-    /// resolve via cache, look up method in remote DB, return
-    /// takes annotation if present.
+    /// Cross-file `@takes` lookup.  Uses resolveRemoteFile so it
+    /// inherits one-hop nested-namespace dispatch (phase 30) for free.
     fn lookupRemoteTakes(
         self: *Builder,
         recv_node: Ast.Node.Index,
         method_name: []const u8,
     ) ?annotations.TakesAnnotation {
+        const file = self.resolveRemoteFile(recv_node) orelse return null;
+        const entry = file.db.lookup(method_name) orelse return null;
+        return entry.takes;
+    }
+
+    /// Walk the receiver chain to its terminal RemoteFile.  Two
+    /// supported shapes:
+    /// (a) `imported.method` — receiver is a bare identifier; one
+    ///     hop through self.remote.imap.
+    /// (b) `imported.Sub.method` — receiver is one-level nested
+    ///     field_access; chase via `imported`'s OWN imap (loaded
+    ///     into RemoteFile.imap as of phase 30) to land in Sub's
+    ///     file.  Path resolution for the second hop uses the
+    ///     intermediate file's directory.
+    /// Deeper chains aren't followed.
+    fn resolveRemoteFile(
+        self: *Builder,
+        recv_node: Ast.Node.Index,
+    ) ?*const remote_resolver.RemoteFile {
         const tree = self.tree;
         const remote = self.remote orelse return null;
-        if (tree.nodeTag(recv_node) != .identifier) return null;
-        const recv_name = tree.tokenSlice(tree.nodeMainToken(recv_node));
-        const import_entry = remote.imap.lookup(recv_name) orelse return null;
-        const remote_file = (remote.cache.loadOrLookup(remote.base_dir, import_entry.path)
-            catch null) orelse return null;
-        const entry = remote_file.db.lookup(method_name) orelse return null;
-        return entry.takes;
+
+        switch (tree.nodeTag(recv_node)) {
+            .identifier => {
+                const recv_name = tree.tokenSlice(tree.nodeMainToken(recv_node));
+                const entry = remote.imap.lookup(recv_name) orelse return null;
+                return (remote.cache.loadOrLookup(remote.base_dir, entry.path) catch null);
+            },
+            .field_access => {
+                const fa = tree.nodeData(recv_node);
+                const outer_node = fa.node_and_token[0];
+                const inner_tok = fa.node_and_token[1];
+                if (tree.nodeTag(outer_node) != .identifier) return null;
+                const outer_name = tree.tokenSlice(tree.nodeMainToken(outer_node));
+                const outer_import = remote.imap.lookup(outer_name) orelse return null;
+                const outer_file = (remote.cache.loadOrLookup(remote.base_dir, outer_import.path) catch null) orelse return null;
+
+                const inner_name = tree.tokenSlice(inner_tok);
+                const inner_import = outer_file.imap.lookup(inner_name) orelse return null;
+                const inner_base_dir = std.fs.path.dirname(outer_file.abs_path) orelse ".";
+                return (remote.cache.loadOrLookup(inner_base_dir, inner_import.path) catch null);
+            },
+            else => return null,
+        }
     }
 
     /// Walk through `try` wrappers to the underlying call node, or
@@ -1496,28 +1541,17 @@ const Builder = struct {
         }
     }
 
-    /// Cross-file resolution.  Receiver must be a bare identifier;
-    /// look it up in the import map, resolve the file via the cache,
-    /// and look up `method_name` in the imported file's annotation DB.
-    /// Returns the annotation (a small value type — safe to copy
-    /// across file boundaries) or null on any miss.
+    /// Cross-file resolution.  Uses resolveRemoteFile so it accepts
+    /// both single-hop (`imported.method`) and nested
+    /// (`imported.Sub.method`) receiver shapes.  Returns null on any
+    /// miss.
     fn lookupRemoteMethod(
         self: *Builder,
         recv_node: Ast.Node.Index,
         method_name: []const u8,
     ) ?annotations.ReturnsAnnotation {
-        const tree = self.tree;
-        const remote = self.remote orelse return null;
-        if (tree.nodeTag(recv_node) != .identifier) return null;
-        const recv_name = tree.tokenSlice(tree.nodeMainToken(recv_node));
-        const import_entry = remote.imap.lookup(recv_name) orelse return null;
-
-        // Cache loads can fail (allocator OOM, etc.); swallow as
-        // conservative miss.  Non-allocator failures (file missing,
-        // parse error) already return null from loadOrLookup.
-        const remote_file = (remote.cache.loadOrLookup(remote.base_dir, import_entry.path)
-            catch null) orelse return null;
-        const entry = remote_file.db.lookup(method_name) orelse return null;
+        const file = self.resolveRemoteFile(recv_node) orelse return null;
+        const entry = file.db.lookup(method_name) orelse return null;
         return entry.annotation; // may itself be null — caller treats as miss
     }
 
