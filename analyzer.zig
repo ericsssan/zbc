@@ -399,6 +399,65 @@ test "invariant #1: matching Ast on both args — no false positive" {
     }
 }
 
+test "invariant #1 fires at var-decl init position (phase 27)" {
+    // `const t = inspect(tree_b, node);` — the call is in init
+    // position, NOT statement position.  Pre-phase-27 emitTakesChecks
+    // only fired from lowerCallStmt; this case was silent despite
+    // the same logical violation.  Phase 27 broadens to init position
+    // so this now flags.
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\pub fn foo() !void {
+        \\    var tree_a = try Ast.parse();
+        \\    var tree_b = try Ast.parse();
+        \\    const node = rootNode(tree_a);
+        \\    const t = inspect(tree_b, node);
+        \\    _ = t;
+        \\    return;
+        \\}
+        \\const Ast = struct { pub fn parse() !Ast { return .{}; } };
+        \\const NodeIndex = u32;
+        \\/// @returns node_index_of(ast)
+        \\pub fn rootNode(ast: Ast) NodeIndex { _ = ast; return 0; }
+        \\/// @takes node_index_of(t)
+        \\pub fn inspect(t: Ast, n: NodeIndex) u32 { _ = t; _ = n; return 0; }
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+
+    var found = false;
+    for (problems.items) |p| {
+        if (std.mem.indexOf(u8, p.message, "invariant #1") != null) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "invariant #1 fires at return position (phase 27)" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\pub fn foo() !u32 {
+        \\    var tree_a = try Ast.parse();
+        \\    var tree_b = try Ast.parse();
+        \\    const node = rootNode(tree_a);
+        \\    return inspect(tree_b, node);
+        \\}
+        \\const Ast = struct { pub fn parse() !Ast { return .{}; } };
+        \\const NodeIndex = u32;
+        \\/// @returns node_index_of(ast)
+        \\pub fn rootNode(ast: Ast) NodeIndex { _ = ast; return 0; }
+        \\/// @takes node_index_of(t)
+        \\pub fn inspect(t: Ast, n: NodeIndex) u32 { _ = t; _ = n; return 0; }
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+
+    var found = false;
+    for (problems.items) |p| {
+        if (std.mem.indexOf(u8, p.message, "invariant #1") != null) found = true;
+    }
+    try std.testing.expect(found);
+}
+
 test "lowering_gap collapses locals to plain — no spurious reports" {
     const gpa = std.testing.allocator;
     // `if (x) return;` triggers a lowering_gap in cfg.zig today.  The

@@ -951,6 +951,12 @@ const Builder = struct {
         else
             .plain;
 
+        // Emit @takes node_index_of checks for any call in init
+        // position — before the .decl so checks appear first in the
+        // block's stmt sequence (transfer is sequential; sequence
+        // doesn't change correctness but reads more naturally).
+        if (init_opt) |init| try self.emitTakesChecksForExpr(init, cur);
+
         try self.appendStmt(cur.*, .{
             .kind = .{ .decl = .{ .local = local, .init_kind = init_kind } },
             .pos = self.posOf(decl_node),
@@ -1009,6 +1015,9 @@ const Builder = struct {
         // its body in-place, advancing cur, before the .assign emits.
         if (try self.maybeLowerLabeledBlockExpr(rhs, cur)) {}
 
+        // @takes checks for call-shaped rhs (phase 27).
+        try self.emitTakesChecksForExpr(rhs, cur);
+
         if (target_local) |t| {
             try self.appendStmt(cur.*, .{
                 .kind = .{ .assign = .{
@@ -1052,6 +1061,9 @@ const Builder = struct {
 
         // Labeled-block expression rhs — lower body first.
         if (try self.maybeLowerLabeledBlockExpr(rhs, cur)) {}
+
+        // @takes checks for call-shaped rhs (phase 27).
+        try self.emitTakesChecksForExpr(rhs, cur);
 
         for (full.ast.variables) |var_node| {
             const vtag = tree.nodeTag(var_node);
@@ -1126,6 +1138,9 @@ const Builder = struct {
             // before the return.  cur advances to post-merge; the
             // ret then emits there.
             if (try self.maybeLowerLabeledBlockExpr(expr, cur)) {}
+
+            // @takes checks for call-shaped return value (phase 27).
+            try self.emitTakesChecksForExpr(expr, cur);
         }
 
         // Success-path defers: fire before the return-value check.
@@ -1275,6 +1290,33 @@ const Builder = struct {
         if (tree.nodeTag(node) != .identifier) return null;
         const name = tree.tokenSlice(tree.nodeMainToken(node));
         return self.name_to_local.get(name);
+    }
+
+    /// Walk through `try` wrappers to the underlying call node, or
+    /// null if `node` isn't a call (possibly after one or more `try`s).
+    /// `catch` not unwrapped — its lhs is a call but the whole
+    /// expression's value has different propagation; conservatively
+    /// skipped here so we don't emit phantom checks.
+    fn unwrapToCallNode(self: *Builder, node: Ast.Node.Index) ?Ast.Node.Index {
+        const tag = self.tree.nodeTag(node);
+        return switch (tag) {
+            .@"try" => self.unwrapToCallNode(self.tree.nodeData(node).node),
+            .call, .call_one, .call_comma, .call_one_comma => node,
+            else => null,
+        };
+    }
+
+    /// If `expr` (after `try` unwrap) is a direct call, emit per-arg
+    /// `.ast_takes_check` statements onto `cur`.  Hook used by
+    /// init/return/assign positions to broaden phase 26's
+    /// statement-position-only emission.
+    fn emitTakesChecksForExpr(
+        self: *Builder,
+        expr: Ast.Node.Index,
+        cur: *BlockId,
+    ) !void {
+        const call_node = self.unwrapToCallNode(expr) orelse return;
+        try self.emitTakesChecksForCall(call_node, cur);
     }
 
     fn classifyExpr(self: *Builder, expr_node: Ast.Node.Index) ExprKind {
