@@ -14,6 +14,9 @@
 //!                        Default is all invariants.  Implies --escape.
 //!   --disable=<list>     Comma-separated invariant names to disable.
 //!                        Subtracted from the enabled set.
+//!   --format=text|json   Output format (default: text).  JSON emits
+//!                        a single array across all input files,
+//!                        suitable for editor/CI tooling.
 //!   --list-invariants    Print known invariant names and exit 0.
 //!   -h / --help          Print usage and exit 0.
 
@@ -35,6 +38,7 @@ pub fn main(init: std.process.Init) !void {
     try enabled.appendSlice(gpa, &lib.all_invariants);
     var escape_mode = false;
     var enabled_explicit = false;
+    var format: Format = .text;
 
     while (arg_it.next()) |a| {
         if (std.mem.eql(u8, a, "-h") or std.mem.eql(u8, a, "--help")) {
@@ -64,6 +68,18 @@ pub fn main(init: std.process.Init) !void {
             try parseInvariantList(gpa, a["--disable=".len..], &enabled, .remove);
             continue;
         }
+        if (std.mem.startsWith(u8, a, "--format=")) {
+            const v = a["--format=".len..];
+            if (std.mem.eql(u8, v, "text")) {
+                format = .text;
+            } else if (std.mem.eql(u8, v, "json")) {
+                format = .json;
+            } else {
+                std.debug.print("zbc: unknown format `{s}` (expected text or json)\n", .{v});
+                std.process.exit(2);
+            }
+            continue;
+        }
         if (std.mem.startsWith(u8, a, "--")) {
             std.debug.print("zbc: unknown flag: {s}\n", .{a});
             printUsage();
@@ -83,6 +99,9 @@ pub fn main(init: std.process.Init) !void {
     defer if (cache_storage) |*c| c.deinit();
 
     var any_problems = false;
+    var json_first = true;
+    if (format == .json) std.debug.print("[", .{});
+
     for (paths.items) |path| {
         const problems = if (escape_mode)
             lib.analyzeEscape(gpa, io, path, &cache_storage.?, &config) catch |err| {
@@ -100,11 +119,17 @@ pub fn main(init: std.process.Init) !void {
 
         if (problems.len == 0) continue;
         any_problems = true;
-        printProblems(path, problems);
+        switch (format) {
+            .text => printProblemsText(path, problems),
+            .json => printProblemsJson(path, problems, &json_first),
+        }
     }
 
+    if (format == .json) std.debug.print("{s}]\n", .{if (json_first) "" else "\n"});
     std.process.exit(if (any_problems) @as(u8, 1) else 0);
 }
+
+const Format = enum { text, json };
 
 const Op = enum { add, remove };
 
@@ -151,27 +176,101 @@ fn printUsage() void {
         \\  --escape              Run Layer-2 escape analysis (default: Layer-1 only).
         \\  --enable=a,b,c        Enable only these invariants (implies --escape).
         \\  --disable=a,b         Disable these invariants from the enabled set.
+        \\  --format=text|json    Output format (default: text).
         \\  --list-invariants     Print known invariant names and exit.
         \\  -h, --help            Print this help.
         \\
     , .{});
 }
 
-fn printProblems(path: []const u8, problems: []const lib.Problem) void {
+fn printProblemsText(path: []const u8, problems: []const lib.Problem) void {
     for (problems) |p| {
         std.debug.print("{s}:{}:{}: {s}: {s} [{s}]\n", .{
             path,
             p.start.line,
             p.start.column,
-            switch (p.severity) {
-                .@"error" => "error",
-                .warning => "warning",
-                .off => "off",
-            },
+            severityName(p.severity),
             p.message,
             p.rule_id,
         });
     }
+}
+
+fn printProblemsJson(path: []const u8, problems: []const lib.Problem, first: *bool) void {
+    for (problems) |p| {
+        if (first.*) {
+            std.debug.print("\n  ", .{});
+            first.* = false;
+        } else {
+            std.debug.print(",\n  ", .{});
+        }
+        std.debug.print("{{\"path\":\"", .{});
+        writeJsonEscaped(path);
+        std.debug.print(
+            "\",\"rule_id\":\"{s}\",\"severity\":\"{s}\"," ++
+                "\"start\":{{\"line\":{},\"column\":{},\"byte\":{}}}," ++
+                "\"end\":{{\"line\":{},\"column\":{},\"byte\":{}}}," ++
+                "\"message\":\"",
+            .{
+                p.rule_id,
+                severityName(p.severity),
+                p.start.line, p.start.column, p.start.byte,
+                p.end.line,   p.end.column,   p.end.byte,
+            },
+        );
+        writeJsonEscaped(p.message);
+        std.debug.print("\"}}", .{});
+    }
+}
+
+fn severityName(s: lib.Severity) []const u8 {
+    return switch (s) {
+        .@"error" => "error",
+        .warning => "warning",
+        .off => "off",
+    };
+}
+
+/// Write `s` to stderr with the minimum JSON-string escapes per RFC 8259:
+/// quote, backslash, and control characters (< 0x20) become \uXXXX.
+/// No Unicode validation — Zig source files are valid UTF-8 already,
+/// and the user's diagnostic messages flow through unchanged.
+fn writeJsonEscaped(s: []const u8) void {
+    for (s) |c| {
+        switch (c) {
+            '"' => std.debug.print("\\\"", .{}),
+            '\\' => std.debug.print("\\\\", .{}),
+            '\n' => std.debug.print("\\n", .{}),
+            '\r' => std.debug.print("\\r", .{}),
+            '\t' => std.debug.print("\\t", .{}),
+            0...0x08, 0x0b, 0x0c, 0x0e...0x1f => std.debug.print("\\u{x:0>4}", .{c}),
+            else => std.debug.print("{c}", .{c}),
+        }
+    }
+}
+
+/// Buffered mirror of writeJsonEscaped — used by tests and any
+/// future library-mode JSON sink that wants the escaped string
+/// in memory rather than streamed to stderr.
+fn jsonEscapeToBuf(gpa: std.mem.Allocator, s: []const u8) ![]u8 {
+    var list: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer list.deinit(gpa);
+    for (s) |c| {
+        switch (c) {
+            '"' => try list.appendSlice(gpa, "\\\""),
+            '\\' => try list.appendSlice(gpa, "\\\\"),
+            '\n' => try list.appendSlice(gpa, "\\n"),
+            '\r' => try list.appendSlice(gpa, "\\r"),
+            '\t' => try list.appendSlice(gpa, "\\t"),
+            0...0x08, 0x0b, 0x0c, 0x0e...0x1f => {
+                var buf: [6]u8 = undefined;
+                const hex = try std.fmt.bufPrint(&buf, "\\u{x:0>4}", .{c});
+                try list.appendSlice(gpa, hex);
+            },
+            else => try list.append(gpa, c),
+        }
+    }
+    return list.toOwnedSlice(gpa);
 }
 
 // ── Tests ──────────────────────────────────────────────────
@@ -202,6 +301,28 @@ test "parseInvariantList: remove from a set" {
     try std.testing.expectEqual(@as(usize, 3), list.items.len);
     try std.testing.expect(!containsInvariant(list.items, .thread_arena));
     try std.testing.expect(!containsInvariant(list.items, .pass_identity));
+}
+
+test "jsonEscapeToBuf: passes ASCII through unchanged" {
+    const gpa = std.testing.allocator;
+    const s = try jsonEscapeToBuf(gpa, "hello, world (idx=42)");
+    defer gpa.free(s);
+    try std.testing.expectEqualStrings("hello, world (idx=42)", s);
+}
+
+test "jsonEscapeToBuf: escapes quote, backslash, common control chars" {
+    const gpa = std.testing.allocator;
+    const s = try jsonEscapeToBuf(gpa, "a\"b\\c\nd\te");
+    defer gpa.free(s);
+    try std.testing.expectEqualStrings("a\\\"b\\\\c\\nd\\te", s);
+}
+
+test "jsonEscapeToBuf: low control bytes become \\uXXXX" {
+    const gpa = std.testing.allocator;
+    // 0x01 + 0x1f sit in the explicit \u-escape range; 0x09 is \t (above).
+    const s = try jsonEscapeToBuf(gpa, &[_]u8{ 'x', 0x01, 'y', 0x1f, 'z' });
+    defer gpa.free(s);
+    try std.testing.expectEqualStrings("x\\u0001y\\u001fz", s);
 }
 
 test "parseInvariantList: whitespace tolerated" {
