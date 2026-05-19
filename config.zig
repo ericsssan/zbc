@@ -53,11 +53,62 @@ pub const Config = struct {
     thread_join_patterns: []const []const u8 = &.{
         ".join(",
     },
+
+    /// Which invariants to enforce (phase 46).  Downstream projects
+    /// can opt out of any subset they don't care about — e.g. a
+    /// codebase that doesn't pass NodeIndex across Ast boundaries
+    /// might only enable arena_escape + ast_mutation.  Default
+    /// `all_invariants` matches historical ez behavior.
+    ///
+    /// Disabling an invariant skips both the emit-side stmts (cfg
+    /// won't allocate per-call check stmts) and the transfer-side
+    /// validation (analyzer won't report).  Other invariants stay
+    /// fully active.
+    enabled: []const Invariant = &all_invariants,
+};
+
+/// Set of invariants the analyzer can enforce.  Each maps to a
+/// specific check pattern documented in the design doc; downstream
+/// projects pick which subset is relevant.
+pub const Invariant = enum {
+    /// #1: NodeIndex from Ast A must only flow back into A.
+    /// Drives @takes node_index_of validation at call sites.
+    ast_identity,
+    /// #2: A slice borrowed from an arena must not outlive that
+    /// arena.  Drives the function-local arena-escape check.
+    arena_escape,
+    /// #3: Worker-arena pointer must not be read by main thread
+    /// before the join point.  Scaffolded only — needs inter-
+    /// procedural propagation to fire.
+    thread_arena,
+    /// #4: ScopeId/SymbolId from pass N must not be used in
+    /// pass M.  Scaffolded only.
+    pass_identity,
+    /// #5: After parse, the Ast is read-only.  Drives
+    /// @mutates_ast call-site flagging.
+    ast_mutation,
+};
+
+pub const all_invariants: [5]Invariant = .{
+    .ast_identity,
+    .arena_escape,
+    .thread_arena,
+    .pass_identity,
+    .ast_mutation,
 };
 
 /// The historical ez config — preserves all behavior from phases 1-41.
 /// Existing tests + sweep validate against this.
 pub const Default: Config = .{};
+
+/// True iff `config.enabled` contains `inv`.  Used by cfg.zig
+/// (gate emit-side checks) and transfer.zig (gate validation).
+pub fn isEnabled(config: *const Config, inv: Invariant) bool {
+    for (config.enabled) |e| {
+        if (e == inv) return true;
+    }
+    return false;
+}
 
 // ── Tests ──────────────────────────────────────────────────
 

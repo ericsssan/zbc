@@ -16,6 +16,7 @@ const problem_mod = @import("problem.zig");
 const annotations = @import("annotations.zig");
 const imports_mod = @import("imports.zig");
 const remote_resolver_mod = @import("remote_resolver.zig");
+const config_mod = @import("config.zig");
 
 const Cfg = cfg_mod.Cfg;
 const BlockId = cfg_mod.BlockId;
@@ -26,6 +27,9 @@ const Problem = problem_mod.Problem;
 pub const Options = struct {
     /// Source file path for diagnostics.
     path: []const u8,
+    /// Invariant gating (phase 46).  Defaults to DefaultConfig
+    /// (all invariants enabled).
+    config: *const config_mod.Config = &config_mod.Default,
 };
 
 /// Run escape analysis over `cfg`, appending Problems to `out`.
@@ -87,6 +91,7 @@ pub fn check(
             .next_ast = &next_ast,
             .problems = out,
             .path = opts.path,
+            .config = opts.config,
         };
 
         for (block.stmts) |stmt| {
@@ -126,6 +131,34 @@ fn analyze(gpa: std.mem.Allocator, src: []const u8) !std.ArrayListUnmanaged(Prob
         var cfg = (try cfg_mod.lowerFunction(gpa, &tree, node, &db)) orelse continue;
         defer cfg.deinit(gpa);
         try check(gpa, &cfg, .{ .path = "<test>" }, &problems);
+    }
+    return problems;
+}
+
+/// Same as analyze but consumes a Config — used by phase-46 opt-in
+/// tests to verify selective invariant disabling.
+fn analyzeWithConfig(
+    gpa: std.mem.Allocator,
+    src: []const u8,
+    config: *const config_mod.Config,
+) !std.ArrayListUnmanaged(Problem) {
+    const src_z = try gpa.dupeSentinel(u8, src, 0);
+    defer gpa.free(src_z);
+    var tree = try Ast.parse(gpa, src_z, .zig);
+    defer tree.deinit(gpa);
+
+    var db = try annotations.build(gpa, &tree);
+    defer db.deinit(gpa);
+
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+
+    var node_idx: u32 = 1;
+    while (node_idx < tree.nodes.len) : (node_idx += 1) {
+        const node: Ast.Node.Index = @enumFromInt(node_idx);
+        if (tree.nodeTag(node) != .fn_decl) continue;
+        var cfg = (try cfg_mod.lowerFunctionFull(gpa, &tree, node, &db, null, config)) orelse continue;
+        defer cfg.deinit(gpa);
+        try check(gpa, &cfg, .{ .path = "<test>", .config = config }, &problems);
     }
     return problems;
 }
@@ -1016,6 +1049,60 @@ test "invariant #1 fires at return position (phase 27)" {
         if (std.mem.indexOf(u8, p.message, "invariant #1") != null) found = true;
     }
     try std.testing.expect(found);
+}
+
+test "Config.enabled opt-out: ast_mutation off → invariant #5 stays silent (phase 46)" {
+    // Same source that fires invariant #5 under DefaultConfig.  With
+    // only arena_escape enabled (ast_mutation OFF), the analyzer
+    // shouldn't emit the .ast_mutation_check stmts at all, and
+    // therefore no invariant #5 problem appears.
+    const gpa = std.testing.allocator;
+    const c: config_mod.Config = .{
+        .enabled = &.{.arena_escape},
+    };
+    var problems = try analyzeWithConfig(gpa,
+        \\const Ast = struct {};
+        \\pub fn foo(ast: Ast) void {
+        \\    ast.setNodeTag(0);
+        \\}
+        \\/// @mutates_ast
+        \\pub fn setNodeTag(self: Ast, _: u32) void { _ = self; }
+        \\
+        , &c);
+    defer freeProblems(gpa, &problems);
+
+    for (problems.items) |p| {
+        try std.testing.expect(std.mem.indexOf(u8, p.message, "invariant #5") == null);
+    }
+}
+
+test "Config.enabled opt-out: arena_escape off → no escape findings (phase 46)" {
+    // Source that fires the arena-escape check under DefaultConfig.
+    // Disabling arena_escape (keeping ast_mutation as the only
+    // enabled invariant) → transfer.transferRet skips the check.
+    const gpa = std.testing.allocator;
+    const c: config_mod.Config = .{
+        .enabled = &.{.ast_mutation},
+    };
+    var problems = try analyzeWithConfig(gpa,
+        \\const std = @import("std");
+        \\const Arena = struct {
+        \\    /// @returns borrowed_from(self)
+        \\    pub fn slice(self: *const Arena) []const u8 {
+        \\        _ = self; return "";
+        \\    }
+        \\};
+        \\pub fn foo() []const u8 {
+        \\    var arena = std.heap.ArenaAllocator.init(undefined);
+        \\    return arena.slice();
+        \\}
+        \\
+        , &c);
+    defer freeProblems(gpa, &problems);
+
+    for (problems.items) |p| {
+        try std.testing.expect(std.mem.indexOf(u8, p.message, "function-local arena") == null);
+    }
 }
 
 test "lowering_gap collapses locals to plain — no spurious reports" {

@@ -108,7 +108,7 @@ pub fn analyzeEscape(
             config,
         )) orelse continue;
         defer cfg.deinit(gpa);
-        try analyzer_mod.check(gpa, &cfg, .{ .path = path }, &problems);
+        try analyzer_mod.check(gpa, &cfg, .{ .path = path, .config = config }, &problems);
     }
 
     return problems.toOwnedSlice(gpa);

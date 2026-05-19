@@ -1331,29 +1331,36 @@ const Builder = struct {
         //   .of(idx)    — explicit param index from the annotation.
         //                 For method calls, idx==0 means the receiver;
         //                 explicit-arg indices shift by one.
-        if (self.lookupMutatesAst(callee_node)) |mut| {
-            const ast_arg: ?Ast.Node.Index = switch (mut) {
-                .implicit => if (recv_is_arg0)
-                    tree.nodeData(callee_node).node_and_token[0]
-                else if (args.len > 0) args[0] else null,
-                .of => |idx| blk: {
-                    if (recv_is_arg0 and idx == 0)
-                        break :blk tree.nodeData(callee_node).node_and_token[0];
-                    const explicit_idx = if (recv_is_arg0) idx - 1 else idx;
-                    if (explicit_idx >= args.len) break :blk null;
-                    break :blk args[explicit_idx];
-                },
-            };
-            if (ast_arg) |n| {
-                if (self.identifierToLocal(n)) |ast_local| {
-                    try self.appendStmt(cur.*, .{
-                        .kind = .{ .ast_mutation_check = .{ .ast_local = ast_local } },
-                        .pos = self.posOf(call_node),
-                    });
+        //
+        // Skipped when invariant ast_mutation is disabled (phase 46).
+        if (config_mod.isEnabled(self.config, .ast_mutation)) {
+            if (self.lookupMutatesAst(callee_node)) |mut| {
+                const ast_arg: ?Ast.Node.Index = switch (mut) {
+                    .implicit => if (recv_is_arg0)
+                        tree.nodeData(callee_node).node_and_token[0]
+                    else if (args.len > 0) args[0] else null,
+                    .of => |idx| blk: {
+                        if (recv_is_arg0 and idx == 0)
+                            break :blk tree.nodeData(callee_node).node_and_token[0];
+                        const explicit_idx = if (recv_is_arg0) idx - 1 else idx;
+                        if (explicit_idx >= args.len) break :blk null;
+                        break :blk args[explicit_idx];
+                    },
+                };
+                if (ast_arg) |n| {
+                    if (self.identifierToLocal(n)) |ast_local| {
+                        try self.appendStmt(cur.*, .{
+                            .kind = .{ .ast_mutation_check = .{ .ast_local = ast_local } },
+                            .pos = self.posOf(call_node),
+                        });
+                    }
                 }
             }
         }
 
+        // Takes check (invariant #1).  Skipped when ast_identity
+        // is disabled — Config.enabled gating (phase 46).
+        if (!config_mod.isEnabled(self.config, .ast_identity)) return;
         const takes = self.lookupTakes(callee_node) orelse return;
 
         // Resolve the source-Ast arg, or short-circuit on the opt-out.

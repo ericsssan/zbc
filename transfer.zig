@@ -11,6 +11,7 @@ const std = @import("std");
 const problem_mod = @import("problem.zig");
 const cfg = @import("cfg.zig");
 const state_mod = @import("abstract_state.zig");
+const config_mod = @import("config.zig");
 
 const Problem = problem_mod.Problem;
 const Severity = problem_mod.Severity;
@@ -33,15 +34,17 @@ pub const Ctx = struct {
     /// Counter for minting fresh ArenaIds at arena_init sites.  One per
     /// function — distinct arena_init sites get distinct IDs.
     next_arena: *u32,
-    /// Counter for minting fresh AstIds at ast_init sites.  Parallel
-    /// to next_arena.  Each `var tree = Ast.parse(...)` site gets a
-    /// distinct AstId so that NodeIndex values tagged with that ID
-    /// can be cross-checked against the destination Ast at use sites.
+    /// Counter for minting fresh AstIds at ast_init sites.
     next_ast: *u32,
     /// Where to push problems.
     problems: *std.ArrayListUnmanaged(Problem),
     /// Source file path for diagnostics.
     path: []const u8,
+    /// Invariant gating (phase 46).  Some checks happen in transfer
+    /// rather than cfg-emit (arena_escape fires inside transferRet,
+    /// not on a dedicated Stmt) — those consult the config to honor
+    /// `Config.enabled`.  Defaults to all invariants enabled.
+    config: *const config_mod.Config = &config_mod.Default,
 };
 
 /// Mutate `state` to reflect the effect of `stmt`.  Emit any problems
@@ -166,6 +169,8 @@ fn transferRet(
     // Value-typed returns MOVE the value (and any arena it owns) to
     // the caller — that's idiomatic, not a bug.  Skip the check.
     if (!r.is_borrowed_return_type) return;
+    // Honor Config.enabled (phase 46): skip when arena_escape opt-out.
+    if (!config_mod.isEnabled(ctx.config, .arena_escape)) return;
 
     const origin = try originOfInit(ctx, state, r.value_kind, pos);
     switch (origin) {
