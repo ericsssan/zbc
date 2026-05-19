@@ -53,10 +53,21 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(2);
     }
 
+    // Sweep-wide remote-resolver cache: built once, used across every
+    // file checked.  A typical src/ sweep imports ast.zig from 30+
+    // sites — promoting the cache out of checkFileEscape avoids
+    // re-parsing it once per importer.  Only allocated when
+    // escape_mode is on (Layer-1 mode doesn't need it).
+    var rcache_storage: ?remote_resolver_mod.Cache = if (escape_mode)
+        remote_resolver_mod.Cache.init(gpa, io)
+    else
+        null;
+    defer if (rcache_storage) |*c| c.deinit();
+
     var any_problems = false;
     for (paths.items) |path| {
         const had = if (escape_mode)
-            try checkFileEscape(gpa, io, path)
+            try checkFileEscape(gpa, io, path, &rcache_storage.?)
         else
             try checkFile(gpa, io, path);
         any_problems = any_problems or had;
@@ -116,7 +127,12 @@ fn checkFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !bool {
 
 /// Layer 2 entry point: parse file, build annotation DB, lower each
 /// function to a CFG, run escape analysis, print problems.
-fn checkFileEscape(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !bool {
+fn checkFileEscape(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    rcache: *remote_resolver_mod.Cache,
+) !bool {
     const src_bytes = std.Io.Dir.cwd().readFileAlloc(
         io,
         path,
@@ -140,17 +156,13 @@ fn checkFileEscape(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !bool {
     var imap = try imports_mod.build(gpa, &tree);
     defer imap.deinit(gpa);
 
-    // Per-file remote-resolver cache.  Lives across every fn_decl in
-    // this file so the same imported file isn't reparsed for each
-    // function that touches it.  Sweep-wide promotion would cut more
-    // reparses but requires threading through main() — defer.
-    var rcache = remote_resolver_mod.Cache.init(gpa, io);
-    defer rcache.deinit();
+    // Remote-resolver cache is sweep-wide (phase 23) — passed in
+    // from main() so common imports parse once per CLI invocation.
     const base_dir = std.fs.path.dirname(path) orelse ".";
     const remote_ctx = cfg_mod.RemoteCtx{
         .imap = &imap,
         .base_dir = base_dir,
-        .cache = &rcache,
+        .cache = rcache,
     };
 
     var problems: std.ArrayListUnmanaged(Problem) = .empty;
