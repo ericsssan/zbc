@@ -22,6 +22,7 @@ const require_arena_kill_tag = @import("rules/require_arena_kill_tag.zig");
 const cfg_mod = @import("cfg.zig");
 const annotations_mod = @import("annotations.zig");
 const analyzer_mod = @import("analyzer.zig");
+const imports_mod = @import("imports.zig");
 // Pulled in via test entry below so refAllDecls sees them.
 const _layer2_abstract_state = @import("abstract_state.zig");
 const _layer2_transfer = @import("transfer.zig");
@@ -135,6 +136,11 @@ fn checkFileEscape(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !bool {
 
     var db = try annotations_mod.build(gpa, &tree);
     defer db.deinit(gpa);
+    // Imports map — extracted but not yet consulted by classifyCall
+    // (phase 22 will wire it in for cross-file annotation lookup).
+    // Extracting now keeps the test path exercised on every sweep.
+    var imap = try imports_mod.build(gpa, &tree);
+    defer imap.deinit(gpa);
 
     var problems: std.ArrayListUnmanaged(Problem) = .empty;
     defer {
@@ -181,6 +187,7 @@ test {
     _ = cfg_mod;
     _ = annotations_mod;
     _ = analyzer_mod;
+    _ = imports_mod;
     _ = _layer2_abstract_state;
     _ = _layer2_transfer;
     std.testing.refAllDecls(@This());
