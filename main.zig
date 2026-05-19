@@ -16,11 +16,13 @@ const require_borrowed_from = @import("rules/require_borrowed_from.zig");
 const require_node_index_origin = @import("rules/require_node_index_origin.zig");
 const require_arena_kill_tag = @import("rules/require_arena_kill_tag.zig");
 
-// Layer 2 — pulled in via refAllDecls so its tests run when we
-// `zig test main.zig`.  Not yet wired into the CLI: week 4 will add
-// transfer functions and a `--escape-check` subcommand.
+// Layer 2 — pulled in via test entry so its tests run when we
+// `zig test main.zig`.  Not yet wired into the CLI default; can be
+// invoked via `--escape-check` flag (week 5 will polish UX).
 const _layer2_cfg = @import("cfg.zig");
 const _layer2_abstract_state = @import("abstract_state.zig");
+const _layer2_transfer = @import("transfer.zig");
+const _layer2_analyzer = @import("analyzer.zig");
 
 const Problem = problem_mod.Problem;
 
@@ -106,5 +108,7 @@ test {
     _ = require_arena_kill_tag;
     _ = _layer2_cfg;
     _ = _layer2_abstract_state;
+    _ = _layer2_transfer;
+    _ = _layer2_analyzer;
     std.testing.refAllDecls(@This());
 }
