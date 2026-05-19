@@ -43,15 +43,23 @@ pub const Map = struct {
     }
 };
 
-/// Walk every top-level decl in `tree` looking for two shapes:
+/// Walk every top-level decl in `tree` looking for three shapes:
 ///   `const NAME = @import("path");`           — Entry{path, subfield=null}
 ///   `const NAME = @import("path").Subfield;`  — Entry{path, subfield="Subfield"}
+///   `const NAME = OtherImport.Subfield;`      — inherits OtherImport's path
+/// Two passes (phase 40):
+///   Pass 1: direct @import + wrapped field-access — order-independent.
+///   Pass 2: alias-of-import — runs after pass 1 so forward references
+///           (alias declared above the @import it depends on) resolve.
 /// Subsequent overwrites silently win (Zig forbids shadowing).
 pub fn build(gpa: std.mem.Allocator, tree: *const Ast) !Map {
     var m: Map = .{ .entries = .empty };
     errdefer m.deinit(gpa);
 
     const decls = tree.rootDecls();
+
+    // Pass 1: every direct @import shape, regardless of declaration
+    // order.  Self-contained — doesn't depend on other decls.
     for (decls) |decl| {
         const var_decl = tree.fullVarDecl(decl) orelse continue;
         const name_tok = var_decl.ast.mut_token + 1;
@@ -69,31 +77,35 @@ pub fn build(gpa: std.mem.Allocator, tree: *const Ast) !Map {
                 .path = hit.path,
                 .subfield = hit.subfield,
             });
-            continue;
         }
-        // Phase 32: alias of an already-imported namespace.
-        //   const lib = @import("foo.zig");
-        //   const X   = lib.Sub;          ← extract X with path="foo.zig",
-        //                                   subfield="Sub" (inherits lib's
-        //                                   path).
-        // Single-pass: we look up the LHS in the partially-built map,
-        // so forward references (alias declared before the @import it
-        // depends on) are skipped.  In real Zig, imports come at the
-        // top of the file in declaration order; the limitation is fine.
-        if (extractIdentFieldAccess(tree, init_node)) |hit| {
-            if (m.entries.get(hit.lhs_name)) |lhs_entry| {
-                // Only inherit when the lhs is itself a bare import
-                // (no subfield).  Aliasing already-subfielded aliases
-                // would need recursive resolution; deferred.
-                if (lhs_entry.subfield == null) {
-                    try m.entries.put(gpa, name, .{
-                        .name = name,
-                        .path = lhs_entry.path,
-                        .subfield = hit.subfield,
-                    });
-                }
-            }
-        }
+    }
+
+    // Pass 2: alias-of-import.  Uses the fully-populated map from
+    // pass 1 so forward references (`const X = lib.Sub;` declared
+    // before `const lib = @import(...);`) now resolve.
+    //   const lib = @import("foo.zig");
+    //   const X   = lib.Sub;      ← X inherits lib's path, adopts "Sub".
+    for (decls) |decl| {
+        const var_decl = tree.fullVarDecl(decl) orelse continue;
+        const name_tok = var_decl.ast.mut_token + 1;
+        if (tree.tokens.items(.tag)[name_tok] != .identifier) continue;
+        const init_node = var_decl.ast.init_node.unwrap() orelse continue;
+        const name = tree.tokenSlice(name_tok);
+
+        // Skip if already entered by pass 1.
+        if (m.entries.contains(name)) continue;
+
+        const hit = extractIdentFieldAccess(tree, init_node) orelse continue;
+        const lhs_entry = m.entries.get(hit.lhs_name) orelse continue;
+        // Only inherit when the lhs is itself a bare import (no
+        // subfield).  Aliasing already-subfielded aliases would need
+        // recursive resolution; still deferred (phase 41+).
+        if (lhs_entry.subfield != null) continue;
+        try m.entries.put(gpa, name, .{
+            .name = name,
+            .path = lhs_entry.path,
+            .subfield = hit.subfield,
+        });
     }
     return m;
 }
@@ -290,10 +302,11 @@ test "alias of non-import identifier is NOT extracted (phase 32 guard)" {
     try std.testing.expect(r.map.lookup("X") == null);
 }
 
-test "forward-reference alias is silently skipped (phase 32 limitation)" {
-    // Alias declared BEFORE the import it depends on.  Single-pass
-    // extraction means this misses — intentional limitation,
-    // documented in build()'s comment.
+test "forward-reference alias resolves via 2-pass extraction (phase 40)" {
+    // Alias declared BEFORE the import it depends on.  Pre-phase-40
+    // this was an intentional single-pass limitation; phase 40's
+    // two-pass build resolves the forward reference because pass 1
+    // fully populates @import entries before pass 2 looks for aliases.
     const gpa = std.testing.allocator;
     var r = try buildFromSrc(gpa,
         \\const X = lib.Sub;
@@ -303,7 +316,9 @@ test "forward-reference alias is silently skipped (phase 32 limitation)" {
     defer r.deinit(gpa);
 
     try std.testing.expectEqualStrings("foo.zig", r.map.lookup("lib").?.path);
-    try std.testing.expect(r.map.lookup("X") == null);
+    const x = r.map.lookup("X").?;
+    try std.testing.expectEqualStrings("foo.zig", x.path);
+    try std.testing.expectEqualStrings("Sub", x.subfield.?);
 }
 
 test "non-string-literal @import arg ignored" {
