@@ -104,11 +104,7 @@ fn checkFn(
                     .{param_name});
             }
         },
-        .owned => {
-            try report(gpa, tree, name_tok, cfg.severity, out,
-                "fn returns a borrowed-shape type but is annotated @returns owned (annotation contradicts signature)",
-                .{});
-        },
+        .owned => {}, // explicit opt-out — caller owns the return value despite borrowed-shape type
         .missing => {
             try report(gpa, tree, name_tok, cfg.severity, out,
                 "fn returns a borrowed-shape type from a borrowed-source parameter; add `/// @returns borrowed_from(<param>)`",
@@ -319,20 +315,18 @@ test "annotation pointing at nonexistent param flagged" {
     });
 }
 
-test "owned annotation on borrowed-shape return flagged" {
+test "owned annotation on borrowed-shape return accepted (opt-out)" {
     const gpa = std.testing.allocator;
     const src =
         \\const Ast = struct {};
         \\/// @returns owned
-        \\pub fn tokenText(self: *const Ast, tok: u32) []const u8 {
-        \\    _ = self; _ = tok;
+        \\pub fn dupedText(self: *const Ast, gpa: u32) ![]const u8 {
+        \\    _ = self; _ = gpa;
         \\    return "";
         \\}
         \\
     ;
-    try expectProblems(gpa, src, &.{
-        .{ .line = 3, .substring = "annotation contradicts signature" },
-    });
+    try expectProblems(gpa, src, &.{});
 }
 
 test "non-public fn skipped" {

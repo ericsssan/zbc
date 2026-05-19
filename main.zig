@@ -13,6 +13,8 @@ const Ast = std.zig.Ast;
 
 const problem_mod = @import("problem.zig");
 const require_borrowed_from = @import("rules/require_borrowed_from.zig");
+const require_node_index_origin = @import("rules/require_node_index_origin.zig");
+const require_arena_kill_tag = @import("rules/require_arena_kill_tag.zig");
 
 const Problem = problem_mod.Problem;
 
@@ -68,6 +70,8 @@ fn checkFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !bool {
     }
 
     try require_borrowed_from.check(gpa, &tree, .{}, &problems);
+    try require_node_index_origin.check(gpa, &tree, .{}, &problems);
+    try require_arena_kill_tag.check(gpa, &tree, .{}, &problems);
 
     if (problems.items.len == 0) return false;
 
