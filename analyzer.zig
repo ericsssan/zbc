@@ -731,6 +731,37 @@ test "invariant #5: @mutates_ast call on an Ast value flags (phase 37)" {
     try std.testing.expect(found);
 }
 
+test "invariant #5 fires through CROSS-FILE namespace call (phase 38)" {
+    // foo.zig holds an Origin.ast value and does
+    //   lib.setNodeTag(ast, 0);
+    // where lib.zig defines setNodeTag with `@mutates_ast`.  Phase 37
+    // only fired on method-call shape (`ast.setNodeTag(0)`); phase 38
+    // adds namespace-call detection (args[0] as the Ast).
+    const gpa = std.testing.allocator;
+    var problems = try analyzeCrossFile(gpa,
+        // foo.zig
+        \\const lib = @import("lib.zig");
+        \\const Ast = lib.Ast;
+        \\pub fn foo(ast: Ast) void {
+        \\    lib.setNodeTag(ast, 0);
+        \\}
+        \\
+        ,
+        // lib.zig
+        \\pub const Ast = struct {};
+        \\/// @mutates_ast
+        \\pub fn setNodeTag(self: Ast, _: u32) void { _ = self; }
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+
+    var found = false;
+    for (problems.items) |p| {
+        if (std.mem.indexOf(u8, p.message, "invariant #5") != null) found = true;
+    }
+    try std.testing.expect(found);
+}
+
 test "invariant #5: non-Ast receiver doesn't fire (regression guard)" {
     // No Ast param — `obj` is untracked, its .none origin won't
     // flag.  Pre-phase-37 there was no check at all; this guards

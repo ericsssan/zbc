@@ -1297,14 +1297,22 @@ const Builder = struct {
         const recv_is_arg0 = (tree.nodeTag(callee_node) == .field_access) and !is_namespace_call;
 
         // Mutation check (invariant #5): emit irrespective of takes.
-        // For method-call shape `obj.method(...)`, the receiver IS
-        // the Ast value; for namespace `Mod.method(ast, ...)` the
-        // first explicit arg plays that role.  We only handle the
-        // method-call case for now (where receiver is a local).
+        // Two call shapes:
+        //   `obj.method(...)`        — receiver IS the Ast (recv_is_arg0).
+        //   `Mod.method(ast, ...)`   — first explicit arg is the Ast
+        //                              (phase 38: namespace shape; we
+        //                              conservatively check args[0]
+        //                              without a per-arg @mutates_ast
+        //                              annotation refinement).
         if (self.lookupMutatesAst(callee_node)) {
-            if (recv_is_arg0) {
-                const recv_node = tree.nodeData(callee_node).node_and_token[0];
-                if (self.identifierToLocal(recv_node)) |ast_local| {
+            const ast_arg: ?Ast.Node.Index = if (recv_is_arg0)
+                tree.nodeData(callee_node).node_and_token[0]
+            else if (args.len > 0)
+                args[0]
+            else
+                null;
+            if (ast_arg) |n| {
+                if (self.identifierToLocal(n)) |ast_local| {
                     try self.appendStmt(cur.*, .{
                         .kind = .{ .ast_mutation_check = .{ .ast_local = ast_local } },
                         .pos = self.posOf(call_node),
