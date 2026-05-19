@@ -674,6 +674,28 @@ const Builder = struct {
         return main - 2;
     }
 
+    /// If `expr` is a top-level labeled block at an expression
+    /// position (`const x = blk: { ... }`, `return blk: {...}`,
+    /// `x = blk: {...}`), lower its body in-place — advancing cur
+    /// to the post-merge — and return true.  The caller then
+    /// emits its decl/ret/assign on the post-merge cur, with an
+    /// .unknown classification since we don't track which break
+    /// path's value was taken.  Returns false for non-block exprs.
+    fn maybeLowerLabeledBlockExpr(
+        self: *Builder,
+        expr: Ast.Node.Index,
+        cur: *BlockId,
+    ) !bool {
+        const tree = self.tree;
+        switch (tree.nodeTag(expr)) {
+            .block, .block_semicolon, .block_two, .block_two_semicolon => {},
+            else => return false,
+        }
+        const lt = self.blockLabelToken(expr) orelse return false;
+        try self.lowerLabeledBlock(expr, lt, cur);
+        return true;
+    }
+
     /// `blk: { ... }` at statement position — push label context,
     /// lower body normally, pop, then sew the natural fallthrough
     /// edge cur → merge and continue from merge.  Any `break :blk`
@@ -866,6 +888,15 @@ const Builder = struct {
         const local = try self.registerLocal(name, self.posOfToken(name_tok));
 
         const init_opt = var_decl.ast.init_node.unwrap();
+
+        // Top-level labeled-block init (`const x = blk: { ... };`) —
+        // lower the body FIRST so its side effects + break paths run
+        // before the binding takes effect.  cur advances to the
+        // post-merge; the .decl emits there with .unknown init_kind.
+        if (init_opt) |init| {
+            if (try self.maybeLowerLabeledBlockExpr(init, cur)) {}
+        }
+
         const init_kind: ExprKind = if (init_opt) |init|
             self.classifyExpr(init)
         else
@@ -924,6 +955,10 @@ const Builder = struct {
         else
             null;
 
+        // Top-level labeled-block rhs (`x = blk: { ... };`) — lower
+        // its body in-place, advancing cur, before the .assign emits.
+        if (try self.maybeLowerLabeledBlockExpr(rhs, cur)) {}
+
         if (target_local) |t| {
             try self.appendStmt(cur.*, .{
                 .kind = .{ .assign = .{
@@ -966,6 +1001,11 @@ const Builder = struct {
                 .@"catch" => try self.emitCatchFork(expr, cur),
                 else => {},
             }
+            // Top-level labeled-block return (`return blk: { ... };`)
+            // — lower body in-place so side effects + breaks run
+            // before the return.  cur advances to post-merge; the
+            // ret then emits there.
+            if (try self.maybeLowerLabeledBlockExpr(expr, cur)) {}
         }
 
         // Success-path defers: fire before the return-value check.
@@ -2372,6 +2412,144 @@ test "labeled block inside loop: break :blk doesn't escape the loop" {
             }
         }
     }
+}
+
+test "expression-position labeled block: var-decl init `const x = blk: {...}` lowers body" {
+    // Side effect inside the labeled-block init (arena.deinit() here)
+    // must reach a CFG block — pre-phase-18 the init was opaque, so
+    // the deinit call was invisible to the analyzer.
+    const gpa = std.testing.allocator;
+    var result = try parseAndLower(gpa,
+        \\pub fn foo() void {
+        \\    var arena = Arena.init(0);
+        \\    const r = blk: {
+        \\        arena.deinit();
+        \\        break :blk 0;
+        \\    };
+        \\    _ = r;
+        \\    return;
+        \\}
+        \\const Arena = struct {
+        \\    pub fn init(_: u32) Arena { return .{}; }
+        \\    pub fn deinit(_: *Arena) void {}
+        \\};
+        \\
+    );
+    defer result.tree.deinit(gpa);
+    var cfg = result.cfg.?;
+    defer cfg.deinit(gpa);
+
+    var saw_kill = false;
+    for (cfg.blocks) |b| {
+        for (b.stmts) |s| {
+            if (s.kind == .arena_kill) saw_kill = true;
+        }
+    }
+    try std.testing.expect(saw_kill);
+}
+
+test "expression-position labeled block: return `return blk: {...}` lowers body" {
+    const gpa = std.testing.allocator;
+    var result = try parseAndLower(gpa,
+        \\pub fn foo() u32 {
+        \\    var arena = Arena.init(0);
+        \\    return blk: {
+        \\        arena.deinit();
+        \\        break :blk 0;
+        \\    };
+        \\}
+        \\const Arena = struct {
+        \\    pub fn init(_: u32) Arena { return .{}; }
+        \\    pub fn deinit(_: *Arena) void {}
+        \\};
+        \\
+    );
+    defer result.tree.deinit(gpa);
+    var cfg = result.cfg.?;
+    defer cfg.deinit(gpa);
+
+    var saw_kill = false;
+    for (cfg.blocks) |b| {
+        for (b.stmts) |s| {
+            if (s.kind == .arena_kill) saw_kill = true;
+        }
+    }
+    try std.testing.expect(saw_kill);
+}
+
+test "expression-position labeled block: `break :blk val` adds edge to merge" {
+    // The block has two exit edges — `break :blk 1` and natural
+    // fallthrough.  Merge should have ≥2 incoming.
+    const gpa = std.testing.allocator;
+    var result = try parseAndLower(gpa,
+        \\pub fn foo(x: bool) u32 {
+        \\    const r = blk: {
+        \\        if (x) break :blk 1;
+        \\        break :blk 0;
+        \\    };
+        \\    return r;
+        \\}
+        \\
+    );
+    defer result.tree.deinit(gpa);
+    var cfg = result.cfg.?;
+    defer cfg.deinit(gpa);
+
+    var incoming = try gpa.alloc(u32, cfg.blocks.len);
+    defer gpa.free(incoming);
+    @memset(incoming, 0);
+    for (cfg.blocks) |b| {
+        for (b.successors) |s| incoming[@intFromEnum(s)] += 1;
+    }
+    var max_in: u32 = 0;
+    for (incoming) |c| if (c > max_in) {
+        max_in = c;
+    };
+    try std.testing.expect(max_in >= 2);
+    // No leftover labeled-break-no-loop gaps.
+    for (cfg.blocks) |b| {
+        for (b.stmts) |s| {
+            if (s.kind == .lowering_gap) {
+                try std.testing.expect(!std.mem.eql(
+                    u8,
+                    s.kind.lowering_gap.note,
+                    "labeled-break-no-loop",
+                ));
+            }
+        }
+    }
+}
+
+test "expression-position labeled block: assign `x = blk: {...}` lowers body" {
+    const gpa = std.testing.allocator;
+    var result = try parseAndLower(gpa,
+        \\pub fn foo() void {
+        \\    var arena = Arena.init(0);
+        \\    var x: u32 = 0;
+        \\    x = blk: {
+        \\        arena.deinit();
+        \\        break :blk 1;
+        \\    };
+        \\    _ = x;
+        \\    return;
+        \\}
+        \\const Arena = struct {
+        \\    pub fn init(_: u32) Arena { return .{}; }
+        \\    pub fn deinit(_: *Arena) void {}
+        \\};
+        \\
+    );
+    defer result.tree.deinit(gpa);
+    var cfg = result.cfg.?;
+    defer cfg.deinit(gpa);
+
+    var saw_kill = false;
+    for (cfg.blocks) |b| {
+        for (b.stmts) |s| {
+            if (s.kind == .arena_kill) saw_kill = true;
+        }
+    }
+    try std.testing.expect(saw_kill);
 }
 
 test "try unwraps inner expression: copy_of(src) preserved through try" {
