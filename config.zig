@@ -110,6 +110,28 @@ pub fn isEnabled(config: *const Config, inv: Invariant) bool {
     return false;
 }
 
+/// Map a CLI-style name ("ast_identity") to its Invariant tag.
+/// Returns null on unknown names so callers can surface a useful
+/// error message rather than silently ignoring typos.
+pub fn invariantFromName(name: []const u8) ?Invariant {
+    inline for (@typeInfo(Invariant).@"enum".fields) |f| {
+        if (std.mem.eql(u8, name, f.name)) return @enumFromInt(f.value);
+    }
+    return null;
+}
+
+test "invariantFromName round-trips every variant" {
+    inline for (@typeInfo(Invariant).@"enum".fields) |f| {
+        const got = invariantFromName(f.name).?;
+        try std.testing.expectEqual(@as(Invariant, @enumFromInt(f.value)), got);
+    }
+}
+
+test "invariantFromName returns null on unknown" {
+    try std.testing.expectEqual(@as(?Invariant, null), invariantFromName("not_an_invariant"));
+    try std.testing.expectEqual(@as(?Invariant, null), invariantFromName(""));
+}
+
 // ── Tests ──────────────────────────────────────────────────
 
 test "Default config matches ez historical strings" {

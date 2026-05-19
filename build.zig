@@ -47,8 +47,18 @@ pub fn build(b: *std.Build) void {
     run_step.dependOn(&run_cmd.step);
 
     // ── Tests ───────────────────────────────────────────────
-    const tests = b.addTest(.{ .root_module = lib_mod });
-    const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run zbc tests");
-    test_step.dependOn(&run_tests.step);
+
+    // Library tests (lib.zig refAllDecls every submodule).
+    const lib_tests = b.addTest(.{ .root_module = lib_mod });
+    test_step.dependOn(&b.addRunArtifact(lib_tests).step);
+
+    // CLI tests (argparse + invariant-list parsing).
+    const cli_test_mod = b.createModule(.{
+        .root_source_file = b.path("main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const cli_tests = b.addTest(.{ .root_module = cli_test_mod });
+    test_step.dependOn(&b.addRunArtifact(cli_tests).step);
 }

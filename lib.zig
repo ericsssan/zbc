@@ -34,6 +34,10 @@ const require_arena_kill_tag = @import("rules/require_arena_kill_tag.zig");
 
 pub const Config = config_mod.Config;
 pub const DefaultConfig = config_mod.Default;
+pub const Invariant = config_mod.Invariant;
+pub const all_invariants = config_mod.all_invariants;
+pub const isEnabled = config_mod.isEnabled;
+pub const invariantFromName = config_mod.invariantFromName;
 pub const Problem = problem_mod.Problem;
 pub const Cache = remote_resolver_mod.Cache;
 
