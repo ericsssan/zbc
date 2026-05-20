@@ -310,6 +310,33 @@ test "stack_escape: return &local propagated through copy" {
     try std.testing.expect(found);
 }
 
+test "R7 inference: namespace-style delegator wrap fires escape" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const std = @import("std");
+        \\const Ctx = struct {
+        \\    inner: std.heap.ArenaAllocator,
+        \\    /// @returns borrowed_from(self)
+        \\    pub fn text(self: *const Ctx) []const u8 { _ = self; return ""; }
+        \\};
+        \\// Namespace-style call: Ctx.text(c) instead of c.text().
+        \\pub fn wrap_ns(c: *const Ctx) []const u8 {
+        \\    return Ctx.text(c);
+        \\}
+        \\pub fn caller() []const u8 {
+        \\    var local_ctx = Ctx{ .inner = std.heap.ArenaAllocator.init(undefined) };
+        \\    return wrap_ns(&local_ctx);
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    var found = false;
+    for (problems.items) |p| {
+        if (std.mem.indexOf(u8, p.message, "function-local arena") != null) found = true;
+    }
+    try std.testing.expect(found);
+}
+
 test "R7 inference: delegator wrap fires escape on local-arena caller" {
     const gpa = std.testing.allocator;
     var problems = try analyze(gpa,

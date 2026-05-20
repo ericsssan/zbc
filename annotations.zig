@@ -105,28 +105,37 @@ pub fn build(gpa: std.mem.Allocator, tree: *const Ast) !Db {
     return db;
 }
 
-/// R7 helper.  Returns a `borrowed_from(param_idx)` annotation if the
-/// fn body is a single-return-stmt whose value is a chained-method
-/// call rooted at one of `fn_proto`'s params, AND that method is
-/// annotated `borrowed_from(self)` in `db`.
+/// R7 helper.  Returns a `borrowed_from(param_idx)` annotation if
+/// the fn body is a single-return-stmt that delegates to an
+/// annotated callee.  Two shapes supported:
+///
+///   `return <param>.<chain>.<method>(args);` (method-style)
+///     — fires when method is `borrowed_from(self)`, propagates the
+///     receiver param's index.
+///
+///   `return <Path>.<method>(arg0, arg1, ...);` (namespace-style)
+///     — fires when method is `borrowed_from(N)` and arg N resolves
+///     to one of our params; propagates that param's index.
 fn inferDelegatorBorrow(
     tree: *const Ast,
     fn_proto: Ast.full.FnProto,
     body_node: Ast.Node.Index,
     db: *const Db,
 ) ?ReturnsAnnotation {
-    // Find the single return-stmt's expr, if the body is just that.
     const return_expr = singleReturnExpr(tree, body_node) orelse return null;
+    var buf: [1]Ast.Node.Index = undefined;
+    const call_full = tree.fullCall(&buf, return_expr) orelse return null;
 
-    // Must be a call.
-    const is_call = switch (tree.nodeTag(return_expr)) {
-        .call, .call_one, .call_comma, .call_one_comma => true,
-        else => false,
-    };
-    if (!is_call) return null;
+    if (inferMethodStyle(tree, fn_proto, return_expr, db)) |a| return a;
+    return inferNamespaceStyle(tree, fn_proto, call_full, db);
+}
 
-    // Walk the call's source tokens for the leading
-    // `<id> ( . <id> )* . <method> (` shape.
+fn inferMethodStyle(
+    tree: *const Ast,
+    fn_proto: Ast.full.FnProto,
+    return_expr: Ast.Node.Index,
+    db: *const Db,
+) ?ReturnsAnnotation {
     const first = tree.firstToken(return_expr);
     const last = tree.lastToken(return_expr);
     const tags = tree.tokens.items(.tag);
@@ -134,11 +143,9 @@ fn inferDelegatorBorrow(
     if (tags[first] != .identifier) return null;
     if (first + 1 > last or tags[first + 1] != .period) return null;
 
-    // Resolve head identifier to a param index.
     const head_name = tree.tokenSlice(first);
     const param_idx = resolveParamIndex(tree, fn_proto, head_name) orelse return null;
 
-    // Walk the dot-chain to find the method name (last id before `(`).
     var k: Ast.TokenIndex = first + 1;
     var method_tok: Ast.TokenIndex = 0;
     while (k + 1 <= last and tags[k] == .period and tags[k + 1] == .identifier) {
@@ -161,6 +168,34 @@ fn inferDelegatorBorrow(
         else => {},
     }
     return null;
+}
+
+fn inferNamespaceStyle(
+    tree: *const Ast,
+    fn_proto: Ast.full.FnProto,
+    call_full: Ast.full.Call,
+    db: *const Db,
+) ?ReturnsAnnotation {
+    const callee = call_full.ast.fn_expr;
+    const method_tok = switch (tree.nodeTag(callee)) {
+        .identifier => tree.nodeMainToken(callee),
+        .field_access => tree.nodeData(callee).node_and_token[1],
+        else => return null,
+    };
+    const method_name = tree.tokenSlice(method_tok);
+    const entry = db.lookup(method_name) orelse return null;
+    switch (entry.annotation) {
+        .borrowed_from => |target_idx| {
+            const args = call_full.ast.params;
+            if (target_idx >= args.len) return null;
+            const arg = args[target_idx];
+            if (tree.nodeTag(arg) != .identifier) return null;
+            const arg_name = tree.tokenSlice(tree.nodeMainToken(arg));
+            const our_param = resolveParamIndex(tree, fn_proto, arg_name) orelse return null;
+            return .{ .borrowed_from = our_param };
+        },
+        else => return null,
+    }
 }
 
 /// Returns the inner expression of the lone `return X;` statement in
