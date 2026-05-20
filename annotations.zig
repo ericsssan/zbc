@@ -86,20 +86,28 @@ pub fn build(gpa: std.mem.Allocator, tree: *const Ast) !Db {
     // where `method` is annotated `@returns borrowed_from(self)`
     //   →  infer `@returns borrowed_from(p)` for `wrap`.
     //
-    // Runs after pass 1 so cross-fn lookups see fully-populated db.
-    node_idx = 1;
-    while (node_idx < tree.nodes.len) : (node_idx += 1) {
-        const node: Ast.Node.Index = @enumFromInt(node_idx);
-        if (tree.nodeTag(node) != .fn_decl) continue;
-        var buf: [1]Ast.Node.Index = undefined;
-        const fn_proto = fullFnProto(tree, &buf, node) orelse continue;
-        const name_tok = fn_proto.name_token orelse continue;
-        const name = tree.tokenSlice(name_tok);
-        if (db.fns.contains(name)) continue;
+    // Iterate to fixed point so wrapper-of-wrapper chains resolve
+    // regardless of source order (wrap2-before-wrap1 etc.).  Each
+    // pass either adds at least one new annotation or stops; with N
+    // wrappers, terminates in ≤ N+1 passes.
+    while (true) {
+        var added = false;
+        node_idx = 1;
+        while (node_idx < tree.nodes.len) : (node_idx += 1) {
+            const node: Ast.Node.Index = @enumFromInt(node_idx);
+            if (tree.nodeTag(node) != .fn_decl) continue;
+            var buf: [1]Ast.Node.Index = undefined;
+            const fn_proto = fullFnProto(tree, &buf, node) orelse continue;
+            const name_tok = fn_proto.name_token orelse continue;
+            const name = tree.tokenSlice(name_tok);
+            if (db.fns.contains(name)) continue;
 
-        const body = tree.nodeData(node).node_and_node[1];
-        const inferred = inferDelegatorBorrow(tree, fn_proto, body, &db) orelse continue;
-        try db.fns.put(gpa, name, .{ .name = name, .annotation = inferred });
+            const body = tree.nodeData(node).node_and_node[1];
+            const inferred = inferDelegatorBorrow(tree, fn_proto, body, &db) orelse continue;
+            try db.fns.put(gpa, name, .{ .name = name, .annotation = inferred });
+            added = true;
+        }
+        if (!added) break;
     }
 
     return db;
@@ -198,30 +206,57 @@ fn inferNamespaceStyle(
     }
 }
 
-/// Returns the inner expression of the lone `return X;` statement in
-/// a body, or null if the body has any other shape.
+/// Returns the inner expression of the body's "return value" if the
+/// body has a R7-recognizable shape:
+///
+///   { return EXPR; }                       → EXPR
+///   { var/const X = EXPR; return X; }      → EXPR  (X must match)
+///
+/// Anything else returns null.
 fn singleReturnExpr(tree: *const Ast, body_node: Ast.Node.Index) ?Ast.Node.Index {
     const tag = tree.nodeTag(body_node);
-    const stmts_data = switch (tag) {
-        .block_two, .block_two_semicolon => blk: {
+    var stmt0: Ast.Node.Index = undefined;
+    var stmt1_opt: ?Ast.Node.Index = null;
+    switch (tag) {
+        .block_two, .block_two_semicolon => {
             const d = tree.nodeData(body_node).opt_node_and_opt_node;
-            // first slot present, second slot absent → 1 stmt.
-            const first = d[0].unwrap() orelse return null;
-            if (d[1].unwrap() != null) return null;
-            break :blk first;
+            stmt0 = d[0].unwrap() orelse return null;
+            stmt1_opt = d[1].unwrap();
         },
-        .block, .block_semicolon => blk: {
+        .block, .block_semicolon => {
             const d = tree.nodeData(body_node).extra_range;
             const start: u32 = @intFromEnum(d.start);
             const end: u32 = @intFromEnum(d.end);
-            if (end - start != 1) return null;
-            const idx: Ast.Node.Index = @enumFromInt(tree.extra_data[start]);
-            break :blk idx;
+            if (end - start == 1) {
+                stmt0 = @enumFromInt(tree.extra_data[start]);
+            } else if (end - start == 2) {
+                stmt0 = @enumFromInt(tree.extra_data[start]);
+                stmt1_opt = @as(Ast.Node.Index, @enumFromInt(tree.extra_data[start + 1]));
+            } else return null;
         },
         else => return null,
-    };
-    if (tree.nodeTag(stmts_data) != .@"return") return null;
-    return tree.nodeData(stmts_data).opt_node.unwrap();
+    }
+
+    // Single-stmt body: must be `return EXPR;`.
+    if (stmt1_opt == null) {
+        if (tree.nodeTag(stmt0) != .@"return") return null;
+        return tree.nodeData(stmt0).opt_node.unwrap();
+    }
+
+    // Two-stmt body: must be `var/const X = EXPR;` then `return X;`.
+    const stmt1 = stmt1_opt.?;
+    if (tree.nodeTag(stmt1) != .@"return") return null;
+    const ret_val = tree.nodeData(stmt1).opt_node.unwrap() orelse return null;
+    if (tree.nodeTag(ret_val) != .identifier) return null;
+    const ret_name = tree.tokenSlice(tree.nodeMainToken(ret_val));
+
+    const var_decl = tree.fullVarDecl(stmt0) orelse return null;
+    const name_tok = var_decl.ast.mut_token + 1;
+    if (tree.tokens.items(.tag)[name_tok] != .identifier) return null;
+    const decl_name = tree.tokenSlice(name_tok);
+    if (!std.mem.eql(u8, decl_name, ret_name)) return null;
+
+    return var_decl.ast.init_node.unwrap();
 }
 
 fn fullFnProto(tree: *const Ast, buf: *[1]Ast.Node.Index, node: Ast.Node.Index) ?Ast.full.FnProto {

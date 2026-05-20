@@ -310,6 +310,64 @@ test "stack_escape: return &local propagated through copy" {
     try std.testing.expect(found);
 }
 
+test "R7 inference: multi-stmt delegator `var x = c.text(); return x;` fires" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const std = @import("std");
+        \\const Ctx = struct {
+        \\    inner: std.heap.ArenaAllocator,
+        \\    /// @returns borrowed_from(self)
+        \\    pub fn text(self: *const Ctx) []const u8 { _ = self; return ""; }
+        \\};
+        \\pub fn wrap_multi(c: *const Ctx) []const u8 {
+        \\    const x = c.text();
+        \\    return x;
+        \\}
+        \\pub fn caller() []const u8 {
+        \\    var local = Ctx{ .inner = std.heap.ArenaAllocator.init(undefined) };
+        \\    return wrap_multi(&local);
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    var found = false;
+    for (problems.items) |p| {
+        if (std.mem.indexOf(u8, p.message, "function-local arena") != null) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "R7 inference: wrapper-of-wrapper across source order via fixed-point" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const std = @import("std");
+        \\const Ctx = struct {
+        \\    inner: std.heap.ArenaAllocator,
+        \\    /// @returns borrowed_from(self)
+        \\    pub fn text(self: *const Ctx) []const u8 { _ = self; return ""; }
+        \\};
+        \\// wrap_outer is defined BEFORE wrap_inner in source order —
+        \\// requires fixed-point iteration to resolve wrap_inner first.
+        \\pub fn wrap_outer(c: *const Ctx) []const u8 {
+        \\    return wrap_inner(c);
+        \\}
+        \\pub fn wrap_inner(c: *const Ctx) []const u8 {
+        \\    return c.text();
+        \\}
+        \\pub fn caller() []const u8 {
+        \\    var local = Ctx{ .inner = std.heap.ArenaAllocator.init(undefined) };
+        \\    return wrap_outer(&local);
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    var found = false;
+    for (problems.items) |p| {
+        if (std.mem.indexOf(u8, p.message, "function-local arena") != null) found = true;
+    }
+    try std.testing.expect(found);
+}
+
 test "R7 inference: namespace-style delegator wrap fires escape" {
     const gpa = std.testing.allocator;
     var problems = try analyze(gpa,
