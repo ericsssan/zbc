@@ -467,6 +467,9 @@ const BlockLabelCtx = struct {
     merge: BlockId,
 };
 
+const DeferKind = enum { normal, err };
+const DeferEntry = struct { kind: DeferKind, body: Ast.Node.Index };
+
 const Builder = struct {
     gpa: std.mem.Allocator,
     tree: *const Ast,
@@ -486,10 +489,19 @@ const Builder = struct {
     /// name → LocalId for current scope.  v1 doesn't handle nested scopes;
     /// names are flat per-function.
     name_to_local: std.StringHashMapUnmanaged(LocalId) = .empty,
-    /// Stack of `defer` bodies, LIFO.  Replayed at every `return` exit
-    /// (always fires) and at function-fallthrough.
-    deferred_normal: std.ArrayListUnmanaged(Ast.Node.Index) = .empty,
-    deferred_err: std.ArrayListUnmanaged(Ast.Node.Index) = .empty,
+    /// Unified declaration-ordered stack of `defer` / `errdefer`
+    /// bodies, LIFO.  Replayed at every `return` (normal only) and
+    /// at synthetic err-exit sinks (both kinds, interleaved by
+    /// declaration order so that Zig's semantics — defers + errdefers
+    /// fire in reverse declaration order — are preserved).
+    ///
+    /// Previously two separate lists (normal/err) caused err-exit
+    /// flushing to fire ALL errdefers before ANY defers, which is
+    /// wrong: an `errdefer free(p);` followed by a `defer use(p);`
+    /// declared later would, on error, run free→use → spurious UAF
+    /// inside the synthetic err_exit block.  Single list with kind
+    /// tag preserves order.
+    deferred: std.ArrayListUnmanaged(DeferEntry) = .empty,
     /// Loop context stack — pushed by lowerWhile/lowerFor before
     /// lowering the body, popped after.  `break` jumps to the
     /// innermost merge; `continue` jumps to the innermost header.
@@ -528,8 +540,7 @@ const Builder = struct {
         self.blocks.deinit(self.gpa);
         self.locals.deinit(self.gpa);
         self.name_to_local.deinit(self.gpa);
-        self.deferred_normal.deinit(self.gpa);
-        self.deferred_err.deinit(self.gpa);
+        self.deferred.deinit(self.gpa);
         self.loop_stack.deinit(self.gpa);
         self.block_label_stack.deinit(self.gpa);
     }
@@ -644,12 +655,11 @@ const Builder = struct {
 
         // Scope-bound defer handling.  Zig defers fire at the
         // enclosing BLOCK's exit, not just at return.  We snapshot
-        // both stacks here; any defer pushed inside this block is
-        // fired (in LIFO order) at fallthrough exit, then popped
-        // so a later return doesn't re-fire it from an already-
-        // exited scope.  Errdefers follow the same scope rule.
-        const def_save = self.deferred_normal.items.len;
-        const errdef_save = self.deferred_err.items.len;
+        // the unified defer stack here; any defer/errdefer pushed
+        // inside this block is fired (LIFO) at fallthrough exit,
+        // then popped so a later return doesn't re-fire it from an
+        // already-exited scope.
+        const save = self.deferred.items.len;
 
         for (stmts) |stmt_idx| {
             try self.lowerStmt(stmt_idx, cur);
@@ -658,13 +668,15 @@ const Builder = struct {
         // Fire defers added inside this block at fallthrough exit.
         // Errdefers do NOT fire on fallthrough (success path) — they
         // only fire on error returns, handled in flushErrAndNormalDefers.
-        var i = self.deferred_normal.items.len;
-        while (i > def_save) {
+        var i = self.deferred.items.len;
+        while (i > save) {
             i -= 1;
-            try self.lowerStmt(self.deferred_normal.items[i], cur);
+            const entry = self.deferred.items[i];
+            if (entry.kind == .normal) {
+                try self.lowerStmt(entry.body, cur);
+            }
         }
-        self.deferred_normal.shrinkRetainingCapacity(def_save);
-        self.deferred_err.shrinkRetainingCapacity(errdef_save);
+        self.deferred.shrinkRetainingCapacity(save);
     }
 
     /// Lower the top-level function body.  lowerBlock now flushes
@@ -701,39 +713,41 @@ const Builder = struct {
     }
 
     fn pushDefer(self: *Builder, body_node: Ast.Node.Index) !void {
-        try self.deferred_normal.append(self.gpa, body_node);
+        try self.deferred.append(self.gpa, .{ .kind = .normal, .body = body_node });
     }
 
     fn pushErrdefer(self: *Builder, body_node: Ast.Node.Index) !void {
-        try self.deferred_err.append(self.gpa, body_node);
+        try self.deferred.append(self.gpa, .{ .kind = .err, .body = body_node });
     }
 
     /// Replay `defer` bodies (LIFO) into `cur`.  Doesn't pop — returns
     /// happen mid-function and subsequent code in the same lexical
     /// scope must still see the same defer set.  Called at function-
-    /// fallthrough exit and at every `return`.  Does NOT replay
-    /// errdefers — see `deferred_err` doc-block for rationale.
+    /// fallthrough exit and at every `return`.  Skips `.err` entries
+    /// since errdefers only fire on error returns (handled in
+    /// `flushErrAndNormalDefers`).
     fn flushDefers(self: *Builder, cur: *BlockId) (std.mem.Allocator.Error)!void {
-        var i = self.deferred_normal.items.len;
+        var i = self.deferred.items.len;
         while (i > 0) {
             i -= 1;
-            try self.lowerStmt(self.deferred_normal.items[i], cur);
+            const entry = self.deferred.items[i];
+            if (entry.kind == .normal) {
+                try self.lowerStmt(entry.body, cur);
+            }
         }
     }
 
-    /// Error-path flush: errdefers LIFO first (they're closer to the
-    /// fail site and run before normal defers per Zig semantics), then
-    /// normal defers LIFO.  Used at synthetic try-error-exit blocks.
+    /// Error-path flush: walk the unified defer stack LIFO, firing
+    /// BOTH errdefers and defers in declaration-reverse order.  This
+    /// matches Zig's semantics — a `defer use(p)` declared AFTER
+    /// an `errdefer free(p)` runs FIRST on error exit, avoiding a
+    /// spurious UAF in the synthetic err_exit sink.  Used at
+    /// synthetic try-error-exit blocks.
     fn flushErrAndNormalDefers(self: *Builder, cur: *BlockId) (std.mem.Allocator.Error)!void {
-        var i = self.deferred_err.items.len;
+        var i = self.deferred.items.len;
         while (i > 0) {
             i -= 1;
-            try self.lowerStmt(self.deferred_err.items[i], cur);
-        }
-        i = self.deferred_normal.items.len;
-        while (i > 0) {
-            i -= 1;
-            try self.lowerStmt(self.deferred_normal.items[i], cur);
+            try self.lowerStmt(self.deferred.items[i].body, cur);
         }
     }
 
@@ -1966,6 +1980,30 @@ const Builder = struct {
         }
 
         if (anyPatternMatches(text, self.config.heap_free_patterns)) {
+            // `<recv>.destroy(<allocator>)` — struct-method shape
+            // where the method frees the receiver and takes the
+            // allocator as an arg.  Inverse of `allocator.destroy(p)`.
+            // Must check before the standard `.destroy(p)` path so we
+            // don't misinterpret the allocator-arg as the freed thing.
+            if (self.destroyReceiverFreed(call_node)) |target| {
+                switch (target) {
+                    .local => |freed| {
+                        try self.appendStmt(cur.*, .{
+                            .kind = .{ .heap_free = .{ .freed_local = freed, .fallback_hid = blk_h: { const h: abstract_state.HeapId = @enumFromInt(self.next_heap); self.next_heap += 1; break :blk_h h; } } },
+                            .pos = self.posOf(call_node),
+                            .end_pos = self.endPosOf(call_node),
+                        });
+                    },
+                    .field => |fref| {
+                        try self.appendStmt(cur.*, .{
+                            .kind = .{ .field_heap_free = .{ .parent = fref.parent, .name = fref.name, .fallback_hid = blk_hid: { const h: abstract_state.HeapId = @enumFromInt(self.next_heap); self.next_heap += 1; break :blk_hid h; } } },
+                            .pos = self.posOf(call_node),
+                            .end_pos = self.endPosOf(call_node),
+                        });
+                    },
+                }
+                return;
+            }
             if (self.heapFreedLocal(call_node)) |freed| {
                 try self.appendStmt(cur.*, .{
                     .kind = .{ .heap_free = .{ .freed_local = freed, .fallback_hid = blk_h: { const h: abstract_state.HeapId = @enumFromInt(self.next_heap); self.next_heap += 1; break :blk_h h; } } },
@@ -2263,6 +2301,83 @@ const Builder = struct {
         return self.fieldLhsFor(arg);
     }
 
+    /// True iff `name` is conventionally an allocator binding:
+    /// `allocator`, `gpa`, `alloc`, or a suffixed form
+    /// (`child_allocator`, `arena_allocator`, etc.).
+    fn looksLikeAllocatorName(name: []const u8) bool {
+        if (std.mem.eql(u8, name, "allocator")) return true;
+        if (std.mem.eql(u8, name, "alloc")) return true;
+        if (std.mem.eql(u8, name, "gpa")) return true;
+        if (std.mem.endsWith(u8, name, "_allocator")) return true;
+        if (std.mem.endsWith(u8, name, "_gpa")) return true;
+        return false;
+    }
+
+    /// True iff `node` is an expression whose surface name suggests an
+    /// allocator: bare identifier with an allocator-looking name, or a
+    /// field access whose terminal field is allocator-looking.
+    fn exprLooksLikeAllocator(self: *Builder, node: Ast.Node.Index) bool {
+        const tree = self.tree;
+        switch (tree.nodeTag(node)) {
+            .identifier => {
+                const name = tree.tokenSlice(tree.nodeMainToken(node));
+                return looksLikeAllocatorName(name);
+            },
+            .field_access => {
+                const fa = tree.nodeData(node).node_and_token;
+                const field = tree.tokenSlice(fa[1]);
+                return looksLikeAllocatorName(field);
+            },
+            else => return false,
+        }
+    }
+
+    /// `<recv>.destroy(<allocator_arg>)` shape — return what's freed.
+    /// The struct-method `destroy` convention takes an allocator and
+    /// frees the receiver, the inverse of `allocator.destroy(p)`.
+    /// Distinguished from `allocator.destroy(p)` by the first arg
+    /// looking like an allocator (and the method being literally
+    /// `destroy`, not `free`).
+    const DestroyTarget = union(enum) {
+        local: LocalId,
+        field: FieldRef,
+    };
+    fn destroyReceiverFreed(self: *Builder, call_node: Ast.Node.Index) ?DestroyTarget {
+        const tree = self.tree;
+        var buf: [1]Ast.Node.Index = undefined;
+        const call_full = tree.fullCall(&buf, call_node) orelse return null;
+        const callee = call_full.ast.fn_expr;
+        if (tree.nodeTag(callee) != .field_access) return null;
+        const fa = tree.nodeData(callee).node_and_token;
+        const method = tree.tokenSlice(fa[1]);
+        if (!std.mem.eql(u8, method, "destroy")) return null;
+        if (call_full.ast.params.len == 0) return null;
+        const arg = call_full.ast.params[0];
+        if (!self.exprLooksLikeAllocator(arg)) return null;
+        const recv = fa[0];
+        // Receiver is the freed thing.  Bare ident → local; field
+        // access shape `parent.field` → FieldRef.
+        switch (tree.nodeTag(recv)) {
+            .identifier => {
+                const name = tree.tokenSlice(tree.nodeMainToken(recv));
+                // Skip allocator-named receivers (`allocator.destroy`)
+                // — those are the canonical Allocator.destroy shape,
+                // and our pattern matched only because the *arg* also
+                // looked allocator-ish (rare, but possible).
+                if (looksLikeAllocatorName(name)) return null;
+                // Skip imported namespaces (`bun.destroy(...)`).
+                if (self.calleeIsImportedNamespace(recv)) return null;
+                const id = self.name_to_local.get(name) orelse return null;
+                return .{ .local = id };
+            },
+            .field_access => {
+                const fref = self.fieldLhsFor(recv) orelse return null;
+                return .{ .field = fref };
+            },
+            else => return null,
+        }
+    }
+
 
     fn classifyExpr(self: *Builder, expr_node: Ast.Node.Index) ExprKind {
         const tree = self.tree;
@@ -2287,7 +2402,13 @@ const Builder = struct {
         }
 
         // `ArenaAllocator.init(...)` → .arena_init
-        // Source-text check, robust to nesting.
+        // Match arena_init patterns against the CALLEE text only —
+        // the function name being called — not the full call
+        // expression.  Without this, a wrapping call whose args
+        // happen to mention "ArenaAllocator.init" (e.g. `bun.new(T,
+        // .{ .arena = ArenaAllocator.init(alloc) })`) would
+        // accidentally classify as arena_init, then `return this`
+        // would flag a bogus arena-escape.
         const first = tree.firstToken(expr_node);
         const last = tree.lastToken(expr_node);
         const start = tree.tokens.items(.start)[first];
@@ -2296,7 +2417,8 @@ const Builder = struct {
         const end: usize = last_start + last_len;
         const text = tree.source[start..end];
 
-        if (anyPatternMatches(text, self.config.arena_init_patterns)) {
+        const callee_text = self.calleeText(expr_node) orelse text;
+        if (anyPatternMatches(callee_text, self.config.arena_init_patterns)) {
             const aid: abstract_state.ArenaId = @enumFromInt(self.next_arena);
             self.next_arena += 1;
             return .{ .arena_init = aid };
@@ -3240,6 +3362,28 @@ const Builder = struct {
     fn isIdentChar(c: u8) bool {
         return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or
             (c >= '0' and c <= '9') or c == '_';
+    }
+
+    /// For a call-like node, return the source-text slice covering
+    /// just the callee expression (the `f` in `f(...)`).  Lets pattern
+    /// matches that should target the function being called avoid
+    /// accidentally matching identifiers buried in the args.  Returns
+    /// null when `expr_node` is not a call shape.
+    fn calleeText(self: *Builder, expr_node: Ast.Node.Index) ?[]const u8 {
+        const tree = self.tree;
+        switch (tree.nodeTag(expr_node)) {
+            .call, .call_one, .call_comma, .call_one_comma => {},
+            else => return null,
+        }
+        var buf: [1]Ast.Node.Index = undefined;
+        const call_full = tree.fullCall(&buf, expr_node) orelse return null;
+        const callee = call_full.ast.fn_expr;
+        const first = tree.firstToken(callee);
+        const last = tree.lastToken(callee);
+        const start = tree.tokens.items(.start)[first];
+        const last_start = tree.tokens.items(.start)[last];
+        const last_len = tree.tokenSlice(last).len;
+        return tree.source[start..(last_start + last_len)];
     }
 
     fn posOf(self: *Builder, node: Ast.Node.Index) SrcPos {
