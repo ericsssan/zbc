@@ -488,19 +488,13 @@ fn lookupBorrowedFromImport(
 /// the common `pub fn wrap(c: *const ns.Type) RetT { return c.method(); }`
 /// shape that real wrappers use.
 ///
-/// What this DOESN'T resolve (and why it's not worth fixing):
-///   - `anytype` params — Zig's duck-typed generic.  Resolving
-///     these would require per-call-site monomorphization, doubling
-///     analysis cost.  Empirically rare in real codebases as
-///     wrappers (most anytype params are `writer: anytype` /
-///     `stream: anytype` returning void or error union).
-///   - Inline anonymous struct types (`c: struct { ... }`) — no
-///     name in our imap; resolving methods would need to walk the
-///     param type's AST.  Even rarer in idiomatic Zig where named
-///     types are the convention.
-/// Both fall back to same-file lookup only.  The Zig style of
-/// "name your types explicitly so they can be `@import`-ed" makes
-/// this a theoretical rather than practical limit.
+/// For genuinely anonymous param types (`anytype`, inline
+/// `struct { ... }`) — where there's no namespace to target — we
+/// fall back to scanning every imap entry's DB for the method.
+/// Cost is bounded because anonymous param types are rare and the
+/// scan only triggers when the targeted lookup misses.  Returns
+/// null on ambiguity (two imports each define the method
+/// differently) so we err toward no inference rather than wrong.
 fn lookupBorrowedFromParamType(
     tree: *const Ast,
     fn_proto: Ast.full.FnProto,
@@ -515,7 +509,13 @@ fn lookupBorrowedFromParamType(
     const param = while (it.next()) |p| : (idx += 1) {
         if (idx == param_idx) break p;
     } else return null;
-    const type_node = param.type_expr orelse return null;
+    // `anytype` params have type_expr == null (anytype_ellipsis3
+    // is set instead).  No named type to resolve — fall straight
+    // to the imap scan.
+    const type_node = param.type_expr orelse {
+        if (param.anytype_ellipsis3 != null) return scanImapForBorrowedFrom(r, method_name);
+        return null;
+    };
 
     // Walk the type's tokens.  Skip pointer/const/optional/slice
     // qualifiers; look for the first `<id>.<id>` pair as the leaf
@@ -540,7 +540,68 @@ fn lookupBorrowedFromParamType(
     // Bare-identifier leaf type (`const Foo = struct {...};` in the
     // SAME file).  Same-file path would have already caught the
     // method via lookupBorrowedFromSameFile; nothing more to do.
+    //
+    // For `anytype` or inline `struct { ... }` param types we have
+    // no namespace to target.  Fall back to scanning every imap
+    // entry for the method — bounded cost (only fires when the
+    // param type is genuinely anonymous, which is rare; one scan
+    // per such call site).  Returns the target_idx if EXACTLY ONE
+    // import has the method annotated borrowed_from(idx); ambiguous
+    // matches bail.
+    if (isAnonymousParamType(tree, type_node)) {
+        return scanImapForBorrowedFrom(r, method_name);
+    }
     return null;
+}
+
+/// True iff the param's type-expr is `anytype` or an inline
+/// `struct { ... }` — both lack a name we can resolve through imap.
+fn isAnonymousParamType(tree: *const Ast, type_node: Ast.Node.Index) bool {
+    const first = tree.firstToken(type_node);
+    const last = tree.lastToken(type_node);
+    const tags = tree.tokens.items(.tag);
+
+    // Skip leading qualifiers (`*`, `const`, `?`, `[`, `]`, identifiers
+    // that are qualifiers like `const`).  Then check the first
+    // significant token.
+    var t: Ast.TokenIndex = first;
+    while (t <= last) : (t += 1) {
+        switch (tags[t]) {
+            .asterisk, .question_mark, .l_bracket, .r_bracket => continue,
+            .keyword_const => continue,
+            .identifier => {
+                const s = tree.tokenSlice(t);
+                if (std.mem.eql(u8, s, "anytype")) return true;
+                return false; // any other identifier is a named type
+            },
+            .keyword_struct, .keyword_union, .keyword_enum, .keyword_opaque => return true,
+            else => return false,
+        }
+    }
+    return false;
+}
+
+/// Scan every imap entry's remote DB for `method_name`.  Returns the
+/// SINGLE target_idx if exactly one import has it as `borrowed_from`;
+/// null on miss or on ambiguity (two imports each define the method
+/// with different target indices).
+fn scanImapForBorrowedFrom(remote: RemoteCtx, method_name: []const u8) ?u32 {
+    var found: ?u32 = null;
+    var it = remote.imap.entries.iterator();
+    while (it.next()) |kv| {
+        const path = kv.value_ptr.path;
+        const file = (remote.cache.loadOrLookup(remote.base_dir, path) catch continue) orelse continue;
+        const entry = file.db.lookup(method_name) orelse continue;
+        const a = entry.annotation orelse continue;
+        switch (a) {
+            .borrowed_from => |idx| {
+                if (found) |existing| if (existing != idx) return null;
+                found = idx;
+            },
+            else => {},
+        }
+    }
+    return found;
 }
 
 fn inferMethodStyle(

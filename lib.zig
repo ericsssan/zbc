@@ -170,6 +170,61 @@ test "lib API: analyzeEscape end-to-end flags arena escape" {
     try std.testing.expect(found);
 }
 
+test "lib API: cross-file R7 method-style via anytype param + imap scan" {
+    const gpa = std.testing.allocator;
+    const tio = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(tio, .{ .sub_path = "inner.zig", .data =
+        \\const std = @import("std");
+        \\pub const Ctx = struct {
+        \\    inner: std.heap.ArenaAllocator,
+        \\    /// @returns borrowed_from(self)
+        \\    pub fn text(self: *const Ctx) []const u8 { _ = self; return ""; }
+        \\};
+        \\
+    });
+    try tmp.dir.writeFile(tio, .{ .sub_path = "lib.zig", .data =
+        \\const inner = @import("inner.zig");
+        \\pub const ReExport = inner.Ctx;
+        \\// Anytype wrapper — param has no named type to resolve.
+        \\// R7 falls back to imap scan; lib's imap contains inner.zig
+        \\// which has text() annotated borrowed_from(self).
+        \\pub fn anytype_wrap(c: anytype) []const u8 {
+        \\    return c.text();
+        \\}
+        \\
+    });
+    try tmp.dir.writeFile(tio, .{ .sub_path = "main.zig", .data =
+        \\const std = @import("std");
+        \\const inner = @import("inner.zig");
+        \\const lib = @import("lib.zig");
+        \\pub fn caller() []const u8 {
+        \\    var local = inner.Ctx{ .inner = std.heap.ArenaAllocator.init(undefined) };
+        \\    return lib.anytype_wrap(local);
+        \\}
+        \\
+    });
+
+    const base_dir = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer gpa.free(base_dir);
+    const path = try std.fs.path.join(gpa, &.{ base_dir, "main.zig" });
+    defer gpa.free(path);
+
+    var cache = Cache.init(gpa, tio);
+    defer cache.deinit();
+
+    const problems = try analyzeEscape(gpa, tio, path, &cache, &DefaultConfig);
+    defer freeProblems(gpa, problems);
+
+    var found = false;
+    for (problems) |p| {
+        if (std.mem.indexOf(u8, p.message, "function-local arena") != null) found = true;
+    }
+    try std.testing.expect(found);
+}
+
 test "lib API: cross-file R7 method-style via AST type-name resolution" {
     const gpa = std.testing.allocator;
     const tio = std.testing.io;
