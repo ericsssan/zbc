@@ -123,6 +123,13 @@ pub const Db = struct {
     /// lookup to the FIELD's type rather than the local's type or
     /// the bare name.
     field_types: std.HashMapUnmanaged(FieldKey, []const u8, FieldKey.Context, std.hash_map.default_max_load_percentage) = .empty,
+    /// (containing-struct, field-name) ∈ set when the field is
+    /// annotated `/// @borrowed` — meaning its storage is owned by
+    /// the containing struct.  Reading or copying the field gives
+    /// you a borrow whose lifetime is tied to the parent's.  When
+    /// the parent later receives a `@takes(0)` (or destructor) call,
+    /// existing borrows fire UAF.
+    borrowed_fields: std.HashMapUnmanaged(FieldKey, void, FieldKey.Context, std.hash_map.default_max_load_percentage) = .empty,
 
     pub fn deinit(self: *Db, gpa: std.mem.Allocator) void {
         var it = self.fns.valueIterator();
@@ -135,6 +142,7 @@ pub const Db = struct {
         self.fns.deinit(gpa);
         self.containing_types.deinit(gpa);
         self.field_types.deinit(gpa);
+        self.borrowed_fields.deinit(gpa);
     }
 
     /// (struct_name, field_name) → declared field type name, or
@@ -142,6 +150,16 @@ pub const Db = struct {
     /// no resolvable base type — slice / array / fn ptr).
     pub fn fieldType(self: *const Db, struct_name: []const u8, field_name: []const u8) ?[]const u8 {
         return self.field_types.get(.{ .containing_type = struct_name, .name = field_name });
+    }
+
+    /// True iff `<struct_name>.<field_name>` carries a
+    /// `/// @borrowed` annotation — used by call sites to treat
+    /// `<local>.<field>` reads as borrows of the local's storage.
+    pub fn isBorrowedField(self: *const Db, struct_name: []const u8, field_name: []const u8) bool {
+        return self.borrowed_fields.containsContext(.{
+            .containing_type = struct_name,
+            .name = field_name,
+        }, .{});
     }
 
     pub const FieldKey = struct {
@@ -322,7 +340,7 @@ pub fn buildFull(
     // enum type; for each field declaration, record its declared
     // type.  Together these let `<recv>.<field>.<method>()` calls
     // disambiguate by both the local's type and the field's type.
-    try discoverContainingTypes(gpa, tree, &db.containing_types, &db.field_types);
+    try discoverContainingTypes(gpa, tree, &db.containing_types, &db.field_types, &db.borrowed_fields);
     const fn_to_type = &db.containing_types;
 
     // Pass 1 — explicit annotations + R6 (slice + body allocs → owned).
@@ -1451,9 +1469,10 @@ fn discoverContainingTypes(
     tree: *const Ast,
     fn_out: *std.AutoHashMapUnmanaged(Ast.Node.Index, []const u8),
     field_out: *std.HashMapUnmanaged(Db.FieldKey, []const u8, Db.FieldKey.Context, std.hash_map.default_max_load_percentage),
+    borrowed_out: *std.HashMapUnmanaged(Db.FieldKey, void, Db.FieldKey.Context, std.hash_map.default_max_load_percentage),
 ) !void {
     const root = tree.containerDeclRoot();
-    try walkContainerMembers(gpa, tree, root.ast.members, null, fn_out, field_out);
+    try walkContainerMembers(gpa, tree, root.ast.members, null, fn_out, field_out, borrowed_out);
 }
 
 fn walkContainerMembers(
@@ -1463,6 +1482,7 @@ fn walkContainerMembers(
     containing_type: ?[]const u8,
     fn_out: *std.AutoHashMapUnmanaged(Ast.Node.Index, []const u8),
     field_out: *std.HashMapUnmanaged(Db.FieldKey, []const u8, Db.FieldKey.Context, std.hash_map.default_max_load_percentage),
+    borrowed_out: *std.HashMapUnmanaged(Db.FieldKey, void, Db.FieldKey.Context, std.hash_map.default_max_load_percentage),
 ) (std.mem.Allocator.Error)!void {
     for (members) |member| {
         switch (tree.nodeTag(member)) {
@@ -1481,7 +1501,7 @@ fn walkContainerMembers(
                 const name_tok = vd.ast.mut_token + 1;
                 if (tree.tokens.items(.tag)[name_tok] != .identifier) continue;
                 const ty_name = tree.tokenSlice(name_tok);
-                try descendContainer(gpa, tree, init_node, ty_name, fn_out, field_out);
+                try descendContainer(gpa, tree, init_node, ty_name, fn_out, field_out, borrowed_out);
             },
             // Struct/union field declarations — `name: T [= default],`.
             .container_field_init,
@@ -1493,16 +1513,45 @@ fn walkContainerMembers(
                 const name_tok = cf.ast.main_token;
                 if (tree.tokens.items(.tag)[name_tok] != .identifier) continue;
                 const field_name = tree.tokenSlice(name_tok);
-                const type_expr = cf.ast.type_expr.unwrap() orelse continue;
-                const field_ty = stripTypeWrappers(tree, type_expr, ct) orelse continue;
-                try field_out.putContext(gpa, .{
-                    .containing_type = ct,
-                    .name = field_name,
-                }, field_ty, .{});
+                if (cf.ast.type_expr.unwrap()) |type_expr| {
+                    if (stripTypeWrappers(tree, type_expr, ct)) |field_ty| {
+                        try field_out.putContext(gpa, .{
+                            .containing_type = ct,
+                            .name = field_name,
+                        }, field_ty, .{});
+                    }
+                }
+                // Annotation scan: `/// @borrowed` (preceding doc
+                // comment) marks the field's storage as owned by the
+                // containing struct.
+                if (fieldHasBorrowedAnnotation(tree, name_tok)) {
+                    try borrowed_out.putContext(gpa, .{
+                        .containing_type = ct,
+                        .name = field_name,
+                    }, {}, .{});
+                }
             },
             else => {},
         }
     }
+}
+
+/// Walk doc_comment tokens immediately preceding `name_tok` (the
+/// field name) and return true if any contains a `@borrowed`
+/// directive.  Same trailing-doc-comment convention as
+/// `parseTakesAnnotation`.
+fn fieldHasBorrowedAnnotation(tree: *const Ast, name_tok: Ast.TokenIndex) bool {
+    if (name_tok == 0) return false;
+    var t: i64 = @as(i64, @intCast(name_tok)) - 1;
+    while (t >= 0) : (t -= 1) {
+        const tok_idx: Ast.TokenIndex = @intCast(t);
+        if (tree.tokens.items(.tag)[tok_idx] != .doc_comment) break;
+        const raw = tree.tokenSlice(tok_idx);
+        const body = stripDocPrefix(raw);
+        const trimmed = std.mem.trim(u8, body, " \t");
+        if (std.mem.eql(u8, trimmed, "@borrowed")) return true;
+    }
+    return false;
 }
 
 /// Dispatch on container_decl variant and recurse with the right
@@ -1516,27 +1565,28 @@ fn descendContainer(
     ty_name: []const u8,
     fn_out: *std.AutoHashMapUnmanaged(Ast.Node.Index, []const u8),
     field_out: *std.HashMapUnmanaged(Db.FieldKey, []const u8, Db.FieldKey.Context, std.hash_map.default_max_load_percentage),
+    borrowed_out: *std.HashMapUnmanaged(Db.FieldKey, void, Db.FieldKey.Context, std.hash_map.default_max_load_percentage),
 ) (std.mem.Allocator.Error)!void {
     switch (tree.nodeTag(node)) {
         .container_decl, .container_decl_trailing => {
-            try walkContainerMembers(gpa, tree, tree.containerDecl(node).ast.members, ty_name, fn_out, field_out);
+            try walkContainerMembers(gpa, tree, tree.containerDecl(node).ast.members, ty_name, fn_out, field_out, borrowed_out);
         },
         .container_decl_two, .container_decl_two_trailing => {
             var buf: [2]Ast.Node.Index = undefined;
-            try walkContainerMembers(gpa, tree, tree.containerDeclTwo(&buf, node).ast.members, ty_name, fn_out, field_out);
+            try walkContainerMembers(gpa, tree, tree.containerDeclTwo(&buf, node).ast.members, ty_name, fn_out, field_out, borrowed_out);
         },
         .container_decl_arg, .container_decl_arg_trailing => {
-            try walkContainerMembers(gpa, tree, tree.containerDeclArg(node).ast.members, ty_name, fn_out, field_out);
+            try walkContainerMembers(gpa, tree, tree.containerDeclArg(node).ast.members, ty_name, fn_out, field_out, borrowed_out);
         },
         .tagged_union, .tagged_union_trailing => {
-            try walkContainerMembers(gpa, tree, tree.taggedUnion(node).ast.members, ty_name, fn_out, field_out);
+            try walkContainerMembers(gpa, tree, tree.taggedUnion(node).ast.members, ty_name, fn_out, field_out, borrowed_out);
         },
         .tagged_union_two, .tagged_union_two_trailing => {
             var buf: [2]Ast.Node.Index = undefined;
-            try walkContainerMembers(gpa, tree, tree.taggedUnionTwo(&buf, node).ast.members, ty_name, fn_out, field_out);
+            try walkContainerMembers(gpa, tree, tree.taggedUnionTwo(&buf, node).ast.members, ty_name, fn_out, field_out, borrowed_out);
         },
         .tagged_union_enum_tag, .tagged_union_enum_tag_trailing => {
-            try walkContainerMembers(gpa, tree, tree.taggedUnionEnumTag(node).ast.members, ty_name, fn_out, field_out);
+            try walkContainerMembers(gpa, tree, tree.taggedUnionEnumTag(node).ast.members, ty_name, fn_out, field_out, borrowed_out);
         },
         else => {},
     }

@@ -420,6 +420,31 @@ fn transferFieldUse(
                 "use of `{s}{s}{s}` while still `undefined`",
                 .{ parent_name, pathSep(u.name), u.name });
         },
+        .stack => |owner_id| {
+            // Field borrows from a stack owner — mirrors the .stack
+            // arm in checkOriginAlive.  When the field carries an
+            // owner-borrow origin (set via classifyExpr's @borrowed-
+            // field route, or via struct-literal unpack of a
+            // borrowed-field read), a kill of the owner invalidates
+            // this read.
+            if (!config_mod.isEnabled(ctx.config, .heap_use_after_free)) return;
+            const owner_origin = state.locals.get(owner_id) orelse return;
+            switch (owner_origin) {
+                .heap => |hid| {
+                    const st = state.heaps.get(hid) orelse return;
+                    if (st.state == .dead) {
+                        try reportWithNote(ctx, "heap-use-after-free", pos, end_pos, .@"error",
+                            "use of `{s}{s}{s}` (borrow from `{s}`) after free",
+                            .{ parent_name, pathSep(u.name), u.name, ctx.locals[@intFromEnum(owner_id)].name },
+                            if (st.killed_at) |ks|
+                                .{ .site = ks, .label = "value freed here" }
+                            else
+                                null);
+                    }
+                },
+                else => {},
+            }
+        },
         else => {},
     }
 }

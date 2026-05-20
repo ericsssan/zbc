@@ -31,6 +31,38 @@ through the same name before re-use:
   persist.  Naming the constructor `init`/`create`/`new`/`open`
   helps the classifier recognise the fresh allocation.
 
+## Borrow-tracking annotations
+
+When the use happens through a borrow rather than the freed pointer
+itself, zbc relies on annotations to connect the borrow back to the
+owner.
+
+- `/// @takes ownership(<param>)` on a fn marks the call as a
+  free of the named param.  Without it, `owner.die()` cannot kill
+  owner's storage and downstream reads are not flagged.
+- `/// @borrowed` on a struct field marks the field's storage as
+  owned by the containing struct.  Reading or copying the field
+  yields a borrow tied to the parent's lifetime; a later
+  `@takes(0)` call on the parent invalidates the borrow.  Without
+  the annotation, zbc treats field reads as independent values
+  (no propagation) to avoid false positives on the many fields
+  that ARE independent — `arr.len`, `obj.tag`, etc.
+
+Example:
+
+    const Owner = struct {
+        /// @borrowed
+        data: []u8 = &.{},
+
+        /// @takes ownership(self)
+        pub fn die(self: *Owner) void { /* ... */ }
+    };
+
+    var owner: Owner = .{};
+    const borrowed = owner.data; // borrowed origin tied to owner
+    owner.die();
+    _ = borrowed;                // ← heap-use-after-free fires
+
 ## Related
 
 - `heap-double-free`: freeing the same pointer twice.

@@ -2959,6 +2959,19 @@ const Builder = struct {
                     if (std.mem.eql(u8, fname, "ptr")) {
                         return .{ .copy_of = id };
                     }
+                    // `/// @borrowed` field annotation: the field's
+                    // storage is owned by the containing struct, so a
+                    // read of `local.field` yields a borrow tied to
+                    // `local`'s lifetime.  Surface as .stack_ref(local)
+                    // so it composes with the stack-owner liveness
+                    // check at use sites — `owner.die()` then
+                    // invalidates the borrow.
+                    if (self.db) |db| {
+                        const info = self.locals.items[@intFromEnum(id)];
+                        if (info.type_name) |ty| if (db.isBorrowedField(ty, fname)) {
+                            if (!info.is_pointer) return .{ .stack_ref = id };
+                        };
+                    }
                     return .{ .field_copy_of = .{ .parent = id, .name = fname } };
                 }
             }
