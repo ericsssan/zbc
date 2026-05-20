@@ -435,12 +435,111 @@ fn inferDelegatorBorrow(
     db: *const Db,
     remote: ?RemoteCtx,
 ) ?ReturnsAnnotation {
-    const return_expr = singleReturnExpr(tree, body_node) orelse return null;
+    // Single-stmt or var+return shape: classify the lone return.
+    if (singleReturnExpr(tree, body_node)) |return_expr| {
+        if (tryInferFromReturnExpr(tree, fn_proto, return_expr, db, remote)) |a| return a;
+    }
+    // Multi-return body (e.g. `if (cond) return c.text(); return "";`):
+    // infer if EVERY return stmt either delegates to the same param
+    // or returns a non-borrow value (literal / null / &.{} / etc.).
+    return inferDelegatorBorrowMultiReturn(tree, fn_proto, body_node, db, remote);
+}
+
+fn tryInferFromReturnExpr(
+    tree: *const Ast,
+    fn_proto: Ast.full.FnProto,
+    return_expr: Ast.Node.Index,
+    db: *const Db,
+    remote: ?RemoteCtx,
+) ?ReturnsAnnotation {
     var buf: [1]Ast.Node.Index = undefined;
     const call_full = tree.fullCall(&buf, return_expr) orelse return null;
-
     if (inferMethodStyle(tree, fn_proto, return_expr, db, remote)) |a| return a;
     return inferNamespaceStyle(tree, fn_proto, call_full, db, remote);
+}
+
+/// Walk every `.@"return"` node whose token range lies within
+/// `body_node`.  For each return stmt:
+///   - If the value matches R7 (method-style or namespace-style
+///     delegating to `borrowed_from(self/arg)` on one of our
+///     params), record the param index.
+///   - If the value is a non-borrow shape (literal / null /
+///     undefined / empty-tuple slice), skip — non-borrow returns
+///     don't constrain the inference.
+///   - Anything else (unrecognized call) → abort to avoid wrong
+///     inference.
+/// Returns `borrowed_from(N)` if at least one return matched and
+/// all matched returns agree on the same N.
+fn inferDelegatorBorrowMultiReturn(
+    tree: *const Ast,
+    fn_proto: Ast.full.FnProto,
+    body_node: Ast.Node.Index,
+    db: *const Db,
+    remote: ?RemoteCtx,
+) ?ReturnsAnnotation {
+    const body_first = tree.firstToken(body_node);
+    const body_last = tree.lastToken(body_node);
+
+    var found: ?u32 = null;
+    var any_match = false;
+
+    var node_idx: u32 = 1;
+    while (node_idx < tree.nodes.len) : (node_idx += 1) {
+        const node: Ast.Node.Index = @enumFromInt(node_idx);
+        if (tree.nodeTag(node) != .@"return") continue;
+        const ft = tree.firstToken(node);
+        const lt = tree.lastToken(node);
+        if (ft < body_first or lt > body_last) continue;
+
+        const value_opt = tree.nodeData(node).opt_node.unwrap();
+        const value = value_opt orelse continue; // `return;` — void
+        if (isNonBorrowReturnValue(tree, value)) continue;
+
+        const inferred = tryInferFromReturnExpr(tree, fn_proto, value, db, remote) orelse {
+            // Recognized neither a borrow delegation nor a known
+            // non-borrow — can't safely infer.
+            return null;
+        };
+        switch (inferred) {
+            .borrowed_from => |idx| {
+                if (found) |existing| if (existing != idx) return null;
+                found = idx;
+                any_match = true;
+            },
+            else => return null,
+        }
+    }
+    if (!any_match) return null;
+    return .{ .borrowed_from = found.? };
+}
+
+/// True iff `expr` is a return-value shape that doesn't borrow
+/// from any local/param — string literal, integer, null, undefined,
+/// `&.{}` (empty tuple-to-slice coercion).  These are safe to
+/// skip when inferring borrowed_from across multiple returns.
+fn isNonBorrowReturnValue(tree: *const Ast, expr: Ast.Node.Index) bool {
+    switch (tree.nodeTag(expr)) {
+        .string_literal, .multiline_string_literal,
+        .number_literal, .char_literal,
+        => return true,
+        .identifier => {
+            const name = tree.tokenSlice(tree.nodeMainToken(expr));
+            return std.mem.eql(u8, name, "null") or
+                std.mem.eql(u8, name, "undefined") or
+                std.mem.eql(u8, name, "true") or
+                std.mem.eql(u8, name, "false");
+        },
+        .address_of => {
+            // `&.{}` — anonymous empty literal address-of.  Inner
+            // is a struct_init_dot_two with no fields.
+            const inner = tree.nodeData(expr).node;
+            return switch (tree.nodeTag(inner)) {
+                .struct_init_dot_two, .struct_init_dot_two_comma => true,
+                else => false,
+            };
+        },
+        else => return false,
+    }
 }
 
 /// Look up `method_name` in the same-file DB, returning its

@@ -421,6 +421,34 @@ test "R7 inference: delegator wrap fires escape on local-arena caller" {
     try std.testing.expect(found);
 }
 
+test "R7 inference: multi-return body — every return delegates to same param" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const std = @import("std");
+        \\const MyArena = struct {
+        \\    inner: std.heap.ArenaAllocator,
+        \\    /// @returns borrowed_from(self)
+        \\    pub fn text(self: *const MyArena) []const u8 { _ = self; return ""; }
+        \\};
+        \\pub fn conditional(c: *const MyArena, cond: bool) []const u8 {
+        \\    if (cond) return c.text();
+        \\    return "";
+        \\}
+        \\pub fn caller() []const u8 {
+        \\    var arena = std.heap.ArenaAllocator.init(undefined);
+        \\    var ma = MyArena{ .inner = arena };
+        \\    return conditional(&ma, true);
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    var found = false;
+    for (problems.items) |p| {
+        if (std.mem.indexOf(u8, p.message, "function-local arena") != null) found = true;
+    }
+    try std.testing.expect(found);
+}
+
 test "arena_escape: struct-wrapping `var ma = W{ .inner = arena };` propagates" {
     const gpa = std.testing.allocator;
     var problems = try analyze(gpa,
