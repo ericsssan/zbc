@@ -3410,19 +3410,54 @@ const Builder = struct {
     /// repeated mentions of the same local only emit one `.use`.
     const FieldRef = struct { parent: LocalId, name: []const u8 };
 
-    /// If `lhs` is `<known_local>.<field>`, return the field ref.
-    /// Otherwise null.  Used by lowerAssign to dispatch field-target
-    /// writes to .field_assign (preserves field-level tracking).
+    /// If `lhs` is `<known_local>.<f1>(.<f2>)*`, return a ref with
+    /// the root local as parent and the source-slice of the dotted
+    /// field path as name.  Handles:
+    ///   `obj.f`         → { obj, "f" }
+    ///   `obj.f.g`       → { obj, "f.g" }
+    ///   `obj.f.g.h`     → { obj, "f.g.h" }
+    /// Returns null when the chain isn't anchored at a known local
+    /// (e.g. `Type.field` namespace) or contains non-ident/non-`.`
+    /// nodes (`obj[i].f`, computed access, etc.).
+    ///
+    /// Used by lowerAssign to dispatch field-target writes to
+    /// .field_assign — symmetric with the field_use prefix
+    /// emission on reads — so deep-path reassignments
+    /// (`o.inner.handle = fresh()`) correctly RESET the freed
+    /// state recorded by R10's N-level chain inference.
     fn fieldLhsFor(self: *Builder, lhs: Ast.Node.Index) ?FieldRef {
         const tree = self.tree;
         if (tree.nodeTag(lhs) != .field_access) return null;
-        const fa = tree.nodeData(lhs).node_and_token;
-        const recv = fa[0];
-        if (tree.nodeTag(recv) != .identifier) return null;
-        const recv_name = tree.tokenSlice(tree.nodeMainToken(recv));
+        // Walk down the field_access chain to the leftmost
+        // identifier.  Each .field_access node has data
+        // .node_and_token = { receiver_node, field_name_token }.
+        // The leftmost receiver must be a bare identifier known to
+        // our locals.
+        var cur = lhs;
+        var depth: u32 = 0;
+        while (tree.nodeTag(cur) == .field_access) : (depth += 1) {
+            cur = tree.nodeData(cur).node_and_token[0];
+        }
+        if (tree.nodeTag(cur) != .identifier) return null;
+        const recv_name = tree.tokenSlice(tree.nodeMainToken(cur));
         const parent = self.name_to_local.get(recv_name) orelse return null;
-        const name = tree.tokenSlice(fa[1]);
-        return .{ .parent = parent, .name = name };
+        // The field-path source slice runs from the FIRST field
+        // ident (token after the leftmost ident's main_token + 1
+        // for the `.`) through the rightmost field ident's
+        // inclusive end.  Easier: lhs's source span minus the
+        // leftmost ident's tokens.
+        const root_tok = tree.nodeMainToken(cur);
+        const root_start = tree.tokens.items(.start)[root_tok];
+        const root_len = tree.tokenSlice(root_tok).len;
+        // First-field token is the one right after the `.` that
+        // follows the root ident.  In source, that's
+        // `root_start + root_len + 1` (for the `.`).
+        const first_field_byte: usize = root_start + root_len + 1;
+        const last_tok = tree.lastToken(lhs);
+        const last_start = tree.tokens.items(.start)[last_tok];
+        const last_len = tree.tokenSlice(last_tok).len;
+        const path = tree.source[first_field_byte..(last_start + last_len)];
+        return .{ .parent = parent, .name = path };
     }
 
     /// Walk LHS tokens of an assignment with a non-identifier target

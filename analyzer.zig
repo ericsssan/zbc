@@ -1609,6 +1609,56 @@ test "R10 multi-field: wrapper frees TWO different fields → both UAFs fire" {
     try std.testing.expect(saw_b);
 }
 
+test "deep-path field_assign clears freed state — `o.inner.handle = fresh()` resets after R10 deep free" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const bun = struct { pub fn destroy(_: anytype) void {} };
+        \\const Handle = struct { pub fn dispose(this: *Handle) void { bun.destroy(this); } };
+        \\const Inner = struct { handle: *Handle };
+        \\const Outer = struct {
+        \\    inner: *Inner,
+        \\    pub fn cleanup(this: *Outer) void { this.inner.handle.dispose(); }
+        \\};
+        \\fn fresh() *Handle { return undefined; }
+        \\pub fn ok(o: *Outer) void {
+        \\    o.cleanup();
+        \\    o.inner.handle = fresh();
+        \\    const v = o.inner.handle;
+        \\    _ = v;
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    // Reassign clears the freed state at the deep path; the read
+    // must not fire.
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
+test "deep-path free via `g.free(obj.f.g)` is recognised" {
+    // fieldLhsFor's extension to dotted paths means
+    // `<allocator>.free(<local>.<f>.<g>)` now emits
+    // .field_heap_free(<local>, "f.g") instead of falling through
+    // to a free-untracked-arg gap.
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const std = @import("std");
+        \\const Inner = struct { p: []u8 };
+        \\const Outer = struct { inner: Inner };
+        \\pub fn buggy(gpa_: std.mem.Allocator, o: *Outer) void {
+        \\    gpa_.free(o.inner.p);
+        \\    const v = o.inner.p;
+        \\    _ = v;
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    var found = false;
+    for (problems.items) |p| {
+        if (std.mem.indexOf(u8, p.message, "use of `o.inner.p`") != null) found = true;
+    }
+    try std.testing.expect(found);
+}
+
 test "R10 deeper chain: `this.inner.handle.dispose()` propagates as field path \"inner.handle\"" {
     const gpa = std.testing.allocator;
     var problems = try analyze(gpa,
