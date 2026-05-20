@@ -41,7 +41,8 @@ pub fn main(init: std.process.Init) !void {
     try enabled.appendSlice(gpa, &lib.all_invariants);
     var mode: Mode = .escape;
     var enabled_explicit = false;
-    var format: Format = .text;
+    var format: Format = .rich;
+    var color_off = false;
 
     var arena_init_patterns: []const []const u8 = lib.DefaultConfig.arena_init_patterns;
     var arena_kill_patterns: []const []const u8 = lib.DefaultConfig.arena_kill_patterns;
@@ -96,14 +97,20 @@ pub fn main(init: std.process.Init) !void {
         }
         if (std.mem.startsWith(u8, a, "--format=")) {
             const v = a["--format=".len..];
-            if (std.mem.eql(u8, v, "text")) {
-                format = .text;
+            if (std.mem.eql(u8, v, "text") or std.mem.eql(u8, v, "rich")) {
+                format = .rich;
+            } else if (std.mem.eql(u8, v, "compact")) {
+                format = .compact;
             } else if (std.mem.eql(u8, v, "json")) {
                 format = .json;
             } else {
-                std.debug.print("zbc: unknown format `{s}` (expected text or json)\n", .{v});
+                std.debug.print("zbc: unknown format `{s}` (expected rich, compact, or json)\n", .{v});
                 std.process.exit(2);
             }
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--no-color")) {
+            color_off = true;
             continue;
         }
         if (std.mem.startsWith(u8, a, "--")) {
@@ -185,17 +192,28 @@ pub fn main(init: std.process.Init) !void {
     std.mem.sort(IndexedProblem, all_problems.items, {}, indexedProblemLess);
 
     if (all_problems.items.len > 0) any_problems = true;
-    if (format == .json) {
-        std.debug.print("[", .{});
-        var first = true;
-        for (all_problems.items) |ip| {
-            printOneProblemJson(ip.path, ip.problem, &first);
-        }
-        std.debug.print("{s}]\n", .{if (first) "" else "\n"});
-    } else {
-        for (all_problems.items) |ip| {
-            printOneProblemText(ip.path, ip.problem);
-        }
+    const use_color = !color_off and std.posix.system.isatty(std.posix.STDERR_FILENO) != 0;
+    var src_cache: SourceCache = .{ .gpa = gpa, .io = io };
+    defer src_cache.deinit();
+    switch (format) {
+        .json => {
+            std.debug.print("[", .{});
+            var first = true;
+            for (all_problems.items) |ip| {
+                printOneProblemJson(ip.path, ip.problem, &first);
+            }
+            std.debug.print("{s}]\n", .{if (first) "" else "\n"});
+        },
+        .compact => {
+            for (all_problems.items) |ip| {
+                printOneProblemCompact(ip.path, ip.problem);
+            }
+        },
+        .rich => {
+            for (all_problems.items) |ip| {
+                printOneProblemRich(&src_cache, ip.path, ip.problem, use_color);
+            }
+        },
     }
     std.process.exit(if (any_problems) @as(u8, 1) else 0);
 }
@@ -241,7 +259,7 @@ fn expandPath(
 }
 
 const Mode = enum { escape, hygiene };
-const Format = enum { text, json };
+const Format = enum { rich, compact, json };
 const Op = enum { add, remove };
 
 fn parseInvariantList(
@@ -294,7 +312,11 @@ fn printUsage() void {
         \\                        (default: ArenaAllocator.init).
         \\  --arena-kill=A,B      Patterns that kill the receiver arena
         \\                        (default: .deinit().
-        \\  --format=text|json    Output format (default: text).
+        \\  --format=rich|compact|json
+        \\                        Output format.  Default `rich` shows
+        \\                        Rustc-style source context and labels.
+        \\                        `compact` is single-line grep-friendly.
+        \\  --no-color            Disable ANSI color in `rich` output.
         \\  --list-invariants     Print known invariant names and exit.
         \\  -h, --help            Print this help.
         \\
@@ -339,15 +361,227 @@ fn runOne(t: *Task) std.Io.Cancelable!void {
     t.problems = problems;
 }
 
-fn printOneProblemText(path: []const u8, p: lib.Problem) void {
-    std.debug.print("{s}:{}:{}: {s}: {s} [{s}]\n", .{
+fn printOneProblemCompact(path: []const u8, p: lib.Problem) void {
+    std.debug.print("{s}:{}:{}: {s}: {s}", .{
         path,
         p.start.line,
         p.start.column,
         severityName(p.severity),
         p.message,
-        p.rule_id,
     });
+    // Tack each note's location and label onto the same line so the
+    // single-line shape stays grep-friendly while still carrying the
+    // related-event spans.
+    for (p.notes) |n| {
+        std.debug.print(" ({s} at {s}:{}:{})", .{
+            n.label, path, n.start.line, n.start.column,
+        });
+    }
+    std.debug.print(" [{s}]\n", .{p.rule_id});
+}
+
+// ── Rich (Rustc-style) renderer ──────────────────────────────────
+
+const SourceCache = struct {
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    entries: std.StringHashMapUnmanaged([]u8) = .empty,
+
+    fn get(self: *SourceCache, path: []const u8) ?[]const u8 {
+        if (self.entries.get(path)) |s| return s;
+        const bytes = std.Io.Dir.cwd().readFileAlloc(
+            self.io,
+            path,
+            self.gpa,
+            std.Io.Limit.limited(16 * 1024 * 1024),
+        ) catch return null;
+        const key = self.gpa.dupe(u8, path) catch {
+            self.gpa.free(bytes);
+            return null;
+        };
+        self.entries.put(self.gpa, key, bytes) catch {
+            self.gpa.free(bytes);
+            self.gpa.free(key);
+            return null;
+        };
+        return bytes;
+    }
+
+    fn deinit(self: *SourceCache) void {
+        var it = self.entries.iterator();
+        while (it.next()) |e| {
+            self.gpa.free(e.key_ptr.*);
+            self.gpa.free(e.value_ptr.*);
+        }
+        self.entries.deinit(self.gpa);
+    }
+};
+
+const Ansi = struct {
+    reset: []const u8,
+    bold: []const u8,
+    red: []const u8,
+    yellow: []const u8,
+    blue: []const u8,
+    cyan: []const u8,
+
+    fn pick(use_color: bool) Ansi {
+        return if (use_color) .{
+            .reset = "\x1b[0m",
+            .bold = "\x1b[1m",
+            .red = "\x1b[31m",
+            .yellow = "\x1b[33m",
+            .blue = "\x1b[34m",
+            .cyan = "\x1b[36m",
+        } else .{
+            .reset = "",
+            .bold = "",
+            .red = "",
+            .yellow = "",
+            .blue = "",
+            .cyan = "",
+        };
+    }
+};
+
+fn printOneProblemRich(
+    cache: *SourceCache,
+    path: []const u8,
+    p: lib.Problem,
+    use_color: bool,
+) void {
+    const c = Ansi.pick(use_color);
+    const sev_color = switch (p.severity) {
+        .@"error" => c.red,
+        .warning => c.yellow,
+        .off => c.cyan,
+    };
+
+    // Header:  error[zbc/heap-use-after-free]: use of `x` after free
+    std.debug.print(
+        "{s}{s}{s}{s}{s}[{s}]{s}: {s}{s}{s}\n",
+        .{
+            c.bold,        sev_color, severityName(p.severity), c.reset,
+            c.bold,        p.rule_id, c.reset,
+            c.bold,        p.message, c.reset,
+        },
+    );
+
+    // Source-context block.
+    const src_opt = cache.get(path);
+    const gutter_width = pickGutterWidth(p);
+
+    // Location line:  --> path:line:col
+    pad(gutter_width);
+    std.debug.print("{s}--> {s}{s}:{}:{}\n", .{
+        c.blue, c.reset, path, p.start.line, p.start.column,
+    });
+
+    if (src_opt) |src| {
+        // Blank gutter row before the primary span.
+        pad(gutter_width);
+        std.debug.print("{s}|{s}\n", .{ c.blue, c.reset });
+
+        renderSpan(src, p.start, p.end, "", sev_color, '^', c, gutter_width);
+
+        for (p.notes) |n| {
+            // For notes in the SAME file, render with the same gutter
+            // alignment so the eye can connect them.  External files
+            // (none today, but cheap to support) would print their own
+            // path lines.
+            pad(gutter_width);
+            std.debug.print("{s}|{s}\n", .{ c.blue, c.reset });
+            renderSpan(src, n.start, n.end, n.label, c.blue, '-', c, gutter_width);
+        }
+    } else {
+        // Source unavailable — fall back to printing the note locations
+        // textually so we don't drop the info.
+        for (p.notes) |n| {
+            pad(gutter_width);
+            std.debug.print("{s}={s} {s} at {s}:{}:{}\n", .{
+                c.blue, c.reset, n.label, path, n.start.line, n.start.column,
+            });
+        }
+    }
+
+    std.debug.print("\n", .{});
+}
+
+/// Number of digits in the widest line number we'll print for this
+/// problem — primary span + notes.  Gutter width = max digits + 1
+/// space, matching Rustc.
+fn pickGutterWidth(p: lib.Problem) usize {
+    var max_line: u32 = p.start.line;
+    for (p.notes) |n| {
+        if (n.start.line > max_line) max_line = n.start.line;
+    }
+    return countDigits(max_line);
+}
+
+fn countDigits(n: u32) usize {
+    if (n == 0) return 1;
+    var v = n;
+    var d: usize = 0;
+    while (v > 0) : (v /= 10) d += 1;
+    return d;
+}
+
+fn pad(width: usize) void {
+    var i: usize = 0;
+    while (i < width) : (i += 1) std.debug.print(" ", .{});
+}
+
+fn renderSpan(
+    src: []const u8,
+    start: lib.Pos,
+    end: lib.Pos,
+    label: []const u8,
+    label_color: []const u8,
+    caret_char: u8,
+    c: Ansi,
+    gutter_width: usize,
+) void {
+    // Find the byte range of `start.line` in src.
+    const line_text = sliceLine(src, start.byte);
+    // Print the source line:  NNN | <text>
+    const line_str_buf: [16]u8 = [_]u8{0} ** 16;
+    var buf = line_str_buf;
+    const ln_str = std.fmt.bufPrint(&buf, "{}", .{start.line}) catch "?";
+    const lead = if (gutter_width > ln_str.len) gutter_width - ln_str.len else 0;
+    pad(lead);
+    std.debug.print("{s}{s} |{s} {s}\n", .{ c.blue, ln_str, c.reset, line_text });
+    // Underline row.  Columns are 1-indexed.
+    pad(gutter_width);
+    std.debug.print("{s}|{s} ", .{ c.blue, c.reset });
+    // Pad to start column.
+    if (start.column > 1) {
+        var i: u32 = 1;
+        while (i < start.column) : (i += 1) std.debug.print(" ", .{});
+    }
+    // Caret length: end.column - start.column on same line; otherwise
+    // 1 (multi-line spans are rare here).
+    var caret_len: u32 = 1;
+    if (end.line == start.line and end.column > start.column) {
+        caret_len = end.column - start.column;
+    }
+    std.debug.print("{s}", .{label_color});
+    var i: u32 = 0;
+    while (i < caret_len) : (i += 1) std.debug.print("{c}", .{caret_char});
+    if (label.len > 0) {
+        std.debug.print(" {s}", .{label});
+    }
+    std.debug.print("{s}\n", .{c.reset});
+}
+
+/// Slice `src` to the line containing `byte_offset` (without the
+/// newline).  If `byte_offset` is past EOF, returns an empty slice.
+fn sliceLine(src: []const u8, byte_offset: u32) []const u8 {
+    if (byte_offset >= src.len) return "";
+    var ls: usize = byte_offset;
+    while (ls > 0 and src[ls - 1] != '\n') ls -= 1;
+    var le: usize = byte_offset;
+    while (le < src.len and src[le] != '\n') le += 1;
+    return src[ls..le];
 }
 
 fn printOneProblemJson(path: []const u8, p: lib.Problem, first: *bool) void {
@@ -372,7 +606,22 @@ fn printOneProblemJson(path: []const u8, p: lib.Problem, first: *bool) void {
         },
     );
     writeJsonEscaped(p.message);
-    std.debug.print("\"}}", .{});
+    std.debug.print("\",\"notes\":[", .{});
+    for (p.notes, 0..) |n, i| {
+        if (i > 0) std.debug.print(",", .{});
+        std.debug.print(
+            "{{\"start\":{{\"line\":{},\"column\":{},\"byte\":{}}}," ++
+                "\"end\":{{\"line\":{},\"column\":{},\"byte\":{}}}," ++
+                "\"label\":\"",
+            .{
+                n.start.line, n.start.column, n.start.byte,
+                n.end.line,   n.end.column,   n.end.byte,
+            },
+        );
+        writeJsonEscaped(n.label);
+        std.debug.print("\"}}", .{});
+    }
+    std.debug.print("]}}", .{});
 }
 
 fn severityName(s: lib.Severity) []const u8 {

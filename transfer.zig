@@ -43,7 +43,7 @@ pub fn transfer(ctx: Ctx, state: *AbstractState, stmt: Stmt) !void {
     switch (stmt.kind) {
         .decl => |d| try transferDecl(ctx, state, d, stmt.pos),
         .assign => |a| try transferAssign(ctx, state, a, stmt.pos),
-        .arena_kill => |k| try transferArenaKill(ctx, state, k, stmt.pos),
+        .arena_kill => |k| try transferArenaKill(ctx, state, k, stmt.pos, stmt.end_pos),
         .heap_free => |f| try transferHeapFree(ctx, state, f, stmt.pos, stmt.end_pos),
         .ret => |r| try transferRet(ctx, state, r, stmt.pos, stmt.end_pos),
         .use => |u| try transferUse(ctx, state, u, stmt.pos, stmt.end_pos),
@@ -116,17 +116,29 @@ fn transferArenaKill(
     state: *AbstractState,
     k: @TypeOf(@as(StmtKind, undefined).arena_kill),
     pos: cfg.SrcPos,
+    end_pos: cfg.SrcPos,
 ) !void {
     const origin = state.locals.get(k.arena_local) orelse return;
     switch (origin) {
         .arena => |aid| {
             try state.arenas.put(ctx.gpa, aid, .{
                 .state = .dead,
-                .killed_at = pos.byte,
+                .killed_at = killSiteOf(pos, end_pos),
             });
         },
         else => {},
     }
+}
+
+fn killSiteOf(pos: cfg.SrcPos, end_pos: cfg.SrcPos) state_mod.KillSite {
+    return .{
+        .line = pos.line,
+        .column = pos.column,
+        .byte = pos.byte,
+        .end_line = end_pos.line,
+        .end_column = end_pos.column,
+        .end_byte = end_pos.byte,
+    };
 }
 
 fn transferHeapFree(
@@ -143,15 +155,19 @@ fn transferHeapFree(
                 if (st.state == .dead) {
                     if (config_mod.isEnabled(ctx.config, .heap_double_free)) {
                         const name = ctx.locals[@intFromEnum(f.freed_local)].name;
-                        try report(ctx, pos, end_pos, .@"error",
-                            "double-free of `{s}` (previously freed at byte {?})",
-                            .{ name, st.killed_at });
+                        try reportWithNote(ctx, "zbc/heap-double-free", pos, end_pos, .@"error",
+                            "double-free of `{s}`",
+                            .{name},
+                            if (st.killed_at) |ks|
+                                .{ .site = ks, .label = "first freed here" }
+                            else
+                                null);
                     }
                     return;
                 }
                 try state.heaps.put(ctx.gpa, hid, .{
                     .state = .dead,
-                    .killed_at = pos.byte,
+                    .killed_at = killSiteOf(pos, end_pos),
                 });
                 return;
             },
@@ -170,7 +186,7 @@ fn transferHeapFree(
     // freed it; record via fallback_hid so subsequent uses fire UAF.
     try state.heaps.put(ctx.gpa, f.fallback_hid, .{
         .state = .dead,
-        .killed_at = pos.byte,
+        .killed_at = killSiteOf(pos, end_pos),
         .is_inter_procedural = true,
     });
     try state.locals.put(ctx.gpa, f.freed_local, .{ .heap = f.fallback_hid });
@@ -201,7 +217,7 @@ fn transferRet(
     if (origin == .undef and !r.is_literal_undef and
         config_mod.isEnabled(ctx.config, .use_undefined))
     {
-        try report(ctx, pos, end_pos, .@"error",
+        try report(ctx, "zbc/use-undefined", pos, end_pos, .@"error",
             "returning a value that is still `undefined`", .{});
         return;
     }
@@ -214,10 +230,10 @@ fn transferRet(
     if (origin == .stack and config_mod.isEnabled(ctx.config, .stack_escape)) {
         const name = ctx.locals[@intFromEnum(origin.stack)].name;
         if (r.is_borrowed_return_type) {
-            try report(ctx, pos, end_pos, .@"error",
+            try report(ctx, "zbc/stack-escape", pos, end_pos, .@"error",
                 "returning a pointer to a function-local stack variable `{s}` (escapes its frame)", .{name});
         } else {
-            try report(ctx, pos, end_pos, .@"error",
+            try report(ctx, "zbc/stack-escape", pos, end_pos, .@"error",
                 "returning a value that holds a pointer to function-local stack variable `{s}` (escapes its frame)", .{name});
         }
         return;
@@ -236,10 +252,10 @@ fn transferRet(
             if (!config_mod.isEnabled(ctx.config, .arena_escape)) return;
             if (state.arenas.contains(aid)) {
                 if (is_composite) {
-                    try report(ctx, pos, end_pos, .@"error",
+                    try report(ctx, "zbc/arena-escape", pos, end_pos, .@"error",
                         "returning a value that holds a borrow from function-local arena (escapes its lifetime)", .{});
                 } else {
-                    try report(ctx, pos, end_pos, .@"error",
+                    try report(ctx, "zbc/arena-escape", pos, end_pos, .@"error",
                         "returning a value borrowed from a function-local arena (escapes its lifetime)", .{});
                 }
             }
@@ -248,9 +264,12 @@ fn transferRet(
             if (!config_mod.isEnabled(ctx.config, .heap_use_after_free)) return;
             const st = state.heaps.get(hid) orelse return;
             if (st.state == .dead) {
-                try report(ctx, pos, end_pos, .@"error",
-                    "returning a heap pointer after free (freed at byte {?})",
-                    .{st.killed_at});
+                try reportWithNote(ctx, "zbc/heap-use-after-free", pos, end_pos, .@"error",
+                    "returning a heap pointer after free", .{},
+                    if (st.killed_at) |ks|
+                        .{ .site = ks, .label = "value freed here" }
+                    else
+                        null);
             }
         },
         else => {},
@@ -292,15 +311,19 @@ fn transferFieldHeapFree(
                 if (st.state == .dead) {
                     if (config_mod.isEnabled(ctx.config, .heap_double_free)) {
                         const parent_name = ctx.locals[@intFromEnum(f.parent)].name;
-                        try report(ctx, pos, end_pos, .@"error",
-                            "double-free of `{s}.{s}` (previously freed at byte {?})",
-                            .{ parent_name, f.name, st.killed_at });
+                        try reportWithNote(ctx, "zbc/heap-double-free", pos, end_pos, .@"error",
+                            "double-free of `{s}.{s}`",
+                            .{ parent_name, f.name },
+                            if (st.killed_at) |ks|
+                                .{ .site = ks, .label = "first freed here" }
+                            else
+                                null);
                     }
                     return;
                 }
                 try state.heaps.put(ctx.gpa, hid, .{
                     .state = .dead,
-                    .killed_at = pos.byte,
+                    .killed_at = killSiteOf(pos, end_pos),
                 });
                 return;
             },
@@ -313,7 +336,7 @@ fn transferFieldHeapFree(
     // .field_use reads on the same field flag UAF.
     try state.heaps.put(ctx.gpa, f.fallback_hid, .{
         .state = .dead,
-        .killed_at = pos.byte,
+        .killed_at = killSiteOf(pos, end_pos),
         .is_inter_procedural = true,
     });
     try state.fields.putContext(ctx.gpa, key, .{ .heap = f.fallback_hid }, .{});
@@ -339,9 +362,12 @@ fn transferFieldUse(
             if (st) |s| if (s.state == .dead and s.is_inter_procedural) {
                 if (config_mod.isEnabled(ctx.config, .heap_use_after_free)) {
                     const parent_name = ctx.locals[@intFromEnum(u.parent)].name;
-                    try report(ctx, pos, end_pos, .@"error",
-                        "use of `{s}` after free (freed at byte {?})",
-                        .{ parent_name, s.killed_at });
+                    try reportWithNote(ctx, "zbc/heap-use-after-free", pos, end_pos, .@"error",
+                        "use of `{s}` after free", .{parent_name},
+                        if (s.killed_at) |ks|
+                            .{ .site = ks, .label = "value freed here" }
+                        else
+                            null);
                 }
                 return;
             };
@@ -356,23 +382,31 @@ fn transferFieldUse(
             if (!config_mod.isEnabled(ctx.config, .arena_use_after_kill)) return;
             const st = state.arenas.get(aid) orelse return;
             if (st.state == .dead) {
-                try report(ctx, pos, end_pos, .@"error",
-                    "`{s}.{s}` borrows from an arena that was deinit'd at byte {?}",
-                    .{ parent_name, u.name, st.killed_at });
+                try reportWithNote(ctx, "zbc/arena-use-after-kill", pos, end_pos, .@"error",
+                    "`{s}.{s}` borrows from an arena that was deinit'd",
+                    .{ parent_name, u.name },
+                    if (st.killed_at) |ks|
+                        .{ .site = ks, .label = "arena deinit'd here" }
+                    else
+                        null);
             }
         },
         .heap => |hid| {
             if (!config_mod.isEnabled(ctx.config, .heap_use_after_free)) return;
             const st = state.heaps.get(hid) orelse return;
             if (st.state == .dead) {
-                try report(ctx, pos, end_pos, .@"error",
-                    "use of `{s}.{s}` after free (freed at byte {?})",
-                    .{ parent_name, u.name, st.killed_at });
+                try reportWithNote(ctx, "zbc/heap-use-after-free", pos, end_pos, .@"error",
+                    "use of `{s}.{s}` after free",
+                    .{ parent_name, u.name },
+                    if (st.killed_at) |ks|
+                        .{ .site = ks, .label = "value freed here" }
+                    else
+                        null);
             }
         },
         .undef => {
             if (!config_mod.isEnabled(ctx.config, .use_undefined)) return;
-            try report(ctx, pos, end_pos, .@"error",
+            try report(ctx, "zbc/use-undefined", pos, end_pos, .@"error",
                 "use of `{s}.{s}` while still `undefined`", .{ parent_name, u.name });
         },
         else => {},
@@ -398,7 +432,7 @@ fn transferCompositeEscape(
     // collapsed the local's origin to .plain before we get here.
     if (!config_mod.isEnabled(ctx.config, .stack_escape)) return;
     const name = ctx.locals[@intFromEnum(c.local)].name;
-    try report(ctx, pos, end_pos, .@"error",
+    try report(ctx, "zbc/stack-escape", pos, end_pos, .@"error",
         "returning a value that holds a pointer to function-local stack variable `{s}` (escapes its frame)", .{name});
 }
 
@@ -512,23 +546,31 @@ fn checkOriginAlive(
             if (!config_mod.isEnabled(ctx.config, .arena_use_after_kill)) return;
             const st = state.arenas.get(aid) orelse return;
             if (st.state == .dead) {
-                try report(ctx, pos, end_pos, .@"error",
-                    "`{s}` borrows from an arena that was deinit'd at byte {?}",
-                    .{ local_name, st.killed_at });
+                try reportWithNote(ctx, "zbc/arena-use-after-kill", pos, end_pos, .@"error",
+                    "`{s}` borrows from an arena that was deinit'd",
+                    .{local_name},
+                    if (st.killed_at) |ks|
+                        .{ .site = ks, .label = "arena deinit'd here" }
+                    else
+                        null);
             }
         },
         .heap => |hid| {
             if (!config_mod.isEnabled(ctx.config, .heap_use_after_free)) return;
             const st = state.heaps.get(hid) orelse return;
             if (st.state == .dead) {
-                try report(ctx, pos, end_pos, .@"error",
-                    "use of `{s}` after free (freed at byte {?})",
-                    .{ local_name, st.killed_at });
+                try reportWithNote(ctx, "zbc/heap-use-after-free", pos, end_pos, .@"error",
+                    "use of `{s}` after free",
+                    .{local_name},
+                    if (st.killed_at) |ks|
+                        .{ .site = ks, .label = "value freed here" }
+                    else
+                        null);
             }
         },
         .undef => {
             if (!config_mod.isEnabled(ctx.config, .use_undefined)) return;
-            try report(ctx, pos, end_pos, .@"error",
+            try report(ctx, "zbc/use-undefined", pos, end_pos, .@"error",
                 "use of `{s}` while still `undefined`", .{local_name});
         },
         else => {},
@@ -537,22 +579,47 @@ fn checkOriginAlive(
 
 fn report(
     ctx: Ctx,
+    rule_id: []const u8,
     pos: cfg.SrcPos,
     end_pos: cfg.SrcPos,
     severity: Severity,
     comptime fmt: []const u8,
     args: anytype,
 ) !void {
+    try reportWithNote(ctx, rule_id, pos, end_pos, severity, fmt, args, null);
+}
+
+fn reportWithNote(
+    ctx: Ctx,
+    rule_id: []const u8,
+    pos: cfg.SrcPos,
+    end_pos: cfg.SrcPos,
+    severity: Severity,
+    comptime fmt: []const u8,
+    args: anytype,
+    kill_site: ?struct { site: state_mod.KillSite, label: []const u8 },
+) !void {
     const msg = try std.fmt.allocPrint(ctx.gpa, fmt, args);
     const real_end: cfg.SrcPos = if (end_pos.byte > pos.byte)
         end_pos
     else
         .{ .line = pos.line, .column = pos.column + 1, .byte = pos.byte + 1 };
+    var notes: []problem_mod.Note = &.{};
+    if (kill_site) |ks| {
+        notes = try ctx.gpa.alloc(problem_mod.Note, 1);
+        const label = try ctx.gpa.dupe(u8, ks.label);
+        notes[0] = .{
+            .start = .{ .line = ks.site.line, .column = ks.site.column, .byte = ks.site.byte },
+            .end = .{ .line = ks.site.end_line, .column = ks.site.end_column, .byte = ks.site.end_byte },
+            .label = label,
+        };
+    }
     try ctx.problems.append(ctx.gpa, .{
-        .rule_id = "zbc/escape-check",
+        .rule_id = rule_id,
         .severity = severity,
         .start = .{ .line = pos.line, .column = pos.column, .byte = pos.byte },
         .end = .{ .line = real_end.line, .column = real_end.column, .byte = real_end.byte },
         .message = msg,
+        .notes = notes,
     });
 }

@@ -39,6 +39,15 @@ pub const Pos = struct {
     }
 };
 
+/// Secondary diagnostic span — a related event (e.g. "value freed
+/// here") that the primary report should point at.  Rendered below
+/// the primary span in rich format.  Label text is owned.
+pub const Note = struct {
+    start: Pos,
+    end: Pos,
+    label: []const u8,
+};
+
 pub const Problem = struct {
     rule_id: []const u8,
     severity: Severity,
@@ -46,8 +55,13 @@ pub const Problem = struct {
     end: Pos,
     /// Owned by the problem (caller dupes before append).
     message: []const u8,
+    /// Optional secondary spans.  Owned (each `label`) plus the slice
+    /// itself.  Empty slice == no notes; `&.{}` is fine.
+    notes: []Note = &.{},
 
     pub fn deinit(self: *Problem, gpa: std.mem.Allocator) void {
         gpa.free(self.message);
+        for (self.notes) |n| gpa.free(n.label);
+        if (self.notes.len > 0) gpa.free(self.notes);
     }
 };

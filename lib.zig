@@ -20,6 +20,8 @@ pub const all_invariants = config_mod.all_invariants;
 pub const isEnabled = config_mod.isEnabled;
 pub const invariantFromName = config_mod.invariantFromName;
 pub const Problem = problem_mod.Problem;
+pub const Note = problem_mod.Note;
+pub const Pos = problem_mod.Pos;
 pub const Severity = problem_mod.Severity;
 pub const Cache = remote_resolver_mod.Cache;
 

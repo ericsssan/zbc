@@ -81,11 +81,23 @@ pub const Origin = union(enum) {
 
 // ── ArenaState ─────────────────────────────────────────────
 
+/// Where a kill (free / arena.deinit) happened — full position so
+/// diagnostics can render a secondary span with the source line, not
+/// just a byte offset.
+pub const KillSite = struct {
+    line: u32,
+    column: u32,
+    byte: u32,
+    end_line: u32,
+    end_column: u32,
+    end_byte: u32,
+};
+
 pub const ArenaState = struct {
     state: enum { live, dead },
     /// When dead, the source position of the kill site — used in
     /// diagnostics.
-    killed_at: ?u32 = null,
+    killed_at: ?KillSite = null,
     /// True when this entry was created by the inter-procedural
     /// fallback in transferHeapFree / transferFieldHeapFree (i.e.,
     /// the local had no prior tracked .heap origin but a
@@ -274,9 +286,10 @@ test "join: dead-on-either-side wins for arenas" {
     defer rhs.deinit(gpa);
     const a: ArenaId = @enumFromInt(0);
     try lhs.arenas.put(gpa, a, .{ .state = .live });
-    try rhs.arenas.put(gpa, a, .{ .state = .dead, .killed_at = 42 });
+    const kill: KillSite = .{ .line = 1, .column = 1, .byte = 42, .end_line = 1, .end_column = 2, .end_byte = 43 };
+    try rhs.arenas.put(gpa, a, .{ .state = .dead, .killed_at = kill });
     const result = try join(&lhs, &rhs, gpa);
     try std.testing.expectEqual(JoinResult.changed, result);
     try std.testing.expect(lhs.arenas.get(a).?.state == .dead);
-    try std.testing.expectEqual(@as(?u32, 42), lhs.arenas.get(a).?.killed_at);
+    try std.testing.expectEqual(@as(u32, 42), lhs.arenas.get(a).?.killed_at.?.byte);
 }
