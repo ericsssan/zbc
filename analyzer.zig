@@ -1634,6 +1634,65 @@ test "deep-path field_assign clears freed state — `o.inner.handle = fresh()` r
     try std.testing.expectEqual(@as(usize, 0), problems.items.len);
 }
 
+test "literal-indexed field free + use: catches `arr[0].ptr` UAF" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const std = @import("std");
+        \\const Item = struct { ptr: []u8 };
+        \\pub fn buggy(gpa_: std.mem.Allocator, arr: []Item) void {
+        \\    gpa_.free(arr[0].ptr);
+        \\    const v = arr[0].ptr;
+        \\    _ = v;
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    var found = false;
+    for (problems.items) |p| {
+        if (std.mem.indexOf(u8, p.message, "arr[0].ptr") != null) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "literal-indexed field: different indices don't cross-pollute (`arr[0]` vs `arr[1]`)" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const std = @import("std");
+        \\const Item = struct { ptr: []u8 };
+        \\pub fn ok(gpa_: std.mem.Allocator, arr: []Item) void {
+        \\    gpa_.free(arr[0].ptr);
+        \\    const v = arr[1].ptr;
+        \\    _ = v;
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    // arr[0] and arr[1] have distinct path keys ("[0].ptr" vs
+    // "[1].ptr"), so the free + read pair doesn't fire.
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
+test "variable-indexed field: NOT tracked (avoids loop-iter FPs)" {
+    const gpa = std.testing.allocator;
+    // `arr[i]` with a variable index is intentionally silent —
+    // tracking would FP across loop iterations where i changes
+    // (the path-key "[i].ptr" matches across distinct elements).
+    // Restricted to literal-constant indices only.
+    var problems = try analyze(gpa,
+        \\const std = @import("std");
+        \\const Item = struct { ptr: []u8 };
+        \\pub fn buggy(gpa_: std.mem.Allocator, arr: []Item, i: usize) void {
+        \\    gpa_.free(arr[i].ptr);
+        \\    const v = arr[i].ptr;
+        \\    _ = v;
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    // Silent miss is intentional precision trade-off.
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
 test "deep-path free via `g.free(obj.f.g)` is recognised" {
     // fieldLhsFor's extension to dotted paths means
     // `<allocator>.free(<local>.<f>.<g>)` now emits

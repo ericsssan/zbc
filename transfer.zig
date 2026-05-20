@@ -130,6 +130,16 @@ fn transferArenaKill(
     }
 }
 
+/// Separator between a parent local name and its field path in
+/// diagnostic messages.  Field paths starting with `[` (subscript
+/// like "[0].field") want no dot — `arr[0].field` not
+/// `arr.[0].field`.  Field paths starting with an ident want a `.`
+/// for readability — `obj.field` not `objfield`.
+fn pathSep(name: []const u8) []const u8 {
+    if (name.len > 0 and name[0] == '[') return "";
+    return ".";
+}
+
 fn killSiteOf(pos: cfg.SrcPos, end_pos: cfg.SrcPos) state_mod.KillSite {
     return .{
         .line = pos.line,
@@ -312,8 +322,8 @@ fn transferFieldHeapFree(
                     if (config_mod.isEnabled(ctx.config, .heap_double_free)) {
                         const parent_name = ctx.locals[@intFromEnum(f.parent)].name;
                         try reportWithNote(ctx, "heap-double-free", pos, end_pos, .@"error",
-                            "double-free of `{s}.{s}`",
-                            .{ parent_name, f.name },
+                            "double-free of `{s}{s}{s}`",
+                            .{ parent_name, pathSep(f.name), f.name },
                             if (st.killed_at) |ks|
                                 .{ .site = ks, .label = "first freed here" }
                             else
@@ -383,8 +393,8 @@ fn transferFieldUse(
             const st = state.arenas.get(aid) orelse return;
             if (st.state == .dead) {
                 try reportWithNote(ctx, "arena-use-after-kill", pos, end_pos, .@"error",
-                    "`{s}.{s}` borrows from an arena that was deinit'd",
-                    .{ parent_name, u.name },
+                    "`{s}{s}{s}` borrows from an arena that was deinit'd",
+                    .{ parent_name, pathSep(u.name), u.name },
                     if (st.killed_at) |ks|
                         .{ .site = ks, .label = "arena deinit'd here" }
                     else
@@ -396,8 +406,8 @@ fn transferFieldUse(
             const st = state.heaps.get(hid) orelse return;
             if (st.state == .dead) {
                 try reportWithNote(ctx, "heap-use-after-free", pos, end_pos, .@"error",
-                    "use of `{s}.{s}` after free",
-                    .{ parent_name, u.name },
+                    "use of `{s}{s}{s}` after free",
+                    .{ parent_name, pathSep(u.name), u.name },
                     if (st.killed_at) |ks|
                         .{ .site = ks, .label = "value freed here" }
                     else
@@ -407,7 +417,8 @@ fn transferFieldUse(
         .undef => {
             if (!config_mod.isEnabled(ctx.config, .use_undefined)) return;
             try report(ctx, "use-undefined", pos, end_pos, .@"error",
-                "use of `{s}.{s}` while still `undefined`", .{ parent_name, u.name });
+                "use of `{s}{s}{s}` while still `undefined`",
+                .{ parent_name, pathSep(u.name), u.name });
         },
         else => {},
     }

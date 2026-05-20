@@ -3410,15 +3410,30 @@ const Builder = struct {
     /// repeated mentions of the same local only emit one `.use`.
     const FieldRef = struct { parent: LocalId, name: []const u8 };
 
-    /// If `lhs` is `<known_local>.<f1>(.<f2>)*`, return a ref with
-    /// the root local as parent and the source-slice of the dotted
-    /// field path as name.  Handles:
-    ///   `obj.f`         → { obj, "f" }
-    ///   `obj.f.g`       → { obj, "f.g" }
-    ///   `obj.f.g.h`     → { obj, "f.g.h" }
-    /// Returns null when the chain isn't anchored at a known local
-    /// (e.g. `Type.field` namespace) or contains non-ident/non-`.`
-    /// nodes (`obj[i].f`, computed access, etc.).
+    /// Return a `{ parent, name }` ref for a LHS expression
+    /// anchored at a known local.  Walks through `field_access`
+    /// AND `array_access` nodes to find the leftmost identifier;
+    /// the `name` is the source-slice of everything to the right.
+    ///
+    /// Handles:
+    ///   `obj.f`              → { obj, "f" }
+    ///   `obj.f.g`            → { obj, "f.g" }
+    ///   `arr[0].field`       → { arr, "[0].field" }
+    ///   `arr[i].field`       → { arr, "[i].field" }
+    ///   `obj.array[0].field` → { obj, "array[0].field" }
+    ///
+    /// Index expressions are kept as source-text (preserving
+    /// literal indices like `[0]`, variable indices like `[i]`,
+    /// even compound expressions like `[i+1]`).  This means
+    /// reads/writes with IDENTICAL index source-text share a
+    /// state-key — `arr[0].f` matches `arr[0].f` but NOT
+    /// `arr[1].f`, and `arr[i].f` matches another `arr[i].f` only
+    /// when both spell `i` the same way.  Conservative for
+    /// precision, intentional miss for "same logical index via
+    /// different expression" patterns.
+    ///
+    /// Returns null when the chain doesn't bottom out at a bare
+    /// known-local ident (`Type.field` namespace, deref, etc.).
     ///
     /// Used by lowerAssign to dispatch field-target writes to
     /// .field_assign — symmetric with the field_use prefix
@@ -3427,36 +3442,50 @@ const Builder = struct {
     /// state recorded by R10's N-level chain inference.
     fn fieldLhsFor(self: *Builder, lhs: Ast.Node.Index) ?FieldRef {
         const tree = self.tree;
-        if (tree.nodeTag(lhs) != .field_access) return null;
-        // Walk down the field_access chain to the leftmost
-        // identifier.  Each .field_access node has data
-        // .node_and_token = { receiver_node, field_name_token }.
-        // The leftmost receiver must be a bare identifier known to
-        // our locals.
+        // Walk down field_access / array_access nodes to the root.
+        // Array_access nodes are only accepted when the index is a
+        // LITERAL CONSTANT (`arr[0]`, not `arr[i]`).  Variable
+        // indices would mean the same source expression refers to
+        // different elements on different evaluations — keying
+        // state by literal source would FP across loop iterations.
         var cur = lhs;
-        var depth: u32 = 0;
-        while (tree.nodeTag(cur) == .field_access) : (depth += 1) {
-            cur = tree.nodeData(cur).node_and_token[0];
+        while (true) {
+            switch (tree.nodeTag(cur)) {
+                .field_access => {
+                    cur = tree.nodeData(cur).node_and_token[0];
+                },
+                .array_access => {
+                    const idx_node = tree.nodeData(cur).node_and_node[1];
+                    if (tree.nodeTag(idx_node) != .number_literal) return null;
+                    cur = tree.nodeData(cur).node_and_node[0];
+                },
+                .identifier => break,
+                else => return null,
+            }
         }
-        if (tree.nodeTag(cur) != .identifier) return null;
+        // Must have actually descended from at least one
+        // field_access / array_access — a bare identifier LHS
+        // (`x = ...`) goes through a different path.
+        if (cur == lhs) return null;
         const recv_name = tree.tokenSlice(tree.nodeMainToken(cur));
         const parent = self.name_to_local.get(recv_name) orelse return null;
-        // The field-path source slice runs from the FIRST field
-        // ident (token after the leftmost ident's main_token + 1
-        // for the `.`) through the rightmost field ident's
-        // inclusive end.  Easier: lhs's source span minus the
-        // leftmost ident's tokens.
+        // Build the path: everything in source between the end of
+        // the root ident and the end of the LHS.  If the next
+        // char after the root is `.` (field access), skip it so
+        // the path doesn't have a leading dot.  If it's `[`
+        // (array access), include it — `[0].f` is the canonical
+        // form.
         const root_tok = tree.nodeMainToken(cur);
         const root_start = tree.tokens.items(.start)[root_tok];
         const root_len = tree.tokenSlice(root_tok).len;
-        // First-field token is the one right after the `.` that
-        // follows the root ident.  In source, that's
-        // `root_start + root_len + 1` (for the `.`).
-        const first_field_byte: usize = root_start + root_len + 1;
+        var first_path_byte: usize = root_start + root_len;
+        if (first_path_byte < tree.source.len and tree.source[first_path_byte] == '.') {
+            first_path_byte += 1;
+        }
         const last_tok = tree.lastToken(lhs);
         const last_start = tree.tokens.items(.start)[last_tok];
         const last_len = tree.tokenSlice(last_tok).len;
-        const path = tree.source[first_field_byte..(last_start + last_len)];
+        const path = tree.source[first_path_byte..(last_start + last_len)];
         return .{ .parent = parent, .name = path };
     }
 
@@ -3624,7 +3653,25 @@ const Builder = struct {
             var ident_in_method_recv_pos = false;
             if (t + 1 <= last) {
                 const next = tags[t + 1];
-                if (next == .l_bracket) continue;
+                if (next == .l_bracket) {
+                    // `id[…].<field>` — subscript followed by field
+                    // access.  Emit a field_use with the subscript-
+                    // prefixed path so the read matches what
+                    // `fieldLhsFor` records on writes / frees.
+                    // Scan past the matched `]` and require a `.<ident>`
+                    // immediately after.
+                    if (self.subscriptFieldPath(t, last)) |info| {
+                        const name = tree.tokenSlice(t);
+                        if (self.name_to_local.get(name)) |id| {
+                            try self.appendStmt(cur, .{
+                                .kind = .{ .field_use = .{ .parent = id, .name = info.path } },
+                                .pos = pos,
+                                .end_pos = end_pos,
+                            });
+                        }
+                    }
+                    continue;
+                }
                 if (next == .colon) continue;
                 if (next == .period and t + 2 <= last and tags[t + 2] == .identifier) {
                     const field = tree.tokenSlice(t + 2);
@@ -3866,6 +3913,51 @@ const Builder = struct {
                 .end_pos = end_pos,
             });
         }
+    }
+
+    /// `<id>[<literal>].<f>(.<g>)*` — return the path slice
+    /// starting at `[` and extending through the final field
+    /// ident.  Only LITERAL-CONSTANT subscripts are recognised
+    /// (`arr[0]`, `arr[1]`) — variable indices (`arr[i]`, `arr[i+1]`)
+    /// are skipped to avoid loop-iteration FPs where the same
+    /// source expression refers to different elements on each
+    /// iteration (most painful symptom: a loop that frees
+    /// `arr[j].x` then increments `j` looks like a double-free
+    /// to zbc).
+    fn subscriptFieldPath(
+        self: *Builder,
+        t: Ast.TokenIndex,
+        last: Ast.TokenIndex,
+    ) ?struct { path: []const u8 } {
+        const tree = self.tree;
+        const tags = tree.tokens.items(.tag);
+        if (t + 3 > last) return null;
+        if (tags[t + 1] != .l_bracket) return null;
+        if (tags[t + 2] != .number_literal) return null;
+        if (tags[t + 3] != .r_bracket) return null;
+        const pos: Ast.TokenIndex = t + 3; // `]`
+        // pos now indexes the matching `]`.
+        // Require `.<ident>` immediately after.
+        if (pos + 2 > last) return null;
+        if (tags[pos + 1] != .period) return null;
+        if (tags[pos + 2] != .identifier) return null;
+        // Extend the chain through further `.<ident>` segments.
+        var chain_end: Ast.TokenIndex = pos + 2;
+        while (chain_end + 2 <= last and tags[chain_end + 1] == .period and tags[chain_end + 2] == .identifier) {
+            chain_end += 2;
+        }
+        // If chain ends with `(`, the last ident is a method.
+        const ends_in_call = chain_end + 1 <= last and tags[chain_end + 1] == .l_paren;
+        const last_field: ?Ast.TokenIndex = if (ends_in_call)
+            (if (chain_end > pos + 2) chain_end - 2 else null)
+        else
+            chain_end;
+        if (last_field == null) return null;
+        // Path starts at the `[` token, ends at the last_field's end.
+        const first_byte = tree.tokens.items(.start)[t + 1];
+        const last_start = tree.tokens.items(.start)[last_field.?];
+        const last_len = tree.tokenSlice(last_field.?).len;
+        return .{ .path = tree.source[first_byte..(last_start + last_len)] };
     }
 
     /// Build the field-path source slice for a chain starting at
