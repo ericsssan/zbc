@@ -1525,13 +1525,21 @@ const Builder = struct {
 
         // Top-level labeled-block rhs (`x = blk: { ... };`) — lower
         // its body in-place, advancing cur, before the .assign emits.
-        if (try self.maybeLowerLabeledBlockExpr(rhs, cur)) {}
+        // When this fires, the body's inner stmts already emitted
+        // their own .use / .assign / .free; walking the same rhs again
+        // via emitUsesInExpr would double-count those tokens and, e.g.
+        // emit a .use(host) at the labeled-block's opening AFTER the
+        // body already lowered an `allocator.free(host)`.  Symmetric
+        // to the same guard in lowerVarDecl.
+        const rhs_was_labeled_block = try self.maybeLowerLabeledBlockExpr(rhs, cur);
 
 
         if (target_local) |t| {
             // .use stmts for rhs reads, skipping the LHS itself
             // (assignment writes LHS, not reads it).
-            try self.emitUsesInExpr(rhs, cur.*, t);
+            if (!rhs_was_labeled_block) {
+                try self.emitUsesInExpr(rhs, cur.*, t);
+            }
             try self.appendStmt(cur.*, .{
                 .kind = .{ .assign = .{
                     .target = t,
@@ -1545,7 +1553,9 @@ const Builder = struct {
             // .field_assign so the field's origin is tracked
             // separately.  Catches store-then-free-then-use of a
             // struct field.
-            try self.emitUsesInExpr(rhs, cur.*, null);
+            if (!rhs_was_labeled_block) {
+                try self.emitUsesInExpr(rhs, cur.*, null);
+            }
             try self.appendStmt(cur.*, .{
                 .kind = .{ .field_assign = .{
                     .parent = fref.parent,
