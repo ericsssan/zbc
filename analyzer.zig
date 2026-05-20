@@ -796,7 +796,11 @@ test "stack_escape: plain value return is OK" {
     try std.testing.expectEqual(@as(usize, 0), problems.items.len);
 }
 
-test "use_undefined: return undefined directly is flagged" {
+test "use_undefined: bare `return undefined;` is intentional sentinel, not flagged" {
+    // Literal `return undefined;` is the canonical Zig idiom for
+    // comptime-gated stubs (bindgen, disabled-feature branches).
+    // We catch the real bug — undef leaking through a variable —
+    // via the next test, which exercises `var x = undefined; return x;`.
     const gpa = std.testing.allocator;
     var problems = try analyze(gpa,
         \\pub fn foo() u32 {
@@ -805,11 +809,12 @@ test "use_undefined: return undefined directly is flagged" {
         \\
     );
     defer freeProblems(gpa, &problems);
-    var found = false;
     for (problems.items) |p| {
-        if (std.mem.indexOf(u8, p.message, "undefined") != null) found = true;
+        if (std.mem.indexOf(u8, p.message, "undefined") != null) {
+            std.debug.print("unexpected: {s}\n", .{p.message});
+            return error.TestUnexpectedResult;
+        }
     }
-    try std.testing.expect(found);
 }
 
 test "use_undefined: return local that was set to undefined" {

@@ -136,7 +136,17 @@ fn transferRet(
 
     // Undefined-return check: not gated on return type — returning
     // garbage is wrong for value types and pointers alike.
-    if (origin == .undef and config_mod.isEnabled(ctx.config, .use_undefined)) {
+    //
+    // EXCEPTION: literal `return undefined;` — the author explicitly
+    // typed the keyword as the return value, almost always as a
+    // comptime-gated sentinel for paths the caller is guaranteed not
+    // to use (bindgen stubs, comptime-disabled features).  The real
+    // bug class — undef leaking through a variable — still fires
+    // because that path produces .undef via an identifier expr, which
+    // doesn't set is_literal_undef.
+    if (origin == .undef and !r.is_literal_undef and
+        config_mod.isEnabled(ctx.config, .use_undefined))
+    {
         try report(ctx, pos, end_pos, .@"error",
             "returning a value that is still `undefined`", .{});
         return;

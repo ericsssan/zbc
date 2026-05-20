@@ -104,7 +104,18 @@ pub const StmtKind = union(enum) {
     /// (slice/pointer) — only those returns can leak a borrowed
     /// origin.  Value-typed returns MOVE the value (and any arena it
     /// owns) to the caller and are exempt from the escape check.
-    ret: struct { value_kind: ExprKind, is_borrowed_return_type: bool },
+    ret: struct {
+        value_kind: ExprKind,
+        is_borrowed_return_type: bool,
+        /// `return undefined;` written literally — canonical sentinel
+        /// for comptime-gated branches (e.g. `if (comptime X) return
+        /// undefined;` in bindgen stubs).  The author is explicitly
+        /// opting in to returning garbage on a path the caller is
+        /// comptime-guaranteed not to use.  The real undef-leak bug
+        /// class is `var x: T = undefined; return x;` (via identifier),
+        /// which still flows through .undef and gets caught.
+        is_literal_undef: bool = false,
+    },
 
     /// Use of a local (to read it).  Generates "is origin still live?"
     /// checks in the analyzer.
@@ -1525,10 +1536,19 @@ const Builder = struct {
             }
         }
 
+        // Detect `return undefined;` — a literal sentinel return,
+        // not an undef-leak through a variable.
+        const is_literal_undef = if (value_opt) |expr| blk: {
+            if (tree.nodeTag(expr) != .identifier) break :blk false;
+            const tok = tree.nodeMainToken(expr);
+            break :blk std.mem.eql(u8, tree.tokenSlice(tok), "undefined");
+        } else false;
+
         try self.appendStmt(cur.*, .{
             .kind = .{ .ret = .{
                 .value_kind = value_kind,
                 .is_borrowed_return_type = self.is_borrowed_return_type,
+                .is_literal_undef = is_literal_undef,
             } },
             .pos = self.posOf(ret_node),
             .end_pos = self.endPosOf(ret_node),
@@ -2471,9 +2491,63 @@ const Builder = struct {
         var aw: std.AutoArrayHashMapUnmanaged(LocalId, void) = .empty;
         defer aw.deinit(self.gpa);
 
+        // Comptime-only builtin parens: `@TypeOf(local)`, `@sizeOf`,
+        // `@alignOf`, `@typeInfo`, etc. don't EVALUATE their argument
+        // at runtime — they query the type.  Idents inside such a
+        // paren range must NOT be treated as runtime reads, or
+        // `var x: T = undefined; @sizeOf(@TypeOf(x))` trips use_undefined.
+        var paren_depth: u32 = 0;
+        var comptime_skip_active: bool = false;
+        var comptime_skip_until: u32 = 0;
+
         var t: Ast.TokenIndex = first;
         while (t <= last) : (t += 1) {
-            if (tags[t] != .identifier) continue;
+            const tag = tags[t];
+            if (tag == .l_paren) {
+                paren_depth += 1;
+                if (!comptime_skip_active and t > 0 and tags[t - 1] == .builtin and
+                    isComptimeOnlyBuiltin(tree.tokenSlice(t - 1)))
+                {
+                    comptime_skip_active = true;
+                    comptime_skip_until = paren_depth - 1;
+                }
+                continue;
+            }
+            if (tag == .r_paren) {
+                if (paren_depth > 0) paren_depth -= 1;
+                if (comptime_skip_active and paren_depth == comptime_skip_until) {
+                    comptime_skip_active = false;
+                }
+                continue;
+            }
+            if (comptime_skip_active) continue;
+            if (tag != .identifier) continue;
+            // LHS of a plain `=` assignment inside a sub-expression
+            // (e.g. a switch arm body or labeled block being used as
+            // the init of an outer var_decl).  Those inner assignments
+            // are NOT lowered as their own .assign statements (the
+            // whole containing expression is one node from the
+            // var_decl lowerer's perspective), so without recording
+            // the write here a later read of the same local inside
+            // the same expression spuriously sees .undef.  Emit
+            // .assign(.unknown) — rhs origin is opaque from a token
+            // walk, but clearing undef is what matters.
+            if (t + 1 <= last and tags[t + 1] == .equal) {
+                const lhs_name = tree.tokenSlice(t);
+                if (self.name_to_local.get(lhs_name)) |lid| {
+                    if (skip_local == null or skip_local.? != lid) {
+                        const gop_w = try aw.getOrPut(self.gpa, lid);
+                        if (!gop_w.found_existing) {
+                            try self.appendStmt(cur, .{
+                                .kind = .{ .assign = .{ .target = lid, .rhs_kind = .unknown } },
+                                .pos = pos,
+                                .end_pos = end_pos,
+                            });
+                        }
+                    }
+                }
+                continue;
+            }
             // Address-of: `&id` is conservatively treated as a possible
             // write (out-param pattern).  Emit an .assign with .unknown
             // rhs so the local's origin collapses to .plain — clears
@@ -2638,6 +2712,20 @@ const Builder = struct {
         if (i == start) return null;
         const name = text[start..i];
         return self.name_to_local.get(name);
+    }
+
+    /// Type-introspection / size-query builtins whose argument is
+    /// evaluated at comptime and never read at runtime.  Idents inside
+    /// these builtin parens must not count as runtime uses.
+    fn isComptimeOnlyBuiltin(name: []const u8) bool {
+        // `name` includes the leading `@`.
+        const candidates = [_][]const u8{
+            "@TypeOf", "@sizeOf", "@alignOf", "@bitSizeOf",
+            "@typeInfo", "@typeName", "@hasField", "@hasDecl",
+            "@offsetOf", "@bitOffsetOf", "@fieldParentPtr",
+        };
+        for (candidates) |c| if (std.mem.eql(u8, name, c)) return true;
+        return false;
     }
 
     fn isIdentChar(c: u8) bool {
