@@ -252,7 +252,8 @@ pub fn lowerFunctionFull(
         const name_tok = fn_proto.name_token orelse break :blk false;
         const name = tree.tokenSlice(name_tok);
         const entry = d.lookup(name) orelse break :blk false;
-        break :blk entry.annotation == .owns_locals;
+        const a = entry.annotation orelse break :blk false;
+        break :blk a == .owns_locals;
     };
 
     var builder: Builder = .{
@@ -1385,6 +1386,19 @@ const Builder = struct {
             return;
         }
 
+        // `@takes ownership(p)` — annotated free-wrapper.  Look up
+        // the callee in the same-file DB; if it carries the
+        // annotation, treat this call as a heap_free for the matched
+        // arg before falling through to the untracked-call path.
+        if (self.takesOwnershipFreedLocal(call_node)) |freed| {
+            try self.appendStmt(cur.*, .{
+                .kind = .{ .heap_free = .{ .freed_local = freed } },
+                .pos = self.posOf(call_node),
+                .end_pos = self.endPosOf(call_node),
+            });
+            return;
+        }
+
         // Untracked call at stmt position — emit uses for everything
         // it references so UAF on call args still fires before the
         // conservative gap erases tracked origins.
@@ -1394,6 +1408,50 @@ const Builder = struct {
             .pos = self.posOf(call_node),
             .end_pos = self.endPosOf(call_node),
         });
+    }
+
+    /// If the callee has `@takes ownership(p)`, return the LocalId
+    /// of the actual arg that maps to p.  Null on any other shape.
+    fn takesOwnershipFreedLocal(self: *Builder, call_node: Ast.Node.Index) ?LocalId {
+        const tree = self.tree;
+        const db = self.db orelse return null;
+        var buf: [1]Ast.Node.Index = undefined;
+        const call_full = tree.fullCall(&buf, call_node) orelse return null;
+        const callee = call_full.ast.fn_expr;
+
+        // Extract callee name + receiver-is-arg0 flag for the lookup.
+        const method_tok = switch (tree.nodeTag(callee)) {
+            .identifier => tree.nodeMainToken(callee),
+            .field_access => tree.nodeData(callee).node_and_token[1],
+            else => return null,
+        };
+        const callee_name = tree.tokenSlice(method_tok);
+        const entry = db.lookup(callee_name) orelse return null;
+        const takes = entry.takes orelse return null;
+        const target_idx = switch (takes) {
+            .ownership => |i| i,
+        };
+
+        // For method-style (field_access callee), args[0] is the
+        // receiver from the source's perspective.  ast.params is the
+        // EXPLICIT arg list which excludes the receiver, so shift.
+        const receiver_is_arg0 = tree.nodeTag(callee) == .field_access;
+        const recv_node: ?Ast.Node.Index = if (receiver_is_arg0)
+            tree.nodeData(callee).node_and_token[0]
+        else
+            null;
+
+        const candidate = if (receiver_is_arg0 and target_idx == 0)
+            recv_node.?
+        else blk: {
+            const explicit_idx = if (receiver_is_arg0) target_idx - 1 else target_idx;
+            if (explicit_idx >= call_full.ast.params.len) return null;
+            break :blk call_full.ast.params[explicit_idx];
+        };
+
+        if (tree.nodeTag(candidate) != .identifier) return null;
+        const name = tree.tokenSlice(tree.nodeMainToken(candidate));
+        return self.name_to_local.get(name);
     }
 
     /// For `<allocator>.free(p)` / `<allocator>.destroy(p)`, return the
@@ -1617,10 +1675,10 @@ const Builder = struct {
 
             const method_name = tree.tokenSlice(method_tok);
             const entry = db.lookup(method_name) orelse continue;
-            switch (entry.annotation) {
+            if (entry.annotation) |a| switch (a) {
                 .borrowed_from => |idx| if (idx == 0) return local,
                 else => {},
-            }
+            };
         }
         return null;
     }
@@ -1643,7 +1701,9 @@ const Builder = struct {
                 // 1. Same-file DB hit on method name.
                 if (self.db) |db| {
                     if (db.lookup(method_name)) |entry| {
-                        return self.applyAnnotationToCall(entry.annotation, recv_node, args, true);
+                        if (entry.annotation) |a| {
+                            return self.applyAnnotationToCall(a, recv_node, args, true);
+                        }
                     }
                 }
 
@@ -1661,7 +1721,9 @@ const Builder = struct {
                 const fn_name = tree.tokenSlice(tree.nodeMainToken(callee_node));
                 if (self.db) |db| {
                     if (db.lookup(fn_name)) |entry| {
-                        return self.applyAnnotationToCall(entry.annotation, callee_node, args, false);
+                        if (entry.annotation) |a| {
+                            return self.applyAnnotationToCall(a, callee_node, args, false);
+                        }
                     }
                 }
                 return .unknown;
@@ -1838,6 +1900,15 @@ const Builder = struct {
             // responsibility for whatever it embedded."  Treat as
             // .owned — caller has no remaining liability.
             .owns_locals => return .owned,
+            // `@returns heap` — mint a HeapId at THIS call site so
+            // downstream free/use tracking fires.  Same shape as a
+            // direct `.heap_alloc` from the heap_alloc_patterns text
+            // match.
+            .heap => {
+                const hid: abstract_state.HeapId = @enumFromInt(self.next_heap);
+                self.next_heap += 1;
+                return .{ .heap_alloc = hid };
+            },
         }
     }
 

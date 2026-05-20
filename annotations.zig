@@ -29,12 +29,29 @@ pub const ReturnsAnnotation = union(enum) {
     /// Use when zbc's pattern inference flags a value-shape return
     /// that semantically transfers ownership.
     owns_locals,
+    /// `/// @returns heap` — caller receives a fresh heap allocation.
+    /// Stronger than `.owned`: result gets a tracked HeapId at the
+    /// call site so subsequent free/use-after-free analysis fires.
+    /// Use on allocator wrappers (`fn xalloc(gpa, n) ![]u8 { ... }`).
+    heap,
+};
+
+pub const TakesAnnotation = union(enum) {
+    /// `/// @takes ownership(<param>)` — the call is a free site
+    /// for the named param's heap allocation.  Caller emits a
+    /// .heap_free against that arg at the call site.
+    ownership: u32,
 };
 
 pub const FnEntry = struct {
     /// Function name (slice into source — keep source alive).
     name: []const u8,
-    annotation: ReturnsAnnotation,
+    /// `@returns ...` annotation if present.  Null for fns that
+    /// only carry a `@takes` signal — their return value isn't
+    /// classified specially at call sites.
+    annotation: ?ReturnsAnnotation,
+    /// Optional `@takes` annotation.  Independent of `annotation`.
+    takes: ?TakesAnnotation = null,
 };
 
 pub const Db = struct {
@@ -64,6 +81,7 @@ pub fn build(gpa: std.mem.Allocator, tree: *const Ast) !Db {
         const name_tok = fn_proto.name_token orelse continue;
 
         var annotation = parseReturnsAnnotation(tree, fn_proto);
+        const takes_anno = parseTakesAnnotation(tree, fn_proto);
 
         if (annotation == null and tree.nodeTag(node) == .fn_decl) {
             if (fn_proto.ast.return_type.unwrap()) |rt| {
@@ -76,9 +94,14 @@ pub fn build(gpa: std.mem.Allocator, tree: *const Ast) !Db {
             }
         }
 
-        if (annotation == null) continue;
+        // Skip if no signal of any flavor.
+        if (annotation == null and takes_anno == null) continue;
         const name = tree.tokenSlice(name_tok);
-        try db.fns.put(gpa, name, .{ .name = name, .annotation = annotation.? });
+        try db.fns.put(gpa, name, .{
+            .name = name,
+            .annotation = annotation,
+            .takes = takes_anno,
+        });
     }
 
     // Pass 2 — R7: trivial delegators.
@@ -100,11 +123,19 @@ pub fn build(gpa: std.mem.Allocator, tree: *const Ast) !Db {
             const fn_proto = fullFnProto(tree, &buf, node) orelse continue;
             const name_tok = fn_proto.name_token orelse continue;
             const name = tree.tokenSlice(name_tok);
-            if (db.fns.contains(name)) continue;
+            // R7 only fills missing `.annotation`.  An entry with
+            // only `.takes` (no return annotation) is still a
+            // candidate for R7 to enrich.
+            const existing = db.fns.get(name);
+            if (existing != null and existing.?.annotation != null) continue;
 
             const body = tree.nodeData(node).node_and_node[1];
             const inferred = inferDelegatorBorrow(tree, fn_proto, body, &db) orelse continue;
-            try db.fns.put(gpa, name, .{ .name = name, .annotation = inferred });
+            try db.fns.put(gpa, name, .{
+                .name = name,
+                .annotation = inferred,
+                .takes = if (existing) |e| e.takes else null,
+            });
             added = true;
         }
         if (!added) break;
@@ -171,10 +202,10 @@ fn inferMethodStyle(
 
     const method_name = tree.tokenSlice(method_tok);
     const entry = db.lookup(method_name) orelse return null;
-    switch (entry.annotation) {
+    if (entry.annotation) |a| switch (a) {
         .borrowed_from => |idx| if (idx == 0) return .{ .borrowed_from = param_idx },
         else => {},
-    }
+    };
     return null;
 }
 
@@ -192,7 +223,8 @@ fn inferNamespaceStyle(
     };
     const method_name = tree.tokenSlice(method_tok);
     const entry = db.lookup(method_name) orelse return null;
-    switch (entry.annotation) {
+    const anno = entry.annotation orelse return null;
+    switch (anno) {
         .borrowed_from => |target_idx| {
             const args = call_full.ast.params;
             if (target_idx >= args.len) return null;
@@ -290,8 +322,11 @@ fn parseReturnsAnnotation(tree: *const Ast, fn_proto: Ast.full.FnProto) ?Returns
         const body = stripDocPrefix(raw);
         const trimmed = std.mem.trim(u8, body, " \t");
 
-        if (std.mem.startsWith(u8, trimmed, "@returns owned")) return .owned;
+        // Order matters: more-specific prefixes must precede their
+        // less-specific siblings (e.g. `owns_locals` before `owned`).
         if (std.mem.startsWith(u8, trimmed, "@returns owns_locals")) return .owns_locals;
+        if (std.mem.startsWith(u8, trimmed, "@returns owned")) return .owned;
+        if (std.mem.startsWith(u8, trimmed, "@returns heap")) return .heap;
 
         const prefix = "@returns borrowed_from(";
         if (std.mem.startsWith(u8, trimmed, prefix)) {
@@ -300,6 +335,32 @@ fn parseReturnsAnnotation(tree: *const Ast, fn_proto: Ast.full.FnProto) ?Returns
             const param_name = std.mem.trim(u8, after[0..close], " \t");
             const idx = resolveParamIndex(tree, fn_proto, param_name) orelse continue;
             return .{ .borrowed_from = idx };
+        }
+    }
+    return null;
+}
+
+fn parseTakesAnnotation(tree: *const Ast, fn_proto: Ast.full.FnProto) ?TakesAnnotation {
+    const fn_first_tok: Ast.TokenIndex = fn_proto.visib_token orelse
+        fn_proto.extern_export_inline_token orelse
+        fn_proto.ast.fn_token;
+    if (fn_first_tok == 0) return null;
+
+    var t: i64 = @as(i64, @intCast(fn_first_tok)) - 1;
+    while (t >= 0) : (t -= 1) {
+        const tok_idx: Ast.TokenIndex = @intCast(t);
+        if (tree.tokens.items(.tag)[tok_idx] != .doc_comment) break;
+        const raw = tree.tokenSlice(tok_idx);
+        const body = stripDocPrefix(raw);
+        const trimmed = std.mem.trim(u8, body, " \t");
+
+        const prefix = "@takes ownership(";
+        if (std.mem.startsWith(u8, trimmed, prefix)) {
+            const after = trimmed[prefix.len..];
+            const close = std.mem.indexOfScalar(u8, after, ')') orelse continue;
+            const param_name = std.mem.trim(u8, after[0..close], " \t");
+            const idx = resolveParamIndex(tree, fn_proto, param_name) orelse continue;
+            return .{ .ownership = idx };
         }
     }
     return null;
@@ -394,7 +455,7 @@ test "extract @returns owned" {
         \\
     );
     defer r.deinit(gpa);
-    try std.testing.expect(r.db.lookup("alloc").?.annotation == .owned);
+    try std.testing.expect(r.db.lookup("alloc").?.annotation.? == .owned);
 }
 
 test "extract @returns borrowed_from" {
@@ -407,8 +468,8 @@ test "extract @returns borrowed_from" {
     );
     defer r.deinit(gpa);
     const entry = r.db.lookup("slice").?;
-    try std.testing.expect(entry.annotation == .borrowed_from);
-    try std.testing.expectEqual(@as(u32, 0), entry.annotation.borrowed_from);
+    try std.testing.expect(entry.annotation.? == .borrowed_from);
+    try std.testing.expectEqual(@as(u32, 0), entry.annotation.?.borrowed_from);
 }
 
 test "R6: slice return + body allocates → @returns owned inferred" {
@@ -421,7 +482,7 @@ test "R6: slice return + body allocates → @returns owned inferred" {
         \\
     );
     defer r.deinit(gpa);
-    try std.testing.expect(r.db.lookup("dupString").?.annotation == .owned);
+    try std.testing.expect(r.db.lookup("dupString").?.annotation.? == .owned);
 }
 
 test "R6: no allocation in body → no inference" {
