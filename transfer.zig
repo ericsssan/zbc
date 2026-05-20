@@ -48,6 +48,9 @@ pub fn transfer(ctx: Ctx, state: *AbstractState, stmt: Stmt) !void {
         .ret => |r| try transferRet(ctx, state, r, stmt.pos, stmt.end_pos),
         .use => |u| try transferUse(ctx, state, u, stmt.pos, stmt.end_pos),
         .composite_escape => |c| try transferCompositeEscape(ctx, state, c, stmt.pos, stmt.end_pos),
+        .field_assign => |a| try transferFieldAssign(ctx, state, a, stmt.pos),
+        .field_heap_free => |f| try transferFieldHeapFree(ctx, state, f, stmt.pos, stmt.end_pos),
+        .field_use => |u| try transferFieldUse(ctx, state, u, stmt.pos, stmt.end_pos),
         .lowering_gap => |g| try transferGap(ctx, state, g, stmt.pos),
     }
 }
@@ -190,6 +193,85 @@ fn transferRet(
     }
 }
 
+fn transferFieldAssign(
+    ctx: Ctx,
+    state: *AbstractState,
+    a: @TypeOf(@as(StmtKind, undefined).field_assign),
+    pos: cfg.SrcPos,
+) !void {
+    const origin = try originOfInit(ctx, state, a.rhs_kind, pos);
+    const key: state_mod.FieldKey = .{ .parent = a.parent, .name = a.name };
+    try state.fields.putContext(ctx.gpa, key, origin, .{});
+}
+
+fn transferFieldHeapFree(
+    ctx: Ctx,
+    state: *AbstractState,
+    f: @TypeOf(@as(StmtKind, undefined).field_heap_free),
+    pos: cfg.SrcPos,
+    end_pos: cfg.SrcPos,
+) !void {
+    const key: state_mod.FieldKey = .{ .parent = f.parent, .name = f.name };
+    const origin = state.fields.getContext(key, .{}) orelse return;
+    switch (origin) {
+        .heap => |hid| {
+            const st = state.heaps.get(hid) orelse return;
+            if (st.state == .dead) {
+                if (config_mod.isEnabled(ctx.config, .heap_double_free)) {
+                    const parent_name = ctx.locals[@intFromEnum(f.parent)].name;
+                    try report(ctx, pos, end_pos, .@"error",
+                        "double-free of `{s}.{s}` (previously freed at byte {?})",
+                        .{ parent_name, f.name, st.killed_at });
+                }
+                return;
+            }
+            try state.heaps.put(ctx.gpa, hid, .{
+                .state = .dead,
+                .killed_at = pos.byte,
+            });
+        },
+        else => {},
+    }
+}
+
+fn transferFieldUse(
+    ctx: Ctx,
+    state: *AbstractState,
+    u: @TypeOf(@as(StmtKind, undefined).field_use),
+    pos: cfg.SrcPos,
+    end_pos: cfg.SrcPos,
+) !void {
+    const key: state_mod.FieldKey = .{ .parent = u.parent, .name = u.name };
+    const origin = state.fields.getContext(key, .{}) orelse return;
+    const parent_name = ctx.locals[@intFromEnum(u.parent)].name;
+    switch (origin) {
+        .arena => |aid| {
+            if (!config_mod.isEnabled(ctx.config, .arena_use_after_kill)) return;
+            const st = state.arenas.get(aid) orelse return;
+            if (st.state == .dead) {
+                try report(ctx, pos, end_pos, .@"error",
+                    "`{s}.{s}` borrows from an arena that was deinit'd at byte {?}",
+                    .{ parent_name, u.name, st.killed_at });
+            }
+        },
+        .heap => |hid| {
+            if (!config_mod.isEnabled(ctx.config, .heap_use_after_free)) return;
+            const st = state.heaps.get(hid) orelse return;
+            if (st.state == .dead) {
+                try report(ctx, pos, end_pos, .@"error",
+                    "use of `{s}.{s}` after free (freed at byte {?})",
+                    .{ parent_name, u.name, st.killed_at });
+            }
+        },
+        .undef => {
+            if (!config_mod.isEnabled(ctx.config, .use_undefined)) return;
+            try report(ctx, pos, end_pos, .@"error",
+                "use of `{s}.{s}` while still `undefined`", .{ parent_name, u.name });
+        },
+        else => {},
+    }
+}
+
 /// Composite-escape check: fires the same escape diagnostics as
 /// transferRet would for a value-shape composite return embedding
 /// this local.  Used for the SECOND, third, ... borrow in a
@@ -275,6 +357,10 @@ fn originOfInit(
         .undef => .undef,
         .borrowed_from => |src_local| state.locals.get(src_local) orelse .plain,
         .copy_of => |src_local| state.locals.get(src_local) orelse .plain,
+        .field_copy_of => |fc| blk: {
+            const key: state_mod.FieldKey = .{ .parent = fc.parent, .name = fc.name };
+            break :blk state.fields.getContext(key, .{}) orelse .plain;
+        },
         .unknown => .plain,
     };
 }

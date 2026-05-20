@@ -566,6 +566,64 @@ test "arena_escape: @returns owns_locals suppresses composite-borrow check" {
     try std.testing.expect(!any_arena);
 }
 
+test "heap_use_after_free: field-level — store, free, return field flags UAF" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const std = @import("std");
+        \\const Self = struct { buf: []u8 };
+        \\pub fn foo(g: std.mem.Allocator) []u8 {
+        \\    var s = Self{ .buf = &.{} };
+        \\    s.buf = g.alloc(u8, 16) catch unreachable;
+        \\    g.free(s.buf);
+        \\    return s.buf;
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    var found = false;
+    for (problems.items) |p| {
+        if (std.mem.indexOf(u8, p.message, "after free") != null) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "heap_double_free: field-level — double free(s.buf)" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const std = @import("std");
+        \\const Self = struct { buf: []u8 };
+        \\pub fn foo(g: std.mem.Allocator) void {
+        \\    var s = Self{ .buf = &.{} };
+        \\    s.buf = g.alloc(u8, 16) catch unreachable;
+        \\    g.free(s.buf);
+        \\    g.free(s.buf);
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    var found = false;
+    for (problems.items) |p| {
+        if (std.mem.indexOf(u8, p.message, "double-free") != null) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "field-level: clean alloc-then-free of field is silent" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const std = @import("std");
+        \\const Self = struct { buf: []u8 };
+        \\pub fn clean(g: std.mem.Allocator) void {
+        \\    var s = Self{ .buf = &.{} };
+        \\    s.buf = g.alloc(u8, 16) catch unreachable;
+        \\    g.free(s.buf);
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
 test "heap_use_after_free: slice-of-heap aliases the heap" {
     const gpa = std.testing.allocator;
     var problems = try analyze(gpa,

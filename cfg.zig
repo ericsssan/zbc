@@ -75,6 +75,19 @@ pub const StmtKind = union(enum) {
     /// bound to `freed_local` dead.  Double-free fires here.
     heap_free: struct { freed_local: LocalId },
 
+    /// `obj.field = RHS;` — write to a struct field.  We track field
+    /// origins separately from the parent local so heap allocations
+    /// stored in fields can be freed and UAF-checked.
+    field_assign: struct { parent: LocalId, name: []const u8, rhs_kind: ExprKind },
+
+    /// `g.free(obj.field)` / `g.destroy(obj.field)` — kill a field's
+    /// heap allocation.
+    field_heap_free: struct { parent: LocalId, name: []const u8 },
+
+    /// Read of `obj.field` — fires UAF / use-of-undef checks against
+    /// the field's tracked origin (separate from the parent local's).
+    field_use: struct { parent: LocalId, name: []const u8 },
+
     /// Synthetic check emitted before a `.ret` when the return-value
     /// expression contains MORE than one borrow of a local
     /// (composite literal embedding multiple `&local` / array-slice
@@ -150,6 +163,9 @@ pub const ExprKind = union(enum) {
     undef,
     /// Reading a local — pass-through of that local's current origin.
     copy_of: LocalId,
+    /// Reading `parent.name` — pass-through of the field's current
+    /// origin (looked up in state.fields).
+    field_copy_of: struct { parent: LocalId, name: []const u8 },
     /// Couldn't classify — conservative .plain at use site.
     unknown,
 };
@@ -1280,15 +1296,27 @@ const Builder = struct {
                 .pos = self.posOf(assign_node),
                 .end_pos = self.endPosOf(assign_node),
             });
+        } else if (self.fieldLhsFor(lhs)) |fref| {
+            // `obj.field = RHS` where obj is a known local — emit
+            // .field_assign so the field's origin is tracked
+            // separately.  Catches store-then-free-then-use of a
+            // struct field.
+            try self.emitUsesInExpr(rhs, cur.*, null);
+            try self.appendStmt(cur.*, .{
+                .kind = .{ .field_assign = .{
+                    .parent = fref.parent,
+                    .name = fref.name,
+                    .rhs_kind = self.classifyExpr(rhs),
+                } },
+                .pos = self.posOf(assign_node),
+                .end_pos = self.endPosOf(assign_node),
+            });
         } else {
-            // Untracked target (e.g. `obj.field = X`, `@field(obj, ...) = X`,
+            // Untracked target (e.g. `@field(obj, ...) = X`,
             // `arr[i] = X`).  For any known local mentioned anywhere in
             // the LHS expression, treat the assignment as a write to
             // that local — `obj.field = X` only type-checks if `obj` is
             // initialized, so clearing its .undef state is sound.
-            // Without this, an inline-for `@field(result, ...) = ...`
-            // loop never clears `result`'s undef and `return result`
-            // spuriously flags.
             try self.emitWritesInLhs(lhs, cur.*);
             try self.appendStmt(cur.*, .{
                 .kind = .{ .lowering_gap = .{ .note = "assign-target" } },
@@ -1556,6 +1584,15 @@ const Builder = struct {
                 });
                 return;
             }
+            // `g.free(obj.field)` — field-level free.
+            if (self.heapFreedField(call_node)) |fref| {
+                try self.appendStmt(cur.*, .{
+                    .kind = .{ .field_heap_free = .{ .parent = fref.parent, .name = fref.name } },
+                    .pos = self.posOf(call_node),
+                    .end_pos = self.endPosOf(call_node),
+                });
+                return;
+            }
             try self.appendStmt(cur.*, .{
                 .kind = .{ .lowering_gap = .{ .note = "free-untracked-arg" } },
                 .pos = self.posOf(call_node),
@@ -1763,6 +1800,16 @@ const Builder = struct {
         return self.name_to_local.get(name);
     }
 
+    /// For `<allocator>.free(obj.field)` shape, return the FieldRef.
+    fn heapFreedField(self: *Builder, call_node: Ast.Node.Index) ?FieldRef {
+        const tree = self.tree;
+        var buf: [1]Ast.Node.Index = undefined;
+        const call_full = tree.fullCall(&buf, call_node) orelse return null;
+        if (call_full.ast.params.len == 0) return null;
+        const arg = call_full.ast.params[0];
+        return self.fieldLhsFor(arg);
+    }
+
 
     fn classifyExpr(self: *Builder, expr_node: Ast.Node.Index) ExprKind {
         const tree = self.tree;
@@ -1805,6 +1852,22 @@ const Builder = struct {
             const hid: abstract_state.HeapId = @enumFromInt(self.next_heap);
             self.next_heap += 1;
             return .{ .heap_alloc = hid };
+        }
+
+        // `obj.field` where obj is a known local → .field_copy_of.
+        // Lets free / use of a field be tracked against its own
+        // origin separately from the parent local.
+        if (tag == .field_access) {
+            const fa = tree.nodeData(expr_node).node_and_token;
+            const recv = fa[0];
+            const field_tok = fa[1];
+            if (tree.nodeTag(recv) == .identifier) {
+                const recv_name = tree.tokenSlice(tree.nodeMainToken(recv));
+                if (self.name_to_local.get(recv_name)) |id| {
+                    const fname = tree.tokenSlice(field_tok);
+                    return .{ .field_copy_of = .{ .parent = id, .name = fname } };
+                }
+            }
         }
 
         // Identifier reference → .undef / .copy_of(local) if known
@@ -2109,6 +2172,23 @@ const Builder = struct {
     /// read the value).  Optional `skip_local` is excluded — used by
     /// assign to avoid emitting a use for the LHS target.  Dedupes so
     /// repeated mentions of the same local only emit one `.use`.
+    const FieldRef = struct { parent: LocalId, name: []const u8 };
+
+    /// If `lhs` is `<known_local>.<field>`, return the field ref.
+    /// Otherwise null.  Used by lowerAssign to dispatch field-target
+    /// writes to .field_assign (preserves field-level tracking).
+    fn fieldLhsFor(self: *Builder, lhs: Ast.Node.Index) ?FieldRef {
+        const tree = self.tree;
+        if (tree.nodeTag(lhs) != .field_access) return null;
+        const fa = tree.nodeData(lhs).node_and_token;
+        const recv = fa[0];
+        if (tree.nodeTag(recv) != .identifier) return null;
+        const recv_name = tree.tokenSlice(tree.nodeMainToken(recv));
+        const parent = self.name_to_local.get(recv_name) orelse return null;
+        const name = tree.tokenSlice(fa[1]);
+        return .{ .parent = parent, .name = name };
+    }
+
     /// Walk LHS tokens of an assignment with a non-identifier target
     /// and emit one assign(id, .unknown) per distinct known-local
     /// mentioned.  Used to clear .undef on locals written through
@@ -2217,6 +2297,19 @@ const Builder = struct {
                 if (next == .period and t + 2 <= last and tags[t + 2] == .identifier) {
                     const field = tree.tokenSlice(t + 2);
                     if (std.mem.eql(u8, field, "len") or std.mem.eql(u8, field, "ptr")) continue;
+                    // `id.field` where id is a known local — emit
+                    // .field_use so the field's tracked origin (not
+                    // the parent local's) is checked.  Skip the
+                    // .use(id) below since we've handled the read.
+                    const name = tree.tokenSlice(t);
+                    if (self.name_to_local.get(name)) |id| {
+                        try self.appendStmt(cur, .{
+                            .kind = .{ .field_use = .{ .parent = id, .name = field } },
+                            .pos = pos,
+                            .end_pos = end_pos,
+                        });
+                        continue;
+                    }
                 }
             }
             const name = tree.tokenSlice(t);
@@ -3027,8 +3120,9 @@ test "assign rhs `try foo()` emits err-exit sink alongside .assign" {
     try std.testing.expect(found_err_sink);
 }
 
-test "assign to field (obj.x = src) falls back to lowering_gap" {
-    // Field assignment isn't a tracked local — must stay conservative.
+test "assign to field (obj.x = src) emits .field_assign" {
+    // Field assignment now goes through .field_assign so the
+    // field's origin is tracked separately from the parent local.
     const gpa = std.testing.allocator;
     var result = try parseAndLower(gpa,
         \\pub fn foo() void {
@@ -3043,15 +3137,15 @@ test "assign to field (obj.x = src) falls back to lowering_gap" {
     defer result.deinit(gpa);
     const cfg = result.cfg.?;
 
-    var found_gap = false;
+    var found_field_assign = false;
     for (cfg.blocks) |b| {
         for (b.stmts) |s| {
-            if (s.kind == .lowering_gap and
-                std.mem.eql(u8, s.kind.lowering_gap.note, "assign-target"))
-                found_gap = true;
+            if (s.kind == .field_assign and
+                std.mem.eql(u8, s.kind.field_assign.name, "x"))
+                found_field_assign = true;
         }
     }
-    try std.testing.expect(found_gap);
+    try std.testing.expect(found_field_assign);
 }
 
 test "break inside while adds edge from body to merge" {

@@ -92,10 +92,16 @@ pub const AbstractState = struct {
     /// Per-heap-allocation liveness.  Same shape as arenas.
     heaps: std.AutoArrayHashMapUnmanaged(HeapId, ArenaState) = .empty,
 
+    /// Field-level origin tracking.  Keyed by (parent local, field
+    /// name); lets `s.buf = alloc(); free(s.buf); use(s.buf);` catch
+    /// UAF.  Name slices borrow from source — caller keeps it alive.
+    fields: std.ArrayHashMapUnmanaged(FieldKey, Origin, FieldKey.Context, true) = .empty,
+
     pub fn deinit(self: *AbstractState, gpa: std.mem.Allocator) void {
         self.locals.deinit(gpa);
         self.arenas.deinit(gpa);
         self.heaps.deinit(gpa);
+        self.fields.deinit(gpa);
     }
 
     pub fn clone(self: *const AbstractState, gpa: std.mem.Allocator) !AbstractState {
@@ -112,8 +118,28 @@ pub const AbstractState = struct {
         for (self.heaps.keys(), self.heaps.values()) |k, v| {
             out.heaps.putAssumeCapacity(k, v);
         }
+        try out.fields.ensureTotalCapacity(gpa, self.fields.count());
+        for (self.fields.keys(), self.fields.values()) |k, v| {
+            out.fields.putAssumeCapacityContext(k, v, .{});
+        }
         return out;
     }
+};
+
+pub const FieldKey = struct {
+    parent: LocalId,
+    name: []const u8,
+
+    pub const Context = struct {
+        pub fn hash(_: Context, k: FieldKey) u32 {
+            var h: u32 = @intFromEnum(k.parent) *% 2654435761;
+            for (k.name) |c| h = h *% 33 +% c;
+            return h;
+        }
+        pub fn eql(_: Context, a: FieldKey, b: FieldKey, _: usize) bool {
+            return a.parent == b.parent and std.mem.eql(u8, a.name, b.name);
+        }
+    };
 };
 
 pub const JoinResult = enum { unchanged, changed };
@@ -163,6 +189,19 @@ pub fn join(
         }
         if (gop.value_ptr.state == .live and other_state.state == .dead) {
             gop.value_ptr.* = other_state;
+            changed = true;
+        }
+    }
+
+    for (other.fields.keys(), other.fields.values()) |fk, other_val| {
+        const gop = try self.fields.getOrPutContext(gpa, fk, .{});
+        if (!gop.found_existing) {
+            gop.value_ptr.* = other_val;
+            changed = true;
+            continue;
+        }
+        if (!gop.value_ptr.eql(other_val)) {
+            gop.value_ptr.* = .plain;
             changed = true;
         }
     }
