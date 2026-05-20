@@ -566,6 +566,39 @@ test "arena_escape: @returns owns_locals suppresses composite-borrow check" {
     try std.testing.expect(!any_arena);
 }
 
+test "heap_use_after_free: through @ptrCast / @bitCast / @constCast" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const std = @import("std");
+        \\pub fn bit(g: std.mem.Allocator) []u8 {
+        \\    const raw = g.alloc(u8, 16) catch unreachable;
+        \\    const view = @as([]u8, raw);
+        \\    g.free(raw);
+        \\    return view;
+        \\}
+        \\pub fn cons(g: std.mem.Allocator) []u8 {
+        \\    const raw = g.alloc(u8, 16) catch unreachable;
+        \\    const mut: []u8 = @constCast(raw);
+        \\    g.free(raw);
+        \\    return mut;
+        \\}
+        \\pub fn ptr(g: std.mem.Allocator) *u32 {
+        \\    const raw = g.alloc(u8, 16) catch unreachable;
+        \\    const p: *u32 = @ptrCast(@alignCast(raw.ptr));
+        \\    g.free(raw);
+        \\    return p;
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    var count: u32 = 0;
+    for (problems.items) |p| {
+        if (std.mem.indexOf(u8, p.message, "after free") != null) count += 1;
+    }
+    // Each fn fires both `use` and `ret` flavors → 6 problems total.
+    try std.testing.expect(count >= 3);
+}
+
 test "heap_use_after_free: field-level — store, free, return field flags UAF" {
     const gpa = std.testing.allocator;
     var problems = try analyze(gpa,

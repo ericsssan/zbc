@@ -1486,6 +1486,65 @@ const Builder = struct {
     /// True for builtin calls that don't return — these terminate
     /// the basic block.  `unreachable` is already handled as a
     /// literal one level up in lowerStmt.
+    /// For builtin calls that produce a value aliasing one of their
+    /// args' underlying storage (`@ptrCast(x)`, `@bitCast(x)`,
+    /// `@alignCast(x)`, `@constCast(x)`, `@volatileCast(x)`,
+    /// `@addrSpaceCast(x)`, `@as(T, x)`, `@fieldParentPtr(name, p)`),
+    /// return the AST node of the SOURCE argument so classifyExpr
+    /// can recursively classify it.  The result's origin is
+    /// whatever the source's was — alloc tracking flows through.
+    fn transparentCastSource(self: *Builder, call_node: Ast.Node.Index) ?Ast.Node.Index {
+        const tree = self.tree;
+        const tok = tree.nodeMainToken(call_node);
+        const name = tree.tokenSlice(tok);
+
+        const SingleArg = enum { last };
+        const LastArg = enum { last };
+        const kind: union(enum) {
+            single: SingleArg,
+            last: LastArg,
+            none,
+        } = blk: {
+            // Single-arg casts (arg 0 is the source).
+            if (std.mem.eql(u8, name, "@ptrCast") or
+                std.mem.eql(u8, name, "@bitCast") or
+                std.mem.eql(u8, name, "@alignCast") or
+                std.mem.eql(u8, name, "@constCast") or
+                std.mem.eql(u8, name, "@volatileCast") or
+                std.mem.eql(u8, name, "@addrSpaceCast"))
+                break :blk .{ .single = .last };
+            // Two-arg builtins where the source/pointer is the LAST arg:
+            //   @as(T, x), @fieldParentPtr(name, ptr).
+            if (std.mem.eql(u8, name, "@as") or
+                std.mem.eql(u8, name, "@fieldParentPtr"))
+                break :blk .{ .last = .last };
+            break :blk .none;
+        };
+
+        if (kind == .none) return null;
+
+        // Extract the LAST arg, which is the source/pointer for all
+        // patterns we care about.  Two AST shapes to handle:
+        //   .builtin_call_two[_comma]   — up to 2 args inline
+        //   .builtin_call[_comma]       — N args via extra_range
+        switch (tree.nodeTag(call_node)) {
+            .builtin_call_two, .builtin_call_two_comma => {
+                const d = tree.nodeData(call_node).opt_node_and_opt_node;
+                if (d[1].unwrap()) |a| return a;
+                if (d[0].unwrap()) |a| return a;
+                return null;
+            },
+            .builtin_call, .builtin_call_comma => {
+                const d = tree.nodeData(call_node).extra_range;
+                const s: u32 = @intFromEnum(d.start);
+                const e: u32 = @intFromEnum(d.end);
+                if (e == s) return null;
+                return @as(Ast.Node.Index, @enumFromInt(tree.extra_data[e - 1]));
+            },
+            else => return null,
+        }
+    }
+
     fn builtinIsDivergent(self: *Builder, call_node: Ast.Node.Index) bool {
         const tree = self.tree;
         const tok = tree.nodeMainToken(call_node);
@@ -1857,6 +1916,11 @@ const Builder = struct {
         // `obj.field` where obj is a known local → .field_copy_of.
         // Lets free / use of a field be tracked against its own
         // origin separately from the parent local.
+        //
+        // EXCEPTION: `.ptr` on a slice is the raw data pointer of the
+        // slice descriptor itself — it points into the SAME allocation
+        // as the slice.  Inherit the parent's origin (.copy_of) so
+        // `@ptrCast(raw.ptr)` correctly carries raw's heap/arena.
         if (tag == .field_access) {
             const fa = tree.nodeData(expr_node).node_and_token;
             const recv = fa[0];
@@ -1865,6 +1929,9 @@ const Builder = struct {
                 const recv_name = tree.tokenSlice(tree.nodeMainToken(recv));
                 if (self.name_to_local.get(recv_name)) |id| {
                     const fname = tree.tokenSlice(field_tok);
+                    if (std.mem.eql(u8, fname, "ptr")) {
+                        return .{ .copy_of = id };
+                    }
                     return .{ .field_copy_of = .{ .parent = id, .name = fname } };
                 }
             }
@@ -1939,6 +2006,21 @@ const Builder = struct {
                     }
                 }
             }
+        }
+
+        // Transparent cast builtins: `@ptrCast(x)`, `@bitCast(x)`,
+        // `@alignCast(x)`, `@constCast(x)`, `@volatileCast(x)`,
+        // `@addrSpaceCast(x)`, `@as(T, x)`, `@fieldParentPtr(name, p)`.
+        // Each produces a value that aliases the underlying storage
+        // of its source arg — propagate the source's origin so
+        // free-then-use through a cast is caught.
+        switch (tag) {
+            .builtin_call, .builtin_call_two, .builtin_call_comma, .builtin_call_two_comma => {
+                if (self.transparentCastSource(expr_node)) |src| {
+                    return self.classifyExpr(src);
+                }
+            },
+            else => {},
         }
 
         // Annotated method/function call: `<recv>.<method>(args)` or
