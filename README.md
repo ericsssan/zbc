@@ -1,125 +1,71 @@
 # zbc
 
-Region/lifetime escape analyzer for Zig.  Currently lives in the
-ez monorepo at `zbc/`; designed for extraction to its own repo
-(phase 45) once it stabilizes.
+A borrow checker for Zig, inspired by Rust's.
 
-## What it does
+## Rules
 
-Two analysis modes on Zig source:
+| Rule | Catches |
+|---|---|
+| `heap-use-after-free` | Reading a heap pointer after `free` / `destroy` |
+| `heap-double-free` | Freeing the same heap pointer twice |
+| `arena-use-after-kill` | Reading an arena-borrowed value after the arena's `deinit` |
+| `arena-escape` | Returning a value borrowed from a function-local arena |
+| `stack-escape` | Returning a pointer to a function-local stack variable |
+| `use-undefined` | Reading a value that is still `undefined` |
+| `require-borrowed-from` | Public borrowed-shape return without `@returns borrowed_from(...)` |
 
-1. **Layer 1 — annotation hygiene** (`zbc file.zig`).  Lints
-   that public functions touching lifetime-bearing types
-   (`NodeIndex`, slices borrowed from Ast source, arena allocators)
-   carry the required `///` doc-comment annotations.
+Cross-function chains, struct-literal aliases, stack-owner borrows
+(`var o = ...; const x = &o.field; o.die(); use(x)`), and
+`@borrowed`-annotated field copies are all tracked.
 
-2. **Layer 2 — escape analysis** (`zbc --escape file.zig`).
-   Lowers each function to a CFG, tracks per-local origins
-   (`.arena`, `.ast`, `.ast_node`), and reports violations of
-   user-declared invariants:
-   - **#1**: A NodeIndex from Ast A must only flow back into A.
-   - **#2**: A slice borrowed from an Ast's source buffer must
-     not outlive that Ast.
-   - **#5**: After parse completion, the Ast is read-only — any
-     `@mutates_ast` method invalidates derived caches.
-   - (#3 thread-arena, #4 pass-tagged IDs scaffolded but need
-     inter-procedural extensions to be useful.)
-
-## Annotation vocabulary
-
-```zig
-/// @returns owned                       — caller owns the result
-/// @returns borrowed_from(<param>)      — return borrows from a param
-/// @returns node_index_of(<param>)      — return is a NodeIndex tagged with param's Ast
-/// @returns ast                         — return is a fresh Ast value
-
-/// @takes node_index_of(<param>)        — NodeIndex args must match param's Ast
-/// @takes node_index_any                — opt-out: any-Ast NodeIndex OK
-
-/// @mutates_ast                         — method mutates receiver (or args[0])
-/// @mutates_ast(<param>)                — method mutates the named param
-```
-
-## Project portability
-
-ez-specific strings live in `Config` (config.zig):
-
-```zig
-pub const Config = struct {
-    ast_type_name: []const u8 = "Ast",
-    ast_init_patterns: []const []const u8 = &.{"Ast.parse"},
-    arena_init_patterns: []const []const u8 = &.{"ArenaAllocator.init"},
-    arena_kill_patterns: []const []const u8 = &.{".deinit("},
-    thread_join_patterns: []const []const u8 = &.{".join("},
-};
-```
-
-Downstream projects construct their own `Config` and pass it to
-`analyzeEscape`.  The historical ez behavior lives at `DefaultConfig`.
-
-## Standalone use
+## Usage
 
 ```sh
-cd zbc
-zig build test            # 136 tests
-zig build run -- --escape path/to/file.zig
+zig build -Doptimize=ReleaseFast
+zbc path/to/file.zig
+zbc --format=compact path/to/file.zig    # grep-friendly
+zbc --list-rules
+zbc --explain heap-use-after-free
 ```
 
-## Library use from another Zig project
+Exit 0 if clean, 1 if problems found.  Default output is Rustc-style
+with caret + secondary span for the free / kill site.
 
-`build.zig.zon`:
+## Annotations
+
+Most analysis is inference-driven.  Annotations fill the gaps where
+source shape is ambiguous:
 
 ```zig
-.dependencies = .{
-    .zbc = .{ .path = "../path/to/zbc" },  // or .url + .hash
-},
+/// @returns owned | borrowed_from(<param>) | owns_locals | heap
+/// @takes ownership(<param>)
+/// @borrowed                              (on a struct field)
 ```
 
-`build.zig`:
+Borrow example:
 
 ```zig
-const zbc_dep = b.dependency("zbc", .{
-    .target = target,
-    .optimize = optimize,
-});
-exe.root_module.addImport("zbc", zbc_dep.module("zbc"));
+const Owner = struct {
+    /// @borrowed
+    data: []u8 = &.{},
+
+    /// @takes ownership(self)
+    pub fn die(self: *Owner) void { /* ... */ }
+};
+
+var owner: Owner = .{};
+const x = owner.data;       // borrow of owner
+owner.die();
+_ = x;                      // → heap-use-after-free
 ```
 
-Your code:
+## Library use
 
 ```zig
 const zbc = @import("zbc");
 
-var cache = zbc.Cache.init(gpa, io);
-defer cache.deinit();
 const problems = try zbc.analyzeEscape(
-    gpa, io, path, &cache, &zbc.DefaultConfig,
+    gpa, io, path, /*cache=*/null, &zbc.DefaultConfig,
 );
 defer zbc.freeProblems(gpa, problems);
 ```
-
-## Layout
-
-```
-zbc/
-├── build.zig            – module + CLI build
-├── build.zig.zon        – package manifest
-├── lib.zig              – public API surface
-├── main.zig             – CLI shell
-├── config.zig           – project-tunable knobs
-├── cfg.zig              – Zig AST → CFG lowering
-├── abstract_state.zig   – Origin / ArenaId / ThreadContext
-├── transfer.zig         – per-Stmt state transitions
-├── analyzer.zig         – worklist fixed-point
-├── annotations.zig      – @returns / @takes / @mutates_ast parser
-├── imports.zig          – @import extractor
-├── remote_resolver.zig  – cross-file annotation cache
-├── problem.zig          – diagnostic type
-└── rules/               – Layer-1 annotation-hygiene rules
-```
-
-## Status
-
-Research-stage, used in production on one codebase (ez).  Phases
-1-44 of the dev log document the build-up; phase 45 will extract
-to its own repo.
