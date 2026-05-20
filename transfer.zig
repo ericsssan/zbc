@@ -47,6 +47,11 @@ pub fn transfer(ctx: Ctx, state: *AbstractState, stmt: Stmt) !void {
         .heap_free => |f| try transferHeapFree(ctx, state, f, stmt.pos, stmt.end_pos),
         .ret => |r| try transferRet(ctx, state, r, stmt.pos, stmt.end_pos),
         .use => |u| try transferUse(ctx, state, u, stmt.pos, stmt.end_pos),
+        .pointer_write => |p| {
+            if (state.locals.get(p.target)) |origin| {
+                if (origin == .undef) try state.locals.put(ctx.gpa, p.target, .plain);
+            }
+        },
         .composite_escape => |c| try transferCompositeEscape(ctx, state, c, stmt.pos, stmt.end_pos),
         .field_assign => |a| try transferFieldAssign(ctx, state, a, stmt.pos),
         .field_heap_free => |f| try transferFieldHeapFree(ctx, state, f, stmt.pos, stmt.end_pos),

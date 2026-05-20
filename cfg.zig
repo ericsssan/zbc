@@ -119,6 +119,12 @@ pub const StmtKind = union(enum) {
 
     /// Use of a local (to read it).  Generates "is origin still live?"
     /// checks in the analyzer.
+    /// Write through a pointer / field of `target` (e.g.
+    /// `arena.* = X;`, `obj.field = X;`).  Does NOT rebind the
+    /// local — its resource identity (.heap / .arena) is unchanged.
+    /// Only clears .undef → .plain (the underlying storage was
+    /// initialized via this write).
+    pointer_write: struct { target: LocalId },
     use: struct {
         local: LocalId,
         /// True when this .use was emitted by a method-call walker
@@ -1340,12 +1346,54 @@ const Builder = struct {
         // foo() catch ...`); buried try inside arithmetic etc. is rare
         // and unmodeled (yields a sink-less success-only path).
         if (init_opt) |init| {
-            switch (tree.nodeTag(init)) {
-                .@"try" => try self.emitTryErrorExit(cur, self.posOf(init)),
-                .@"catch" => try self.emitCatchFork(init, cur),
-                else => {},
-            }
+            try self.lowerInitSideEffects(init, cur);
         }
+    }
+
+    /// Walk an init / rhs expression for top-level catch / try / orelse
+    /// forms whose bodies have side effects (defers fire, locals
+    /// initialize, arena.deinit() runs).  Without lowering these, the
+    /// abstract state at the decl's post-position reflects only the
+    /// success path — a catch body that does `arena.deinit(); return
+    /// throwValue(log.toJS());` would never be seen, hiding a UAK.
+    ///
+    /// Handles:
+    ///   - `expr catch BODY` → emitCatchFork
+    ///   - `try expr`        → emitTryErrorExit
+    ///   - `expr orelse BODY` → recurse into lhs (catch may live there),
+    ///     plus lower orelse-BODY as a fork of its own
+    ///
+    /// Recursion bounded by AST depth; cheap.
+    fn lowerInitSideEffects(self: *Builder, init: Ast.Node.Index, cur: *BlockId) (std.mem.Allocator.Error)!void {
+        const tree = self.tree;
+        switch (tree.nodeTag(init)) {
+            .@"try" => try self.emitTryErrorExit(cur, self.posOf(init)),
+            .@"catch" => try self.emitCatchFork(init, cur),
+            .@"orelse" => {
+                const data = tree.nodeData(init).node_and_node;
+                // lhs may itself contain a top-level catch/try whose
+                // body has side effects (the common
+                // `expr catch {...} orelse {...}` shape).
+                try self.lowerInitSideEffects(data[0], cur);
+                // Fork the orelse body: success edge (optional was
+                // non-null) and orelse-body edge.  Body is BODY=data[1].
+                try self.emitOrelseFork(data[1], cur);
+            },
+            else => {},
+        }
+    }
+
+    /// Like emitCatchFork but for an `orelse BODY`.  The body runs
+    /// when the optional resolves to null.  Same join shape.
+    fn emitOrelseFork(self: *Builder, body_node: Ast.Node.Index, cur: *BlockId) !void {
+        const orelse_block = try self.newBlock();
+        const merge = try self.newBlock();
+        try self.addEdge(cur.*, orelse_block);
+        try self.addEdge(cur.*, merge);
+        var ob_cur = orelse_block;
+        try self.lowerStmt(body_node, &ob_cur);
+        try self.addEdge(ob_cur, merge);
+        cur.* = merge;
     }
 
     /// `LHS = RHS;` — when LHS is a known simple-identifier local, emit
@@ -2065,6 +2113,22 @@ const Builder = struct {
             self.next_arena += 1;
             return .{ .arena_init = aid };
         }
+        // Heap-allocated arena: `gpa.create(ArenaAllocator)` returns a
+        // pointer to a fresh arena.  The pointer itself is heap, but
+        // the arena identity is what matters for UAK tracking — its
+        // .deinit() kills the underlying bump memory regardless of
+        // where the descriptor lives.  Treat as arena_init so
+        // arena_kill propagation works.  Detected by combining
+        // heap_alloc pattern match with "ArenaAllocator" in the call
+        // text (the type passed to `.create`).
+        if (anyPatternMatches(text, self.config.heap_alloc_patterns) and
+            std.mem.indexOf(u8, text, "ArenaAllocator") != null and
+            std.mem.indexOf(u8, text, ".create(") != null)
+        {
+            const aid: abstract_state.ArenaId = @enumFromInt(self.next_arena);
+            self.next_arena += 1;
+            return .{ .arena_init = aid };
+        }
         if (anyPatternMatches(text, self.config.heap_alloc_patterns)) {
             // Allocator-provenance check: if the call's immediate
             // receiver is a local known to be an arena_allocator (or
@@ -2659,8 +2723,14 @@ const Builder = struct {
             const id = self.name_to_local.get(name) orelse continue;
             const gop = try seen.getOrPut(self.gpa, id);
             if (gop.found_existing) continue;
+            // `arena.* = X` / `obj.field = X` — writes THROUGH the
+            // local, doesn't rebind it.  The local's resource
+            // identity (.heap / .arena / .arena_borrow) is unchanged;
+            // only an .undef may have been initialized.  Emit
+            // assign-via-pointer-write that only clears .undef →
+            // .plain in transferAssign, preserving resource origins.
             try self.appendStmt(cur, .{
-                .kind = .{ .assign = .{ .target = id, .rhs_kind = .unknown } },
+                .kind = .{ .pointer_write = .{ .target = id } },
                 .pos = pos,
                 .end_pos = end_pos,
             });
