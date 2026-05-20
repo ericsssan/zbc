@@ -192,7 +192,18 @@ pub const LocalInfo = struct {
     init_hint: InitHint = .other,
 };
 
-pub const InitHint = enum { other, arena_local, heap_local };
+pub const InitHint = enum { other, arena_local, heap_local, noreturn_alias };
+
+/// Known-stdlib noreturn callee chains.  Hoisted so both the
+/// call-site detector (calleeIsNoreturn) and the alias detector
+/// (initIsNoreturnAlias) share a single list.  Builtins like
+/// `@panic` and `@trap` go through builtinIsDivergent, not here.
+const known_noreturn_chains = [_][]const u8{
+    "process.exit",
+    "posix.exit",
+    "os.abort",
+    "process.abort",
+};
 
 // ── Lowering ───────────────────────────────────────────────
 
@@ -1122,10 +1133,17 @@ const Builder = struct {
 
         // Derive init_hint from the classification — avoids a second
         // classifyExpr call (which would double-mint Arena/Heap ids).
-        const init_hint: InitHint = switch (init_kind) {
-            .arena_init => .arena_local,
-            .heap_alloc => .heap_local,
-            else => .other,
+        const init_hint: InitHint = blk: {
+            switch (init_kind) {
+                .arena_init => break :blk .arena_local,
+                .heap_alloc => break :blk .heap_local,
+                else => {},
+            }
+            // Aliased noreturn fn: `const exit = std.process.exit;`
+            // Lets later call sites that use the alias terminate
+            // their block.
+            if (init_opt) |i| if (self.initIsNoreturnAlias(i)) break :blk .noreturn_alias;
+            break :blk .other;
         };
         const local = try self.registerLocalFull(name, self.posOfToken(name_tok), is_array, init_hint);
 
@@ -1366,6 +1384,23 @@ const Builder = struct {
         return std.mem.eql(u8, slice, "@panic") or std.mem.eql(u8, slice, "@trap");
     }
 
+    /// True iff `init_node`'s source text ends with one of the
+    /// known-noreturn callee chains — set on the declaring local's
+    /// init_hint so subsequent calls through the alias terminate.
+    fn initIsNoreturnAlias(self: *Builder, init_node: Ast.Node.Index) bool {
+        const tree = self.tree;
+        const first = tree.firstToken(init_node);
+        const last = tree.lastToken(init_node);
+        const start = tree.tokens.items(.start)[first];
+        const last_start = tree.tokens.items(.start)[last];
+        const last_len = tree.tokenSlice(last).len;
+        const text = tree.source[start .. last_start + last_len];
+        for (known_noreturn_chains) |pat| {
+            if (std.mem.endsWith(u8, text, pat)) return true;
+        }
+        return false;
+    }
+
     fn lowerCallStmt(self: *Builder, call_node: Ast.Node.Index, cur: *BlockId) !void {
         // Detect arena.deinit() patterns; otherwise emit nothing
         // (call has no side-effect from our pov).
@@ -1467,27 +1502,28 @@ const Builder = struct {
             const recv = tree.nodeData(callee).node_and_token[0];
             if (self.lookupRemoteEntry(recv, name)) |entry| if (entry.is_noreturn) return true;
         }
+        // Aliased noreturn local: `const exit = std.process.exit;`
+        // then `exit(1)`.  Bare-identifier callee referencing a
+        // local whose init was a known noreturn chain.
+        if (tree.nodeTag(callee) == .identifier) {
+            if (self.name_to_local.get(name)) |local| {
+                if (self.locals.items[@intFromEnum(local)].init_hint == .noreturn_alias) {
+                    return true;
+                }
+            }
+        }
+
         // Known-stdlib noreturn callees.  Match against the leading
         // tokens of the callee chain (not the full call text) so an
         // arg shape like `(exitcode)` doesn't pull patterns from
         // arbitrary user text into the match window.
         const first = tree.firstToken(call_node);
-        // Last token of the CALLEE (not the call).  We need to stop
-        // at the `(` to avoid matching pattern fragments in args.
         const callee_last = tree.lastToken(callee);
         const start = tree.tokens.items(.start)[first];
         const end_tok_start = tree.tokens.items(.start)[callee_last];
         const end_tok_len = tree.tokenSlice(callee_last).len;
         const callee_text = tree.source[start .. end_tok_start + end_tok_len];
-        // Builtins like @trap go through lowerStmt's builtin_call
-        // dispatch, not here — only list non-builtin chains.
-        const known_noreturn = [_][]const u8{
-            "process.exit",
-            "posix.exit",
-            "os.abort",
-            "process.abort",
-        };
-        for (known_noreturn) |pat| {
+        for (known_noreturn_chains) |pat| {
             if (std.mem.endsWith(u8, callee_text, pat)) return true;
         }
         return false;
