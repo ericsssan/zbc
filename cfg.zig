@@ -245,6 +245,12 @@ pub const Cfg = struct {
     fn_span: struct { start: u32, end: u32 },
     /// Local-name table (name & decl position keyed by LocalId).
     locals: []LocalInfo,
+    /// Path strings referenced by `field_assign` / `field_use`
+    /// statements that aren't contiguous in source — e.g. struct-
+    /// literal unpacking builds "parent_prefix.field_name" from two
+    /// disjoint tokens.  Most paths ARE source slices (no entry
+    /// here); these own the rest.
+    owned_paths: [][]u8 = &.{},
 
     pub fn deinit(self: *Cfg, gpa: std.mem.Allocator) void {
         for (self.blocks) |b| {
@@ -253,6 +259,8 @@ pub const Cfg = struct {
         }
         gpa.free(self.blocks);
         gpa.free(self.locals);
+        for (self.owned_paths) |p| gpa.free(p);
+        gpa.free(self.owned_paths);
     }
 };
 
@@ -551,6 +559,11 @@ const Builder = struct {
     /// and state.heaps unboundedly.
     next_arena: u32 = 0,
     next_heap: u32 = 0,
+    /// Path strings the builder allocated (currently used for
+    /// struct-literal unpacking, where `parent_prefix.field_name`
+    /// is non-contiguous in source).  Transferred to Cfg at finalize
+    /// and freed in Cfg.deinit.
+    owned_paths: std.ArrayListUnmanaged([]u8) = .empty,
 
     fn tempDeinit(self: *Builder) void {
         for (self.block_stmts.items) |*s| s.deinit(self.gpa);
@@ -563,6 +576,8 @@ const Builder = struct {
         self.deferred.deinit(self.gpa);
         self.loop_stack.deinit(self.gpa);
         self.block_label_stack.deinit(self.gpa);
+        for (self.owned_paths.items) |p| self.gpa.free(p);
+        self.owned_paths.deinit(self.gpa);
     }
 
     fn newBlock(self: *Builder) !BlockId {
@@ -1658,6 +1673,13 @@ const Builder = struct {
                 .pos = self.posOf(assign_node),
                 .end_pos = self.endPosOf(assign_node),
             });
+            // Struct-literal RHS: unpack so aliased fields buried in
+            // the literal get their own field_assign keyed by name.
+            // `container = .{ .ptr = buf }` registers
+            // `(container, "ptr") → buf's origin` so a later
+            // `container.ptr` read sees buf's freed state.
+            try self.unpackStructInitFields(cur.*, t, null, rhs,
+                self.posOf(assign_node), self.endPosOf(assign_node));
         } else if (self.fieldLhsFor(lhs)) |fref| {
             // `obj.field = RHS` where obj is a known local — emit
             // .field_assign so the field's origin is tracked
@@ -1675,6 +1697,11 @@ const Builder = struct {
                 .pos = self.posOf(assign_node),
                 .end_pos = self.endPosOf(assign_node),
             });
+            // Nested struct-literal unpack for the field LHS, e.g.
+            // `install.ca = .{ .str = buf }` → field_assign on
+            // `(install, "ca.str")`.  PR #25563 shape.
+            try self.unpackStructInitFields(cur.*, fref.parent, fref.name, rhs,
+                self.posOf(assign_node), self.endPosOf(assign_node));
         } else if (tree.nodeTag(lhs) == .identifier and
             std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(lhs)), "_"))
         {
@@ -3489,6 +3516,73 @@ const Builder = struct {
         return .{ .parent = parent, .name = path };
     }
 
+    /// `.field_name = <value>` field initializer in a struct literal:
+    /// return the field name token's slice.  Recognises the canonical
+    /// shape (a value preceded by `.name =`), returns null on
+    /// positional inits (tuples) or shapes we don't expect.
+    fn fieldInitName(self: *Builder, field_value: Ast.Node.Index) ?[]const u8 {
+        const tree = self.tree;
+        const first = tree.firstToken(field_value);
+        if (first < 3) return null;
+        const tags = tree.tokens.items(.tag);
+        if (tags[first - 1] != .equal) return null;
+        if (tags[first - 2] != .identifier) return null;
+        if (tags[first - 3] != .period) return null;
+        return tree.tokenSlice(first - 2);
+    }
+
+    /// Build a dotted path `prefix.leaf` and stash the allocated bytes
+    /// in `owned_paths` so the resulting slice outlives the lowering
+    /// pass.  If `prefix` is null, returns `leaf` unchanged (no
+    /// allocation).
+    fn allocDottedPath(self: *Builder, prefix: ?[]const u8, leaf: []const u8) ![]const u8 {
+        const p = prefix orelse return leaf;
+        const bytes = try std.fmt.allocPrint(self.gpa, "{s}.{s}", .{ p, leaf });
+        errdefer self.gpa.free(bytes);
+        try self.owned_paths.append(self.gpa, bytes);
+        return bytes;
+    }
+
+    /// Unpack a struct-literal RHS into per-field `field_assign`
+    /// statements so that aliases buried inside the literal are
+    /// tracked by name.  Example: for `install.ca = .{ .str = buf }`
+    /// (`parent = install`, `prefix = "ca"`), emit
+    /// `field_assign(install, "ca.str", copy_of(buf))`.
+    ///
+    /// Recurses into nested struct literals so deeper aliases
+    /// (`outer.inner = .{ .a = .{ .b = ptr } }`) are flattened too.
+    /// This is purely additive — the existing `assign` /
+    /// `field_assign` for the whole RHS is still emitted by the
+    /// caller and remains the source of truth for the local /
+    /// outermost field's own origin.
+    fn unpackStructInitFields(
+        self: *Builder,
+        cur: BlockId,
+        parent: LocalId,
+        prefix: ?[]const u8,
+        rhs_node: Ast.Node.Index,
+        pos: SrcPos,
+        end_pos: SrcPos,
+    ) std.mem.Allocator.Error!void {
+        const tree = self.tree;
+        var buf: [2]Ast.Node.Index = undefined;
+        const init = tree.fullStructInit(&buf, rhs_node) orelse return;
+        for (init.ast.fields) |field_value| {
+            const leaf = self.fieldInitName(field_value) orelse continue;
+            const path = try self.allocDottedPath(prefix, leaf);
+            try self.appendStmt(cur, .{
+                .kind = .{ .field_assign = .{
+                    .parent = parent,
+                    .name = path,
+                    .rhs_kind = self.classifyExpr(field_value),
+                } },
+                .pos = pos,
+                .end_pos = end_pos,
+            });
+            try self.unpackStructInitFields(cur, parent, path, field_value, pos, end_pos);
+        }
+    }
+
     /// Walk LHS tokens of an assignment with a non-identifier target
     /// and emit one assign(id, .unknown) per distinct known-local
     /// mentioned.  Used to clear .undef on locals written through
@@ -4085,6 +4179,7 @@ const Builder = struct {
             };
         }
         const locals = try self.locals.toOwnedSlice(self.gpa);
+        const owned_paths = try self.owned_paths.toOwnedSlice(self.gpa);
         const start = tree.tokens.items(.start)[tree.firstToken(fn_decl)];
         const end_tok = tree.lastToken(fn_decl);
         const end = tree.tokens.items(.start)[end_tok] + tree.tokenSlice(end_tok).len;
@@ -4093,6 +4188,7 @@ const Builder = struct {
             .entry = entry,
             .fn_span = .{ .start = start, .end = @intCast(end) },
             .locals = locals,
+            .owned_paths = owned_paths,
         };
     }
 };
