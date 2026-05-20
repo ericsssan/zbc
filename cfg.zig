@@ -600,6 +600,13 @@ const Builder = struct {
             // unreachable; free(buf);` would lose buf's .heap origin
             // at the merge because the catch arm collapses to .plain.
             .unreachable_literal => cur.* = try self.newBlock(),
+            .builtin_call, .builtin_call_two, .builtin_call_two_comma, .builtin_call_comma => {
+                if (self.builtinIsDivergent(stmt_node)) {
+                    cur.* = try self.newBlock();
+                } else {
+                    try self.lowerCallStmt(stmt_node, cur);
+                }
+            },
             // Nested blocks: recurse so empty blocks DON'T trigger
             // the conservative .plain collapse via lowering_gap.
             // Labeled forms (`blk: { ... break :blk; }`) get the
@@ -1349,6 +1356,16 @@ const Builder = struct {
         cur.* = try self.newBlock();
     }
 
+    /// True for builtin calls that don't return — these terminate
+    /// the basic block.  Currently: `@panic(...)`.  `unreachable` is
+    /// already handled as a literal one level up in lowerStmt.
+    fn builtinIsDivergent(self: *Builder, call_node: Ast.Node.Index) bool {
+        const tree = self.tree;
+        const tok = tree.nodeMainToken(call_node);
+        const slice = tree.tokenSlice(tok);
+        return std.mem.eql(u8, slice, "@panic");
+    }
+
     fn lowerCallStmt(self: *Builder, call_node: Ast.Node.Index, cur: *BlockId) !void {
         // Detect arena.deinit() patterns; otherwise emit nothing
         // (call has no side-effect from our pov).
@@ -1417,6 +1434,53 @@ const Builder = struct {
             .pos = self.posOf(call_node),
             .end_pos = self.endPosOf(call_node),
         });
+
+        // If the callee is annotated/inferred `noreturn`, the call
+        // diverges — terminate this block (matches the treatment of
+        // `unreachable` / `@panic`).
+        if (self.calleeIsNoreturn(call_node)) {
+            cur.* = try self.newBlock();
+        }
+    }
+
+    /// True iff the call's callee resolves to a fn whose DB entry
+    /// carries is_noreturn=true.  Consults same-file DB and (when
+    /// remote ctx exists) the imported file's DB.
+    fn calleeIsNoreturn(self: *Builder, call_node: Ast.Node.Index) bool {
+        const tree = self.tree;
+        var buf: [1]Ast.Node.Index = undefined;
+        const call_full = tree.fullCall(&buf, call_node) orelse return false;
+        const callee = call_full.ast.fn_expr;
+        const method_tok = switch (tree.nodeTag(callee)) {
+            .identifier => tree.nodeMainToken(callee),
+            .field_access => tree.nodeData(callee).node_and_token[1],
+            else => return false,
+        };
+        const name = tree.tokenSlice(method_tok);
+        if (self.db) |db| {
+            if (db.lookup(name)) |entry| if (entry.is_noreturn) return true;
+        }
+        if (tree.nodeTag(callee) == .field_access) {
+            const recv = tree.nodeData(callee).node_and_token[0];
+            if (self.lookupRemoteEntry(recv, name)) |entry| if (entry.is_noreturn) return true;
+        }
+        return false;
+    }
+
+    /// Cross-file FnEntry lookup — shared by callers that need
+    /// multiple fields off the remote entry.
+    fn lookupRemoteEntry(
+        self: *Builder,
+        recv_node: Ast.Node.Index,
+        method_name: []const u8,
+    ) ?annotations.FnEntry {
+        const remote = self.remote orelse return null;
+        const tree = self.tree;
+        if (tree.nodeTag(recv_node) != .identifier) return null;
+        const recv_name = tree.tokenSlice(tree.nodeMainToken(recv_node));
+        const imap_entry = remote.imap.lookup(recv_name) orelse return null;
+        const remote_file = (remote.cache.loadOrLookup(remote.base_dir, imap_entry.path) catch return null) orelse return null;
+        return remote_file.db.lookup(method_name);
     }
 
     /// If the callee has `@takes ownership(p)`, return the LocalId

@@ -65,6 +65,10 @@ pub const FnEntry = struct {
     annotation: ?ReturnsAnnotation,
     /// Optional `@takes` annotation.  Independent of `annotation`.
     takes: ?TakesAnnotation = null,
+    /// True iff the fn's declared return type is `noreturn`.
+    /// Detected at extraction time so call sites can terminate
+    /// their basic block (the call diverges, no successor state).
+    is_noreturn: bool = false,
 };
 
 pub const Db = struct {
@@ -108,6 +112,10 @@ pub fn buildWithConfig(
 
         var annotation = parseReturnsAnnotation(tree, fn_proto);
         const takes_anno = parseTakesAnnotation(tree, fn_proto);
+        const is_noreturn = if (fn_proto.ast.return_type.unwrap()) |rt|
+            returnTypeIsNoreturn(tree, rt)
+        else
+            false;
 
         if (annotation == null and tree.nodeTag(node) == .fn_decl) {
             if (fn_proto.ast.return_type.unwrap()) |rt| {
@@ -121,12 +129,13 @@ pub fn buildWithConfig(
         }
 
         // Skip if no signal of any flavor.
-        if (annotation == null and takes_anno == null) continue;
+        if (annotation == null and takes_anno == null and !is_noreturn) continue;
         const name = tree.tokenSlice(name_tok);
         try db.fns.put(gpa, name, .{
             .name = name,
             .annotation = annotation,
             .takes = takes_anno,
+            .is_noreturn = is_noreturn,
         });
     }
 
@@ -161,6 +170,7 @@ pub fn buildWithConfig(
                 .name = name,
                 .annotation = inferred,
                 .takes = if (existing) |e| e.takes else null,
+                .is_noreturn = if (existing) |e| e.is_noreturn else false,
             });
             added = true;
         }
@@ -186,6 +196,7 @@ pub fn buildWithConfig(
             .name = name,
             .annotation = null,
             .takes = null,
+            .is_noreturn = false,
         };
         var changed = false;
 
@@ -597,6 +608,14 @@ fn stripDocPrefix(raw: []const u8) []const u8 {
 }
 
 // ── R6 helpers (returns-owned inference via body allocation scan) ──
+
+fn returnTypeIsNoreturn(tree: *const Ast, type_node: Ast.Node.Index) bool {
+    const first = tree.firstToken(type_node);
+    const last = tree.lastToken(type_node);
+    if (first != last) return false; // composite type, not bare keyword
+    if (tree.tokens.items(.tag)[first] != .identifier) return false;
+    return std.mem.eql(u8, tree.tokenSlice(first), "noreturn");
+}
 
 fn typeIsSliceShaped(tree: *const Ast, type_node: Ast.Node.Index) bool {
     const first = tree.firstToken(type_node);

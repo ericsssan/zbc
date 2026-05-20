@@ -732,6 +732,48 @@ test "R8 inference: multi-stmt free wrapper still infers @takes ownership" {
     try std.testing.expect(found);
 }
 
+test "CFG: `@panic(...)` in catch arm is a terminator" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const std = @import("std");
+        \\pub fn foo(g: std.mem.Allocator) []u8 {
+        \\    const buf = g.alloc(u8, 16) catch @panic("oom");
+        \\    g.free(buf);
+        \\    return buf;
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    var found = false;
+    for (problems.items) |p| {
+        if (std.mem.indexOf(u8, p.message, "after free") != null) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "CFG: noreturn user fn in catch arm is a terminator" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const std = @import("std");
+        \\pub fn die(msg: []const u8) noreturn {
+        \\    _ = msg;
+        \\    @panic("bye");
+        \\}
+        \\pub fn foo(g: std.mem.Allocator) []u8 {
+        \\    const buf = g.alloc(u8, 16) catch die("oom");
+        \\    g.free(buf);
+        \\    return buf;
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    var found = false;
+    for (problems.items) |p| {
+        if (std.mem.indexOf(u8, p.message, "after free") != null) found = true;
+    }
+    try std.testing.expect(found);
+}
+
 test "CFG: `catch unreachable` is a terminator; success state survives the merge" {
     const gpa = std.testing.allocator;
     var problems = try analyze(gpa,
