@@ -121,8 +121,13 @@ pub const Cache = struct {
         errdefer self.gpa.free(abs);
 
         // Fast path: lock just long enough to check + return on hit
-        // or bail on a re-entry (cycle).
-        {
+        // or bail on a re-entry (cycle).  Hoists `loading_key` out
+        // of the locked block so the cleanup defer below can use it
+        // — abs gets freed on every error/dedup return below, so
+        // looking the loading set up by `abs` would be a UAF (zbc's
+        // own borrow checker flagged this).  loading_key is a
+        // separate dupe that survives until the defer fires.
+        const loading_key = blk: {
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
             if (self.files.get(abs)) |hit| {
@@ -140,23 +145,25 @@ pub const Cache = struct {
             }
             // Mark loading.  Duplicate ownership: the loading-set
             // owns its own copy of the abs path; the `files` entry
-            // (on success) gets the original.  Free on the failure
-            // / completion paths below.
-            const loading_key = self.gpa.dupe(u8, abs) catch {
+            // (on success) gets the original.
+            const lk = self.gpa.dupe(u8, abs) catch {
                 self.gpa.free(abs);
                 return null;
             };
-            self.loading.put(self.gpa, loading_key, {}) catch {
-                self.gpa.free(loading_key);
+            self.loading.put(self.gpa, lk, {}) catch {
+                self.gpa.free(lk);
                 self.gpa.free(abs);
                 return null;
             };
-        }
-        // Remove from loading-set on every exit path.
+            break :blk lk;
+        };
+        // Remove from loading-set on every exit path.  Look up by
+        // loading_key (not abs) — abs is freed on most error /
+        // dedup paths below and reading it here would be UB.
         defer {
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
-            if (self.loading.fetchRemove(abs)) |kv| self.gpa.free(kv.key);
+            if (self.loading.fetchRemove(loading_key)) |kv| self.gpa.free(kv.key);
         }
 
         const src_bytes = std.Io.Dir.cwd().readFileAlloc(
