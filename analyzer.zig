@@ -58,7 +58,7 @@ pub fn check(
     while (worklist.pop()) |block_id| {
         iter_guard += 1;
         if (iter_guard > MAX_ITERS) {
-            std.debug.print("zbc/escape-check: bailed after {} iterations on {s}\n", .{
+            std.debug.print("zbc: bailed after {} iterations on {s}\n", .{
                 MAX_ITERS, opts.path,
             });
             return;
