@@ -343,6 +343,14 @@ pub fn buildFull(
     try discoverContainingTypes(gpa, tree, &db.containing_types, &db.field_types, &db.borrowed_fields);
     const fn_to_type = &db.containing_types;
 
+    // Field-ownership inference — walk every method body inside each
+    // container type, look for `self.<field> = <RHS>` writes, and
+    // mark a field borrowed when ALL writes look like allocations
+    // (no caller-owned values flowed in).  Composes with the
+    // explicit `/// @borrowed` annotation parsed in
+    // `discoverContainingTypes`.
+    try inferBorrowedFields(gpa, tree, &db, alloc_patterns);
+
     // Pass 1 — explicit annotations + R6 (slice + body allocs → owned).
     //
     // Only walk fn_decl nodes (fns with bodies).  `fullFnProto` would
@@ -1552,6 +1560,258 @@ fn fieldHasBorrowedAnnotation(tree: *const Ast, name_tok: Ast.TokenIndex) bool {
         if (std.mem.eql(u8, trimmed, "@borrowed")) return true;
     }
     return false;
+}
+
+// ── Field-ownership inference ──────────────────────────────────
+//
+// For each method defined inside a container type, scan the body
+// for assignments of the form `<self>.<field> = <RHS>` where <self>
+// is the method's first param (and the param's type matches the
+// enclosing container).  Classify each write:
+//
+//   - `alloc`    — RHS source contains one of the heap_alloc_patterns
+//                  (e.g. `.alloc(`, `.create(`, `.dupe(`).  The
+//                  field's storage was minted by `self` here.
+//   - `neutral`  — RHS is `undefined`, `.empty`, or starts with `.{`
+//                  or `&.{`.  These are sentinels / default values
+//                  that don't import storage from elsewhere; they
+//                  neither support nor disqualify a borrow inference.
+//   - `other`    — anything else.  Could be a caller-provided value
+//                  (`self.f = arg`), a delegated alloc through an
+//                  unrecognised helper, etc.  We can't tell, so we
+//                  conservatively disqualify the field.
+//
+// A field is inferred `@borrowed` iff at least one alloc-shape
+// write was observed AND no `other`-class writes exist.  Composes
+// with explicit `/// @borrowed` annotations — the union of explicit
+// and inferred entries seeds `db.borrowed_fields`.
+//
+// Walks tokens (not the AST) because we need to scan many methods
+// quickly and the only structural fact we care about is "<ident> .
+// <ident> = ..."; a full-tree recursion would cost more.
+
+const FieldStats = struct {
+    alloc_writes: u32 = 0,
+    other_writes: u32 = 0,
+};
+
+const RhsClass = enum { alloc, neutral, other };
+
+fn inferBorrowedFields(
+    gpa: std.mem.Allocator,
+    tree: *const Ast,
+    db: *Db,
+    alloc_patterns: []const []const u8,
+) !void {
+    var stats: std.HashMapUnmanaged(Db.FieldKey, FieldStats, Db.FieldKey.Context, std.hash_map.default_max_load_percentage) = .empty;
+    defer stats.deinit(gpa);
+
+    var it = db.containing_types.iterator();
+    while (it.next()) |entry| {
+        const fn_decl = entry.key_ptr.*;
+        const ct = entry.value_ptr.*;
+        if (tree.nodeTag(fn_decl) != .fn_decl) continue;
+        const body = tree.nodeData(fn_decl).node_and_node[1];
+
+        // Build the set of identifier names that, within this body,
+        // are bound to the container type.  Includes the first
+        // param when its type matches (`self: *Owner`), plus any
+        // var/const decl whose annotated type matches
+        // (`var o: Owner = ...`).  Implicit-typed decls
+        // (`var o = Owner{...}`) are skipped — adding them needs
+        // type inference we'd rather punt on for now.
+        var self_names: std.StringHashMapUnmanaged(void) = .empty;
+        defer self_names.deinit(gpa);
+        if (firstSelfParamName(tree, fn_decl, ct)) |sn| {
+            try self_names.put(gpa, sn, {});
+        }
+        try collectCtLocals(tree, body, ct, gpa, &self_names);
+        if (self_names.count() == 0) continue;
+
+        try scanBodyForFieldWrites(tree, body, &self_names, ct, alloc_patterns, gpa, &stats);
+    }
+
+    var stats_it = stats.iterator();
+    while (stats_it.next()) |entry| {
+        const s = entry.value_ptr.*;
+        if (s.alloc_writes >= 1 and s.other_writes == 0) {
+            try db.borrowed_fields.putContext(gpa, entry.key_ptr.*, {}, .{});
+        }
+    }
+}
+
+/// First param's name when its type (after stripping pointer / const
+/// / optional wrappers) matches the enclosing container.  Returns
+/// null for free functions and for methods whose first param has a
+/// different type (rare but legal — top-level `fn` declared inside
+/// a struct).
+fn firstSelfParamName(
+    tree: *const Ast,
+    fn_decl: Ast.Node.Index,
+    ct: []const u8,
+) ?[]const u8 {
+    var buf: [1]Ast.Node.Index = undefined;
+    const fn_proto = fullFnProto(tree, &buf, fn_decl) orelse return null;
+    var it = fn_proto.iterate(tree);
+    const first = it.next() orelse return null;
+    const name_tok = first.name_token orelse return null;
+    const type_expr = first.type_expr orelse return null;
+    const ty = stripTypeWrappers(tree, type_expr, ct) orelse return null;
+    if (!std.mem.eql(u8, ty, ct)) return null;
+    return tree.tokenSlice(name_tok);
+}
+
+/// Token-scan a function body for `var/const <name> : <T> = ...`
+/// declarations whose annotated type matches `ct`, and add each
+/// name to `self_names`.  Catches the common constructor idiom
+/// where the to-be-returned value is a typed local:
+///
+///     pub fn init(...) Owner {
+///         var o: Owner = .{};      // ← adds "o"
+///         o.data = try ...;
+///         return o;
+///     }
+fn collectCtLocals(
+    tree: *const Ast,
+    body: Ast.Node.Index,
+    ct: []const u8,
+    gpa: std.mem.Allocator,
+    self_names: *std.StringHashMapUnmanaged(void),
+) !void {
+    const first = tree.firstToken(body);
+    const last = tree.lastToken(body);
+    const tags = tree.tokens.items(.tag);
+
+    var t: Ast.TokenIndex = first;
+    while (t <= last) : (t += 1) {
+        const tag = tags[t];
+        if (tag != .keyword_var and tag != .keyword_const) continue;
+        if (t + 2 > last) continue;
+        if (tags[t + 1] != .identifier) continue;
+        if (tags[t + 2] != .colon) continue;
+
+        // Type expression spans from t+3 to the next `=` (or end).
+        // Walk for the first identifier and stripTypeWrappers on
+        // the source span between t+3 and the terminator.
+        var ty_end: Ast.TokenIndex = t + 3;
+        var paren: i32 = 0;
+        while (ty_end <= last) : (ty_end += 1) {
+            const tt = tags[ty_end];
+            switch (tt) {
+                .l_paren, .l_bracket, .l_brace => paren += 1,
+                .r_paren, .r_bracket, .r_brace => paren -= 1,
+                .equal, .semicolon, .comma => if (paren == 0) break,
+                else => {},
+            }
+        }
+        if (ty_end <= t + 3) continue;
+        const last_ty_tok = ty_end - 1;
+
+        // Match: stripTypeWrappers expects a single type-expression
+        // node, but we only have a token range.  Walk forward
+        // skipping `?` / `*` / `const` and read the first identifier;
+        // compare with ct.  Skip more elaborate types (slices,
+        // arrays, function ptrs) — they aren't the container.
+        var p: Ast.TokenIndex = t + 3;
+        while (p <= last_ty_tok) : (p += 1) {
+            switch (tags[p]) {
+                .question_mark, .asterisk, .keyword_const => continue,
+                .identifier => break,
+                else => break,
+            }
+        }
+        if (p > last_ty_tok) continue;
+        if (tags[p] != .identifier) continue;
+        // Walk a dotted chain (`lib.Owner`) — take the last segment.
+        var name_tok = p;
+        var q: Ast.TokenIndex = p + 1;
+        while (q + 1 <= last_ty_tok) : (q += 2) {
+            if (tags[q] != .period) break;
+            if (tags[q + 1] != .identifier) break;
+            name_tok = q + 1;
+        }
+        const ty_name = tree.tokenSlice(name_tok);
+        if (!std.mem.eql(u8, ty_name, ct)) continue;
+
+        const local_name = tree.tokenSlice(t + 1);
+        try self_names.put(gpa, local_name, {});
+    }
+}
+
+fn scanBodyForFieldWrites(
+    tree: *const Ast,
+    body: Ast.Node.Index,
+    self_names: *const std.StringHashMapUnmanaged(void),
+    ct: []const u8,
+    alloc_patterns: []const []const u8,
+    gpa: std.mem.Allocator,
+    stats: *std.HashMapUnmanaged(Db.FieldKey, FieldStats, Db.FieldKey.Context, std.hash_map.default_max_load_percentage),
+) !void {
+    const first = tree.firstToken(body);
+    const last = tree.lastToken(body);
+    const tags = tree.tokens.items(.tag);
+    const starts = tree.tokens.items(.start);
+
+    var t: Ast.TokenIndex = first;
+    while (t + 3 <= last) : (t += 1) {
+        if (tags[t] != .identifier) continue;
+        // Skip when this ident is itself a field name in a chain.
+        if (t > 0 and tags[t - 1] == .period) continue;
+        if (!self_names.contains(tree.tokenSlice(t))) continue;
+        if (tags[t + 1] != .period) continue;
+        if (tags[t + 2] != .identifier) continue;
+        if (tags[t + 3] != .equal) continue;
+
+        const field_name = tree.tokenSlice(t + 2);
+
+        // Locate the matching `;` at top-level paren/brace/bracket
+        // depth.  Defensive: stop at `last` if the body is malformed.
+        var paren: i32 = 0;
+        var brace: i32 = 0;
+        var bracket: i32 = 0;
+        var rhs_end: Ast.TokenIndex = t + 4;
+        while (rhs_end <= last) : (rhs_end += 1) {
+            switch (tags[rhs_end]) {
+                .l_paren => paren += 1,
+                .r_paren => paren -= 1,
+                .l_brace => brace += 1,
+                .r_brace => brace -= 1,
+                .l_bracket => bracket += 1,
+                .r_bracket => bracket -= 1,
+                .semicolon => if (paren == 0 and brace == 0 and bracket == 0) break,
+                else => {},
+            }
+        }
+        const rhs_start_byte = starts[t + 4];
+        const rhs_end_byte = if (rhs_end <= last) starts[rhs_end] else tree.source.len;
+        const rhs_text = tree.source[rhs_start_byte..rhs_end_byte];
+
+        const cls = classifyRhsText(rhs_text, alloc_patterns);
+        const key: Db.FieldKey = .{ .containing_type = ct, .name = field_name };
+        const gop = try stats.getOrPutContext(gpa, key, .{});
+        if (!gop.found_existing) gop.value_ptr.* = .{};
+        switch (cls) {
+            .alloc => gop.value_ptr.alloc_writes += 1,
+            .neutral => {},
+            .other => gop.value_ptr.other_writes += 1,
+        }
+
+        // Skip the scanner past this write so the same `=` isn't
+        // re-processed.
+        t = rhs_end;
+    }
+}
+
+fn classifyRhsText(text: []const u8, alloc_patterns: []const []const u8) RhsClass {
+    const trimmed = std.mem.trim(u8, text, " \t\n\r");
+    if (std.mem.eql(u8, trimmed, "undefined")) return .neutral;
+    if (std.mem.eql(u8, trimmed, ".empty")) return .neutral;
+    if (std.mem.startsWith(u8, trimmed, ".{")) return .neutral;
+    if (std.mem.startsWith(u8, trimmed, "&.{")) return .neutral;
+    for (alloc_patterns) |pat| {
+        if (std.mem.indexOf(u8, text, pat) != null) return .alloc;
+    }
+    return .other;
 }
 
 /// Dispatch on container_decl variant and recurse with the right
