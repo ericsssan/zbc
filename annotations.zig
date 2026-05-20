@@ -1626,9 +1626,24 @@ fn inferBorrowedFields(
             try self_names.put(gpa, sn, {});
         }
         try collectCtLocals(tree, body, ct, gpa, &self_names);
-        if (self_names.count() == 0) continue;
 
-        try scanBodyForFieldWrites(tree, body, &self_names, ct, alloc_patterns, gpa, &stats);
+        if (self_names.count() > 0) {
+            try scanBodyForFieldWrites(tree, body, &self_names, ct, alloc_patterns, gpa, &stats);
+        }
+
+        // Constructor-shape inference — when this fn's return type
+        // resolves to `ct`, treat the fields of any top-level
+        // `return .{ ... }` or `return T{ ... }` as direct writes
+        // to the about-to-be-returned value.  Catches:
+        //
+        //     pub fn init(alloc: Allocator) Owner {
+        //         return .{ .data = try alloc.alloc(...) };
+        //     }
+        //
+        // which the `<self>.<field> =` scanner above can't see.
+        if (fnReturnTypeMatches(tree, fn_decl, ct)) {
+            try scanReturnStructLiterals(tree, body, ct, alloc_patterns, gpa, &stats);
+        }
     }
 
     var stats_it = stats.iterator();
@@ -1812,6 +1827,109 @@ fn classifyRhsText(text: []const u8, alloc_patterns: []const []const u8) RhsClas
         if (std.mem.indexOf(u8, text, pat) != null) return .alloc;
     }
     return .other;
+}
+
+/// True iff the fn's declared return type carries `ct` as its base
+/// identifier — `Owner`, `!Owner`, `?Owner`, `*Owner`,
+/// `anyerror!Owner`, `Allocator.Error!Owner` all match "Owner".
+/// Walks the return-type tokens backward looking for the LAST
+/// identifier, since `<errset>!<payload>` puts the payload type
+/// after the error set.
+fn fnReturnTypeMatches(tree: *const Ast, fn_decl: Ast.Node.Index, ct: []const u8) bool {
+    var buf: [1]Ast.Node.Index = undefined;
+    const fn_proto = fullFnProto(tree, &buf, fn_decl) orelse return false;
+    const rt = fn_proto.ast.return_type.unwrap() orelse return false;
+    const first = tree.firstToken(rt);
+    const last = tree.lastToken(rt);
+    const tags = tree.tokens.items(.tag);
+    var t: Ast.TokenIndex = last;
+    while (true) {
+        if (tags[t] == .identifier) {
+            return std.mem.eql(u8, tree.tokenSlice(t), ct);
+        }
+        if (t == first) return false;
+        t -= 1;
+    }
+}
+
+/// Walk every struct_init node in the file; for each one inside
+/// `body`'s token range AND immediately preceded by the `return`
+/// keyword, classify the field initializers as alloc / neutral /
+/// other and update `stats`.  Inner nested struct literals are NOT
+/// recursed into here — their preceding token isn't `return`, so
+/// they're silently skipped (matches the conservatism elsewhere in
+/// this module).
+fn scanReturnStructLiterals(
+    tree: *const Ast,
+    body: Ast.Node.Index,
+    ct: []const u8,
+    alloc_patterns: []const []const u8,
+    gpa: std.mem.Allocator,
+    stats: *std.HashMapUnmanaged(Db.FieldKey, FieldStats, Db.FieldKey.Context, std.hash_map.default_max_load_percentage),
+) !void {
+    const body_first = tree.firstToken(body);
+    const body_last = tree.lastToken(body);
+    const tags = tree.tokens.items(.tag);
+    const starts = tree.tokens.items(.start);
+
+    var node_idx: u32 = 1;
+    while (node_idx < tree.nodes.len) : (node_idx += 1) {
+        const node: Ast.Node.Index = @enumFromInt(node_idx);
+        const is_si = switch (tree.nodeTag(node)) {
+            .struct_init,
+            .struct_init_comma,
+            .struct_init_one,
+            .struct_init_one_comma,
+            .struct_init_dot,
+            .struct_init_dot_comma,
+            .struct_init_dot_two,
+            .struct_init_dot_two_comma,
+            => true,
+            else => false,
+        };
+        if (!is_si) continue;
+
+        const t0 = tree.firstToken(node);
+        if (t0 < body_first or t0 > body_last) continue;
+        if (t0 == 0) continue;
+        if (tags[t0 - 1] != .keyword_return) continue;
+
+        var buf: [2]Ast.Node.Index = undefined;
+        const si = tree.fullStructInit(&buf, node) orelse continue;
+        for (si.ast.fields) |field_value| {
+            const fname = scannedFieldInitName(tree, field_value) orelse continue;
+            const fl_first = tree.firstToken(field_value);
+            const fl_last = tree.lastToken(field_value);
+            const rhs_start = starts[fl_first];
+            const rhs_end = starts[fl_last] + tree.tokenSlice(fl_last).len;
+            const rhs_text = tree.source[rhs_start..rhs_end];
+
+            const cls = classifyRhsText(rhs_text, alloc_patterns);
+            const key: Db.FieldKey = .{ .containing_type = ct, .name = fname };
+            const gop = try stats.getOrPutContext(gpa, key, .{});
+            if (!gop.found_existing) gop.value_ptr.* = .{};
+            switch (cls) {
+                .alloc => gop.value_ptr.alloc_writes += 1,
+                .neutral => {},
+                .other => gop.value_ptr.other_writes += 1,
+            }
+        }
+    }
+}
+
+/// Recover the field name for a struct-literal field initializer
+/// of the shape `.name = <value>`.  The `<value>` node's firstToken
+/// is preceded by `=`, `name`, `.` — return `name`.  Mirrors
+/// cfg.zig's `fieldInitName`; duplicated here so this module
+/// doesn't depend on cfg.
+fn scannedFieldInitName(tree: *const Ast, field_value: Ast.Node.Index) ?[]const u8 {
+    const first = tree.firstToken(field_value);
+    if (first < 3) return null;
+    const tags = tree.tokens.items(.tag);
+    if (tags[first - 1] != .equal) return null;
+    if (tags[first - 2] != .identifier) return null;
+    if (tags[first - 3] != .period) return null;
+    return tree.tokenSlice(first - 2);
 }
 
 /// Dispatch on container_decl variant and recurse with the right
