@@ -162,6 +162,51 @@ test "lib API: analyzeEscape end-to-end flags arena escape" {
     try std.testing.expect(found);
 }
 
+test "lib API: cross-file R8 inference fires UAF through imported alloc/free wrappers" {
+    const gpa = std.testing.allocator;
+    const tio = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(tio, .{ .sub_path = "heap_lib.zig", .data =
+        \\const std = @import("std");
+        \\pub fn xalloc(g: std.mem.Allocator, n: usize) []u8 {
+        \\    return g.alloc(u8, n) catch unreachable;
+        \\}
+        \\pub fn dispose(g: std.mem.Allocator, p: []u8) void {
+        \\    g.free(p);
+        \\}
+        \\
+    });
+    try tmp.dir.writeFile(tio, .{ .sub_path = "main.zig", .data =
+        \\const std = @import("std");
+        \\const lib = @import("heap_lib.zig");
+        \\pub fn caller(g: std.mem.Allocator) []u8 {
+        \\    const buf = lib.xalloc(g, 16);
+        \\    lib.dispose(g, buf);
+        \\    return buf;
+        \\}
+        \\
+    });
+
+    const base_dir = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer gpa.free(base_dir);
+    const path = try std.fs.path.join(gpa, &.{ base_dir, "main.zig" });
+    defer gpa.free(path);
+
+    var cache = Cache.init(gpa, tio);
+    defer cache.deinit();
+
+    const problems = try analyzeEscape(gpa, tio, path, &cache, &DefaultConfig);
+    defer freeProblems(gpa, problems);
+
+    var found = false;
+    for (problems) |p| {
+        if (std.mem.indexOf(u8, p.message, "after free") != null) found = true;
+    }
+    try std.testing.expect(found);
+}
+
 test "lib API: analyzeEscape with null cache still works on same-file annotations" {
     const gpa = std.testing.allocator;
     const tio = std.testing.io;

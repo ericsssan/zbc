@@ -1411,40 +1411,56 @@ const Builder = struct {
     }
 
     /// If the callee has `@takes ownership(p)`, return the LocalId
-    /// of the actual arg that maps to p.  Null on any other shape.
+    /// of the actual arg that maps to p.  Consults the same-file
+    /// annotation DB AND (when remote context is available) the
+    /// imported file's DB for cross-file wrappers.  Null on miss.
     fn takesOwnershipFreedLocal(self: *Builder, call_node: Ast.Node.Index) ?LocalId {
         const tree = self.tree;
-        const db = self.db orelse return null;
         var buf: [1]Ast.Node.Index = undefined;
         const call_full = tree.fullCall(&buf, call_node) orelse return null;
         const callee = call_full.ast.fn_expr;
 
-        // Extract callee name + receiver-is-arg0 flag for the lookup.
         const method_tok = switch (tree.nodeTag(callee)) {
             .identifier => tree.nodeMainToken(callee),
             .field_access => tree.nodeData(callee).node_and_token[1],
             else => return null,
         };
         const callee_name = tree.tokenSlice(method_tok);
-        const entry = db.lookup(callee_name) orelse return null;
-        const takes = entry.takes orelse return null;
-        const target_idx = switch (takes) {
-            .ownership => |i| i,
-        };
-
-        // For method-style (field_access callee), args[0] is the
-        // receiver from the source's perspective.  ast.params is the
-        // EXPLICIT arg list which excludes the receiver, so shift.
         const receiver_is_arg0 = tree.nodeTag(callee) == .field_access;
         const recv_node: ?Ast.Node.Index = if (receiver_is_arg0)
             tree.nodeData(callee).node_and_token[0]
         else
             null;
 
-        const candidate = if (receiver_is_arg0 and target_idx == 0)
+        // Look up @takes annotation.  Try same-file first.  For
+        // `lib.dispose(...)` shape (recv is an imported namespace),
+        // also try the remote file's DB.
+        const takes = blk: {
+            if (self.db) |db| {
+                if (db.lookup(callee_name)) |entry| {
+                    if (entry.takes) |t| break :blk t;
+                }
+            }
+            if (receiver_is_arg0) {
+                if (self.lookupRemoteTakes(recv_node.?, callee_name)) |t| break :blk t;
+            }
+            return null;
+        };
+
+        const target_idx = switch (takes) {
+            .ownership => |i| i,
+        };
+
+        // For cross-file namespace calls (`lib.dispose(g, buf)`), the
+        // receiver IS the imported namespace — not part of the
+        // callee's logical arg list.  ast.params already holds the
+        // full explicit-arg list; don't subtract for the namespace.
+        const effective_recv_is_arg0 = receiver_is_arg0 and !self.calleeIsImportedNamespace(recv_node.?);
+
+        const candidate = if (effective_recv_is_arg0 and target_idx == 0)
             recv_node.?
         else blk: {
-            const explicit_idx = if (receiver_is_arg0) target_idx - 1 else target_idx;
+            const explicit_idx = if (effective_recv_is_arg0) target_idx - 1 else target_idx;
             if (explicit_idx >= call_full.ast.params.len) return null;
             break :blk call_full.ast.params[explicit_idx];
         };
@@ -1452,6 +1468,34 @@ const Builder = struct {
         if (tree.nodeTag(candidate) != .identifier) return null;
         const name = tree.tokenSlice(tree.nodeMainToken(candidate));
         return self.name_to_local.get(name);
+    }
+
+    /// Cross-file `@takes` lookup — see lookupRemoteMethod for the
+    /// resolution mechanics.
+    fn lookupRemoteTakes(
+        self: *Builder,
+        recv_node: Ast.Node.Index,
+        method_name: []const u8,
+    ) ?annotations.TakesAnnotation {
+        const remote = self.remote orelse return null;
+        const tree = self.tree;
+        if (tree.nodeTag(recv_node) != .identifier) return null;
+        const recv_name = tree.tokenSlice(tree.nodeMainToken(recv_node));
+        const imap_entry = remote.imap.lookup(recv_name) orelse return null;
+        const remote_file = (remote.cache.loadOrLookup(remote.base_dir, imap_entry.path) catch return null) orelse return null;
+        const entry = remote_file.db.lookup(method_name) orelse return null;
+        return entry.takes;
+    }
+
+    /// True iff `node` is a bare identifier that resolves to an
+    /// imported namespace in our imap (e.g. `lib` in `lib.foo(...)`).
+    /// Used to disambiguate method-style calls from namespace calls.
+    fn calleeIsImportedNamespace(self: *Builder, node: Ast.Node.Index) bool {
+        const remote = self.remote orelse return false;
+        const tree = self.tree;
+        if (tree.nodeTag(node) != .identifier) return false;
+        const name = tree.tokenSlice(tree.nodeMainToken(node));
+        return remote.imap.lookup(name) != null;
     }
 
     /// For `<allocator>.free(p)` / `<allocator>.destroy(p)`, return the
@@ -1861,19 +1905,25 @@ const Builder = struct {
         }
     }
 
-    /// Cross-file resolution.  Uses resolveRemoteFile so it accepts
-    /// both single-hop (`imported.method`) and nested
-    /// (`imported.Sub.method`) receiver shapes.  Returns null on any
-    /// miss.
+    /// Cross-file annotation lookup.  When the call shape is
+    /// `<imported>.<method>(...)`, resolve `imported` through the
+    /// local imap to a path, load that file's annotation DB through
+    /// the sweep-wide remote cache, and return `method`'s annotation
+    /// (if any).  Returns null on any miss — never errors; callers
+    /// must treat missing remote info as "no annotation."
     fn lookupRemoteMethod(
         self: *Builder,
         recv_node: Ast.Node.Index,
         method_name: []const u8,
     ) ?annotations.ReturnsAnnotation {
-        _ = self;
-        _ = recv_node;
-        _ = method_name;
-        return null;
+        const remote = self.remote orelse return null;
+        const tree = self.tree;
+        if (tree.nodeTag(recv_node) != .identifier) return null;
+        const recv_name = tree.tokenSlice(tree.nodeMainToken(recv_node));
+        const imap_entry = remote.imap.lookup(recv_name) orelse return null;
+        const remote_file = (remote.cache.loadOrLookup(remote.base_dir, imap_entry.path) catch return null) orelse return null;
+        const entry = remote_file.db.lookup(method_name) orelse return null;
+        return entry.annotation;
     }
 
     fn applyAnnotationToCall(
