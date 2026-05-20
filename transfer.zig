@@ -202,6 +202,15 @@ fn transferFieldAssign(
     const origin = try originOfInit(ctx, state, a.rhs_kind, pos);
     const key: state_mod.FieldKey = .{ .parent = a.parent, .name = a.name };
     try state.fields.putContext(ctx.gpa, key, origin, .{});
+
+    // Field assignment initializes the parent (partially).  Clear
+    // the parent's .undef so `var x = undefined; x.field = val;
+    // return x;` doesn't fire spuriously — common Zig idiom.
+    if (state.locals.get(a.parent)) |parent_origin| {
+        if (parent_origin == .undef) {
+            try state.locals.put(ctx.gpa, a.parent, .plain);
+        }
+    }
 }
 
 fn transferFieldHeapFree(

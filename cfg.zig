@@ -552,18 +552,37 @@ const Builder = struct {
         const tree = self.tree;
         var stmt_buf: [2]Ast.Node.Index = undefined;
         const stmts = blockStmts(tree, block_node, &stmt_buf);
+
+        // Scope-bound defer handling.  Zig defers fire at the
+        // enclosing BLOCK's exit, not just at return.  We snapshot
+        // both stacks here; any defer pushed inside this block is
+        // fired (in LIFO order) at fallthrough exit, then popped
+        // so a later return doesn't re-fire it from an already-
+        // exited scope.  Errdefers follow the same scope rule.
+        const def_save = self.deferred_normal.items.len;
+        const errdef_save = self.deferred_err.items.len;
+
         for (stmts) |stmt_idx| {
             try self.lowerStmt(stmt_idx, cur);
         }
+
+        // Fire defers added inside this block at fallthrough exit.
+        // Errdefers do NOT fire on fallthrough (success path) — they
+        // only fire on error returns, handled in flushErrAndNormalDefers.
+        var i = self.deferred_normal.items.len;
+        while (i > def_save) {
+            i -= 1;
+            try self.lowerStmt(self.deferred_normal.items[i], cur);
+        }
+        self.deferred_normal.shrinkRetainingCapacity(def_save);
+        self.deferred_err.shrinkRetainingCapacity(errdef_save);
     }
 
-    /// Lower the top-level function body — same as lowerBlock but flushes
-    /// pending defers at the end (implicit-fallthrough return).  Only the
-    /// outermost block of a function does this; nested blocks defer to
-    /// their enclosing return statements.
+    /// Lower the top-level function body.  lowerBlock now flushes
+    /// its own defers at fallthrough exit, so no separate flush is
+    /// needed here.
     fn lowerFunctionBody(self: *Builder, body_node: Ast.Node.Index, cur: *BlockId) !void {
         try self.lowerBlock(body_node, cur);
-        try self.flushDefers(cur);
     }
 
     fn pushDefer(self: *Builder, body_node: Ast.Node.Index) !void {
@@ -916,7 +935,7 @@ const Builder = struct {
         // Success path: side-effects of the wrapped expression.
         try self.lowerStmt(inner, cur);
         // Error path: synthetic sink.
-        try self.emitTryErrorExit(cur.*, self.posOf(try_node));
+        try self.emitTryErrorExit(cur, self.posOf(try_node));
     }
 
     /// Is this block node labeled (`blk: { ... }`)?  Returns the
@@ -1096,9 +1115,17 @@ const Builder = struct {
     /// Used by both `lowerTryStmt` and `lowerVarDecl` (when init is a
     /// top-level `.@"try"`).  The sink is a new block reachable from
     /// `from` with errdefer + defer replayed, terminated by a ret.
-    fn emitTryErrorExit(self: *Builder, from: BlockId, pos: SrcPos) !void {
+    fn emitTryErrorExit(self: *Builder, cur: *BlockId, pos: SrcPos) !void {
+        // Split: success path continues in a FRESH block.  Without
+        // this, subsequent stmts emitted into the original `cur`
+        // would propagate their post-state into the err_exit sink
+        // (via the cur→err_exit edge), causing the sink to see e.g.
+        // post-defer-free state and fire spurious double-free.
         const err_exit = try self.newBlock();
-        try self.addEdge(from, err_exit);
+        const post_try = try self.newBlock();
+        try self.addEdge(cur.*, err_exit);
+        try self.addEdge(cur.*, post_try);
+
         var err_cur = err_exit;
         try self.flushErrAndNormalDefers(&err_cur);
         try self.appendStmt(err_cur, .{
@@ -1111,6 +1138,8 @@ const Builder = struct {
             // to a single-column range via end_pos = pos.
             .end_pos = pos,
         });
+
+        cur.* = post_try;
     }
 
     /// `lhs catch BODY` at statement position — forks into two paths:
@@ -1198,8 +1227,9 @@ const Builder = struct {
         // lower the body FIRST so its side effects + break paths run
         // before the binding takes effect.  cur advances to the
         // post-merge; the .decl emits there with .unknown init_kind.
+        var init_was_labeled_block = false;
         if (init_opt) |init| {
-            if (try self.maybeLowerLabeledBlockExpr(init, cur)) {}
+            init_was_labeled_block = try self.maybeLowerLabeledBlockExpr(init, cur);
         }
 
         const init_kind: ExprKind = if (init_opt) |init|
@@ -1240,7 +1270,14 @@ const Builder = struct {
 
         // Emit .use stmts for every local read by the init expression
         // (before the .decl so the read is checked against pre-decl state).
-        if (init_opt) |init| try self.emitUsesInExpr(init, cur.*, null);
+        // Skip emitUsesInExpr when init was a labeled block — the
+        // block's body already lowered each inner stmt (with its
+        // own .use/.assign emissions).  Walking the whole init
+        // expression's tokens would incorrectly emit .use for LHS
+        // identifiers of inner assigns.
+        if (!init_was_labeled_block) {
+            if (init_opt) |init| try self.emitUsesInExpr(init, cur.*, null);
+        }
 
         try self.appendStmt(cur.*, .{
             .kind = .{ .decl = .{ .local = local, .init_kind = effective_init_kind } },
@@ -1257,7 +1294,7 @@ const Builder = struct {
         // and unmodeled (yields a sink-less success-only path).
         if (init_opt) |init| {
             switch (tree.nodeTag(init)) {
-                .@"try" => try self.emitTryErrorExit(cur.*, self.posOf(init)),
+                .@"try" => try self.emitTryErrorExit(cur, self.posOf(init)),
                 .@"catch" => try self.emitCatchFork(init, cur),
                 else => {},
             }
@@ -1345,7 +1382,7 @@ const Builder = struct {
 
         // Mirror the init-position try/catch dispatch.
         switch (tree.nodeTag(rhs)) {
-            .@"try" => try self.emitTryErrorExit(cur.*, self.posOf(rhs)),
+            .@"try" => try self.emitTryErrorExit(cur, self.posOf(rhs)),
             .@"catch" => try self.emitCatchFork(rhs, cur),
             else => {},
         }
@@ -1420,7 +1457,7 @@ const Builder = struct {
         // per-target emissions (so the success path has the assigns
         // visible before the error-exit / catch fork branches off).
         switch (tree.nodeTag(rhs)) {
-            .@"try" => try self.emitTryErrorExit(cur.*, self.posOf(rhs)),
+            .@"try" => try self.emitTryErrorExit(cur, self.posOf(rhs)),
             .@"catch" => try self.emitCatchFork(rhs, cur),
             else => {},
         }
@@ -1439,7 +1476,7 @@ const Builder = struct {
         // success-path return.
         if (value_opt) |expr| {
             switch (tree.nodeTag(expr)) {
-                .@"try" => try self.emitTryErrorExit(cur.*, self.posOf(expr)),
+                .@"try" => try self.emitTryErrorExit(cur, self.posOf(expr)),
                 .@"catch" => try self.emitCatchFork(expr, cur),
                 else => {},
             }
@@ -2095,28 +2132,33 @@ const Builder = struct {
             return self.classifyCall(expr_node);
         }
 
-        // Composite escape fallback — for shapes we didn't classify
-        // above (struct literals, anonymous inits, etc.), scan tokens
-        // for borrow patterns and treat the whole expression as
-        // carrying that local's frame lifetime.  Two flavors:
-        //
-        //  - explicit borrows (`&local`, `local[..]`)  → .stack_ref
-        //    Fires stack_escape regardless of return type.
-        //
-        //  - resource-method borrows (`arena_local.text()` where
-        //    the method is annotated `@returns borrowed_from(self)`
-        //    and `arena_local` was declared via ArenaAllocator.init)
-        //                                              → .composite_borrow
-        //    Propagates the local's origin (.arena/.heap) and
-        //    transferRet fires arena_escape / heap UAF regardless
-        //    of return type.  Suppressed by `@returns owns_locals`
-        //    on the enclosing fn.
-        if (self.firstAddressedLocal(expr_node)) |id| {
-            return .{ .stack_ref = id };
-        }
-        if (!self.suppress_composite_borrow) {
-            if (self.firstResourceMethodBorrow(expr_node)) |id| {
-                return .{ .composite_borrow = id };
+        // Composite escape fallback — only fires for expressions
+        // whose TOP-LEVEL shape is a composite literal (struct or
+        // array init).  For other shapes (binary ops, catch chains,
+        // parens, ifs, etc.) an `&local` token sequence inside is
+        // typically a call arg buried in the expression, not part
+        // of the return value's shape — firing would produce a
+        // flood of false positives like `return (call(&buf)) != 0`.
+        const is_composite_literal = switch (tag) {
+            .struct_init, .struct_init_comma,
+            .struct_init_one, .struct_init_one_comma,
+            .struct_init_dot, .struct_init_dot_comma,
+            .struct_init_dot_two, .struct_init_dot_two_comma,
+            .array_init, .array_init_comma,
+            .array_init_one, .array_init_one_comma,
+            .array_init_dot, .array_init_dot_comma,
+            .array_init_dot_two, .array_init_dot_two_comma,
+            => true,
+            else => false,
+        };
+        if (is_composite_literal) {
+            if (self.firstAddressedLocal(expr_node)) |id| {
+                return .{ .stack_ref = id };
+            }
+            if (!self.suppress_composite_borrow) {
+                if (self.firstResourceMethodBorrow(expr_node)) |id| {
+                    return .{ .composite_borrow = id };
+                }
             }
         }
 
@@ -2145,15 +2187,20 @@ const Builder = struct {
         defer seen.deinit(self.gpa);
         if (primary_local) |p| try seen.put(self.gpa, p, {});
 
+        // Same depth-gate as firstAddressedLocal: only direct field
+        // values of the outermost composite literal, not nested
+        // inside call args / switch arms / sub-literals.
+        var depth: i32 = 0;
         var t: Ast.TokenIndex = first;
         while (t <= last) : (t += 1) {
+            switch (tags[t]) {
+                .l_brace, .l_paren, .l_bracket => depth += 1,
+                .r_brace, .r_paren, .r_bracket => depth -= 1,
+                else => {},
+            }
+            if (depth != 1) continue;
             const id_opt: ?LocalId = blk: {
                 if (tags[t] == .ampersand and t + 1 <= last and tags[t + 1] == .identifier) {
-                    // Skip `&local.field` / `&local[i]` — the
-                    // address-of binds to the whole field/element
-                    // expression, which typically references
-                    // caller-owned storage through the local's
-                    // pointer/slice/etc.
                     if (t + 2 <= last) {
                         const next = tags[t + 2];
                         if (next == .period or next == .l_bracket) break :blk null;
@@ -2192,12 +2239,26 @@ const Builder = struct {
         const last = tree.lastToken(expr_node);
         const tags = tree.tokens.items(.tag);
 
+        // Bracket-depth tracker: only fire at depth == 1 (direct
+        // field values of the OUTERMOST struct/array literal).  At
+        // depth 0 we'd match expressions outside the literal (we
+        // skip that anyway since callers gate on the literal tag).
+        // At depth 2+ we're inside nested calls, switch arms,
+        // sub-literals — `&local` there is rarely a field value.
+        var depth: i32 = 0;
         var t: Ast.TokenIndex = first;
         while (t <= last) : (t += 1) {
+            switch (tags[t]) {
+                .l_brace, .l_paren, .l_bracket => depth += 1,
+                .r_brace, .r_paren, .r_bracket => depth -= 1,
+                else => {},
+            }
+            if (depth != 1) continue;
+
             // Address-of pattern: `& <ident>` where `<ident>` is the
-            // WHOLE address-of operand (not `&local.field` or
-            // `&local[i]` — those take the address of memory the
-            // local merely points INTO, typically caller-owned).
+            // WHOLE address-of operand (not `&local.field` /
+            // `&local[i]` — those address memory the local merely
+            // points INTO, typically caller-owned).
             if (tags[t] == .ampersand and t + 1 <= last and tags[t + 1] == .identifier) {
                 if (t + 2 <= last) {
                     const next = tags[t + 2];
