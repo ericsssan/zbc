@@ -334,12 +334,20 @@ fn transferGap(
     _ = g;
     _ = pos;
     _ = ctx;
-    // Conservative: collapse every local's origin to .plain — we don't
-    // know what the gap statement did.  Arena liveness is preserved
-    // (gaps shouldn't kill arenas — if they did, we'd model them
-    // properly in cfg.zig).
+    // Conservative: collapse .undef → .plain since an unknown stmt
+    // may have written through a passed pointer to initialize the
+    // local.  But PRESERVE resource origins (.heap, .arena,
+    // .arena_borrow, .stack_ref) — an unknown call can't free a
+    // tracked allocation or kill an arena unless it matches a free /
+    // arena-kill pattern (in which case cfg lowers it as the proper
+    // op, not a gap).  Without this preservation, a single
+    // `foo(args)` between `alloc(args)` and `free(args)` wipes the
+    // .heap origin and defeats double-free / use-after-free tracking
+    // for the rest of the function.
     var it = state.locals.iterator();
-    while (it.next()) |entry| entry.value_ptr.* = .plain;
+    while (it.next()) |entry| {
+        if (entry.value_ptr.* == .undef) entry.value_ptr.* = .plain;
+    }
 }
 
 /// Map an ExprKind (RHS classification) to the Origin it produces.

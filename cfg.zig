@@ -1377,6 +1377,17 @@ const Builder = struct {
                 .pos = self.posOf(assign_node),
                 .end_pos = self.endPosOf(assign_node),
             });
+        } else if (tree.nodeTag(lhs) == .identifier and
+            std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(lhs)), "_"))
+        {
+            // Discard: `_ = expr;`.  Reads the RHS, writes nothing.
+            // CRUCIALLY we must NOT emit a .lowering_gap here — gap
+            // collapses every local to .plain (since it represents
+            // "we don't know what this stmt did").  `_ = x` is a
+            // common idiom (`_ = arg; // autofix`) sprinkled all over
+            // real codebases; treating each as a state wipe defeats
+            // heap / arena tracking everywhere downstream.
+            try self.emitUsesInExpr(rhs, cur.*, null);
         } else {
             // Untracked target (e.g. `@field(obj, ...) = X`,
             // `arr[i] = X`).  For any known local mentioned anywhere in
