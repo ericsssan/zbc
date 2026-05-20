@@ -56,15 +56,6 @@ pub const TakesAnnotation = union(enum) {
     /// for the named param's heap allocation.  Caller emits a
     /// .heap_free against that arg at the call site.
     ownership: u32,
-    /// Inferred-only (no explicit annotation surface) — the call
-    /// frees a FIELD of one of its params.  Set when R10's walker
-    /// sees `<param>.<field>.<method>()` and the resolved method
-    /// is `@takes ownership(0)` (it frees its receiver).
-    ///
-    /// Caller emits `.field_heap_free` on the Nth arg's field at
-    /// the call site.  Field name is borrowed from source — keep
-    /// the tree alive while entries are live.
-    ownership_field: struct { param: u32, field: []const u8 },
 };
 
 pub const FnEntry = struct {
@@ -85,19 +76,18 @@ pub const FnEntry = struct {
     /// Detected at extraction time so call sites can terminate
     /// their basic block (the call diverges, no successor state).
     is_noreturn: bool = false,
-    /// **Inferred receiver-freeing effects (R9 / R10).**  Set when
-    /// the function body contains a free call whose argument is the
-    /// first param's identifier (R9: frees the receiver itself) or
-    /// `<first_param>.<field>` (R10: frees a field).  Conservative —
-    /// the free may be conditional on a runtime branch, but for
-    /// UAF detection "may free" is the safe direction.  At call
-    /// sites, applying these effects lets us catch
-    /// `obj.method(); use(obj);`  /  `obj.freeFoo(); use(obj.foo);`
-    /// — the canonical inter-procedural UAF class.
+    /// (Unused stub; reserved for future R9 self-freeing inference
+    /// that's distinct from R8b's `@takes(ownership)`.)
     may_free_self: bool = false,
-    /// Names of `this.<field>` references that appear as the first
-    /// arg of a free call inside the body.  Owned by the Db's
-    /// arena via the source slice.  Empty when none detected.
+    /// Names of the receiver's (param 0's) fields that the fn body
+    /// destroys via `this.<field>.<destroying-method>()` chains —
+    /// R10's field-chain inference.  Caller emits a
+    /// `.field_heap_free` for each entry on a `<recv>.<this-fn>()`
+    /// call so subsequent reads of `recv.<field>` fire UAF.
+    ///
+    /// Field name slices are borrowed from source (keep tree
+    /// alive); the outer slice is owned by the Db (freed on
+    /// `Db.deinit`).  Empty when no chain matched.
     may_free_fields: []const []const u8 = &.{},
 };
 
@@ -476,20 +466,46 @@ pub fn buildFull(
             const name = tree.tokenSlice(name_tok);
             const ct = fn_to_type.get(node);
             const existing = findByCt(&db, name, ct);
-            // Skip if already has a `takes` — don't overwrite explicit
-            // annotations or R8b's direct-free inference.
-            if (existing != null and existing.?.takes != null) continue;
+            const had_takes = existing != null and existing.?.takes != null;
+            const had_fields = existing != null and existing.?.may_free_fields.len > 0;
+            // Skip fns that already have both kinds of info — no
+            // further inference can add anything.
+            if (had_takes and had_fields) continue;
 
             const body = tree.nodeData(node).node_and_node[1];
-            const inferred = inferTakesViaReceiverCall(tree, fn_proto, body, &db, ct, remote) orelse continue;
+            const inferred = try inferTakesViaReceiverCall(gpa, tree, fn_proto, body, &db, ct, remote);
+
+            // Decide what's NEW.  Don't overwrite existing data —
+            // R8b's direct-free inference + explicit @takes are
+            // higher-confidence than R10's chain inference.
+            const got_new_takes = !had_takes and inferred.takes != null;
+            const got_new_fields = !had_fields and inferred.may_free_fields.len > 0;
+            if (!got_new_takes and !got_new_fields) {
+                // Nothing new — drop any allocated slice on the floor.
+                if (inferred.may_free_fields.len > 0) gpa.free(inferred.may_free_fields);
+                continue;
+            }
+
+            const new_takes = if (had_takes) existing.?.takes else inferred.takes;
+            const new_fields = if (had_fields)
+                existing.?.may_free_fields
+            else
+                inferred.may_free_fields;
+            // Free the unused allocation if we didn't end up
+            // adopting it.
+            if (!got_new_fields and inferred.may_free_fields.len > 0) {
+                gpa.free(inferred.may_free_fields);
+            }
             const ep = try putOrUpdate(&db, gpa, name, ct, .{
                 .name = name,
                 .containing_type = ct,
                 .annotation = if (existing) |e| e.annotation else null,
-                .takes = inferred,
+                .takes = new_takes,
                 .is_noreturn = if (existing) |e| e.is_noreturn else false,
+                .may_free_fields = new_fields,
             });
-            ep.takes = inferred;
+            ep.takes = new_takes;
+            ep.may_free_fields = new_fields;
             added = true;
         }
         if (!added) break;
@@ -540,17 +556,34 @@ fn inferReturnsHeap(
 /// Does NOT recurse through deeper chains like `this.field.method()`
 /// — only direct `<param>.<method>()`.  Deeper field chains would
 /// require type info zbc doesn't track.
+/// R10 inference result.  Either or both fields may be set.
+///   - `takes` is the classic `<param>.<destroying-method>()`
+///     shape (frees the param itself).
+///   - `may_free_fields` is the list of receiver-field names from
+///     `<param=0>.<field>.<destroying-method>()` chains.  Multi-
+///     valued: a wrapper that destroys both `this.a` and `this.b`
+///     gets both names.  Caller owns the slice via gpa.
+const InferReceiverResult = struct {
+    takes: ?TakesAnnotation = null,
+    may_free_fields: []const []const u8 = &.{},
+};
+
 fn inferTakesViaReceiverCall(
+    gpa: std.mem.Allocator,
     tree: *const Ast,
     fn_proto: Ast.full.FnProto,
     body_node: Ast.Node.Index,
     db: *const Db,
     self_type: ?[]const u8,
     remote: ?RemoteCtx,
-) ?TakesAnnotation {
+) !InferReceiverResult {
     const first = tree.firstToken(body_node);
     const last = tree.lastToken(body_node);
     const tags = tree.tokens.items(.tag);
+
+    var result: InferReceiverResult = .{};
+    var fields: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer fields.deinit(gpa);
 
     var t: Ast.TokenIndex = first;
     while (t + 3 <= last) : (t += 1) {
@@ -570,16 +603,23 @@ fn inferTakesViaReceiverCall(
         //   case A: `<param>.<method>(`         — frees the param.
         //   case B: `<param>.<field>.<method>(` — frees a field of the param.
         if (tags[t + 3] == .l_paren) {
-            // CASE A.  method = t+2.
+            // CASE A.  Method on the param itself.
+            if (result.takes != null) continue;  // first match wins
             const method_name = tree.tokenSlice(t + 2);
             const callee = resolveMethod(db, parent_ty, method_name, remote) orelse continue;
             const callee_takes = callee.takes orelse continue;
             switch (callee_takes) {
-                .ownership => |i| if (i == 0) return .{ .ownership = param_idx },
-                .ownership_field => {},
+                .ownership => |i| if (i == 0) {
+                    result.takes = .{ .ownership = param_idx };
+                },
             }
         } else if (t + 5 <= last and tags[t + 3] == .period and tags[t + 4] == .identifier and tags[t + 5] == .l_paren) {
-            // CASE B.  field = t+2, method = t+4.
+            // CASE B.  Field-chain.  Restricted to param 0
+            // (receiver) so the call-site emission is unambiguous
+            // — `<recv>.<this-fn>()` knows recv is param 0's
+            // counterpart.  Field-chains on other params would
+            // need a richer representation.
+            if (param_idx != 0) continue;
             const field_name = tree.tokenSlice(t + 2);
             const method_name = tree.tokenSlice(t + 4);
             const pty = parent_ty orelse continue;
@@ -587,16 +627,28 @@ fn inferTakesViaReceiverCall(
             const callee = resolveMethod(db, field_ty, method_name, remote) orelse continue;
             const callee_takes = callee.takes orelse continue;
             switch (callee_takes) {
-                .ownership => |i| {
+                .ownership => |i| if (i == 0) {
                     // method is @takes(0) on its receiver (the field).
-                    // → THIS fn frees `param.field`.
-                    if (i == 0) return .{ .ownership_field = .{ .param = param_idx, .field = field_name } };
+                    // → THIS fn frees `this.<field>`.  Dedupe so
+                    // multiple occurrences of the same field don't
+                    // produce duplicate diagnostics.
+                    var already_seen = false;
+                    for (fields.items) |existing| {
+                        if (std.mem.eql(u8, existing, field_name)) {
+                            already_seen = true;
+                            break;
+                        }
+                    }
+                    if (!already_seen) try fields.append(gpa, field_name);
                 },
-                .ownership_field => {},
             }
         }
     }
-    return null;
+
+    if (fields.items.len > 0) {
+        result.may_free_fields = try fields.toOwnedSlice(gpa);
+    }
+    return result;
 }
 
 /// Resolve a method by (containing_type, name) — local DB first,

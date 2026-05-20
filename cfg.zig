@@ -2095,16 +2095,18 @@ const Builder = struct {
             });
             return;
         }
-        if (self.takesOwnershipFreedReceiverField(node)) |fref| {
-            try self.appendStmt(cur.*, .{
-                .kind = .{ .field_heap_free = .{ .parent = fref.parent, .name = fref.name, .fallback_hid = blk_hid: {
-                    const h: abstract_state.HeapId = @enumFromInt(self.next_heap);
-                    self.next_heap += 1;
-                    break :blk_hid h;
-                } } },
-                .pos = self.posOf(node),
-                .end_pos = self.endPosOf(node),
-            });
+        if (self.mayFreeReceiverFields(node)) |info| {
+            for (info.fields) |fname| {
+                try self.appendStmt(cur.*, .{
+                    .kind = .{ .field_heap_free = .{ .parent = info.parent, .name = fname, .fallback_hid = blk_hid: {
+                        const h: abstract_state.HeapId = @enumFromInt(self.next_heap);
+                        self.next_heap += 1;
+                        break :blk_hid h;
+                    } } },
+                    .pos = self.posOf(node),
+                    .end_pos = self.endPosOf(node),
+                });
+            }
             return;
         }
     }
@@ -2215,16 +2217,18 @@ const Builder = struct {
             return;
         }
         // `obj.wrapper_method(...)` where wrapper_method has
-        // `@takes ownership_field { param=0, field=F }` — the callee
-        // frees `obj.F`.  Emit .field_heap_free on (obj, F).  This is
+        // `may_free_fields = [F, ...]` — the callee frees `obj.F`
+        // for each F.  Emit a .field_heap_free per field.  This is
         // R10's transitive field-chain case (a wrapper method that
-        // calls `this.F.destroy()` internally).
-        if (self.takesOwnershipFreedReceiverField(call_node)) |fref| {
-            try self.appendStmt(cur.*, .{
-                .kind = .{ .field_heap_free = .{ .parent = fref.parent, .name = fref.name, .fallback_hid = blk_hid: { const h: abstract_state.HeapId = @enumFromInt(self.next_heap); self.next_heap += 1; break :blk_hid h; } } },
-                .pos = self.posOf(call_node),
-                .end_pos = self.endPosOf(call_node),
-            });
+        // calls `this.<F>.destroy()` internally for one or more F).
+        if (self.mayFreeReceiverFields(call_node)) |info| {
+            for (info.fields) |fname| {
+                try self.appendStmt(cur.*, .{
+                    .kind = .{ .field_heap_free = .{ .parent = info.parent, .name = fname, .fallback_hid = blk_hid: { const h: abstract_state.HeapId = @enumFromInt(self.next_heap); self.next_heap += 1; break :blk_hid h; } } },
+                    .pos = self.posOf(call_node),
+                    .end_pos = self.endPosOf(call_node),
+                });
+            }
             return;
         }
 
@@ -2374,10 +2378,6 @@ const Builder = struct {
 
         const target_idx = switch (takes) {
             .ownership => |i| i,
-            // ownership_field is a SEPARATE call-site path
-            // (`takesOwnershipFreedReceiverField`) — emits
-            // .field_heap_free rather than .heap_free.  Skip here.
-            .ownership_field => return null,
         };
 
         // For cross-file namespace calls (`lib.dispose(g, buf)`), the
@@ -2456,10 +2456,6 @@ const Builder = struct {
         };
         switch (takes) {
             .ownership => |idx| if (idx != 0) return null,
-            // ownership_field on `<local>.<field>.<method>()` shape
-            // would describe a chain three levels deep — not yet
-            // tracked.  Skip rather than misinterpret.
-            .ownership_field => return null,
         }
         return .{ .parent = parent, .name = field_name };
     }
@@ -2477,11 +2473,17 @@ const Builder = struct {
         return self.locals.items[@intFromEnum(lid)].type_name;
     }
 
-    /// `<recv>.<method>(...)` where method's @takes is
-    /// `ownership_field { param=0, field=F }` — the call frees
-    /// `<recv>.F`.  Returns the FieldRef on the recv local.  Null
-    /// when the shape doesn't match or no annotation propagates.
-    fn takesOwnershipFreedReceiverField(self: *Builder, call_node: Ast.Node.Index) ?FieldRef {
+    /// `<recv>.<method>(...)` where method's `may_free_fields` is
+    /// non-empty — the call frees `<recv>.<f>` for each `f` in the
+    /// list.  Returns the parent local plus the slice of field
+    /// names so the caller can emit a `.field_heap_free` per
+    /// field.  Null when the shape doesn't match or no chain
+    /// inference applies.
+    const ReceiverFieldFrees = struct {
+        parent: LocalId,
+        fields: []const []const u8,
+    };
+    fn mayFreeReceiverFields(self: *Builder, call_node: Ast.Node.Index) ?ReceiverFieldFrees {
         const tree = self.tree;
         var buf: [1]Ast.Node.Index = undefined;
         const call_full = tree.fullCall(&buf, call_node) orelse return null;
@@ -2493,28 +2495,19 @@ const Builder = struct {
         const recv_name = tree.tokenSlice(tree.nodeMainToken(recv));
         const parent = self.name_to_local.get(recv_name) orelse return null;
         const method_name = tree.tokenSlice(fa[1]);
-        // Resolve method's @takes: typed local → cross-file → null.
+        // Resolve method's entry: typed local → cross-file → null.
         const recv_ty = self.receiverTypeOfNode(recv);
-        const takes = blk: {
+        const entry: annotations.FnEntry = blk: {
             if (self.db) |db| {
-                if (db.lookupTyped(recv_ty, method_name)) |entry| {
-                    if (entry.takes) |t| break :blk t;
-                }
+                if (db.lookupTyped(recv_ty, method_name)) |e| break :blk e;
             }
             if (recv_ty) |ty| {
-                if (self.lookupCrossFileMethod(ty, method_name)) |entry| {
-                    if (entry.takes) |t| break :blk t;
-                }
+                if (self.lookupCrossFileMethod(ty, method_name)) |e| break :blk e;
             }
             return null;
         };
-        return switch (takes) {
-            .ownership => null,
-            .ownership_field => |f| if (f.param == 0)
-                .{ .parent = parent, .name = f.field }
-            else
-                null,
-        };
+        if (entry.may_free_fields.len == 0) return null;
+        return .{ .parent = parent, .fields = entry.may_free_fields };
     }
 
     /// Cross-file method lookup by (containing_type, method_name).

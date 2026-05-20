@@ -1575,6 +1575,68 @@ test "R10 field-chain: wrapper method `this.inner.dispose()` propagates as owner
     try std.testing.expect(found);
 }
 
+test "R10 multi-field: wrapper frees TWO different fields → both UAFs fire" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const bun = struct { pub fn destroy(_: anytype) void {} };
+        \\const A = struct { pub fn dispose(this: *A) void { bun.destroy(this); } };
+        \\const B = struct { pub fn dispose(this: *B) void { bun.destroy(this); } };
+        \\const Wrapper = struct {
+        \\    a: *A,
+        \\    b: *B,
+        \\    pub fn cleanup(this: *Wrapper) void {
+        \\        this.a.dispose();
+        \\        this.b.dispose();
+        \\    }
+        \\};
+        \\pub fn buggy(w: *Wrapper) void {
+        \\    w.cleanup();
+        \\    const x = w.a;
+        \\    const y = w.b;
+        \\    _ = x;
+        \\    _ = y;
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    var saw_a = false;
+    var saw_b = false;
+    for (problems.items) |p| {
+        if (std.mem.indexOf(u8, p.message, "use of `w.a`") != null) saw_a = true;
+        if (std.mem.indexOf(u8, p.message, "use of `w.b`") != null) saw_b = true;
+    }
+    try std.testing.expect(saw_a);
+    try std.testing.expect(saw_b);
+}
+
+test "R10 multi-field: dedupes — same field destroyed twice doesn't double-emit" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const bun = struct { pub fn destroy(_: anytype) void {} };
+        \\const A = struct { pub fn dispose(this: *A) void { bun.destroy(this); } };
+        \\const Wrapper = struct {
+        \\    a: *A,
+        \\    pub fn cleanup(this: *Wrapper) void {
+        \\        if (true) this.a.dispose() else this.a.dispose();
+        \\    }
+        \\};
+        \\pub fn caller(w: *Wrapper) void {
+        \\    w.cleanup();
+        \\    const x = w.a;
+        \\    _ = x;
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    var count: usize = 0;
+    for (problems.items) |p| {
+        if (std.mem.indexOf(u8, p.message, "use of `w.a`") != null) count += 1;
+    }
+    // Exactly one finding on `w.a` (not two from the two
+    // `this.a.dispose()` calls in cleanup's body).
+    try std.testing.expectEqual(@as(usize, 1), count);
+}
+
 test "R10 field-chain: wrapper with NON-destroying inner method doesn't FP" {
     const gpa = std.testing.allocator;
     var problems = try analyze(gpa,
