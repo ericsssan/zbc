@@ -1,2 +1,6 @@
 .zig-cache/
 zig-out/
+
+# Local-only working notes — handoff context between sessions.
+# Lives on disk for the agent to read, but never tracked.
+HANDOFF.md
