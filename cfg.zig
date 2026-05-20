@@ -2095,19 +2095,24 @@ const Builder = struct {
             });
             return;
         }
-        if (self.mayFreeReceiverFields(node)) |info| {
-            for (info.fields) |fname| {
-                try self.appendStmt(cur.*, .{
-                    .kind = .{ .field_heap_free = .{ .parent = info.parent, .name = fname, .fallback_hid = blk_hid: {
-                        const h: abstract_state.HeapId = @enumFromInt(self.next_heap);
-                        self.next_heap += 1;
-                        break :blk_hid h;
-                    } } },
-                    .pos = self.posOf(node),
-                    .end_pos = self.endPosOf(node),
-                });
+        {
+            var emissions: std.ArrayListUnmanaged(CalleeFieldFree) = .empty;
+            defer emissions.deinit(self.gpa);
+            try self.collectCalleeFieldFrees(node, self.gpa, &emissions);
+            if (emissions.items.len > 0) {
+                for (emissions.items) |em| {
+                    try self.appendStmt(cur.*, .{
+                        .kind = .{ .field_heap_free = .{ .parent = em.parent, .name = em.field, .fallback_hid = blk_hid: {
+                            const h: abstract_state.HeapId = @enumFromInt(self.next_heap);
+                            self.next_heap += 1;
+                            break :blk_hid h;
+                        } } },
+                        .pos = self.posOf(node),
+                        .end_pos = self.endPosOf(node),
+                    });
+                }
+                return;
             }
-            return;
         }
     }
 
@@ -2216,20 +2221,26 @@ const Builder = struct {
             });
             return;
         }
-        // `obj.wrapper_method(...)` where wrapper_method has
-        // `may_free_fields = [F, ...]` — the callee frees `obj.F`
-        // for each F.  Emit a .field_heap_free per field.  This is
-        // R10's transitive field-chain case (a wrapper method that
-        // calls `this.<F>.destroy()` internally for one or more F).
-        if (self.mayFreeReceiverFields(call_node)) |info| {
-            for (info.fields) |fname| {
-                try self.appendStmt(cur.*, .{
-                    .kind = .{ .field_heap_free = .{ .parent = info.parent, .name = fname, .fallback_hid = blk_hid: { const h: abstract_state.HeapId = @enumFromInt(self.next_heap); self.next_heap += 1; break :blk_hid h; } } },
-                    .pos = self.posOf(call_node),
-                    .end_pos = self.endPosOf(call_node),
-                });
+        // Callee's `may_free_fields` (R10 field-chain inference) —
+        // each entry says "the call frees param[N]'s field F".
+        // Resolve each to the caller-side local and emit a
+        // `.field_heap_free`.  Catches the wrapper-method-frees-
+        // field pattern, single or multiple fields, receiver or
+        // non-receiver params.
+        {
+            var emissions: std.ArrayListUnmanaged(CalleeFieldFree) = .empty;
+            defer emissions.deinit(self.gpa);
+            try self.collectCalleeFieldFrees(call_node, self.gpa, &emissions);
+            if (emissions.items.len > 0) {
+                for (emissions.items) |em| {
+                    try self.appendStmt(cur.*, .{
+                        .kind = .{ .field_heap_free = .{ .parent = em.parent, .name = em.field, .fallback_hid = blk_hid: { const h: abstract_state.HeapId = @enumFromInt(self.next_heap); self.next_heap += 1; break :blk_hid h; } } },
+                        .pos = self.posOf(call_node),
+                        .end_pos = self.endPosOf(call_node),
+                    });
+                }
+                return;
             }
-            return;
         }
 
         // Untracked call at stmt position — emit uses for everything
@@ -2473,41 +2484,94 @@ const Builder = struct {
         return self.locals.items[@intFromEnum(lid)].type_name;
     }
 
-    /// `<recv>.<method>(...)` where method's `may_free_fields` is
-    /// non-empty — the call frees `<recv>.<f>` for each `f` in the
-    /// list.  Returns the parent local plus the slice of field
-    /// names so the caller can emit a `.field_heap_free` per
-    /// field.  Null when the shape doesn't match or no chain
-    /// inference applies.
-    const ReceiverFieldFrees = struct {
+    /// A single (parent_local, field) emission triggered by a
+    /// callee's `may_free_fields` entry at the call site.
+    /// `lowerCallStmt`/`applyTopLevelCallEffects` emit one
+    /// `.field_heap_free` per slot.
+    const CalleeFieldFree = struct {
         parent: LocalId,
-        fields: []const []const u8,
+        field: []const u8,
     };
-    fn mayFreeReceiverFields(self: *Builder, call_node: Ast.Node.Index) ?ReceiverFieldFrees {
+
+    /// Walk the callee's `may_free_fields` list, resolve each
+    /// `{param, field}` to the corresponding caller-side arg local,
+    /// and call `cb` with the resolved `(parent, field)` pair.
+    /// Entries whose param maps to an unresolvable arg (non-ident,
+    /// out of bounds) are silently skipped.
+    ///
+    /// Handles method-call form (`recv.method(a, b)` — param 0 =
+    /// recv, param N = call's args[N-1]) and bare call form
+    /// (`fn(a, b, c)` — param N = call's args[N]).  Imported-
+    /// namespace prefixes (`bun.method(p)`) don't consume a param
+    /// slot — `bun` isn't a logical argument.
+    fn collectCalleeFieldFrees(
+        self: *Builder,
+        call_node: Ast.Node.Index,
+        gpa: std.mem.Allocator,
+        out: *std.ArrayListUnmanaged(CalleeFieldFree),
+    ) !void {
         const tree = self.tree;
         var buf: [1]Ast.Node.Index = undefined;
-        const call_full = tree.fullCall(&buf, call_node) orelse return null;
+        const call_full = tree.fullCall(&buf, call_node) orelse return;
         const callee = call_full.ast.fn_expr;
-        if (tree.nodeTag(callee) != .field_access) return null;
-        const fa = tree.nodeData(callee).node_and_token;
-        const recv = fa[0];
-        if (tree.nodeTag(recv) != .identifier) return null;
-        const recv_name = tree.tokenSlice(tree.nodeMainToken(recv));
-        const parent = self.name_to_local.get(recv_name) orelse return null;
-        const method_name = tree.tokenSlice(fa[1]);
-        // Resolve method's entry: typed local → cross-file → null.
-        const recv_ty = self.receiverTypeOfNode(recv);
+
+        const method_tok = switch (tree.nodeTag(callee)) {
+            .identifier => tree.nodeMainToken(callee),
+            .field_access => tree.nodeData(callee).node_and_token[1],
+            else => return,
+        };
+        const raw_callee_name = tree.tokenSlice(method_tok);
+        const callee_name = if (tree.nodeTag(callee) == .identifier)
+            self.resolveBoundCallee(raw_callee_name)
+        else
+            raw_callee_name;
+        const receiver_is_arg0 = tree.nodeTag(callee) == .field_access;
+        const recv_node: ?Ast.Node.Index = if (receiver_is_arg0)
+            tree.nodeData(callee).node_and_token[0]
+        else
+            null;
+        const recv_ty: ?[]const u8 = if (recv_node) |rn|
+            self.receiverTypeOfNode(rn)
+        else
+            null;
+
+        // Resolve callee entry: typed local → cross-file → null.
         const entry: annotations.FnEntry = blk: {
             if (self.db) |db| {
-                if (db.lookupTyped(recv_ty, method_name)) |e| break :blk e;
+                if (db.lookupTyped(recv_ty, callee_name)) |e| break :blk e;
             }
             if (recv_ty) |ty| {
-                if (self.lookupCrossFileMethod(ty, method_name)) |e| break :blk e;
+                if (self.lookupCrossFileMethod(ty, callee_name)) |e| break :blk e;
             }
-            return null;
+            return;
         };
-        if (entry.may_free_fields.len == 0) return null;
-        return .{ .parent = parent, .fields = entry.may_free_fields };
+        if (entry.may_free_fields.len == 0) return;
+
+        // For method-call shape, param 0 is the receiver; subsequent
+        // params come from explicit args.  Imported namespaces
+        // (`bun.method(p)`) are NOT a logical arg — strip from the
+        // receiver-is-arg0 calculation so param indices map to
+        // explicit args directly.
+        const effective_recv_is_arg0 = receiver_is_arg0 and recv_node != null and
+            !self.calleeIsImportedNamespace(recv_node.?);
+
+        for (entry.may_free_fields) |ff| {
+            // Map the callee's param index to the caller's arg node.
+            const arg_node: Ast.Node.Index = if (effective_recv_is_arg0 and ff.param == 0)
+                recv_node.?
+            else blk: {
+                const explicit_idx = if (effective_recv_is_arg0) ff.param - 1 else ff.param;
+                if (explicit_idx >= call_full.ast.params.len) continue;
+                break :blk call_full.ast.params[explicit_idx];
+            };
+            // The arg local must be a bare identifier known to the
+            // caller — that's the only shape we can rebind a field
+            // origin on.
+            if (tree.nodeTag(arg_node) != .identifier) continue;
+            const arg_name = tree.tokenSlice(tree.nodeMainToken(arg_node));
+            const parent = self.name_to_local.get(arg_name) orelse continue;
+            try out.append(gpa, .{ .parent = parent, .field = ff.field });
+        }
     }
 
     /// Cross-file method lookup by (containing_type, method_name).

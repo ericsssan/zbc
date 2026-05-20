@@ -1609,6 +1609,62 @@ test "R10 multi-field: wrapper frees TWO different fields → both UAFs fire" {
     try std.testing.expect(saw_b);
 }
 
+test "R10 non-receiver field: `cleanup(self, other)` frees other.f" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const bun = struct { pub fn destroy(_: anytype) void {} };
+        \\const Item = struct { pub fn dispose(this: *Item) void { bun.destroy(this); } };
+        \\const X = struct { dummy: u32 = 0 };
+        \\const Y = struct { f: *Item };
+        \\pub fn cleanup(self: *X, other: *Y) void {
+        \\    _ = self;
+        \\    other.f.dispose();
+        \\}
+        \\pub fn buggy(x: *X, y: *Y) void {
+        \\    cleanup(x, y);
+        \\    const v = y.f;
+        \\    _ = v;
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    var found = false;
+    for (problems.items) |p| {
+        if (std.mem.indexOf(u8, p.message, "use of `y.f`") != null) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "R10 non-receiver field: method call where 2nd param's field is freed" {
+    const gpa = std.testing.allocator;
+    // recv.method(arg) — callee's param 0 = recv, param 1 = arg.
+    // If method frees arg.f, the call site should free recv-arg's f.
+    var problems = try analyze(gpa,
+        \\const bun = struct { pub fn destroy(_: anytype) void {} };
+        \\const Item = struct { pub fn dispose(this: *Item) void { bun.destroy(this); } };
+        \\const Holder = struct { f: *Item };
+        \\const Cleaner = struct {
+        \\    dummy: u32 = 0,
+        \\    pub fn cleanup(self: *Cleaner, target: *Holder) void {
+        \\        _ = self;
+        \\        target.f.dispose();
+        \\    }
+        \\};
+        \\pub fn buggy(c: *Cleaner, h: *Holder) void {
+        \\    c.cleanup(h);
+        \\    const v = h.f;
+        \\    _ = v;
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    var found = false;
+    for (problems.items) |p| {
+        if (std.mem.indexOf(u8, p.message, "use of `h.f`") != null) found = true;
+    }
+    try std.testing.expect(found);
+}
+
 test "R10 multi-field: dedupes — same field destroyed twice doesn't double-emit" {
     const gpa = std.testing.allocator;
     var problems = try analyze(gpa,

@@ -58,6 +58,17 @@ pub const TakesAnnotation = union(enum) {
     ownership: u32,
 };
 
+/// One field-of-param free effect.  Carried in lists on
+/// `FnEntry.may_free_fields`; one entry per `<param>.<field>.<method>()`
+/// chain found in the body that resolves to a destroying method.
+pub const FieldFree = struct {
+    /// Index of the param whose field is freed.  0 is the receiver
+    /// for method-call-style invocations; > 0 is a regular arg.
+    param: u32,
+    /// Field name (borrowed from source — keep tree alive).
+    field: []const u8,
+};
+
 pub const FnEntry = struct {
     /// Function name (slice into source — keep source alive).
     name: []const u8,
@@ -79,16 +90,18 @@ pub const FnEntry = struct {
     /// (Unused stub; reserved for future R9 self-freeing inference
     /// that's distinct from R8b's `@takes(ownership)`.)
     may_free_self: bool = false,
-    /// Names of the receiver's (param 0's) fields that the fn body
-    /// destroys via `this.<field>.<destroying-method>()` chains —
-    /// R10's field-chain inference.  Caller emits a
-    /// `.field_heap_free` for each entry on a `<recv>.<this-fn>()`
-    /// call so subsequent reads of `recv.<field>` fire UAF.
+    /// Per-param field-frees inferred from `<param>.<field>.
+    /// <destroying-method>()` chains in the body — R10's
+    /// field-chain inference.  Each entry says "the call frees
+    /// `<arg_at_param>.<field>`."  Caller maps the param index to
+    /// the corresponding call argument and emits a
+    /// `.field_heap_free` per entry.
     ///
-    /// Field name slices are borrowed from source (keep tree
-    /// alive); the outer slice is owned by the Db (freed on
-    /// `Db.deinit`).  Empty when no chain matched.
-    may_free_fields: []const []const u8 = &.{},
+    /// Slices borrow field names from source; the outer slice is
+    /// owned by the Db (freed on `Db.deinit`).  Empty when no
+    /// chain matched.  Supports multiple frees per body and frees
+    /// on non-receiver params alike.
+    may_free_fields: []const FieldFree = &.{},
 };
 
 pub const Db = struct {
@@ -182,12 +195,20 @@ pub const Db = struct {
         var found: ?FnEntry = null;
         var count: u32 = 0;
         for (list.items) |e| {
-            if (e.annotation == null and e.takes == null and !e.is_noreturn) continue;
+            if (entryIsEmpty(e)) continue;
             count += 1;
             found = e;
         }
         if (count != 1) return null;
         return found;
+    }
+
+    /// True iff a Pass-1 placeholder — no annotation, no takes, not
+    /// noreturn, no inferred field-frees.  Used by `lookup` to skip
+    /// these when counting overloads.
+    fn entryIsEmpty(e: FnEntry) bool {
+        return e.annotation == null and e.takes == null and !e.is_noreturn and
+            e.may_free_fields.len == 0 and !e.may_free_self;
     }
 
     /// Look up a method by (containing_type, name).  When `ty` is
@@ -559,13 +580,14 @@ fn inferReturnsHeap(
 /// R10 inference result.  Either or both fields may be set.
 ///   - `takes` is the classic `<param>.<destroying-method>()`
 ///     shape (frees the param itself).
-///   - `may_free_fields` is the list of receiver-field names from
-///     `<param=0>.<field>.<destroying-method>()` chains.  Multi-
-///     valued: a wrapper that destroys both `this.a` and `this.b`
-///     gets both names.  Caller owns the slice via gpa.
+///   - `may_free_fields` is the list of `{param, field}` pairs
+///     from `<param>.<field>.<destroying-method>()` chains.
+///     Multi-valued: a wrapper that destroys `this.a`, `this.b`
+///     AND `other.c` gets all three entries.  Caller owns the
+///     slice via gpa.
 const InferReceiverResult = struct {
     takes: ?TakesAnnotation = null,
-    may_free_fields: []const []const u8 = &.{},
+    may_free_fields: []const FieldFree = &.{},
 };
 
 fn inferTakesViaReceiverCall(
@@ -582,7 +604,7 @@ fn inferTakesViaReceiverCall(
     const tags = tree.tokens.items(.tag);
 
     var result: InferReceiverResult = .{};
-    var fields: std.ArrayListUnmanaged([]const u8) = .empty;
+    var fields: std.ArrayListUnmanaged(FieldFree) = .empty;
     errdefer fields.deinit(gpa);
 
     var t: Ast.TokenIndex = first;
@@ -614,12 +636,10 @@ fn inferTakesViaReceiverCall(
                 },
             }
         } else if (t + 5 <= last and tags[t + 3] == .period and tags[t + 4] == .identifier and tags[t + 5] == .l_paren) {
-            // CASE B.  Field-chain.  Restricted to param 0
-            // (receiver) so the call-site emission is unambiguous
-            // — `<recv>.<this-fn>()` knows recv is param 0's
-            // counterpart.  Field-chains on other params would
-            // need a richer representation.
-            if (param_idx != 0) continue;
+            // CASE B.  Field-chain on ANY param (not just receiver).
+            // Each match records `{param_idx, field_name}` so the
+            // call site can map each entry back to the
+            // corresponding caller-side argument.
             const field_name = tree.tokenSlice(t + 2);
             const method_name = tree.tokenSlice(t + 4);
             const pty = parent_ty orelse continue;
@@ -628,18 +648,22 @@ fn inferTakesViaReceiverCall(
             const callee_takes = callee.takes orelse continue;
             switch (callee_takes) {
                 .ownership => |i| if (i == 0) {
-                    // method is @takes(0) on its receiver (the field).
-                    // → THIS fn frees `this.<field>`.  Dedupe so
-                    // multiple occurrences of the same field don't
-                    // produce duplicate diagnostics.
+                    // Dedupe: same (param, field) pair already
+                    // seen?  Multiple occurrences in the same body
+                    // shouldn't double-emit at the call site.
                     var already_seen = false;
                     for (fields.items) |existing| {
-                        if (std.mem.eql(u8, existing, field_name)) {
+                        if (existing.param == param_idx and
+                            std.mem.eql(u8, existing.field, field_name))
+                        {
                             already_seen = true;
                             break;
                         }
                     }
-                    if (!already_seen) try fields.append(gpa, field_name);
+                    if (!already_seen) try fields.append(gpa, .{
+                        .param = param_idx,
+                        .field = field_name,
+                    });
                 },
             }
         }
