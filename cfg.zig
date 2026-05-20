@@ -1143,6 +1143,7 @@ const Builder = struct {
 
         // Derive init_hint from the classification — avoids a second
         // classifyExpr call (which would double-mint Arena/Heap ids).
+        var effective_init_kind = init_kind;
         const init_hint: InitHint = blk: {
             switch (init_kind) {
                 .arena_init => break :blk .arena_local,
@@ -1153,6 +1154,15 @@ const Builder = struct {
             // Lets later call sites that use the alias terminate
             // their block.
             if (init_opt) |i| if (self.initIsNoreturnAlias(i)) break :blk .noreturn_alias;
+            // Struct-wrap propagation: `var ma = Wrapper{ .inner =
+            // arena };` — ma carries arena via its field.  Override
+            // init_kind to .copy_of(wrapper) so transferDecl
+            // propagates arena's origin to ma at state-tracking time
+            // (the hint alone only affects classify-time decisions).
+            if (init_opt) |i| if (self.initWrapsResourceLocalRef(i)) |hit| {
+                effective_init_kind = .{ .copy_of = hit.local };
+                break :blk hit.hint;
+            };
             break :blk .other;
         };
         const local = try self.registerLocalFull(name, self.posOfToken(name_tok), is_array, init_hint);
@@ -1162,7 +1172,7 @@ const Builder = struct {
         if (init_opt) |init| try self.emitUsesInExpr(init, cur.*, null);
 
         try self.appendStmt(cur.*, .{
-            .kind = .{ .decl = .{ .local = local, .init_kind = init_kind } },
+            .kind = .{ .decl = .{ .local = local, .init_kind = effective_init_kind } },
             .pos = self.posOf(decl_node),
             .end_pos = self.endPosOf(decl_node),
         });
@@ -1416,6 +1426,42 @@ const Builder = struct {
         const tok = tree.nodeMainToken(call_node);
         const slice = tree.tokenSlice(tok);
         return std.mem.eql(u8, slice, "@panic") or std.mem.eql(u8, slice, "@trap");
+    }
+
+    const WrapHit = struct { local: LocalId, hint: InitHint };
+
+    /// If `init_node` is a struct-literal whose field values include
+    /// a known arena_local or heap_local, return the strongest hit
+    /// (source local + its hint).  Caller overrides init_kind to
+    /// `.copy_of(hit.local)` so transferDecl propagates the wrapped
+    /// resource's origin to the new local — composite-borrow
+    /// checks then fire correctly on methods called on the wrapper.
+    fn initWrapsResourceLocalRef(self: *Builder, init_node: Ast.Node.Index) ?WrapHit {
+        const tree = self.tree;
+        switch (tree.nodeTag(init_node)) {
+            .struct_init, .struct_init_comma, .struct_init_one, .struct_init_one_comma,
+            .struct_init_dot, .struct_init_dot_comma, .struct_init_dot_two, .struct_init_dot_two_comma,
+            => {},
+            else => return null,
+        }
+        const first = tree.firstToken(init_node);
+        const last = tree.lastToken(init_node);
+        const tags = tree.tokens.items(.tag);
+        var result: ?WrapHit = null;
+        var t: Ast.TokenIndex = first;
+        while (t <= last) : (t += 1) {
+            if (tags[t] != .identifier) continue;
+            if (t > 0 and tags[t - 1] == .period) continue; // field name
+            const name = tree.tokenSlice(t);
+            const id = self.name_to_local.get(name) orelse continue;
+            const hint = self.locals.items[@intFromEnum(id)].init_hint;
+            switch (hint) {
+                .arena_local => return .{ .local = id, .hint = .arena_local },
+                .heap_local => result = .{ .local = id, .hint = .heap_local },
+                else => {},
+            }
+        }
+        return result;
     }
 
     /// True iff `init_node`'s source text ends with one of the
