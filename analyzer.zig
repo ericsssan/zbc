@@ -566,6 +566,47 @@ test "arena_escape: @returns owns_locals suppresses composite-borrow check" {
     try std.testing.expect(!any_arena);
 }
 
+test "heap_use_after_free: slice-of-heap aliases the heap" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const std = @import("std");
+        \\pub fn foo(g: std.mem.Allocator) []u8 {
+        \\    const buf = g.alloc(u8, 16) catch unreachable;
+        \\    const view = buf[0..8];
+        \\    g.free(buf);
+        \\    return view;
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    var found = false;
+    for (problems.items) |p| {
+        if (std.mem.indexOf(u8, p.message, "after free") != null) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "heap_use_after_free: `return blk: { free(buf); break :blk buf; }` flagged" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const std = @import("std");
+        \\pub fn foo(g: std.mem.Allocator) []u8 {
+        \\    const buf = g.alloc(u8, 16) catch unreachable;
+        \\    return blk: {
+        \\        g.free(buf);
+        \\        break :blk buf;
+        \\    };
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    var found = false;
+    for (problems.items) |p| {
+        if (std.mem.indexOf(u8, p.message, "after free") != null) found = true;
+    }
+    try std.testing.expect(found);
+}
+
 test "stack_escape: composite with TWO stack borrows flags both" {
     const gpa = std.testing.allocator;
     var problems = try analyze(gpa,

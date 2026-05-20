@@ -910,6 +910,37 @@ const Builder = struct {
     /// emits its decl/ret/assign on the post-merge cur, with an
     /// .unknown classification since we don't track which break
     /// path's value was taken.  Returns false for non-block exprs.
+    /// If the labeled block has exactly one `break :label X` with
+    /// a value, return X for classification.  Multiple distinct
+    /// break values or none → null.
+    fn singleLabeledBreakValue(
+        self: *Builder,
+        block_node: Ast.Node.Index,
+        label_token: Ast.TokenIndex,
+    ) ?Ast.Node.Index {
+        const tree = self.tree;
+        const label = tree.tokenSlice(label_token);
+        const block_first = tree.firstToken(block_node);
+        const block_last = tree.lastToken(block_node);
+
+        var found: ?Ast.Node.Index = null;
+        var node_idx: u32 = 1;
+        while (node_idx < tree.nodes.len) : (node_idx += 1) {
+            const node: Ast.Node.Index = @enumFromInt(node_idx);
+            if (tree.nodeTag(node) != .@"break") continue;
+            const ft = tree.firstToken(node);
+            const lt = tree.lastToken(node);
+            if (ft < block_first or lt > block_last) continue;
+            const data = tree.nodeData(node).opt_token_and_opt_node;
+            const lbl_tok = data[0].unwrap() orelse continue;
+            if (!std.mem.eql(u8, tree.tokenSlice(lbl_tok), label)) continue;
+            const val = data[1].unwrap() orelse continue; // bare `break :blk;`
+            if (found != null) return null; // multiple breaks — ambiguous
+            found = val;
+        }
+        return found;
+    }
+
     fn maybeLowerLabeledBlockExpr(
         self: *Builder,
         expr: Ast.Node.Index,
@@ -959,20 +990,14 @@ const Builder = struct {
         node: Ast.Node.Index,
     ) !void {
         const tree = self.tree;
-        if (self.loop_stack.items.len == 0) {
-            try self.appendStmt(cur.*, .{
-                .kind = .{ .lowering_gap = .{ .note = "break-outside-loop" } },
-                .pos = self.posOf(node),
-                .end_pos = self.endPosOf(node),
-            });
-            return;
-        }
 
         // `break/continue :name` — Ast data is opt_token_and_opt_node;
         // the OptionalTokenIndex points at the bare identifier (no
         // colon).  For labeled break, search block_label_stack first
         // (since blocks can only be break targets, never continue),
-        // then fall through to loop_stack.
+        // then fall through to loop_stack.  Done BEFORE the "no
+        // loops" check so `break :blk` inside a labeled block (which
+        // doesn't push onto loop_stack) still resolves correctly.
         const opt_label_tok = tree.nodeData(node).opt_token_and_opt_node[0];
         if (opt_label_tok.unwrap()) |lt| {
             const wanted = tree.tokenSlice(lt);
@@ -1016,7 +1041,19 @@ const Builder = struct {
             return;
         }
 
-        // Unlabeled: innermost loop.
+        // Unlabeled: innermost loop.  Now `loop_stack` may be empty
+        // (we don't pre-check anymore so labeled-break can resolve
+        // via block_label_stack first); a truly unlabeled break
+        // outside any loop is a Zig compile error, so handle
+        // defensively with a gap.
+        if (self.loop_stack.items.len == 0) {
+            try self.appendStmt(cur.*, .{
+                .kind = .{ .lowering_gap = .{ .note = "break-outside-loop" } },
+                .pos = self.posOf(node),
+                .end_pos = self.endPosOf(node),
+            });
+            return;
+        }
         const ctx = self.loop_stack.items[self.loop_stack.items.len - 1];
         const target = switch (kind) {
             .@"break" => ctx.merge,
@@ -1804,12 +1841,38 @@ const Builder = struct {
             .slice, .slice_sentinel => tree.nodeData(expr_node).node_and_extra[0],
             else => null,
         };
+        // Labeled-block expression (`blk: { ... break :blk X; }`):
+        // body was already lowered by maybeLowerLabeledBlockExpr in
+        // the caller.  Classify the break value here so the .ret /
+        // assign sees the right origin.  If exactly one `break :blk`
+        // with a value exists, use that; multiple distinct break
+        // values fall through to .unknown.
+        switch (tag) {
+            .block, .block_semicolon, .block_two, .block_two_semicolon => {
+                if (self.blockLabelToken(expr_node)) |lt| {
+                    if (self.singleLabeledBreakValue(expr_node, lt)) |v| {
+                        return self.classifyExpr(v);
+                    }
+                }
+            },
+            else => {},
+        }
+
         if (slicee_opt) |slicee| {
             if (tree.nodeTag(slicee) == .identifier) {
                 const name = tree.tokenSlice(tree.nodeMainToken(slicee));
                 if (self.name_to_local.get(name)) |id| {
-                    if (self.locals.items[@intFromEnum(id)].is_array) {
+                    const info = self.locals.items[@intFromEnum(id)];
+                    if (info.is_array) {
                         return .{ .stack_ref = id };
+                    }
+                    // Slice of a heap/arena-bearing local — the
+                    // sub-slice aliases the same allocation, so
+                    // propagate the local's origin via .copy_of.
+                    // `const view = buf[0..n]; free(buf); return view;`
+                    // then correctly fires UAF.
+                    if (info.init_hint == .heap_local or info.init_hint == .arena_local) {
+                        return .{ .copy_of = id };
                     }
                 }
             }
