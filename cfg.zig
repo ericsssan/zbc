@@ -2984,6 +2984,21 @@ const Builder = struct {
                     return .{ .field_copy_of = .{ .parent = id, .name = fname } };
                 }
             }
+            // Deep chain (`<local>.<f1>.<f2>...`): walk down via
+            // `fieldLhsFor` to find the root local and the
+            // dotted-path it builds, then look up `(root_type,
+            // dotted_path)` in `borrowed_fields`.  Closes the gap
+            // where nested-literal inference marks dotted paths
+            // borrowed but the single-level classifier above only
+            // catches `<local>.<field>`.
+            if (self.db) |db| {
+                if (self.fieldLhsFor(expr_node)) |fref| {
+                    const info = self.locals.items[@intFromEnum(fref.parent)];
+                    if (info.type_name) |ty| if (db.isBorrowedField(ty, fref.name)) {
+                        if (!info.is_pointer) return .{ .stack_ref = fref.parent };
+                    };
+                }
+            }
         }
 
         // Identifier reference → .undef / .copy_of(local) if known

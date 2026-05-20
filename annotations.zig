@@ -129,7 +129,19 @@ pub const Db = struct {
     /// you a borrow whose lifetime is tied to the parent's.  When
     /// the parent later receives a `@takes(0)` (or destructor) call,
     /// existing borrows fire UAF.
+    ///
+    /// `name` may be a single field (`"data"`) or a dotted path
+    /// (`"outer.inner"`) when inference detects a nested
+    /// struct-literal constructor.  Dotted-path keys' string
+    /// storage lives in `owned_paths` (single-segment keys are
+    /// source-slices owned by the tree).
     borrowed_fields: std.HashMapUnmanaged(FieldKey, void, FieldKey.Context, std.hash_map.default_max_load_percentage) = .empty,
+    /// Owned byte slices for any field-name strings in
+    /// `borrowed_fields` that aren't a contiguous slice of the
+    /// source (currently: dotted paths built by nested-literal
+    /// inference).  Single-segment names use source-slices and
+    /// don't appear here.  Freed in `deinit`.
+    owned_paths: std.ArrayListUnmanaged([]u8) = .empty,
 
     pub fn deinit(self: *Db, gpa: std.mem.Allocator) void {
         var it = self.fns.valueIterator();
@@ -143,6 +155,8 @@ pub const Db = struct {
         self.containing_types.deinit(gpa);
         self.field_types.deinit(gpa);
         self.borrowed_fields.deinit(gpa);
+        for (self.owned_paths.items) |p| gpa.free(p);
+        self.owned_paths.deinit(gpa);
     }
 
     /// (struct_name, field_name) → declared field type name, or
@@ -1908,24 +1922,22 @@ fn fnReturnTypeMatches(tree: *const Ast, fn_decl: Ast.Node.Index, ct: []const u8
 
 /// Walk every struct_init node in the file; for each one inside
 /// `body`'s token range AND immediately preceded by the `return`
-/// keyword, classify the field initializers as alloc / neutral /
-/// other and update `stats`.  Inner nested struct literals are NOT
-/// recursed into here — their preceding token isn't `return`, so
-/// they're silently skipped (matches the conservatism elsewhere in
-/// this module).
+/// keyword, classify the field initializers and update `stats`.
+/// Recurses into nested struct-literal RHS values with a dotted
+/// path prefix — `return .{ .outer = .{ .inner = try alloc(...) } }`
+/// produces a stat entry for `(ct, "outer.inner")`.
 fn scanReturnStructLiterals(
     tree: *const Ast,
     body: Ast.Node.Index,
     ct: []const u8,
     alloc_patterns: []const []const u8,
-    db: *const Db,
+    db: *Db,
     gpa: std.mem.Allocator,
     stats: *std.HashMapUnmanaged(Db.FieldKey, FieldStats, Db.FieldKey.Context, std.hash_map.default_max_load_percentage),
 ) !void {
     const body_first = tree.firstToken(body);
     const body_last = tree.lastToken(body);
     const tags = tree.tokens.items(.tag);
-    const starts = tree.tokens.items(.start);
 
     var node_idx: u32 = 1;
     while (node_idx < tree.nodes.len) : (node_idx += 1) {
@@ -1949,27 +1961,69 @@ fn scanReturnStructLiterals(
         if (t0 == 0) continue;
         if (tags[t0 - 1] != .keyword_return) continue;
 
-        var buf: [2]Ast.Node.Index = undefined;
-        const si = tree.fullStructInit(&buf, node) orelse continue;
-        for (si.ast.fields) |field_value| {
-            const fname = scannedFieldInitName(tree, field_value) orelse continue;
-            const fl_first = tree.firstToken(field_value);
-            const fl_last = tree.lastToken(field_value);
-            const rhs_start = starts[fl_first];
-            const rhs_end = starts[fl_last] + tree.tokenSlice(fl_last).len;
-            const rhs_text = tree.source[rhs_start..rhs_end];
+        try recordStructLiteralFields(tree, node, ct, null, alloc_patterns, db, gpa, stats);
+    }
+}
 
-            const cls = classifyRhsText(rhs_text, alloc_patterns, db);
-            const key: Db.FieldKey = .{ .containing_type = ct, .name = fname };
-            const gop = try stats.getOrPutContext(gpa, key, .{});
-            if (!gop.found_existing) gop.value_ptr.* = .{};
-            switch (cls) {
-                .alloc => gop.value_ptr.alloc_writes += 1,
-                .neutral => {},
-                .other => gop.value_ptr.other_writes += 1,
-            }
+/// Walk a struct literal's fields and update `stats`.  Each field
+/// gets a stat entry keyed by (ct, prefix++"."++fname) or (ct,
+/// fname) when prefix is null.  When a field's RHS is itself a
+/// struct literal, recurses with the field's path as the new
+/// prefix — covering `.{ .outer = .{ .inner = try alloc() } }`.
+///
+/// Dotted-path keys are duped into `db.owned_paths` so they
+/// outlive the inference's local stats map.
+fn recordStructLiteralFields(
+    tree: *const Ast,
+    struct_init_node: Ast.Node.Index,
+    ct: []const u8,
+    prefix: ?[]const u8,
+    alloc_patterns: []const []const u8,
+    db: *Db,
+    gpa: std.mem.Allocator,
+    stats: *std.HashMapUnmanaged(Db.FieldKey, FieldStats, Db.FieldKey.Context, std.hash_map.default_max_load_percentage),
+) std.mem.Allocator.Error!void {
+    var buf: [2]Ast.Node.Index = undefined;
+    const si = tree.fullStructInit(&buf, struct_init_node) orelse return;
+    const starts = tree.tokens.items(.start);
+
+    for (si.ast.fields) |field_value| {
+        const fname = scannedFieldInitName(tree, field_value) orelse continue;
+        const path: []const u8 = if (prefix) |p| try dottedPath(db, gpa, p, fname) else fname;
+
+        const fl_first = tree.firstToken(field_value);
+        const fl_last = tree.lastToken(field_value);
+        const rhs_start = starts[fl_first];
+        const rhs_end = starts[fl_last] + tree.tokenSlice(fl_last).len;
+        const rhs_text = tree.source[rhs_start..rhs_end];
+
+        const cls = classifyRhsText(rhs_text, alloc_patterns, db);
+        const key: Db.FieldKey = .{ .containing_type = ct, .name = path };
+        const gop = try stats.getOrPutContext(gpa, key, .{});
+        if (!gop.found_existing) gop.value_ptr.* = .{};
+        switch (cls) {
+            .alloc => gop.value_ptr.alloc_writes += 1,
+            .neutral => {
+                // Nested struct literal: recurse with this field's
+                // path as the new prefix.  Other neutral shapes
+                // (`undefined`, `.empty`, `&.{}`) aren't struct
+                // literals — fullStructInit returns null for them.
+                try recordStructLiteralFields(tree, field_value, ct, path, alloc_patterns, db, gpa, stats);
+            },
+            .other => gop.value_ptr.other_writes += 1,
         }
     }
+}
+
+/// Build "<prefix>.<leaf>" and stash the bytes in `db.owned_paths`
+/// so the slice outlives the local stats map.  Used for nested
+/// struct-literal inference where the dotted path isn't contiguous
+/// in source.
+fn dottedPath(db: *Db, gpa: std.mem.Allocator, prefix: []const u8, leaf: []const u8) ![]const u8 {
+    const bytes = try std.fmt.allocPrint(gpa, "{s}.{s}", .{ prefix, leaf });
+    errdefer gpa.free(bytes);
+    try db.owned_paths.append(gpa, bytes);
+    return bytes;
 }
 
 /// Recover the field name for a struct-literal field initializer
