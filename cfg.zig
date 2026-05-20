@@ -73,7 +73,17 @@ pub const StmtKind = union(enum) {
 
     /// `gpa.free(p)` / `gpa.destroy(p)` — marks the heap allocation
     /// bound to `freed_local` dead.  Double-free fires here.
-    heap_free: struct { freed_local: LocalId },
+    heap_free: struct {
+        freed_local: LocalId,
+        /// Fallback HeapId — used by transferHeapFree when the local
+        /// has no prior tracked .heap origin (e.g. inter-procedural
+        /// free of a `*T` parameter via @takes ownership(0); the
+        /// caller might have allocated, or might not have, but we
+        /// know the callee took ownership so any subsequent use is
+        /// undefined regardless).  Same shape as
+        /// .field_heap_free.fallback_hid.
+        fallback_hid: abstract_state.HeapId,
+    },
 
     /// `obj.field = RHS;` — write to a struct field.  We track field
     /// origins separately from the parent local so heap allocations
@@ -82,7 +92,18 @@ pub const StmtKind = union(enum) {
 
     /// `g.free(obj.field)` / `g.destroy(obj.field)` — kill a field's
     /// heap allocation.
-    field_heap_free: struct { parent: LocalId, name: []const u8 },
+    field_heap_free: struct {
+        parent: LocalId,
+        name: []const u8,
+        /// Synthetic HeapId minted at cfg-build time, used by
+        /// transferFieldHeapFree when the field has no prior tracked
+        /// origin (e.g. an inter-procedural free of a field on a
+        /// `*T` parameter where the allocation happened in the
+        /// caller).  Lets subsequent .field_use reads see a .dead
+        /// state and fire UAF.  Without this, only fields with an
+        /// in-function alloc + free pair were trackable.
+        fallback_hid: abstract_state.HeapId,
+    },
 
     /// Read of `obj.field` — fires UAF / use-of-undef checks against
     /// the field's tracked origin (separate from the parent local's).
@@ -125,6 +146,14 @@ pub const StmtKind = union(enum) {
     /// Only clears .undef → .plain (the underlying storage was
     /// initialized via this write).
     pointer_write: struct { target: LocalId },
+    /// Re-bind a local to .plain.  Emitted at loop body entry for
+    /// `while (it) |n|` / `for (xs) |x|` captures so back-edges
+    /// don't carry one iteration's `free(n)` state into the next —
+    /// the capture refers to a different element each iteration.
+    /// Without this, the @takes-ownership / heap_free fallback path
+    /// (which now marks plain locals as .heap.dead) cascades
+    /// spurious double-free reports across loop iterations.
+    reset_capture: struct { local: LocalId },
     use: struct {
         local: LocalId,
         /// True when this .use was emitted by a method-call walker
@@ -347,6 +376,7 @@ pub fn lowerFunctionFull(
         .config = config,
         .is_borrowed_return_type = is_borrowed_ret,
         .suppress_composite_borrow = suppress_cb,
+        .fn_proto = fn_proto,
     };
     defer builder.tempDeinit();
 
@@ -449,6 +479,10 @@ const Builder = struct {
     block_stmts: std.ArrayListUnmanaged(std.ArrayListUnmanaged(Stmt)) = .empty,
     block_successors: std.ArrayListUnmanaged(std.ArrayListUnmanaged(BlockId)) = .empty,
     locals: std.ArrayListUnmanaged(LocalInfo) = .empty,
+    /// Parsed fn prototype for the fn being lowered.  Used by
+    /// registerFnParams.  Optional only for cfg-builder constructs
+    /// outside of normal fn lowering (currently none).
+    fn_proto: ?Ast.full.FnProto = null,
     /// name → LocalId for current scope.  v1 doesn't handle nested scopes;
     /// names are flat per-function.
     name_to_local: std.StringHashMapUnmanaged(LocalId) = .empty,
@@ -564,6 +598,16 @@ const Builder = struct {
     /// the body now resolve via name_to_local rather than falling
     /// through to .unknown identifier classification.
     fn registerCaptures(self: *Builder, payload_token: Ast.TokenIndex) !void {
+        _ = try self.registerCapturesWith(payload_token, null);
+    }
+
+    /// Variant that, when `reset_into` is non-null, emits a
+    /// .reset_capture stmt for each registered capture into the
+    /// given block.  Used by loop lowerers so each iteration starts
+    /// with a fresh .plain origin for the capture (back-edge state
+    /// would otherwise propagate across iterations — the capture
+    /// refers to a different element each time).
+    fn registerCapturesWith(self: *Builder, payload_token: Ast.TokenIndex, reset_into: ?BlockId) !void {
         const tree = self.tree;
         const tags = tree.tokens.items(.tag);
         var t: Ast.TokenIndex = payload_token;
@@ -572,11 +616,15 @@ const Builder = struct {
                 .pipe => return, // closing `|`
                 .identifier => {
                     const name = tree.tokenSlice(t);
-                    // `_` is the discard placeholder — don't track.
                     if (std.mem.eql(u8, name, "_")) continue;
-                    // Zig forbids shadowing, so name_to_local can't
-                    // already hold this name — safe to register.
-                    _ = try self.registerLocal(name, self.posOfToken(t));
+                    const lid = try self.registerLocal(name, self.posOfToken(t));
+                    if (reset_into) |blk| {
+                        try self.appendStmt(blk, .{
+                            .kind = .{ .reset_capture = .{ .local = lid } },
+                            .pos = self.posOfToken(t),
+                            .end_pos = self.posOfToken(t),
+                        });
+                    }
                 },
                 else => {}, // `,`, `*`, `|` (opening): skip
             }
@@ -623,7 +671,33 @@ const Builder = struct {
     /// its own defers at fallthrough exit, so no separate flush is
     /// needed here.
     fn lowerFunctionBody(self: *Builder, body_node: Ast.Node.Index, cur: *BlockId) !void {
+        // Register function parameters as locals so the body can
+        // reference them (e.g. `b.foo` where `b` is a `*Bar` param).
+        // Params get .other init_hint and .plain origin — they're
+        // caller-owned; the analysis only flags state changes that
+        // happen INSIDE this function.  Without registration,
+        // inter-procedural patterns like `b.foo.dispose()` can't
+        // resolve `b` to a LocalId, so .field_heap_free / .field_use
+        // emissions silently drop.
+        try self.registerFnParams();
         try self.lowerBlock(body_node, cur);
+    }
+
+    fn registerFnParams(self: *Builder) !void {
+        const tree = self.tree;
+        // Find the fn_decl currently being lowered.  The Builder is
+        // single-use per fn, so we re-derive via the cfg's parent
+        // pointer when finalize is called — for now, iterate all
+        // top-level fn_decls and find the one whose body matches.
+        // Cheaper: store the proto on Builder.  Add a field.
+        const proto = self.fn_proto orelse return;
+        var it = proto.iterate(tree);
+        while (it.next()) |param| {
+            const name_tok = param.name_token orelse continue;
+            const name = tree.tokenSlice(name_tok);
+            if (std.mem.eql(u8, name, "_")) continue;
+            _ = try self.registerLocal(name, self.posOfToken(name_tok));
+        }
     }
 
     fn pushDefer(self: *Builder, body_node: Ast.Node.Index) !void {
@@ -773,8 +847,10 @@ const Builder = struct {
         try self.addEdge(cur.*, else_block orelse merge_block);
 
         // Lower the then branch.  `if (opt) |val|` payload is in scope
-        // for the then-body only.
-        if (if_data.payload_token) |pt| try self.registerCaptures(pt);
+        // for the then-body only.  Reset at then-entry: when the if is
+        // inside a loop body, the capture rebinds each iteration so
+        // prior-iter state must not propagate.
+        if (if_data.payload_token) |pt| try self.registerCapturesWith(pt, then_block);
         var then_cur = then_block;
         try self.lowerStmt(if_data.ast.then_expr, &then_cur);
         // Then-branch exits flow into merge.
@@ -783,7 +859,7 @@ const Builder = struct {
         // Lower the else branch if present.  `else |err|` payload is
         // in scope for the else-body only.
         if (else_block) |eb| {
-            if (if_data.error_token) |et| try self.registerCaptures(et);
+            if (if_data.error_token) |et| try self.registerCapturesWith(et, eb);
             var else_cur = eb;
             try self.lowerStmt(if_data.ast.else_expr.unwrap().?, &else_cur);
             try self.addEdge(else_cur, merge_block);
@@ -841,8 +917,11 @@ const Builder = struct {
             .merge = merge,
             .label = label_slice,
         });
-        // `while (opt) |x|` payload capture — register before body.
-        if (while_data.payload_token) |pt| try self.registerCaptures(pt);
+        // `while (opt) |x|` payload capture — register before body
+        // and emit reset stmts at body entry so back-edges don't
+        // propagate one iteration's state (e.g. .heap.dead from
+        // `free(x)`) into the next iteration's view of the capture.
+        if (while_data.payload_token) |pt| try self.registerCapturesWith(pt, body);
         var body_cur = body;
         try self.lowerStmt(while_data.ast.then_expr, &body_cur);
         _ = self.loop_stack.pop();
@@ -902,7 +981,8 @@ const Builder = struct {
             .label = for_label,
         });
         // For-loops always have a payload (`|x|` or `|x, idx|`).
-        try self.registerCaptures(for_data.payload_token);
+        // Reset on iteration entry — see lowerWhile for rationale.
+        try self.registerCapturesWith(for_data.payload_token, body);
         var body_cur = body;
         try self.lowerStmt(for_data.ast.then_expr, &body_cur);
         _ = self.loop_stack.pop();
@@ -1472,6 +1552,10 @@ const Builder = struct {
             // real codebases; treating each as a state wipe defeats
             // heap / arena tracking everywhere downstream.
             try self.emitUsesInExpr(rhs, cur.*, null);
+            // If RHS is a call, its @takes-ownership / arena-kill
+            // side effects must still fire.  `_ = h.markInactive();`
+            // would otherwise miss the inter-procedural UAF.
+            try self.applyTopLevelCallEffects(rhs, cur);
         } else {
             // Untracked target (e.g. `@field(obj, ...) = X`,
             // `arr[i] = X`).  For any known local mentioned anywhere in
@@ -1803,6 +1887,55 @@ const Builder = struct {
         return false;
     }
 
+    /// Apply free / arena-kill side effects of a top-level call
+    /// expression appearing in any context that's not a bare-stmt
+    /// (var-decl init, assign RHS, return value, discard RHS).
+    /// Returns true if anything was emitted; caller may use this to
+    /// decide whether to additionally emit a use/gap.  Does NOT
+    /// terminate the block for noreturn — callers handle that.
+    fn applyTopLevelCallEffects(self: *Builder, expr_node: Ast.Node.Index, cur: *BlockId) (std.mem.Allocator.Error)!void {
+        const tree = self.tree;
+        // Walk through `try` / `catch` wrappers — they don't change
+        // which call's effects fire on success path.
+        var node = expr_node;
+        while (true) switch (tree.nodeTag(node)) {
+            .@"try" => node = tree.nodeData(node).node,
+            .@"catch" => node = tree.nodeData(node).node_and_node[0],
+            else => break,
+        };
+        switch (tree.nodeTag(node)) {
+            .call, .call_one, .call_comma, .call_one_comma => {},
+            else => return,
+        }
+        // Re-use the same dispatch logic as lowerCallStmt.  Pattern-
+        // matched arena/heap kills already detected by lowerCallStmt
+        // for bare-stmt calls — here we ALSO need @takes effects.
+        if (self.takesOwnershipFreedLocal(node)) |freed| {
+            try self.appendStmt(cur.*, .{
+                .kind = .{ .heap_free = .{ .freed_local = freed, .fallback_hid = blk_h: {
+                    const h: abstract_state.HeapId = @enumFromInt(self.next_heap);
+                    self.next_heap += 1;
+                    break :blk_h h;
+                } } },
+                .pos = self.posOf(node),
+                .end_pos = self.endPosOf(node),
+            });
+            return;
+        }
+        if (self.takesOwnershipFreedField(node)) |fref| {
+            try self.appendStmt(cur.*, .{
+                .kind = .{ .field_heap_free = .{ .parent = fref.parent, .name = fref.name, .fallback_hid = blk_hid: {
+                    const h: abstract_state.HeapId = @enumFromInt(self.next_heap);
+                    self.next_heap += 1;
+                    break :blk_hid h;
+                } } },
+                .pos = self.posOf(node),
+                .end_pos = self.endPosOf(node),
+            });
+            return;
+        }
+    }
+
     fn lowerCallStmt(self: *Builder, call_node: Ast.Node.Index, cur: *BlockId) !void {
         // Detect arena.deinit() patterns; otherwise emit nothing
         // (call has no side-effect from our pov).
@@ -1835,7 +1968,7 @@ const Builder = struct {
         if (anyPatternMatches(text, self.config.heap_free_patterns)) {
             if (self.heapFreedLocal(call_node)) |freed| {
                 try self.appendStmt(cur.*, .{
-                    .kind = .{ .heap_free = .{ .freed_local = freed } },
+                    .kind = .{ .heap_free = .{ .freed_local = freed, .fallback_hid = blk_h: { const h: abstract_state.HeapId = @enumFromInt(self.next_heap); self.next_heap += 1; break :blk_h h; } } },
                     .pos = self.posOf(call_node),
                     .end_pos = self.endPosOf(call_node),
                 });
@@ -1844,7 +1977,7 @@ const Builder = struct {
             // `g.free(obj.field)` — field-level free.
             if (self.heapFreedField(call_node)) |fref| {
                 try self.appendStmt(cur.*, .{
-                    .kind = .{ .field_heap_free = .{ .parent = fref.parent, .name = fref.name } },
+                    .kind = .{ .field_heap_free = .{ .parent = fref.parent, .name = fref.name, .fallback_hid = blk_hid: { const h: abstract_state.HeapId = @enumFromInt(self.next_heap); self.next_heap += 1; break :blk_hid h; } } },
                     .pos = self.posOf(call_node),
                     .end_pos = self.endPosOf(call_node),
                 });
@@ -1864,7 +1997,21 @@ const Builder = struct {
         // arg before falling through to the untracked-call path.
         if (self.takesOwnershipFreedLocal(call_node)) |freed| {
             try self.appendStmt(cur.*, .{
-                .kind = .{ .heap_free = .{ .freed_local = freed } },
+                .kind = .{ .heap_free = .{ .freed_local = freed, .fallback_hid = blk_h: { const h: abstract_state.HeapId = @enumFromInt(self.next_heap); self.next_heap += 1; break :blk_h h; } } },
+                .pos = self.posOf(call_node),
+                .end_pos = self.endPosOf(call_node),
+            });
+            return;
+        }
+        // Same but for `<local>.<field>.method(...)` where method has
+        // @takes ownership(0) (R9 inference: callee frees its receiver).
+        // The freed thing is the FIELD of the caller's local.  Without
+        // this, inter-procedural UAF through struct fields (PR #30176
+        // class) is invisible: takesOwnershipFreedLocal returns null
+        // because the receiver is a field_access, not a bare ident.
+        if (self.takesOwnershipFreedField(call_node)) |fref| {
+            try self.appendStmt(cur.*, .{
+                .kind = .{ .field_heap_free = .{ .parent = fref.parent, .name = fref.name, .fallback_hid = blk_hid: { const h: abstract_state.HeapId = @enumFromInt(self.next_heap); self.next_heap += 1; break :blk_hid h; } } },
                 .pos = self.posOf(call_node),
                 .end_pos = self.endPosOf(call_node),
             });
@@ -2022,6 +2169,47 @@ const Builder = struct {
         if (tree.nodeTag(candidate) != .identifier) return null;
         const name = tree.tokenSlice(tree.nodeMainToken(candidate));
         return self.name_to_local.get(name);
+    }
+
+    /// Companion to `takesOwnershipFreedLocal`: when the call is
+    /// `<local>.<field>.method(...)` and method has @takes
+    /// ownership(0) (receiver-freeing — R8b inferred or annotated),
+    /// the freed entity is the FIELD of caller's local.
+    /// Returns the (local, field-name) pair for emission as
+    /// .field_heap_free.
+    fn takesOwnershipFreedField(self: *Builder, call_node: Ast.Node.Index) ?FieldRef {
+        const tree = self.tree;
+        var buf: [1]Ast.Node.Index = undefined;
+        const call_full = tree.fullCall(&buf, call_node) orelse return null;
+        const callee = call_full.ast.fn_expr;
+        if (tree.nodeTag(callee) != .field_access) return null;
+        const fa = tree.nodeData(callee).node_and_token;
+        const recv = fa[0];
+        // Receiver must be `<local>.<field>` exactly (one level of
+        // field access).  Deeper chains (`a.b.c.method()`) are out of
+        // scope for now — they need full field-aliasing.
+        if (tree.nodeTag(recv) != .field_access) return null;
+        const recv_fa = tree.nodeData(recv).node_and_token;
+        const recv_recv = recv_fa[0];
+        if (tree.nodeTag(recv_recv) != .identifier) return null;
+        const recv_name = tree.tokenSlice(tree.nodeMainToken(recv_recv));
+        const parent = self.name_to_local.get(recv_name) orelse return null;
+        const field_name = tree.tokenSlice(recv_fa[1]);
+        const method_name = tree.tokenSlice(fa[1]);
+
+        // Resolve method's @takes via same-file or cross-file DB.
+        const takes = blk: {
+            if (self.db) |db| {
+                if (db.lookup(method_name)) |entry| {
+                    if (entry.takes) |t| break :blk t;
+                }
+            }
+            return null;
+        };
+        switch (takes) {
+            .ownership => |idx| if (idx != 0) return null,
+        }
+        return .{ .parent = parent, .name = field_name };
     }
 
     /// Cross-file `@takes` lookup — see lookupRemoteMethod for the

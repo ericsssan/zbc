@@ -71,12 +71,30 @@ pub const FnEntry = struct {
     /// Detected at extraction time so call sites can terminate
     /// their basic block (the call diverges, no successor state).
     is_noreturn: bool = false,
+    /// **Inferred receiver-freeing effects (R9 / R10).**  Set when
+    /// the function body contains a free call whose argument is the
+    /// first param's identifier (R9: frees the receiver itself) or
+    /// `<first_param>.<field>` (R10: frees a field).  Conservative —
+    /// the free may be conditional on a runtime branch, but for
+    /// UAF detection "may free" is the safe direction.  At call
+    /// sites, applying these effects lets us catch
+    /// `obj.method(); use(obj);`  /  `obj.freeFoo(); use(obj.foo);`
+    /// — the canonical inter-procedural UAF class.
+    may_free_self: bool = false,
+    /// Names of `this.<field>` references that appear as the first
+    /// arg of a free call inside the body.  Owned by the Db's
+    /// arena via the source slice.  Empty when none detected.
+    may_free_fields: []const []const u8 = &.{},
 };
 
 pub const Db = struct {
     fns: std.StringHashMapUnmanaged(FnEntry),
 
     pub fn deinit(self: *Db, gpa: std.mem.Allocator) void {
+        var it = self.fns.valueIterator();
+        while (it.next()) |e| {
+            if (e.may_free_fields.len > 0) gpa.free(e.may_free_fields);
+        }
         self.fns.deinit(gpa);
     }
 
@@ -314,6 +332,13 @@ fn inferTakesOwnership(
                 .r_paren => depth -= 1,
                 .identifier => {
                     if (k > 0 and tags[k - 1] == .period) continue;
+                    // `<ident>.something` is a FIELD ACCESS on
+                    // <ident> — the param itself isn't the freed
+                    // thing, the field is.  Without this guard
+                    // `.free(this.hostname)` infers @takes(this),
+                    // making every `obj.clearData()` call look like
+                    // a free of obj.
+                    if (k + 1 < tags.len and tags[k + 1] == .period) continue;
                     const name = tree.tokenSlice(k);
                     if (resolveParamIndex(tree, fn_proto, name)) |idx| {
                         match = idx;

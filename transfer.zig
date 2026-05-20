@@ -52,6 +52,23 @@ pub fn transfer(ctx: Ctx, state: *AbstractState, stmt: Stmt) !void {
                 if (origin == .undef) try state.locals.put(ctx.gpa, p.target, .plain);
             }
         },
+        .reset_capture => |r| {
+            try state.locals.put(ctx.gpa, r.local, .plain);
+            // Also clear any tracked FIELD origins for this local —
+            // `for (bins) |bin| ctx.allocator.free(bin.path);` frees
+            // `bin.path` once per iteration; without clearing the
+            // field, iter N+1 sees iter N's freed state and reports
+            // a spurious double-free of `bin.path`.
+            var i: usize = 0;
+            while (i < state.fields.count()) {
+                const key = state.fields.keys()[i];
+                if (key.parent == r.local) {
+                    state.fields.swapRemoveAt(i);
+                } else {
+                    i += 1;
+                }
+            }
+        },
         .composite_escape => |c| try transferCompositeEscape(ctx, state, c, stmt.pos, stmt.end_pos),
         .field_assign => |a| try transferFieldAssign(ctx, state, a, stmt.pos),
         .field_heap_free => |f| try transferFieldHeapFree(ctx, state, f, stmt.pos, stmt.end_pos),
@@ -68,6 +85,20 @@ fn transferDecl(
 ) !void {
     const origin = try originOfInit(ctx, state, d.init_kind, pos);
     try state.locals.put(ctx.gpa, d.local, origin);
+    // Clear any stale field state for this local — a fresh decl
+    // (e.g. `const source = ...` inside a loop body) creates a new
+    // instance; prior-iteration field tracking for the same LocalId
+    // is a back-edge artifact that would spuriously fire double-free
+    // / UAF on the new instance.
+    var i: usize = 0;
+    while (i < state.fields.count()) {
+        const key = state.fields.keys()[i];
+        if (key.parent == d.local) {
+            state.fields.swapRemoveAt(i);
+        } else {
+            i += 1;
+        }
+    }
 }
 
 fn transferAssign(
@@ -105,26 +136,44 @@ fn transferHeapFree(
     pos: cfg.SrcPos,
     end_pos: cfg.SrcPos,
 ) !void {
-    const origin = state.locals.get(f.freed_local) orelse return;
-    switch (origin) {
-        .heap => |hid| {
-            const st = state.heaps.get(hid) orelse return;
-            if (st.state == .dead) {
-                if (config_mod.isEnabled(ctx.config, .heap_double_free)) {
-                    const name = ctx.locals[@intFromEnum(f.freed_local)].name;
-                    try report(ctx, pos, end_pos, .@"error",
-                        "double-free of `{s}` (previously freed at byte {?})",
-                        .{ name, st.killed_at });
+    if (state.locals.get(f.freed_local)) |origin| {
+        switch (origin) {
+            .heap => |hid| {
+                const st = state.heaps.get(hid) orelse return;
+                if (st.state == .dead) {
+                    if (config_mod.isEnabled(ctx.config, .heap_double_free)) {
+                        const name = ctx.locals[@intFromEnum(f.freed_local)].name;
+                        try report(ctx, pos, end_pos, .@"error",
+                            "double-free of `{s}` (previously freed at byte {?})",
+                            .{ name, st.killed_at });
+                    }
+                    return;
                 }
+                try state.heaps.put(ctx.gpa, hid, .{
+                    .state = .dead,
+                    .killed_at = pos.byte,
+                });
                 return;
-            }
-            try state.heaps.put(ctx.gpa, hid, .{
-                .state = .dead,
-                .killed_at = pos.byte,
-            });
-        },
-        else => {},
+            },
+            .plain, .undef => {
+                // Fall through to fallback below — plain/undef
+                // means we have no tracked heap id, but the @takes
+                // annotation says callee took ownership, so any
+                // subsequent use of this local is UB.
+            },
+            else => return, // .arena, .arena_borrow, .stack — not a free target
+        }
     }
+    // Inter-procedural fallback: local has no tracked .heap origin
+    // (e.g. it's a `*T` parameter whose allocation happened in the
+    // caller).  The @takes ownership annotation tells us the callee
+    // freed it; record via fallback_hid so subsequent uses fire UAF.
+    try state.heaps.put(ctx.gpa, f.fallback_hid, .{
+        .state = .dead,
+        .killed_at = pos.byte,
+        .is_inter_procedural = true,
+    });
+    try state.locals.put(ctx.gpa, f.freed_local, .{ .heap = f.fallback_hid });
 }
 
 fn transferRet(
@@ -236,26 +285,38 @@ fn transferFieldHeapFree(
     end_pos: cfg.SrcPos,
 ) !void {
     const key: state_mod.FieldKey = .{ .parent = f.parent, .name = f.name };
-    const origin = state.fields.getContext(key, .{}) orelse return;
-    switch (origin) {
-        .heap => |hid| {
-            const st = state.heaps.get(hid) orelse return;
-            if (st.state == .dead) {
-                if (config_mod.isEnabled(ctx.config, .heap_double_free)) {
-                    const parent_name = ctx.locals[@intFromEnum(f.parent)].name;
-                    try report(ctx, pos, end_pos, .@"error",
-                        "double-free of `{s}.{s}` (previously freed at byte {?})",
-                        .{ parent_name, f.name, st.killed_at });
+    if (state.fields.getContext(key, .{})) |origin| {
+        switch (origin) {
+            .heap => |hid| {
+                const st = state.heaps.get(hid) orelse return;
+                if (st.state == .dead) {
+                    if (config_mod.isEnabled(ctx.config, .heap_double_free)) {
+                        const parent_name = ctx.locals[@intFromEnum(f.parent)].name;
+                        try report(ctx, pos, end_pos, .@"error",
+                            "double-free of `{s}.{s}` (previously freed at byte {?})",
+                            .{ parent_name, f.name, st.killed_at });
+                    }
+                    return;
                 }
+                try state.heaps.put(ctx.gpa, hid, .{
+                    .state = .dead,
+                    .killed_at = pos.byte,
+                });
                 return;
-            }
-            try state.heaps.put(ctx.gpa, hid, .{
-                .state = .dead,
-                .killed_at = pos.byte,
-            });
-        },
-        else => {},
+            },
+            else => {},
+        }
     }
+    // Inter-procedural fallback: field had no prior tracked alloc
+    // (e.g. it was allocated by the caller before passing `*T` in).
+    // Use the cfg-minted fallback_hid to record the free so later
+    // .field_use reads on the same field flag UAF.
+    try state.heaps.put(ctx.gpa, f.fallback_hid, .{
+        .state = .dead,
+        .killed_at = pos.byte,
+        .is_inter_procedural = true,
+    });
+    try state.fields.putContext(ctx.gpa, key, .{ .heap = f.fallback_hid }, .{});
 }
 
 fn transferFieldUse(
@@ -265,6 +326,28 @@ fn transferFieldUse(
     pos: cfg.SrcPos,
     end_pos: cfg.SrcPos,
 ) !void {
+    // Parent-liveness check, gated on inter-procedural origin:
+    // `h.x` after `h` was freed via a @takes-ownership call IS a
+    // UAF regardless of whether `h.x` itself was tracked.  Only
+    // fire when the parent's freed state came from the
+    // inter-procedural fallback — regular alloc+free pairs already
+    // track their own field state, and would otherwise cascade
+    // back-edge FPs across loop iterations.
+    if (state.locals.get(u.parent)) |parent_origin| switch (parent_origin) {
+        .heap => |hid| {
+            const st = state.heaps.get(hid);
+            if (st) |s| if (s.state == .dead and s.is_inter_procedural) {
+                if (config_mod.isEnabled(ctx.config, .heap_use_after_free)) {
+                    const parent_name = ctx.locals[@intFromEnum(u.parent)].name;
+                    try report(ctx, pos, end_pos, .@"error",
+                        "use of `{s}` after free (freed at byte {?})",
+                        .{ parent_name, s.killed_at });
+                }
+                return;
+            };
+        },
+        else => {},
+    };
     const key: state_mod.FieldKey = .{ .parent = u.parent, .name = u.name };
     const origin = state.fields.getContext(key, .{}) orelse return;
     const parent_name = ctx.locals[@intFromEnum(u.parent)].name;
