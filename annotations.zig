@@ -105,6 +105,12 @@ pub const Db = struct {
     /// `*@This()` resolve correctly and `<recv>.method()` look-ups
     /// disambiguate by recv type.
     containing_types: std.AutoHashMapUnmanaged(Ast.Node.Index, []const u8) = .empty,
+    /// (containing-struct, field-name) → declared field type name
+    /// (with `*` / `?` / `const` stripped, `Self` resolved).  Lets
+    /// `<local>.<field>.<method>()` call sites scope the method
+    /// lookup to the FIELD's type rather than the local's type or
+    /// the bare name.
+    field_types: std.HashMapUnmanaged(FieldKey, []const u8, FieldKey.Context, std.hash_map.default_max_load_percentage) = .empty,
 
     pub fn deinit(self: *Db, gpa: std.mem.Allocator) void {
         var it = self.fns.valueIterator();
@@ -116,7 +122,33 @@ pub const Db = struct {
         }
         self.fns.deinit(gpa);
         self.containing_types.deinit(gpa);
+        self.field_types.deinit(gpa);
     }
+
+    /// (struct_name, field_name) → declared field type name, or
+    /// null when the struct or field isn't known (or the field has
+    /// no resolvable base type — slice / array / fn ptr).
+    pub fn fieldType(self: *const Db, struct_name: []const u8, field_name: []const u8) ?[]const u8 {
+        return self.field_types.get(.{ .containing_type = struct_name, .name = field_name });
+    }
+
+    pub const FieldKey = struct {
+        containing_type: []const u8,
+        name: []const u8,
+        pub const Context = struct {
+            pub fn hash(_: Context, k: FieldKey) u64 {
+                var h: u64 = 0;
+                for (k.containing_type) |c| h = h *% 31 +% c;
+                h = h *% 31 +% '.';
+                for (k.name) |c| h = h *% 31 +% c;
+                return h;
+            }
+            pub fn eql(_: Context, a: FieldKey, b: FieldKey) bool {
+                return std.mem.eql(u8, a.containing_type, b.containing_type) and
+                    std.mem.eql(u8, a.name, b.name);
+            }
+        };
+    };
 
     /// Returns the containing type name for a fn_decl AST node, or
     /// null when the fn is top-level (or the node isn't a fn_decl).
@@ -124,17 +156,28 @@ pub const Db = struct {
         return self.containing_types.get(fn_decl);
     }
 
-    /// Look up by name only.  Returns the entry only when EXACTLY ONE
-    /// fn_decl has this name — multiple matches are ambiguous (we
-    /// can't tell from a bare-name call which overload is meant), so
-    /// we return null rather than guess and risk propagating
-    /// annotations from a sibling overload (the classic
-    /// "HTMLRewriter.finalize destroys self, HTMLRewriterLoader.finalize
-    /// doesn't" trap).
+    /// Look up by name only.  Counts entries with at least one signal
+    /// (annotation, takes, or is_noreturn).  Returns the single
+    /// signal-carrying entry, or null when count != 1.
+    ///
+    /// Empty entries (Pass 1 placeholders for overloads without
+    /// inferred or explicit signal) are skipped — they're load-
+    /// bearing for the multi-map's count of total declarations but
+    /// shouldn't shadow a sibling overload's real annotation when
+    /// the caller has no receiver-type information.  Multiple
+    /// signal-carrying entries DO collapse to null, matching the
+    /// "we can't pick an overload without type info" rule.
     pub fn lookup(self: *const Db, name: []const u8) ?FnEntry {
         const list = self.fns.get(name) orelse return null;
-        if (list.items.len != 1) return null;
-        return list.items[0];
+        var found: ?FnEntry = null;
+        var count: u32 = 0;
+        for (list.items) |e| {
+            if (e.annotation == null and e.takes == null and !e.is_noreturn) continue;
+            count += 1;
+            found = e;
+        }
+        if (count != 1) return null;
+        return found;
     }
 
     /// Look up a method by (containing_type, name).  When `ty` is
@@ -245,12 +288,10 @@ pub fn buildFull(
     errdefer db.deinit(gpa);
 
     // Pre-pass — for each fn_decl, find its containing struct/union/
-    // enum type so methods can be looked up by (type, name) rather
-    // than bare name.  Resolves `<recv>.method()` to the right
-    // overload when multiple types declare the same method name.
-    // The map is owned by the Db (kept across passes + exposed to the
-    // cfg builder so it can populate self_type per fn).
-    try discoverContainingTypes(gpa, tree, &db.containing_types);
+    // enum type; for each field declaration, record its declared
+    // type.  Together these let `<recv>.<field>.<method>()` calls
+    // disambiguate by both the local's type and the field's type.
+    try discoverContainingTypes(gpa, tree, &db.containing_types, &db.field_types);
     const fn_to_type = &db.containing_types;
 
     // Pass 1 — explicit annotations + R6 (slice + body allocs → owned).
@@ -287,8 +328,14 @@ pub fn buildFull(
             }
         }
 
-        // Skip if no signal of any flavor.
-        if (annotation == null and takes_anno == null and !is_noreturn) continue;
+        // Register the entry even when it has NO signal of any flavor.
+        // Sounds wasteful, but it's load-bearing for type-aware
+        // lookup: the multi-map needs to see every overload so that
+        // `lookupTyped(T2, name)` can RETURN NULL when name's only
+        // entry with a signal belongs to type T1 (the other type's
+        // method is unrelated).  Without this, T2's call site falls
+        // back to the single-entry bare-name lookup and inherits
+        // T1's @takes — the classic html_rewriter FP.
         const name = tree.tokenSlice(name_tok);
         const ct = fn_to_type.get(node);
         _ = try putOrUpdate(&db, gpa, name, ct, .{
@@ -1158,19 +1205,17 @@ fn singleReturnExpr(tree: *const Ast, body_node: Ast.Node.Index) ?Ast.Node.Index
 
 /// Walk the AST top-down from the root container.  For every
 /// `const TypeName = struct { ... };` (or union/enum), record each
-/// fn_decl member as belonging to `TypeName`.  Recursively descends
-/// into nested types.  Top-level fns get no entry (their containing
-/// type is null).
-///
-/// Used by the type-aware lookup so a `*<recv>.method()` site can
-/// disambiguate between overloads.
+/// fn_decl member as belonging to `TypeName`, and every field's
+/// declared type into `field_types`.  Recursively descends into
+/// nested types.  Top-level fns get no entry (containing type null).
 fn discoverContainingTypes(
     gpa: std.mem.Allocator,
     tree: *const Ast,
-    out: *std.AutoHashMapUnmanaged(Ast.Node.Index, []const u8),
+    fn_out: *std.AutoHashMapUnmanaged(Ast.Node.Index, []const u8),
+    field_out: *std.HashMapUnmanaged(Db.FieldKey, []const u8, Db.FieldKey.Context, std.hash_map.default_max_load_percentage),
 ) !void {
     const root = tree.containerDeclRoot();
-    try walkContainerMembers(gpa, tree, root.ast.members, null, out);
+    try walkContainerMembers(gpa, tree, root.ast.members, null, fn_out, field_out);
 }
 
 fn walkContainerMembers(
@@ -1178,12 +1223,13 @@ fn walkContainerMembers(
     tree: *const Ast,
     members: []const Ast.Node.Index,
     containing_type: ?[]const u8,
-    out: *std.AutoHashMapUnmanaged(Ast.Node.Index, []const u8),
+    fn_out: *std.AutoHashMapUnmanaged(Ast.Node.Index, []const u8),
+    field_out: *std.HashMapUnmanaged(Db.FieldKey, []const u8, Db.FieldKey.Context, std.hash_map.default_max_load_percentage),
 ) (std.mem.Allocator.Error)!void {
     for (members) |member| {
         switch (tree.nodeTag(member)) {
             .fn_decl => {
-                if (containing_type) |ct| try out.put(gpa, member, ct);
+                if (containing_type) |ct| try fn_out.put(gpa, member, ct);
             },
             .simple_var_decl,
             .local_var_decl,
@@ -1197,7 +1243,24 @@ fn walkContainerMembers(
                 const name_tok = vd.ast.mut_token + 1;
                 if (tree.tokens.items(.tag)[name_tok] != .identifier) continue;
                 const ty_name = tree.tokenSlice(name_tok);
-                try descendContainer(gpa, tree, init_node, ty_name, out);
+                try descendContainer(gpa, tree, init_node, ty_name, fn_out, field_out);
+            },
+            // Struct/union field declarations — `name: T [= default],`.
+            .container_field_init,
+            .container_field_align,
+            .container_field,
+            => {
+                const ct = containing_type orelse continue;
+                const cf = tree.fullContainerField(member) orelse continue;
+                const name_tok = cf.ast.main_token;
+                if (tree.tokens.items(.tag)[name_tok] != .identifier) continue;
+                const field_name = tree.tokenSlice(name_tok);
+                const type_expr = cf.ast.type_expr.unwrap() orelse continue;
+                const field_ty = stripTypeWrappers(tree, type_expr, ct) orelse continue;
+                try field_out.putContext(gpa, .{
+                    .containing_type = ct,
+                    .name = field_name,
+                }, field_ty, .{});
             },
             else => {},
         }
@@ -1213,28 +1276,29 @@ fn descendContainer(
     tree: *const Ast,
     node: Ast.Node.Index,
     ty_name: []const u8,
-    out: *std.AutoHashMapUnmanaged(Ast.Node.Index, []const u8),
+    fn_out: *std.AutoHashMapUnmanaged(Ast.Node.Index, []const u8),
+    field_out: *std.HashMapUnmanaged(Db.FieldKey, []const u8, Db.FieldKey.Context, std.hash_map.default_max_load_percentage),
 ) (std.mem.Allocator.Error)!void {
     switch (tree.nodeTag(node)) {
         .container_decl, .container_decl_trailing => {
-            try walkContainerMembers(gpa, tree, tree.containerDecl(node).ast.members, ty_name, out);
+            try walkContainerMembers(gpa, tree, tree.containerDecl(node).ast.members, ty_name, fn_out, field_out);
         },
         .container_decl_two, .container_decl_two_trailing => {
             var buf: [2]Ast.Node.Index = undefined;
-            try walkContainerMembers(gpa, tree, tree.containerDeclTwo(&buf, node).ast.members, ty_name, out);
+            try walkContainerMembers(gpa, tree, tree.containerDeclTwo(&buf, node).ast.members, ty_name, fn_out, field_out);
         },
         .container_decl_arg, .container_decl_arg_trailing => {
-            try walkContainerMembers(gpa, tree, tree.containerDeclArg(node).ast.members, ty_name, out);
+            try walkContainerMembers(gpa, tree, tree.containerDeclArg(node).ast.members, ty_name, fn_out, field_out);
         },
         .tagged_union, .tagged_union_trailing => {
-            try walkContainerMembers(gpa, tree, tree.taggedUnion(node).ast.members, ty_name, out);
+            try walkContainerMembers(gpa, tree, tree.taggedUnion(node).ast.members, ty_name, fn_out, field_out);
         },
         .tagged_union_two, .tagged_union_two_trailing => {
             var buf: [2]Ast.Node.Index = undefined;
-            try walkContainerMembers(gpa, tree, tree.taggedUnionTwo(&buf, node).ast.members, ty_name, out);
+            try walkContainerMembers(gpa, tree, tree.taggedUnionTwo(&buf, node).ast.members, ty_name, fn_out, field_out);
         },
         .tagged_union_enum_tag, .tagged_union_enum_tag_trailing => {
-            try walkContainerMembers(gpa, tree, tree.taggedUnionEnumTag(node).ast.members, ty_name, out);
+            try walkContainerMembers(gpa, tree, tree.taggedUnionEnumTag(node).ast.members, ty_name, fn_out, field_out);
         },
         else => {},
     }

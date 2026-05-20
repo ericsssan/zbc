@@ -2376,11 +2376,16 @@ const Builder = struct {
         const method_name = tree.tokenSlice(fa[1]);
 
         // The receiver of the method call is the FIELD (`parent.field`).
-        // Its declared type is what we want to scope the method lookup
-        // to.  We don't track field types; so far this is name-keyed.
-        // Keeping it as bare-name with the ambiguity guard is the
-        // conservative behaviour pending field-type tracking.
-        const recv_ty: ?[]const u8 = null;
+        // Resolve its declared type via the parent local's type +
+        // field name → Db.fieldType.  This scopes `<local>.<field>
+        // .<method>()` lookups to the field's exact type instead of
+        // falling back to bare-name (which would inherit a sibling
+        // overload's annotation across types).
+        const recv_ty: ?[]const u8 = blk: {
+            const parent_ty = self.locals.items[@intFromEnum(parent)].type_name orelse break :blk null;
+            const db = self.db orelse break :blk null;
+            break :blk db.fieldType(parent_ty, field_name);
+        };
 
         // Resolve method's @takes via same-file or cross-file DB.
         const takes = blk: {

@@ -1517,6 +1517,59 @@ test "type-aware lookup: cross-fn self-freeing fires when callee on same type DO
     try std.testing.expect(found);
 }
 
+test "field-type lookup: `wrapper.field.method()` resolves via field's type" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const bun = struct { pub fn destroy(_: anytype) void {} };
+        \\const Item = struct {
+        \\    /// destroys self
+        \\    pub fn dispose(this: *Item) void { bun.destroy(this); }
+        \\};
+        \\const Other = struct {
+        \\    /// does NOT destroy
+        \\    pub fn dispose(this: *Other) void { _ = this; }
+        \\};
+        \\const Wrapper = struct {
+        \\    item: *Item,
+        \\    other: *Other,
+        \\};
+        \\pub fn caller(w: *Wrapper) void {
+        \\    w.other.dispose();   // NOT a free
+        \\    const x = w.other;   // would FP without field-type tracking
+        \\    _ = x;
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    // `Other.dispose` doesn't destroy.  Field-type tracking says
+    // `w.other` is *Other, so the dispose call resolves to Other.dispose
+    // (no @takes), not Item.dispose (@takes(0)).  Zero findings expected.
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
+test "field-type lookup: still catches `w.field.method()` when method DOES destroy that field's type" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const bun = struct { pub fn destroy(_: anytype) void {} };
+        \\const Item = struct {
+        \\    pub fn dispose(this: *Item) void { bun.destroy(this); }
+        \\};
+        \\const Wrapper = struct { item: *Item };
+        \\pub fn buggy(w: *Wrapper) void {
+        \\    w.item.dispose();
+        \\    const x = w.item;
+        \\    _ = x;
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    var found = false;
+    for (problems.items) |p| {
+        if (std.mem.indexOf(u8, p.message, "after free") != null) found = true;
+    }
+    try std.testing.expect(found);
+}
+
 test "return error.X without prior explicit free — clean (errdefer is the SOLE free)" {
     const gpa = std.testing.allocator;
     var problems = try analyze(gpa,
