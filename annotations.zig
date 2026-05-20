@@ -621,13 +621,28 @@ fn inferTakesViaReceiverCall(
         const param_idx = resolveParamIndex(tree, fn_proto, param_name) orelse continue;
         const parent_ty = paramTypeName(tree, fn_proto, param_idx, self_type);
 
-        // Two shapes to recognise:
-        //   case A: `<param>.<method>(`         — frees the param.
-        //   case B: `<param>.<field>.<method>(` — frees a field of the param.
-        if (tags[t + 3] == .l_paren) {
-            // CASE A.  Method on the param itself.
-            if (result.takes != null) continue;  // first match wins
-            const method_name = tree.tokenSlice(t + 2);
+        // Scan the dotted chain after `<param>` to find the trailing
+        // method call.  Build the field path (everything between the
+        // param and the method).  Cases:
+        //   `<param>.<method>(`                         — depth 0 path (no fields)
+        //   `<param>.<f1>.<method>(`                    — depth 1 path "f1"
+        //   `<param>.<f1>.<f2>.<method>(`               — depth 2 path "f1.f2"
+        //   `<param>.<f1>.<f2>...<fN>.<method>(`        — depth N
+        //
+        // The trailing `(` is what distinguishes the method ident
+        // from a field ident.  Without `(`, the chain is just a
+        // field-access expression — no method call to propagate.
+        const chain = scanFieldChain(tree, t, last) orelse continue;
+        // chain.method_tok is the ident immediately before `(`;
+        // chain.first_field_tok / last_field_tok bracket the field
+        // identifiers (or null if depth = 0).
+        const method_name = tree.tokenSlice(chain.method_tok);
+
+        if (chain.first_field_tok == null) {
+            // CASE A.  No fields between param and method.  This is
+            // the classic `<param>.<method>()` shape — propagates
+            // ownership of the param itself.
+            if (result.takes != null) continue; // first match wins
             const callee = resolveMethod(db, parent_ty, method_name, remote) orelse continue;
             const callee_takes = callee.takes orelse continue;
             switch (callee_takes) {
@@ -635,37 +650,51 @@ fn inferTakesViaReceiverCall(
                     result.takes = .{ .ownership = param_idx };
                 },
             }
-        } else if (t + 5 <= last and tags[t + 3] == .period and tags[t + 4] == .identifier and tags[t + 5] == .l_paren) {
-            // CASE B.  Field-chain on ANY param (not just receiver).
-            // Each match records `{param_idx, field_name}` so the
-            // call site can map each entry back to the
-            // corresponding caller-side argument.
-            const field_name = tree.tokenSlice(t + 2);
-            const method_name = tree.tokenSlice(t + 4);
-            const pty = parent_ty orelse continue;
-            const field_ty = db.fieldType(pty, field_name) orelse continue;
-            const callee = resolveMethod(db, field_ty, method_name, remote) orelse continue;
-            const callee_takes = callee.takes orelse continue;
-            switch (callee_takes) {
-                .ownership => |i| if (i == 0) {
-                    // Dedupe: same (param, field) pair already
-                    // seen?  Multiple occurrences in the same body
-                    // shouldn't double-emit at the call site.
-                    var already_seen = false;
-                    for (fields.items) |existing| {
-                        if (existing.param == param_idx and
-                            std.mem.eql(u8, existing.field, field_name))
-                        {
-                            already_seen = true;
-                            break;
-                        }
+            continue;
+        }
+
+        // CASE B.  Walk the type chain so we can look up the method
+        // against the deepest field's type.
+        const pty = parent_ty orelse continue;
+        var cur_ty: []const u8 = pty;
+        var resolution_ok = true;
+        var ft: Ast.TokenIndex = chain.first_field_tok.?;
+        while (ft <= chain.last_field_tok.?) : (ft += 2) {
+            const fname = tree.tokenSlice(ft);
+            const next_ty = db.fieldType(cur_ty, fname) orelse {
+                resolution_ok = false;
+                break;
+            };
+            cur_ty = next_ty;
+        }
+        if (!resolution_ok) continue;
+
+        const callee = resolveMethod(db, cur_ty, method_name, remote) orelse continue;
+        const callee_takes = callee.takes orelse continue;
+        switch (callee_takes) {
+            .ownership => |i| if (i == 0) {
+                // Build the field-path string as a SOURCE SLICE
+                // from the first field's start to the last field's
+                // end — no allocation needed.
+                const start_byte = tree.tokens.items(.start)[chain.first_field_tok.?];
+                const last_start = tree.tokens.items(.start)[chain.last_field_tok.?];
+                const last_len = tree.tokenSlice(chain.last_field_tok.?).len;
+                const path = tree.source[start_byte..(last_start + last_len)];
+                // Dedupe: same (param, path) seen?
+                var already_seen = false;
+                for (fields.items) |existing| {
+                    if (existing.param == param_idx and
+                        std.mem.eql(u8, existing.field, path))
+                    {
+                        already_seen = true;
+                        break;
                     }
-                    if (!already_seen) try fields.append(gpa, .{
-                        .param = param_idx,
-                        .field = field_name,
-                    });
-                },
-            }
+                }
+                if (!already_seen) try fields.append(gpa, .{
+                    .param = param_idx,
+                    .field = path,
+                });
+            },
         }
     }
 
@@ -686,6 +715,58 @@ fn resolveMethod(
     if (db.lookupTyped(ty, method_name)) |e| return e;
     if (ty != null and remote != null) {
         if (lookupCrossFile(remote.?, ty.?, method_name)) |e| return e;
+    }
+    return null;
+}
+
+/// Parsed shape of a `<param>(.<field>)*.<method>(` token chain.
+/// `method_tok` is the ident immediately before `(`.  When the
+/// param is followed directly by the method (depth 0),
+/// `first_field_tok` / `last_field_tok` are both null.  Otherwise
+/// they bracket the inclusive range of field idents between param
+/// and method.
+const FieldChain = struct {
+    method_tok: Ast.TokenIndex,
+    first_field_tok: ?Ast.TokenIndex,
+    last_field_tok: ?Ast.TokenIndex,
+};
+
+/// Scan starting at param-ident token `t` (which is followed by
+/// `.<ident>`) for a `<ident>(.<ident>)*.<ident>(` shape.  Returns
+/// the chain layout, or null if no trailing `(` is found.
+fn scanFieldChain(
+    tree: *const Ast,
+    t: Ast.TokenIndex,
+    last: Ast.TokenIndex,
+) ?FieldChain {
+    const tags = tree.tokens.items(.tag);
+    // tags[t] = ident (param); tags[t+1] = `.`; tags[t+2] = ident.
+    // Walk: `<.>.<ident>` repetitions, stopping when we see ident
+    // followed by `(`.
+    var pos: Ast.TokenIndex = t + 2;
+    var first_field: ?Ast.TokenIndex = null;
+    var last_field: ?Ast.TokenIndex = null;
+    while (pos <= last) {
+        if (tags[pos] != .identifier) return null;
+        // Look ahead: is this ident the method (followed by `(`)?
+        if (pos + 1 <= last and tags[pos + 1] == .l_paren) {
+            return .{
+                .method_tok = pos,
+                .first_field_tok = first_field,
+                .last_field_tok = last_field,
+            };
+        }
+        // Otherwise, treat it as a field; continue if there's
+        // another `.<ident>` after.
+        if (first_field == null) first_field = pos;
+        last_field = pos;
+        if (pos + 2 <= last and tags[pos + 1] == .period and tags[pos + 2] == .identifier) {
+            pos += 2;
+            continue;
+        }
+        // Chain ends without a `(` — not a method-call shape we
+        // care about for R10 inference.
+        return null;
     }
     return null;
 }

@@ -3623,11 +3623,20 @@ const Builder = struct {
                             }
                             // Accessor: fall through to .use emission.
                         } else {
-                            try self.appendStmt(cur, .{
-                                .kind = .{ .field_use = .{ .parent = id, .name = field } },
-                                .pos = pos,
-                                .end_pos = end_pos,
-                            });
+                            // Field-access read.  Emit a field_use
+                            // for EVERY prefix of the dotted-chain
+                            // path so:
+                            //   - If `obj.f1` is freed, reading
+                            //     `obj.f1.f2.f3` still fires UAF
+                            //     (the "f1" prefix matches).
+                            //   - If `obj.f1.f2` is freed (via R10
+                            //     chain inference), reading
+                            //     `obj.f1.f2.f3` ALSO fires (the
+                            //     "f1.f2" prefix matches).
+                            // Trailing-method idents (`obj.f1.f2.m(`)
+                            // are excluded from the path by
+                            // `fieldChainPath`.
+                            try self.emitFieldUsePrefixes(cur, id, t, last, pos, end_pos);
                             continue;
                         }
                     } else if (!is_method_call) {
@@ -3776,6 +3785,88 @@ const Builder = struct {
         };
         for (candidates) |c| if (std.mem.eql(u8, name, c)) return true;
         return false;
+    }
+
+    /// Emit a `.field_use` for every PREFIX of the dotted chain
+    /// starting at `obj` (token `t`): "f1", "f1.f2", "f1.f2.f3",
+    /// etc.  This way a free recorded at any depth (e.g.
+    /// `field_heap_free(obj, "f1")` from a shallow R8b match) and
+    /// a free at the deepest path (from R10's N-level inference)
+    /// both fire when the caller reads the deep access.
+    fn emitFieldUsePrefixes(
+        self: *Builder,
+        cur: BlockId,
+        parent: LocalId,
+        t: Ast.TokenIndex,
+        last: Ast.TokenIndex,
+        pos: SrcPos,
+        end_pos: SrcPos,
+    ) (std.mem.Allocator.Error)!void {
+        const tree = self.tree;
+        const tags = tree.tokens.items(.tag);
+        // Caller verified tags[t+1] == `.`, tags[t+2] = ident.
+        const first_field: Ast.TokenIndex = t + 2;
+        var chain_end: Ast.TokenIndex = first_field;
+        while (chain_end + 2 <= last and tags[chain_end + 1] == .period and tags[chain_end + 2] == .identifier) {
+            chain_end += 2;
+        }
+        const ends_in_call = chain_end + 1 <= last and tags[chain_end + 1] == .l_paren;
+        // Last ident to INCLUDE in the field portion.  If the chain
+        // ends with `(`, the final ident is a method name — skip it.
+        const last_field: ?Ast.TokenIndex = if (ends_in_call)
+            (if (chain_end > first_field) chain_end - 2 else null)
+        else
+            chain_end;
+        if (last_field == null) return;
+        // Emit one prefix per inclusive field ident.
+        const start_byte = tree.tokens.items(.start)[first_field];
+        var f: Ast.TokenIndex = first_field;
+        while (f <= last_field.?) : (f += 2) {
+            const f_start = tree.tokens.items(.start)[f];
+            const f_len = tree.tokenSlice(f).len;
+            const path = tree.source[start_byte..(f_start + f_len)];
+            try self.appendStmt(cur, .{
+                .kind = .{ .field_use = .{ .parent = parent, .name = path } },
+                .pos = pos,
+                .end_pos = end_pos,
+            });
+        }
+    }
+
+    /// Build the field-path source slice for a chain starting at
+    /// `obj` (token `t`).  Token sequence: `<obj>` `.` `<f1>` (`.`
+    /// `<f2>`)* [`(` …].  Returns the dotted source slice of the
+    /// field segment (e.g. "f1.f2") — a single field for 1-deep,
+    /// multi-segment for deeper.  When the trailing token after the
+    /// final ident is `(`, that final ident is the method name and
+    /// is excluded from the path.  Falls back to the immediate
+    /// field name for any unexpected shape.
+    fn fieldChainPath(tree: *const Ast, t: Ast.TokenIndex, last: Ast.TokenIndex) []const u8 {
+        const tags = tree.tokens.items(.tag);
+        // Caller has already verified tags[t+1] == `.`, tags[t+2] = ident.
+        const first_field: Ast.TokenIndex = t + 2;
+        var chain_end: Ast.TokenIndex = first_field;
+        while (chain_end + 2 <= last and tags[chain_end + 1] == .period and tags[chain_end + 2] == .identifier) {
+            chain_end += 2;
+        }
+        // If the chain ends with `<ident>(`, exclude that ident
+        // (it's the method).
+        const ends_in_call = chain_end + 1 <= last and tags[chain_end + 1] == .l_paren;
+        const last_field: Ast.TokenIndex = if (ends_in_call) blk: {
+            // The chain has at least 2 idents (the param's first
+            // field + the method) only if chain_end > first_field.
+            // If they're equal, there are NO field idents — just a
+            // method call directly on the param.  Fall back to the
+            // immediate ident (still emits the single field; though
+            // realistically the caller's `is_method_call` branch
+            // handles this path).
+            if (chain_end <= first_field) break :blk first_field;
+            break :blk chain_end - 2;
+        } else chain_end;
+        const start_byte = tree.tokens.items(.start)[first_field];
+        const last_start = tree.tokens.items(.start)[last_field];
+        const last_len = tree.tokenSlice(last_field).len;
+        return tree.source[start_byte..(last_start + last_len)];
     }
 
     fn isIdentChar(c: u8) bool {
