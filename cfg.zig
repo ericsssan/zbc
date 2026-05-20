@@ -216,6 +216,11 @@ pub const LocalInfo = struct {
     /// treated as a borrow source.  Set at registerLocalFull from
     /// the same classifier that produces the .decl's init_kind.
     init_hint: InitHint = .other,
+    /// If this local was declared from a bare identifier that names
+    /// a fn in our annotation DB, the name of that fn.  Lets call
+    /// sites `local(args)` resolve through the binding to the
+    /// underlying fn's annotation.
+    bound_fn_name: ?[]const u8 = null,
 };
 
 pub const InitHint = enum { other, arena_local, heap_local, noreturn_alias };
@@ -475,16 +480,24 @@ const Builder = struct {
     }
 
     fn registerLocal(self: *Builder, name: []const u8, pos: SrcPos) !LocalId {
-        return self.registerLocalFull(name, pos, false, .other);
+        return self.registerLocalFull(name, pos, false, .other, null);
     }
 
-    fn registerLocalFull(self: *Builder, name: []const u8, pos: SrcPos, is_array: bool, init_hint: InitHint) !LocalId {
+    fn registerLocalFull(
+        self: *Builder,
+        name: []const u8,
+        pos: SrcPos,
+        is_array: bool,
+        init_hint: InitHint,
+        bound_fn_name: ?[]const u8,
+    ) !LocalId {
         const id: LocalId = @enumFromInt(self.locals.items.len);
         try self.locals.append(self.gpa, .{
             .name = name,
             .decl_pos = pos,
             .is_array = is_array,
             .init_hint = init_hint,
+            .bound_fn_name = bound_fn_name,
         });
         try self.name_to_local.put(self.gpa, name, id);
         return id;
@@ -1218,7 +1231,12 @@ const Builder = struct {
             };
             break :blk .other;
         };
-        const local = try self.registerLocalFull(name, self.posOfToken(name_tok), is_array, init_hint);
+        // Function-pointer binding: `const op = some_fn;` where
+        // some_fn is in our annotation DB.  Records the binding so
+        // call sites `op(args)` resolve through to some_fn's
+        // annotation / takes / is_noreturn.
+        const bound_fn_name: ?[]const u8 = if (init_opt) |i| self.boundFnName(i) else null;
+        const local = try self.registerLocalFull(name, self.posOfToken(name_tok), is_array, init_hint, bound_fn_name);
 
         // Emit .use stmts for every local read by the init expression
         // (before the .decl so the read is checked against pre-decl state).
@@ -1588,6 +1606,29 @@ const Builder = struct {
         return result;
     }
 
+    /// If `name` matches a local with a function-pointer binding,
+    /// return the bound fn's name.  Otherwise return `name` unchanged.
+    /// Lets `const op = some_fn; op(args)` resolve to some_fn's
+    /// annotation at call sites.
+    fn resolveBoundCallee(self: *Builder, name: []const u8) []const u8 {
+        const id = self.name_to_local.get(name) orelse return name;
+        return self.locals.items[@intFromEnum(id)].bound_fn_name orelse name;
+    }
+
+    /// If `init_node` is a bare identifier that names an annotated
+    /// fn (or any fn present in our DB — annotation can be null
+    /// when only `@takes`/`is_noreturn` is set), return the fn's
+    /// name slice.  Used to record function-pointer bindings so
+    /// call sites via the local resolve to the original fn.
+    fn boundFnName(self: *Builder, init_node: Ast.Node.Index) ?[]const u8 {
+        const tree = self.tree;
+        if (tree.nodeTag(init_node) != .identifier) return null;
+        const name = tree.tokenSlice(tree.nodeMainToken(init_node));
+        const db = self.db orelse return null;
+        if (db.lookup(name) == null) return null;
+        return name;
+    }
+
     /// True iff `init_node`'s source text ends with one of the
     /// known-noreturn callee chains — set on the declaring local's
     /// init_hint so subsequent calls through the alias terminate.
@@ -1707,7 +1748,11 @@ const Builder = struct {
             .field_access => tree.nodeData(callee).node_and_token[1],
             else => return false,
         };
-        const name = tree.tokenSlice(method_tok);
+        const raw_name = tree.tokenSlice(method_tok);
+        const name = if (tree.nodeTag(callee) == .identifier)
+            self.resolveBoundCallee(raw_name)
+        else
+            raw_name;
         if (self.db) |db| {
             if (db.lookup(name)) |entry| if (entry.is_noreturn) return true;
         }
@@ -1773,7 +1818,11 @@ const Builder = struct {
             .field_access => tree.nodeData(callee).node_and_token[1],
             else => return null,
         };
-        const callee_name = tree.tokenSlice(method_tok);
+        const raw_callee_name = tree.tokenSlice(method_tok);
+        const callee_name = if (tree.nodeTag(callee) == .identifier)
+            self.resolveBoundCallee(raw_callee_name)
+        else
+            raw_callee_name;
         const receiver_is_arg0 = tree.nodeTag(callee) == .field_access;
         const recv_node: ?Ast.Node.Index = if (receiver_is_arg0)
             tree.nodeData(callee).node_and_token[0]
@@ -2234,7 +2283,11 @@ const Builder = struct {
                 return .unknown;
             },
             .identifier => {
-                const fn_name = tree.tokenSlice(tree.nodeMainToken(callee_node));
+                const raw_name = tree.tokenSlice(tree.nodeMainToken(callee_node));
+                // Resolve function-pointer binding: if the callee
+                // identifier names a local that's bound to a fn, use
+                // the bound fn's name for the DB lookup.
+                const fn_name = self.resolveBoundCallee(raw_name);
                 if (self.db) |db| {
                     if (db.lookup(fn_name)) |entry| {
                         if (entry.annotation) |a| {

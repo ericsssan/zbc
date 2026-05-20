@@ -566,6 +566,35 @@ test "arena_escape: @returns owns_locals suppresses composite-borrow check" {
     try std.testing.expect(!any_arena);
 }
 
+test "heap_use_after_free: through function-pointer binding" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const std = @import("std");
+        \\/// @returns heap
+        \\fn xalloc(g: std.mem.Allocator, n: usize) []u8 {
+        \\    return g.alloc(u8, n) catch unreachable;
+        \\}
+        \\/// @takes ownership(p)
+        \\fn dispose(g: std.mem.Allocator, p: []u8) void {
+        \\    g.free(p);
+        \\}
+        \\pub fn caller(g: std.mem.Allocator) []u8 {
+        \\    const alloc_fn = xalloc;
+        \\    const dispose_fn = dispose;
+        \\    const buf = alloc_fn(g, 16);
+        \\    dispose_fn(g, buf);
+        \\    return buf;
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    var found = false;
+    for (problems.items) |p| {
+        if (std.mem.indexOf(u8, p.message, "after free") != null) found = true;
+    }
+    try std.testing.expect(found);
+}
+
 test "heap_use_after_free: through @ptrCast / @bitCast / @constCast" {
     const gpa = std.testing.allocator;
     var problems = try analyze(gpa,
