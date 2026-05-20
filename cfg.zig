@@ -273,6 +273,14 @@ pub const LocalInfo = struct {
     /// slice or pointer just produces another view of caller-owned
     /// storage, not an escape.
     is_array: bool = false,
+    /// True iff the local's declared type begins with `*` (possibly
+    /// preceded by `?` or `const`) — i.e. the local is a pointer
+    /// (typically a `*Self` parameter).  The pointee lives in the
+    /// caller, so `&local.field` for a pointer-typed local is NOT a
+    /// stack-frame borrow; it's a borrow from caller-owned storage.
+    /// Address-of classification gates on this to avoid spurious
+    /// stack-escape on the common `return &self.field` shape.
+    is_pointer: bool = false,
     /// Coarse classification of the init expression — lets the
     /// composite-borrow walker decide at classify time whether a
     /// bare reference to this local in a returned struct should be
@@ -604,6 +612,30 @@ const Builder = struct {
         return self.registerLocalWithType(name, pos, false, .other, null, null);
     }
 
+    fn registerLocalWithPointerHint(
+        self: *Builder,
+        name: []const u8,
+        pos: SrcPos,
+        is_array: bool,
+        init_hint: InitHint,
+        bound_fn_name: ?[]const u8,
+        type_name: ?[]const u8,
+        is_pointer: bool,
+    ) !LocalId {
+        const id: LocalId = @enumFromInt(self.locals.items.len);
+        try self.locals.append(self.gpa, .{
+            .name = name,
+            .decl_pos = pos,
+            .is_array = is_array,
+            .init_hint = init_hint,
+            .bound_fn_name = bound_fn_name,
+            .type_name = type_name,
+            .is_pointer = is_pointer,
+        });
+        try self.name_to_local.put(self.gpa, name, id);
+        return id;
+    }
+
     fn registerLocalFull(
         self: *Builder,
         name: []const u8,
@@ -647,6 +679,26 @@ const Builder = struct {
         if (tags[first] != .l_bracket) return false;
         if (first + 1 >= tree.tokens.len) return false;
         return tags[first + 1] == .number_literal;
+    }
+
+    /// True iff `type_node` begins with `*` (possibly preceded by
+    /// `?` or `const`) — the shape of a pointer.  Used to gate the
+    /// `&local.field` → `.stack_ref(local)` extension so we don't
+    /// FP on `&self.field` where `self` is a pointer parameter.
+    fn typeIsPointer(self: *Builder, type_node: Ast.Node.Index) bool {
+        const tree = self.tree;
+        const first = tree.firstToken(type_node);
+        const last = tree.lastToken(type_node);
+        const tags = tree.tokens.items(.tag);
+        var t: Ast.TokenIndex = first;
+        while (t <= last) : (t += 1) {
+            switch (tags[t]) {
+                .question_mark, .keyword_const => continue,
+                .asterisk => return true,
+                else => return false,
+            }
+        }
+        return false;
     }
 
     /// Walk the type expression's tokens, stripping pointer / optional
@@ -812,13 +864,18 @@ const Builder = struct {
                 self.extractTypeName(te, self.self_type)
             else
                 null;
-            _ = try self.registerLocalWithType(
+            const is_pointer = if (param.type_expr) |te|
+                self.typeIsPointer(te)
+            else
+                false;
+            _ = try self.registerLocalWithPointerHint(
                 name,
                 self.posOfToken(name_tok),
                 false,
                 .other,
                 null,
                 type_name,
+                is_pointer,
             );
         }
     }
@@ -1466,6 +1523,10 @@ const Builder = struct {
             self.typeIsStackArray(tn)
         else
             false;
+        const is_pointer = if (var_decl.ast.type_node.unwrap()) |tn|
+            self.typeIsPointer(tn)
+        else
+            false;
 
         const init_opt = var_decl.ast.init_node.unwrap();
 
@@ -1531,13 +1592,14 @@ const Builder = struct {
             self.extractTypeName(tn, self.self_type)
         else
             null;
-        const local = try self.registerLocalWithType(
+        const local = try self.registerLocalWithPointerHint(
             name,
             self.posOfToken(name_tok),
             is_array,
             init_hint,
             bound_fn_name,
             decl_type_name,
+            is_pointer,
         );
 
         // Emit .use stmts for every local read by the init expression
@@ -2912,13 +2974,28 @@ const Builder = struct {
         }
 
         // `&<local>` — address-of of a known local.  Produces a
-        // pointer bound to that local's stack frame.
+        // pointer bound to that local's stack frame.  Also accept
+        // `&<local>.<field>(.<f2>...)` — a borrow into the local's
+        // storage; same lifetime semantics, since taking the address
+        // of a field is taking a pointer into the parent.
         if (tag == .address_of) {
             const inner = tree.nodeData(expr_node).node;
             if (tree.nodeTag(inner) == .identifier) {
                 const name = tree.tokenSlice(tree.nodeMainToken(inner));
                 if (self.name_to_local.get(name)) |id| {
                     return .{ .stack_ref = id };
+                }
+            }
+            if (tree.nodeTag(inner) == .field_access) {
+                if (self.fieldLhsFor(inner)) |fref| {
+                    // Pointer-typed parent: the pointee lives in the
+                    // caller, not this fn's stack frame.  `&self.field`
+                    // where `self: *Self` is a borrow from caller-owned
+                    // storage — not a stack escape candidate.
+                    if (self.locals.items[@intFromEnum(fref.parent)].is_pointer) {
+                        return .unknown;
+                    }
+                    return .{ .stack_ref = fref.parent };
                 }
             }
         }

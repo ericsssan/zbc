@@ -584,6 +584,33 @@ fn checkOriginAlive(
             try report(ctx, "use-undefined", pos, end_pos, .@"error",
                 "use of `{s}` while still `undefined`", .{local_name});
         },
+        .stack => |owner_id| {
+            // Stack-borrow liveness — the borrow inherits the owner
+            // local's death.  Today this fires when `owner` was the
+            // target of an inter-procedural @takes-ownership call
+            // (transferHeapFree's fallback path rewrites
+            // state.locals[owner] to .heap(fake_dead)), so a borrow
+            // taken via `&owner.field` then used after `owner.die()`
+            // surfaces as UAF on the borrow itself.  Stack-frame
+            // death across return is still handled by transferRet.
+            if (!config_mod.isEnabled(ctx.config, .heap_use_after_free)) return;
+            const owner_origin = state.locals.get(owner_id) orelse return;
+            switch (owner_origin) {
+                .heap => |hid| {
+                    const st = state.heaps.get(hid) orelse return;
+                    if (st.state == .dead) {
+                        try reportWithNote(ctx, "heap-use-after-free", pos, end_pos, .@"error",
+                            "use of `{s}` (borrow from `{s}`) after free",
+                            .{ local_name, ctx.locals[@intFromEnum(owner_id)].name },
+                            if (st.killed_at) |ks|
+                                .{ .site = ks, .label = "value freed here" }
+                            else
+                                null);
+                    }
+                },
+                else => {},
+            }
+        },
         else => {},
     }
 }
