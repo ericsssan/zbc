@@ -276,6 +276,15 @@ pub const LocalInfo = struct {
     /// sites `local(args)` resolve through the binding to the
     /// underlying fn's annotation.
     bound_fn_name: ?[]const u8 = null,
+    /// The local's declared base type name (e.g. "Foo" for `*Foo`,
+    /// `*const Foo`, `?*Foo`), with pointer/optional/const wrappers
+    /// stripped.  `*Self` / `*@This()` is resolved to the enclosing
+    /// fn's containing type.  Null when the local has no explicit
+    /// type annotation (inferred type — not tracked).
+    ///
+    /// Used by call-site lookup to disambiguate `<recv>.method()`
+    /// across method-name overloads on different types.
+    type_name: ?[]const u8 = null,
 };
 
 pub const InitHint = enum {
@@ -368,6 +377,11 @@ pub fn lowerFunctionFull(
         break :blk a == .owns_locals;
     };
 
+    // Pull the containing type for this fn_decl from the DB's
+    // pre-pass map so Self / @This() resolve inside param types and
+    // receiver-type lookups have a starting scope.
+    const self_type: ?[]const u8 = if (db) |d| d.containingType(fn_decl) else null;
+
     var builder: Builder = .{
         .gpa = gpa,
         .tree = tree,
@@ -377,6 +391,7 @@ pub fn lowerFunctionFull(
         .is_borrowed_return_type = is_borrowed_ret,
         .suppress_composite_borrow = suppress_cb,
         .fn_proto = fn_proto,
+        .self_type = self_type,
     };
     defer builder.tempDeinit();
 
@@ -476,6 +491,11 @@ const Builder = struct {
     db: ?*const annotations.Db = null,
     remote: ?*const RemoteCtx = null,
     config: *const Config = &config_mod.Default,
+    /// The struct/union/enum that contains the fn being lowered.  Set
+    /// by the caller of `build` per fn (via `lib.zig`'s walker).
+    /// Used to resolve `Self` / `*@This()` in param types and to seed
+    /// the lookup namespace for `<recv>.method()` disambiguation.
+    self_type: ?[]const u8 = null,
     blocks: std.ArrayListUnmanaged(BasicBlock) = .empty,
     /// Per-block staging — stmts being appended.  Flushed to `blocks[i].stmts`
     /// in finalize().
@@ -566,7 +586,7 @@ const Builder = struct {
     }
 
     fn registerLocal(self: *Builder, name: []const u8, pos: SrcPos) !LocalId {
-        return self.registerLocalFull(name, pos, false, .other, null);
+        return self.registerLocalWithType(name, pos, false, .other, null, null);
     }
 
     fn registerLocalFull(
@@ -577,6 +597,18 @@ const Builder = struct {
         init_hint: InitHint,
         bound_fn_name: ?[]const u8,
     ) !LocalId {
+        return self.registerLocalWithType(name, pos, is_array, init_hint, bound_fn_name, null);
+    }
+
+    fn registerLocalWithType(
+        self: *Builder,
+        name: []const u8,
+        pos: SrcPos,
+        is_array: bool,
+        init_hint: InitHint,
+        bound_fn_name: ?[]const u8,
+        type_name: ?[]const u8,
+    ) !LocalId {
         const id: LocalId = @enumFromInt(self.locals.items.len);
         try self.locals.append(self.gpa, .{
             .name = name,
@@ -584,6 +616,7 @@ const Builder = struct {
             .is_array = is_array,
             .init_hint = init_hint,
             .bound_fn_name = bound_fn_name,
+            .type_name = type_name,
         });
         try self.name_to_local.put(self.gpa, name, id);
         return id;
@@ -599,6 +632,44 @@ const Builder = struct {
         if (tags[first] != .l_bracket) return false;
         if (first + 1 >= tree.tokens.len) return false;
         return tags[first + 1] == .number_literal;
+    }
+
+    /// Walk the type expression's tokens, stripping pointer / optional
+    /// / const wrappers, and return the BASE identifier (e.g. "Foo"
+    /// for `*Foo`, `*const Foo`, `?*Foo`, `*const ?Foo`).  Returns
+    /// null when no plain identifier is found — e.g. slice `[]T`,
+    /// function pointer, anonymous struct, etc.
+    ///
+    /// `Self` / `@This()` resolves to the enclosing fn's containing
+    /// type when `self_type` is supplied.
+    fn extractTypeName(self: *Builder, type_node: Ast.Node.Index, self_type: ?[]const u8) ?[]const u8 {
+        const tree = self.tree;
+        const first = tree.firstToken(type_node);
+        const last = tree.lastToken(type_node);
+        const tags = tree.tokens.items(.tag);
+        var t: Ast.TokenIndex = first;
+        // Strip leading `?`, `*`, `const` tokens.  Stop at the first
+        // identifier and treat it as the base type.
+        while (t <= last) : (t += 1) {
+            switch (tags[t]) {
+                .question_mark, .asterisk, .keyword_const => continue,
+                // `[*]T`, `[]T`, `[N]T` — slice / pointer-with-len /
+                // array.  Not a struct receiver; bail.
+                .l_bracket => return null,
+                .identifier => {
+                    const name = tree.tokenSlice(t);
+                    if (std.mem.eql(u8, name, "Self")) return self_type;
+                    return name;
+                },
+                .builtin => {
+                    const name = tree.tokenSlice(t);
+                    if (std.mem.eql(u8, name, "@This")) return self_type;
+                    return null;
+                },
+                else => return null,
+            }
+        }
+        return null;
     }
 
     /// Register `|x|` / `|x, y|` / `|*x, idx|` capture identifiers
@@ -697,18 +768,28 @@ const Builder = struct {
 
     fn registerFnParams(self: *Builder) !void {
         const tree = self.tree;
-        // Find the fn_decl currently being lowered.  The Builder is
-        // single-use per fn, so we re-derive via the cfg's parent
-        // pointer when finalize is called — for now, iterate all
-        // top-level fn_decls and find the one whose body matches.
-        // Cheaper: store the proto on Builder.  Add a field.
         const proto = self.fn_proto orelse return;
         var it = proto.iterate(tree);
         while (it.next()) |param| {
             const name_tok = param.name_token orelse continue;
             const name = tree.tokenSlice(name_tok);
             if (std.mem.eql(u8, name, "_")) continue;
-            _ = try self.registerLocal(name, self.posOfToken(name_tok));
+            // Extract the param's declared base type (e.g. "Foo" from
+            // `*const Foo`), resolving Self / @This() to the enclosing
+            // type so methods inside `pub const Foo = struct { fn f(
+            // self: *Self) ... }` get a type_name of "Foo".
+            const type_name: ?[]const u8 = if (param.type_expr) |te|
+                self.extractTypeName(te, self.self_type)
+            else
+                null;
+            _ = try self.registerLocalWithType(
+                name,
+                self.posOfToken(name_tok),
+                false,
+                .other,
+                null,
+                type_name,
+            );
         }
     }
 
@@ -1413,7 +1494,21 @@ const Builder = struct {
         // call sites `op(args)` resolve through to some_fn's
         // annotation / takes / is_noreturn.
         const bound_fn_name: ?[]const u8 = if (init_opt) |i| self.boundFnName(i) else null;
-        const local = try self.registerLocalFull(name, self.posOfToken(name_tok), is_array, init_hint, bound_fn_name);
+        // Type annotation on the decl (`var x: Foo = ...`) — extracted
+        // for receiver-type tracking.  Implicit-typed decls leave
+        // type_name null; the lookup will fall back to bare-name.
+        const decl_type_name: ?[]const u8 = if (var_decl.ast.type_node.unwrap()) |tn|
+            self.extractTypeName(tn, self.self_type)
+        else
+            null;
+        const local = try self.registerLocalWithType(
+            name,
+            self.posOfToken(name_tok),
+            is_array,
+            init_hint,
+            bound_fn_name,
+            decl_type_name,
+        );
 
         // Emit .use stmts for every local read by the init expression
         // (before the .decl so the read is checked against pre-decl state).
@@ -2207,13 +2302,21 @@ const Builder = struct {
             tree.nodeData(callee).node_and_token[0]
         else
             null;
+        // Receiver's type name — used to disambiguate methods that
+        // share a name across container types.  Null when the recv
+        // isn't a known local with type info, in which case the DB
+        // falls back to bare-name lookup.
+        const recv_ty: ?[]const u8 = if (recv_node) |rn|
+            self.receiverTypeOfNode(rn)
+        else
+            null;
 
         // Look up @takes annotation.  Try same-file first.  For
         // `lib.dispose(...)` shape (recv is an imported namespace),
         // also try the remote file's DB.
         const takes = blk: {
             if (self.db) |db| {
-                if (db.lookup(callee_name)) |entry| {
+                if (db.lookupTyped(recv_ty, callee_name)) |entry| {
                     if (entry.takes) |t| break :blk t;
                 }
             }
@@ -2272,10 +2375,17 @@ const Builder = struct {
         const field_name = tree.tokenSlice(recv_fa[1]);
         const method_name = tree.tokenSlice(fa[1]);
 
+        // The receiver of the method call is the FIELD (`parent.field`).
+        // Its declared type is what we want to scope the method lookup
+        // to.  We don't track field types; so far this is name-keyed.
+        // Keeping it as bare-name with the ambiguity guard is the
+        // conservative behaviour pending field-type tracking.
+        const recv_ty: ?[]const u8 = null;
+
         // Resolve method's @takes via same-file or cross-file DB.
         const takes = blk: {
             if (self.db) |db| {
-                if (db.lookup(method_name)) |entry| {
+                if (db.lookupTyped(recv_ty, method_name)) |entry| {
                     if (entry.takes) |t| break :blk t;
                 }
             }
@@ -2285,6 +2395,19 @@ const Builder = struct {
             .ownership => |idx| if (idx != 0) return null,
         }
         return .{ .parent = parent, .name = field_name };
+    }
+
+    /// Best-effort type name for a node used as a method-call
+    /// receiver.  Looks up the node's identifier in name_to_local to
+    /// get a known local's declared type.  Returns null when the
+    /// node isn't a tracked local or doesn't have a type annotation
+    /// — callers fall back to bare-name lookup.
+    fn receiverTypeOfNode(self: *Builder, node: Ast.Node.Index) ?[]const u8 {
+        const tree = self.tree;
+        if (tree.nodeTag(node) != .identifier) return null;
+        const name = tree.tokenSlice(tree.nodeMainToken(node));
+        const lid = self.name_to_local.get(name) orelse return null;
+        return self.locals.items[@intFromEnum(lid)].type_name;
     }
 
     /// Cross-file `@takes` lookup — see lookupRemoteMethod for the

@@ -61,6 +61,11 @@ pub const TakesAnnotation = union(enum) {
 pub const FnEntry = struct {
     /// Function name (slice into source — keep source alive).
     name: []const u8,
+    /// Name of the struct/union/enum the fn was declared inside, or
+    /// null for top-level fns.  Used by lookupTyped to disambiguate
+    /// methods that share a name across types (`finalize` on both
+    /// `HTMLRewriter` and `HTMLRewriterLoader`).
+    containing_type: ?[]const u8 = null,
     /// `@returns ...` annotation if present.  Null for fns that
     /// only carry a `@takes` signal — their return value isn't
     /// classified specially at call sites.
@@ -88,46 +93,119 @@ pub const FnEntry = struct {
 };
 
 pub const Db = struct {
-    fns: std.StringHashMapUnmanaged(FnEntry),
-    /// Set of fn names that appear MORE THAN ONCE as fn_decl in the
-    /// source file (e.g. `finalize` defined on both `HTMLRewriter`
-    /// and `HTMLRewriterLoader`).  zbc's annotation DB is keyed by
-    /// bare name — no struct scoping — so the second definition
-    /// silently overwrites the first.  Marking names as ambiguous
-    /// disables `@takes` / `@returns` propagation through `lookup`
-    /// for them, preventing the kind of FP where R8b infers
-    /// `@takes(0)` on the destroy-flavoured `finalize` and every
-    /// unrelated `<recv>.finalize()` call site then looks like a
-    /// destruction.
-    ambiguous: std.StringHashMapUnmanaged(void) = .empty,
+    /// Multi-map: each name keys an array of entries, one per
+    /// fn_decl with that name.  Most names have exactly one entry;
+    /// methods that overload across types (e.g. `finalize` on both
+    /// `HTMLRewriter` and `HTMLRewriterLoader`) have more.
+    /// Disambiguation by containing_type lives in `lookupTyped`.
+    fns: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(FnEntry)),
+    /// fn_decl AST node → containing struct/union/enum type name.
+    /// Populated by buildFull's pre-pass.  Lets the cfg builder
+    /// pull `self_type` for the fn it's lowering so `*Self` /
+    /// `*@This()` resolve correctly and `<recv>.method()` look-ups
+    /// disambiguate by recv type.
+    containing_types: std.AutoHashMapUnmanaged(Ast.Node.Index, []const u8) = .empty,
 
     pub fn deinit(self: *Db, gpa: std.mem.Allocator) void {
         var it = self.fns.valueIterator();
-        while (it.next()) |e| {
-            if (e.may_free_fields.len > 0) gpa.free(e.may_free_fields);
+        while (it.next()) |list| {
+            for (list.items) |e| {
+                if (e.may_free_fields.len > 0) gpa.free(e.may_free_fields);
+            }
+            list.deinit(gpa);
         }
         self.fns.deinit(gpa);
-        self.ambiguous.deinit(gpa);
+        self.containing_types.deinit(gpa);
     }
 
-    /// True iff the name has multiple fn_decl definitions in the
-    /// file (e.g. method overload across types).  Callers that
-    /// depend on cross-fn semantics — R10 inference, call-site
-    /// `@takes` resolution — should skip ambiguous names rather
-    /// than guess which overload is being called.
-    pub fn isAmbiguous(self: *const Db, name: []const u8) bool {
-        return self.ambiguous.contains(name);
+    /// Returns the containing type name for a fn_decl AST node, or
+    /// null when the fn is top-level (or the node isn't a fn_decl).
+    pub fn containingType(self: *const Db, fn_decl: Ast.Node.Index) ?[]const u8 {
+        return self.containing_types.get(fn_decl);
     }
 
-    /// Look up a fn's annotations.  Returns null for ambiguous names
-    /// (multiple definitions) so callers don't latch onto the
-    /// arbitrary "last writer wins" entry and propagate annotations
-    /// that belong to a sibling overload.
+    /// Look up by name only.  Returns the entry only when EXACTLY ONE
+    /// fn_decl has this name — multiple matches are ambiguous (we
+    /// can't tell from a bare-name call which overload is meant), so
+    /// we return null rather than guess and risk propagating
+    /// annotations from a sibling overload (the classic
+    /// "HTMLRewriter.finalize destroys self, HTMLRewriterLoader.finalize
+    /// doesn't" trap).
     pub fn lookup(self: *const Db, name: []const u8) ?FnEntry {
-        if (self.ambiguous.contains(name)) return null;
-        return self.fns.get(name);
+        const list = self.fns.get(name) orelse return null;
+        if (list.items.len != 1) return null;
+        return list.items[0];
+    }
+
+    /// Look up a method by (containing_type, name).  When `ty` is
+    /// known: return the entry whose containing_type matches
+    /// exactly, or null.  Crucially: do NOT fall back to bare-name
+    /// lookup when ty was given — that would return a sibling
+    /// overload's entry (the classic `HTMLRewriter.finalize` /
+    /// `HTMLRewriterLoader.finalize` trap, where the wrong-type
+    /// match would propagate @takes(0) to all `<loader>.finalize()`
+    /// calls).  When `ty` is null (recv type unknown), fall back to
+    /// bare-name lookup with its own ambiguity guard.
+    pub fn lookupTyped(self: *const Db, ty: ?[]const u8, name: []const u8) ?FnEntry {
+        if (ty) |t| {
+            const list = self.fns.get(name) orelse return null;
+            for (list.items) |e| {
+                if (e.containing_type) |ct| {
+                    if (std.mem.eql(u8, ct, t)) return e;
+                }
+            }
+            return null;
+        }
+        return self.lookup(name);
+    }
+
+    /// Lower-level helper for callers that want to iterate matching
+    /// entries themselves (e.g. R10 inference checking whether ALL
+    /// overloads agree on @takes(0)).
+    pub fn lookupAll(self: *const Db, name: []const u8) []const FnEntry {
+        const list = self.fns.get(name) orelse return &.{};
+        return list.items;
     }
 };
+
+/// Find an existing entry by (name, containing_type) without
+/// inserting.  Returns a copy by value (callers that want to mutate
+/// in place go through `putOrUpdate`).
+fn findByCt(db: *const Db, name: []const u8, ct: ?[]const u8) ?FnEntry {
+    const list = db.fns.get(name) orelse return null;
+    for (list.items) |e| {
+        const a_null = e.containing_type == null;
+        const b_null = ct == null;
+        if (a_null and b_null) return e;
+        if (!a_null and !b_null and std.mem.eql(u8, e.containing_type.?, ct.?)) return e;
+    }
+    return null;
+}
+
+/// Helper for the build passes: append-or-update an entry by
+/// (name, containing_type).  Returns a pointer to the entry in db.fns
+/// so callers can mutate fields in place.
+fn putOrUpdate(
+    db: *Db,
+    gpa: std.mem.Allocator,
+    name: []const u8,
+    containing_type: ?[]const u8,
+    initial: FnEntry,
+) !*FnEntry {
+    const gop = try db.fns.getOrPut(gpa, name);
+    if (!gop.found_existing) {
+        gop.value_ptr.* = .empty;
+    }
+    // Find existing entry with the same containing_type, or append.
+    for (gop.value_ptr.items) |*e| {
+        const a_null = e.containing_type == null;
+        const b_null = containing_type == null;
+        if (a_null and b_null) return e;
+        if (!a_null and !b_null and std.mem.eql(u8, e.containing_type.?, containing_type.?)) return e;
+    }
+    try gop.value_ptr.append(gpa, initial);
+    return &gop.value_ptr.items[gop.value_ptr.items.len - 1];
+}
 
 /// Walk every fn_decl in `tree`, extract any explicit `@returns`
 /// annotation, then run inference (R6, R7, R8) to fill obvious holes.
@@ -166,33 +244,27 @@ pub fn buildFull(
     var db: Db = .{ .fns = .empty };
     errdefer db.deinit(gpa);
 
-    // Pre-pass — count fn_decl name occurrences to detect overloads.
-    // Names with >1 definition go into db.ambiguous; subsequent
-    // inference passes and call-site lookups skip them.
-    {
-        var name_count: std.StringHashMapUnmanaged(u32) = .empty;
-        defer name_count.deinit(gpa);
-        var ni: u32 = 1;
-        while (ni < tree.nodes.len) : (ni += 1) {
-            const n: Ast.Node.Index = @enumFromInt(ni);
-            if (tree.nodeTag(n) != .fn_decl) continue;
-            var nbuf: [1]Ast.Node.Index = undefined;
-            const np = fullFnProto(tree, &nbuf, n) orelse continue;
-            const nt = np.name_token orelse continue;
-            const nn = tree.tokenSlice(nt);
-            const gop = try name_count.getOrPut(gpa, nn);
-            if (gop.found_existing) gop.value_ptr.* += 1 else gop.value_ptr.* = 1;
-        }
-        var it = name_count.iterator();
-        while (it.next()) |e| {
-            if (e.value_ptr.* > 1) try db.ambiguous.put(gpa, e.key_ptr.*, {});
-        }
-    }
+    // Pre-pass — for each fn_decl, find its containing struct/union/
+    // enum type so methods can be looked up by (type, name) rather
+    // than bare name.  Resolves `<recv>.method()` to the right
+    // overload when multiple types declare the same method name.
+    // The map is owned by the Db (kept across passes + exposed to the
+    // cfg builder so it can populate self_type per fn).
+    try discoverContainingTypes(gpa, tree, &db.containing_types);
+    const fn_to_type = &db.containing_types;
 
     // Pass 1 — explicit annotations + R6 (slice + body allocs → owned).
+    //
+    // Only walk fn_decl nodes (fns with bodies).  `fullFnProto` would
+    // also succeed for the standalone fn_proto node *inside* each
+    // fn_decl — that double-processes every fn and (with the new
+    // multi-map keyed by containing_type) inserts duplicate entries
+    // for the proto's ct=null entry, making the name ambiguous and
+    // poisoning bare-name lookups.
     var node_idx: u32 = 1;
     while (node_idx < tree.nodes.len) : (node_idx += 1) {
         const node: Ast.Node.Index = @enumFromInt(node_idx);
+        if (tree.nodeTag(node) != .fn_decl) continue;
         var buf: [1]Ast.Node.Index = undefined;
         const fn_proto = fullFnProto(tree, &buf, node) orelse continue;
         const name_tok = fn_proto.name_token orelse continue;
@@ -218,8 +290,10 @@ pub fn buildFull(
         // Skip if no signal of any flavor.
         if (annotation == null and takes_anno == null and !is_noreturn) continue;
         const name = tree.tokenSlice(name_tok);
-        try db.fns.put(gpa, name, .{
+        const ct = fn_to_type.get(node);
+        _ = try putOrUpdate(&db, gpa, name, ct, .{
             .name = name,
+            .containing_type = ct,
             .annotation = annotation,
             .takes = takes_anno,
             .is_noreturn = is_noreturn,
@@ -245,20 +319,23 @@ pub fn buildFull(
             const fn_proto = fullFnProto(tree, &buf, node) orelse continue;
             const name_tok = fn_proto.name_token orelse continue;
             const name = tree.tokenSlice(name_tok);
+            const ct = fn_to_type.get(node);
             // R7 only fills missing `.annotation`.  An entry with
             // only `.takes` (no return annotation) is still a
             // candidate for R7 to enrich.
-            const existing = db.fns.get(name);
+            const existing = findByCt(&db, name, ct);
             if (existing != null and existing.?.annotation != null) continue;
 
             const body = tree.nodeData(node).node_and_node[1];
             const inferred = inferDelegatorBorrow(tree, fn_proto, body, &db, remote) orelse continue;
-            try db.fns.put(gpa, name, .{
+            const ep = try putOrUpdate(&db, gpa, name, ct, .{
                 .name = name,
+                .containing_type = ct,
                 .annotation = inferred,
                 .takes = if (existing) |e| e.takes else null,
                 .is_noreturn = if (existing) |e| e.is_noreturn else false,
             });
+            ep.annotation = inferred;
             added = true;
         }
         if (!added) break;
@@ -277,10 +354,13 @@ pub fn buildFull(
         const fn_proto = fullFnProto(tree, &buf, node) orelse continue;
         const name_tok = fn_proto.name_token orelse continue;
         const name = tree.tokenSlice(name_tok);
+        const ct = fn_to_type.get(node);
         const body = tree.nodeData(node).node_and_node[1];
 
-        var entry = db.fns.get(name) orelse FnEntry{
+        const existing = findByCt(&db, name, ct);
+        var entry: FnEntry = existing orelse .{
             .name = name,
+            .containing_type = ct,
             .annotation = null,
             .takes = null,
             .is_noreturn = false,
@@ -302,7 +382,10 @@ pub fn buildFull(
                 changed = true;
             }
         }
-        if (changed) try db.fns.put(gpa, name, entry);
+        if (changed) {
+            const ep = try putOrUpdate(&db, gpa, name, ct, entry);
+            ep.* = entry;
+        }
     }
 
     // Pass 4 — R10: transitive receiver-freeing inference.
@@ -324,19 +407,22 @@ pub fn buildFull(
             const fn_proto = fullFnProto(tree, &buf, node) orelse continue;
             const name_tok = fn_proto.name_token orelse continue;
             const name = tree.tokenSlice(name_tok);
-            const existing = db.fns.get(name);
+            const ct = fn_to_type.get(node);
+            const existing = findByCt(&db, name, ct);
             // Skip if already has a `takes` — don't overwrite explicit
             // annotations or R8b's direct-free inference.
             if (existing != null and existing.?.takes != null) continue;
 
             const body = tree.nodeData(node).node_and_node[1];
-            const inferred = inferTakesViaReceiverCall(tree, fn_proto, body, &db) orelse continue;
-            try db.fns.put(gpa, name, .{
+            const inferred = inferTakesViaReceiverCall(tree, fn_proto, body, &db, ct) orelse continue;
+            const ep = try putOrUpdate(&db, gpa, name, ct, .{
                 .name = name,
+                .containing_type = ct,
                 .annotation = if (existing) |e| e.annotation else null,
                 .takes = inferred,
                 .is_noreturn = if (existing) |e| e.is_noreturn else false,
             });
+            ep.takes = inferred;
             added = true;
         }
         if (!added) break;
@@ -392,6 +478,7 @@ fn inferTakesViaReceiverCall(
     fn_proto: Ast.full.FnProto,
     body_node: Ast.Node.Index,
     db: *const Db,
+    self_type: ?[]const u8,
 ) ?TakesAnnotation {
     const first = tree.firstToken(body_node);
     const last = tree.lastToken(body_node);
@@ -412,10 +499,12 @@ fn inferTakesViaReceiverCall(
         const recv_name = tree.tokenSlice(t);
         const method_name = tree.tokenSlice(t + 2);
         const param_idx = resolveParamIndex(tree, fn_proto, recv_name) orelse continue;
-        // `lookup` (not `fns.get`) filters ambiguous names — names with
-        // multiple definitions across types — so R10 doesn't propagate
-        // a `@takes(0)` that was inferred on a sibling overload.
-        const callee = db.lookup(method_name) orelse continue;
+        // The receiver type is the param's declared type, with
+        // Self / @This() resolved to the enclosing fn's containing
+        // type.  Lets `lookupTyped` route to the right overload
+        // when `method_name` is shared across types.
+        const recv_ty = paramTypeName(tree, fn_proto, param_idx, self_type);
+        const callee = db.lookupTyped(recv_ty, method_name) orelse continue;
         const callee_takes = callee.takes orelse continue;
         switch (callee_takes) {
             .ownership => |i| {
@@ -424,6 +513,59 @@ fn inferTakesViaReceiverCall(
                 // free arg 0 propagate self-freeing-ness.
                 if (i == 0) return .{ .ownership = param_idx };
             },
+        }
+    }
+    return null;
+}
+
+/// Return the param's declared base type name (with `*`/`?`/`const`
+/// stripped, and `Self` / `@This()` resolved to `self_type`).  Null
+/// when the param has no type annotation, the type is a slice/array,
+/// or the param index is out of range.
+fn paramTypeName(
+    tree: *const Ast,
+    fn_proto: Ast.full.FnProto,
+    param_idx: u32,
+    self_type: ?[]const u8,
+) ?[]const u8 {
+    var it = fn_proto.iterate(tree);
+    var i: u32 = 0;
+    while (it.next()) |p| : (i += 1) {
+        if (i != param_idx) continue;
+        const type_expr = p.type_expr orelse return null;
+        return stripTypeWrappers(tree, type_expr, self_type);
+    }
+    return null;
+}
+
+/// Strip leading `?`, `*`, `const` tokens; return the first
+/// identifier as the base type name.  Resolves `Self` and `@This()`
+/// to `self_type`.  Returns null for slices, arrays, function ptrs,
+/// or anonymous types.
+fn stripTypeWrappers(
+    tree: *const Ast,
+    type_node: Ast.Node.Index,
+    self_type: ?[]const u8,
+) ?[]const u8 {
+    const first = tree.firstToken(type_node);
+    const last = tree.lastToken(type_node);
+    const tags = tree.tokens.items(.tag);
+    var t: Ast.TokenIndex = first;
+    while (t <= last) : (t += 1) {
+        switch (tags[t]) {
+            .question_mark, .asterisk, .keyword_const => continue,
+            .l_bracket => return null,
+            .identifier => {
+                const name = tree.tokenSlice(t);
+                if (std.mem.eql(u8, name, "Self")) return self_type;
+                return name;
+            },
+            .builtin => {
+                const name = tree.tokenSlice(t);
+                if (std.mem.eql(u8, name, "@This")) return self_type;
+                return null;
+            },
+            else => return null,
         }
     }
     return null;
@@ -1012,6 +1154,90 @@ fn singleReturnExpr(tree: *const Ast, body_node: Ast.Node.Index) ?Ast.Node.Index
     if (!std.mem.eql(u8, decl_name, ret_name)) return null;
 
     return var_decl.ast.init_node.unwrap();
+}
+
+/// Walk the AST top-down from the root container.  For every
+/// `const TypeName = struct { ... };` (or union/enum), record each
+/// fn_decl member as belonging to `TypeName`.  Recursively descends
+/// into nested types.  Top-level fns get no entry (their containing
+/// type is null).
+///
+/// Used by the type-aware lookup so a `*<recv>.method()` site can
+/// disambiguate between overloads.
+fn discoverContainingTypes(
+    gpa: std.mem.Allocator,
+    tree: *const Ast,
+    out: *std.AutoHashMapUnmanaged(Ast.Node.Index, []const u8),
+) !void {
+    const root = tree.containerDeclRoot();
+    try walkContainerMembers(gpa, tree, root.ast.members, null, out);
+}
+
+fn walkContainerMembers(
+    gpa: std.mem.Allocator,
+    tree: *const Ast,
+    members: []const Ast.Node.Index,
+    containing_type: ?[]const u8,
+    out: *std.AutoHashMapUnmanaged(Ast.Node.Index, []const u8),
+) (std.mem.Allocator.Error)!void {
+    for (members) |member| {
+        switch (tree.nodeTag(member)) {
+            .fn_decl => {
+                if (containing_type) |ct| try out.put(gpa, member, ct);
+            },
+            .simple_var_decl,
+            .local_var_decl,
+            .aligned_var_decl,
+            .global_var_decl,
+            => {
+                const vd = tree.fullVarDecl(member) orelse continue;
+                const init_node = vd.ast.init_node.unwrap() orelse continue;
+                // The var decl's name (token after `const`/`var`) is
+                // the type's identifier when init is a container_decl.
+                const name_tok = vd.ast.mut_token + 1;
+                if (tree.tokens.items(.tag)[name_tok] != .identifier) continue;
+                const ty_name = tree.tokenSlice(name_tok);
+                try descendContainer(gpa, tree, init_node, ty_name, out);
+            },
+            else => {},
+        }
+    }
+}
+
+/// Dispatch on container_decl variant and recurse with the right
+/// member slice.  Variants that store members inline in a stack
+/// buffer (the `*Two` family) keep the buffer in scope of THIS
+/// function so the slice stays valid for the recursive call.
+fn descendContainer(
+    gpa: std.mem.Allocator,
+    tree: *const Ast,
+    node: Ast.Node.Index,
+    ty_name: []const u8,
+    out: *std.AutoHashMapUnmanaged(Ast.Node.Index, []const u8),
+) (std.mem.Allocator.Error)!void {
+    switch (tree.nodeTag(node)) {
+        .container_decl, .container_decl_trailing => {
+            try walkContainerMembers(gpa, tree, tree.containerDecl(node).ast.members, ty_name, out);
+        },
+        .container_decl_two, .container_decl_two_trailing => {
+            var buf: [2]Ast.Node.Index = undefined;
+            try walkContainerMembers(gpa, tree, tree.containerDeclTwo(&buf, node).ast.members, ty_name, out);
+        },
+        .container_decl_arg, .container_decl_arg_trailing => {
+            try walkContainerMembers(gpa, tree, tree.containerDeclArg(node).ast.members, ty_name, out);
+        },
+        .tagged_union, .tagged_union_trailing => {
+            try walkContainerMembers(gpa, tree, tree.taggedUnion(node).ast.members, ty_name, out);
+        },
+        .tagged_union_two, .tagged_union_two_trailing => {
+            var buf: [2]Ast.Node.Index = undefined;
+            try walkContainerMembers(gpa, tree, tree.taggedUnionTwo(&buf, node).ast.members, ty_name, out);
+        },
+        .tagged_union_enum_tag, .tagged_union_enum_tag_trailing => {
+            try walkContainerMembers(gpa, tree, tree.taggedUnionEnumTag(node).ast.members, ty_name, out);
+        },
+        else => {},
+    }
 }
 
 fn fullFnProto(tree: *const Ast, buf: *[1]Ast.Node.Index, node: Ast.Node.Index) ?Ast.full.FnProto {

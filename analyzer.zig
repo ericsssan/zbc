@@ -1461,6 +1461,62 @@ test "return switch (...) { .err => { free; return error.X } } — errdefer fire
     try std.testing.expectEqualStrings("heap-double-free", problems.items[0].rule_id);
 }
 
+test "type-aware lookup: `loader.finalize()` doesn't inherit `rewriter.finalize()`'s @takes(0)" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const bun = struct { pub fn destroy(_: anytype) void {} };
+        \\pub const HTMLRewriter = struct {
+        \\    pub fn finalize(this: *HTMLRewriter) void {
+        \\        bun.destroy(this);
+        \\    }
+        \\};
+        \\pub const HTMLRewriterLoader = struct {
+        \\    finalized: bool = false,
+        \\    pub fn finalize(this: *HTMLRewriterLoader) void {
+        \\        this.finalized = true;
+        \\    }
+        \\    pub fn fail(this: *HTMLRewriterLoader) void {
+        \\        this.finalize();
+        \\    }
+        \\    pub fn buggy(this: *HTMLRewriterLoader) void {
+        \\        this.fail();
+        \\        this.finalize();
+        \\    }
+        \\};
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    // Neither `this.fail()` nor `this.finalize()` actually frees the
+    // loader receiver — only `HTMLRewriter.finalize` (different type)
+    // does, and type-aware lookup keeps the @takes(0) scoped to that
+    // overload.  Expect zero findings.
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
+test "type-aware lookup: cross-fn self-freeing fires when callee on same type DOES destroy" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const bun = struct { pub fn destroy(_: anytype) void {} };
+        \\const T = struct {
+        \\    x: u32,
+        \\    pub fn finalize(this: *T) void { bun.destroy(this); }
+        \\    pub fn onFinish(this: *T) void { this.finalize(); }
+        \\    pub fn caller(this: *T) void {
+        \\        this.onFinish();
+        \\        const v = this.x;
+        \\        _ = v;
+        \\    }
+        \\};
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    var found = false;
+    for (problems.items) |p| {
+        if (std.mem.indexOf(u8, p.message, "after free") != null) found = true;
+    }
+    try std.testing.expect(found);
+}
+
 test "return error.X without prior explicit free — clean (errdefer is the SOLE free)" {
     const gpa = std.testing.allocator;
     var problems = try analyze(gpa,
