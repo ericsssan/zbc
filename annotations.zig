@@ -343,14 +343,6 @@ pub fn buildFull(
     try discoverContainingTypes(gpa, tree, &db.containing_types, &db.field_types, &db.borrowed_fields);
     const fn_to_type = &db.containing_types;
 
-    // Field-ownership inference — walk every method body inside each
-    // container type, look for `self.<field> = <RHS>` writes, and
-    // mark a field borrowed when ALL writes look like allocations
-    // (no caller-owned values flowed in).  Composes with the
-    // explicit `/// @borrowed` annotation parsed in
-    // `discoverContainingTypes`.
-    try inferBorrowedFields(gpa, tree, &db, alloc_patterns);
-
     // Pass 1 — explicit annotations + R6 (slice + body allocs → owned).
     //
     // Only walk fn_decl nodes (fns with bodies).  `fullFnProto` would
@@ -557,6 +549,16 @@ pub fn buildFull(
         }
         if (!added) break;
     }
+
+    // Field-ownership inference — runs LAST so it can consult the
+    // fully-populated `db.fns` (R6/R7/R8 annotations) when
+    // classifying RHS expressions.  Walks every method body inside
+    // each container type, looks for `self.<field> = <RHS>` writes
+    // and `return .{ .field = <RHS> }` constructor-shapes, and marks
+    // a field borrowed when ALL writes look like allocations.
+    // Composes with explicit `/// @borrowed` annotations parsed in
+    // `discoverContainingTypes`.
+    try inferBorrowedFields(gpa, tree, &db, alloc_patterns);
 
     return db;
 }
@@ -1628,7 +1630,7 @@ fn inferBorrowedFields(
         try collectCtLocals(tree, body, ct, gpa, &self_names);
 
         if (self_names.count() > 0) {
-            try scanBodyForFieldWrites(tree, body, &self_names, ct, alloc_patterns, gpa, &stats);
+            try scanBodyForFieldWrites(tree, body, &self_names, ct, alloc_patterns, db, gpa, &stats);
         }
 
         // Constructor-shape inference — when this fn's return type
@@ -1642,7 +1644,7 @@ fn inferBorrowedFields(
         //
         // which the `<self>.<field> =` scanner above can't see.
         if (fnReturnTypeMatches(tree, fn_decl, ct)) {
-            try scanReturnStructLiterals(tree, body, ct, alloc_patterns, gpa, &stats);
+            try scanReturnStructLiterals(tree, body, ct, alloc_patterns, db, gpa, &stats);
         }
     }
 
@@ -1759,6 +1761,7 @@ fn scanBodyForFieldWrites(
     self_names: *const std.StringHashMapUnmanaged(void),
     ct: []const u8,
     alloc_patterns: []const []const u8,
+    db: *const Db,
     gpa: std.mem.Allocator,
     stats: *std.HashMapUnmanaged(Db.FieldKey, FieldStats, Db.FieldKey.Context, std.hash_map.default_max_load_percentage),
 ) !void {
@@ -1801,7 +1804,7 @@ fn scanBodyForFieldWrites(
         const rhs_end_byte = if (rhs_end <= last) starts[rhs_end] else tree.source.len;
         const rhs_text = tree.source[rhs_start_byte..rhs_end_byte];
 
-        const cls = classifyRhsText(rhs_text, alloc_patterns);
+        const cls = classifyRhsText(rhs_text, alloc_patterns, db);
         const key: Db.FieldKey = .{ .containing_type = ct, .name = field_name };
         const gop = try stats.getOrPutContext(gpa, key, .{});
         if (!gop.found_existing) gop.value_ptr.* = .{};
@@ -1817,7 +1820,11 @@ fn scanBodyForFieldWrites(
     }
 }
 
-fn classifyRhsText(text: []const u8, alloc_patterns: []const []const u8) RhsClass {
+fn classifyRhsText(
+    text: []const u8,
+    alloc_patterns: []const []const u8,
+    db: *const Db,
+) RhsClass {
     const trimmed = std.mem.trim(u8, text, " \t\n\r");
     if (std.mem.eql(u8, trimmed, "undefined")) return .neutral;
     if (std.mem.eql(u8, trimmed, ".empty")) return .neutral;
@@ -1826,7 +1833,54 @@ fn classifyRhsText(text: []const u8, alloc_patterns: []const []const u8) RhsClas
     for (alloc_patterns) |pat| {
         if (std.mem.indexOf(u8, text, pat) != null) return .alloc;
     }
+    // Helper-delegated alloc: RHS is a call to a fn we already know
+    // returns heap-owned memory (annotated `@returns heap` or
+    // R6-inferred `@returns owned`).  Recognises `<recv>.<method>(...)`
+    // and bare `<method>(...)`; misses chained method calls like
+    // `foo().bar()` where the chain isn't a single recognised method.
+    if (callRhsReturnsHeap(trimmed, db)) return .alloc;
     return .other;
+}
+
+/// Text-level recogniser for a call expression whose callee is in
+/// `db.fns` with `@returns heap` (or R6 `.owned`).  Strips a leading
+/// `try `, requires the trimmed text to end with `)`, takes
+/// everything before the FIRST `(` as the callee, and takes the
+/// segment after the last `.` as the method name.
+///
+/// Intentionally narrow: returns false for `1 + foo()`, `foo().bar`,
+/// or anything more elaborate than a plain call.  Conservative on
+/// purpose — over-classifying as alloc would FP fields downstream.
+fn callRhsReturnsHeap(trimmed: []const u8, db: *const Db) bool {
+    var s = trimmed;
+    if (std.mem.startsWith(u8, s, "try ")) {
+        s = std.mem.trim(u8, s[4..], " \t\n\r");
+    }
+    if (!std.mem.endsWith(u8, s, ")")) return false;
+    const paren_pos = std.mem.indexOfScalar(u8, s, '(') orelse return false;
+    const callee = std.mem.trim(u8, s[0..paren_pos], " \t\n\r");
+    if (callee.len == 0) return false;
+    // Reject if callee contains whitespace or operators — we want a
+    // dotted identifier chain only.
+    for (callee) |c| {
+        switch (c) {
+            'A'...'Z', 'a'...'z', '0'...'9', '_', '.', '@' => {},
+            else => return false,
+        }
+    }
+    const method = if (std.mem.lastIndexOfScalar(u8, callee, '.')) |dot|
+        callee[dot + 1 ..]
+    else
+        callee;
+    if (method.len == 0) return false;
+    const list = db.fns.get(method) orelse return false;
+    for (list.items) |e| {
+        if (e.annotation) |a| switch (a) {
+            .heap, .owned => return true,
+            else => {},
+        };
+    }
+    return false;
 }
 
 /// True iff the fn's declared return type carries `ct` as its base
@@ -1864,6 +1918,7 @@ fn scanReturnStructLiterals(
     body: Ast.Node.Index,
     ct: []const u8,
     alloc_patterns: []const []const u8,
+    db: *const Db,
     gpa: std.mem.Allocator,
     stats: *std.HashMapUnmanaged(Db.FieldKey, FieldStats, Db.FieldKey.Context, std.hash_map.default_max_load_percentage),
 ) !void {
@@ -1904,7 +1959,7 @@ fn scanReturnStructLiterals(
             const rhs_end = starts[fl_last] + tree.tokenSlice(fl_last).len;
             const rhs_text = tree.source[rhs_start..rhs_end];
 
-            const cls = classifyRhsText(rhs_text, alloc_patterns);
+            const cls = classifyRhsText(rhs_text, alloc_patterns, db);
             const key: Db.FieldKey = .{ .containing_type = ct, .name = fname };
             const gop = try stats.getOrPutContext(gpa, key, .{});
             if (!gop.found_existing) gop.value_ptr.* = .{};
