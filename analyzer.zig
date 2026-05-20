@@ -1547,6 +1547,58 @@ test "field-type lookup: `wrapper.field.method()` resolves via field's type" {
     try std.testing.expectEqual(@as(usize, 0), problems.items.len);
 }
 
+test "R10 field-chain: wrapper method `this.inner.dispose()` propagates as ownership_field" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const bun = struct { pub fn destroy(_: anytype) void {} };
+        \\const Item = struct {
+        \\    pub fn dispose(this: *Item) void { bun.destroy(this); }
+        \\};
+        \\const Wrapper = struct {
+        \\    inner: *Item,
+        \\    pub fn cleanup(this: *Wrapper) void {
+        \\        this.inner.dispose();
+        \\    }
+        \\};
+        \\pub fn buggy(w: *Wrapper) void {
+        \\    w.cleanup();
+        \\    const x = w.inner;
+        \\    _ = x;
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    var found = false;
+    for (problems.items) |p| {
+        if (std.mem.indexOf(u8, p.message, "use of `w.inner`") != null) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "R10 field-chain: wrapper with NON-destroying inner method doesn't FP" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const Item = struct {
+        \\    used: bool = false,
+        \\    pub fn nudge(this: *Item) void { this.used = true; }
+        \\};
+        \\const Wrapper = struct {
+        \\    inner: *Item,
+        \\    pub fn cleanup(this: *Wrapper) void {
+        \\        this.inner.nudge();
+        \\    }
+        \\};
+        \\pub fn clean(w: *Wrapper) void {
+        \\    w.cleanup();
+        \\    const x = w.inner;
+        \\    _ = x;
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
 test "field-type lookup: still catches `w.field.method()` when method DOES destroy that field's type" {
     const gpa = std.testing.allocator;
     var problems = try analyze(gpa,

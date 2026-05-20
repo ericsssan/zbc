@@ -56,6 +56,15 @@ pub const TakesAnnotation = union(enum) {
     /// for the named param's heap allocation.  Caller emits a
     /// .heap_free against that arg at the call site.
     ownership: u32,
+    /// Inferred-only (no explicit annotation surface) — the call
+    /// frees a FIELD of one of its params.  Set when R10's walker
+    /// sees `<param>.<field>.<method>()` and the resolved method
+    /// is `@takes ownership(0)` (it frees its receiver).
+    ///
+    /// Caller emits `.field_heap_free` on the Nth arg's field at
+    /// the call site.  Field name is borrowed from source — keep
+    /// the tree alive while entries are live.
+    ownership_field: struct { param: u32, field: []const u8 },
 };
 
 pub const FnEntry = struct {
@@ -545,42 +554,62 @@ fn inferTakesViaReceiverCall(
 
     var t: Ast.TokenIndex = first;
     while (t + 3 <= last) : (t += 1) {
-        // Pattern: <identifier> `.` <identifier> `(`
         if (tags[t] != .identifier) continue;
         if (tags[t + 1] != .period) continue;
         if (tags[t + 2] != .identifier) continue;
-        if (tags[t + 3] != .l_paren) continue;
         // Reject longer-chain heads — `a.b.c(...)` where we'd match
         // at `b.c(` but `b` isn't a function param.  Skip if the
         // token BEFORE our receiver is `.` (we're mid-chain).
         if (t > 0 and tags[t - 1] == .period) continue;
 
-        const recv_name = tree.tokenSlice(t);
-        const method_name = tree.tokenSlice(t + 2);
-        const param_idx = resolveParamIndex(tree, fn_proto, recv_name) orelse continue;
-        // The receiver type is the param's declared type, with
-        // Self / @This() resolved to the enclosing fn's containing
-        // type.  Lets `lookupTyped` route to the right overload
-        // when `method_name` is shared across types.
-        const recv_ty = paramTypeName(tree, fn_proto, param_idx, self_type);
-        // Local DB first; cross-file when the recv's type lives in
-        // an imported file (e.g. our `caller(x: *lib.HTMLRewriter)`
-        // calls `x.finalize()` and HTMLRewriter is defined in lib.zig).
-        const callee: FnEntry = if (db.lookupTyped(recv_ty, method_name)) |e|
-            e
-        else if (recv_ty != null and remote != null)
-            (lookupCrossFile(remote.?, recv_ty.?, method_name) orelse continue)
-        else
-            continue;
-        const callee_takes = callee.takes orelse continue;
-        switch (callee_takes) {
-            .ownership => |i| {
-                // Callee frees its arg at index `i`.  For receiver
-                // -calls the receiver is arg 0, so only callees that
-                // free arg 0 propagate self-freeing-ness.
-                if (i == 0) return .{ .ownership = param_idx };
-            },
+        const param_name = tree.tokenSlice(t);
+        const param_idx = resolveParamIndex(tree, fn_proto, param_name) orelse continue;
+        const parent_ty = paramTypeName(tree, fn_proto, param_idx, self_type);
+
+        // Two shapes to recognise:
+        //   case A: `<param>.<method>(`         — frees the param.
+        //   case B: `<param>.<field>.<method>(` — frees a field of the param.
+        if (tags[t + 3] == .l_paren) {
+            // CASE A.  method = t+2.
+            const method_name = tree.tokenSlice(t + 2);
+            const callee = resolveMethod(db, parent_ty, method_name, remote) orelse continue;
+            const callee_takes = callee.takes orelse continue;
+            switch (callee_takes) {
+                .ownership => |i| if (i == 0) return .{ .ownership = param_idx },
+                .ownership_field => {},
+            }
+        } else if (t + 5 <= last and tags[t + 3] == .period and tags[t + 4] == .identifier and tags[t + 5] == .l_paren) {
+            // CASE B.  field = t+2, method = t+4.
+            const field_name = tree.tokenSlice(t + 2);
+            const method_name = tree.tokenSlice(t + 4);
+            const pty = parent_ty orelse continue;
+            const field_ty = db.fieldType(pty, field_name) orelse continue;
+            const callee = resolveMethod(db, field_ty, method_name, remote) orelse continue;
+            const callee_takes = callee.takes orelse continue;
+            switch (callee_takes) {
+                .ownership => |i| {
+                    // method is @takes(0) on its receiver (the field).
+                    // → THIS fn frees `param.field`.
+                    if (i == 0) return .{ .ownership_field = .{ .param = param_idx, .field = field_name } };
+                },
+                .ownership_field => {},
+            }
         }
+    }
+    return null;
+}
+
+/// Resolve a method by (containing_type, name) — local DB first,
+/// then cross-file when remote is available.  Used by R10 inference.
+fn resolveMethod(
+    db: *const Db,
+    ty: ?[]const u8,
+    method_name: []const u8,
+    remote: ?RemoteCtx,
+) ?FnEntry {
+    if (db.lookupTyped(ty, method_name)) |e| return e;
+    if (ty != null and remote != null) {
+        if (lookupCrossFile(remote.?, ty.?, method_name)) |e| return e;
     }
     return null;
 }

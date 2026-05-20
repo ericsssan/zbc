@@ -381,6 +381,57 @@ test "lib API: cross-file R10 chain — wrapper fn calls cross-file destroying m
     try std.testing.expect(found);
 }
 
+test "lib API: cross-file R10 field-chain — wrapper method frees field via cross-file destroy" {
+    const gpa = std.testing.allocator;
+    const tio = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // lib.zig: Item.dispose destroys self.
+    try tmp.dir.writeFile(tio, .{ .sub_path = "lib.zig", .data =
+        \\const bun = struct { pub fn destroy(_: anytype) void {} };
+        \\pub const Item = struct {
+        \\    pub fn dispose(this: *Item) void { bun.destroy(this); }
+        \\};
+        \\
+    });
+    // caller.zig: Wrapper.cleanup calls this.inner.dispose() — chain
+    // resolves to lib.Item.dispose (cross-file), so cleanup should be
+    // inferred as ownership_field { param=0, field="inner" }.
+    try tmp.dir.writeFile(tio, .{ .sub_path = "caller.zig", .data =
+        \\const lib = @import("lib.zig");
+        \\pub const Wrapper = struct {
+        \\    inner: *lib.Item,
+        \\    pub fn cleanup(this: *Wrapper) void {
+        \\        this.inner.dispose();
+        \\    }
+        \\};
+        \\pub fn buggy(w: *Wrapper) void {
+        \\    w.cleanup();
+        \\    const x = w.inner;
+        \\    _ = x;
+        \\}
+        \\
+    });
+
+    const base_dir = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer gpa.free(base_dir);
+    const path = try std.fs.path.join(gpa, &.{ base_dir, "caller.zig" });
+    defer gpa.free(path);
+
+    var cache = Cache.init(gpa, tio);
+    defer cache.deinit();
+
+    const problems = try analyzeEscape(gpa, tio, path, &cache, &DefaultConfig);
+    defer freeProblems(gpa, problems);
+
+    var found = false;
+    for (problems) |p| {
+        if (std.mem.indexOf(u8, p.message, "use of `w.inner`") != null) found = true;
+    }
+    try std.testing.expect(found);
+}
+
 test "lib API: cross-file type-aware lookup disambiguates method overloads" {
     const gpa = std.testing.allocator;
     const tio = std.testing.io;

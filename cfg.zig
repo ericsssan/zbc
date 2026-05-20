@@ -2095,6 +2095,18 @@ const Builder = struct {
             });
             return;
         }
+        if (self.takesOwnershipFreedReceiverField(node)) |fref| {
+            try self.appendStmt(cur.*, .{
+                .kind = .{ .field_heap_free = .{ .parent = fref.parent, .name = fref.name, .fallback_hid = blk_hid: {
+                    const h: abstract_state.HeapId = @enumFromInt(self.next_heap);
+                    self.next_heap += 1;
+                    break :blk_hid h;
+                } } },
+                .pos = self.posOf(node),
+                .end_pos = self.endPosOf(node),
+            });
+            return;
+        }
     }
 
     fn lowerCallStmt(self: *Builder, call_node: Ast.Node.Index, cur: *BlockId) !void {
@@ -2195,6 +2207,19 @@ const Builder = struct {
         // class) is invisible: takesOwnershipFreedLocal returns null
         // because the receiver is a field_access, not a bare ident.
         if (self.takesOwnershipFreedField(call_node)) |fref| {
+            try self.appendStmt(cur.*, .{
+                .kind = .{ .field_heap_free = .{ .parent = fref.parent, .name = fref.name, .fallback_hid = blk_hid: { const h: abstract_state.HeapId = @enumFromInt(self.next_heap); self.next_heap += 1; break :blk_hid h; } } },
+                .pos = self.posOf(call_node),
+                .end_pos = self.endPosOf(call_node),
+            });
+            return;
+        }
+        // `obj.wrapper_method(...)` where wrapper_method has
+        // `@takes ownership_field { param=0, field=F }` — the callee
+        // frees `obj.F`.  Emit .field_heap_free on (obj, F).  This is
+        // R10's transitive field-chain case (a wrapper method that
+        // calls `this.F.destroy()` internally).
+        if (self.takesOwnershipFreedReceiverField(call_node)) |fref| {
             try self.appendStmt(cur.*, .{
                 .kind = .{ .field_heap_free = .{ .parent = fref.parent, .name = fref.name, .fallback_hid = blk_hid: { const h: abstract_state.HeapId = @enumFromInt(self.next_heap); self.next_heap += 1; break :blk_hid h; } } },
                 .pos = self.posOf(call_node),
@@ -2349,6 +2374,10 @@ const Builder = struct {
 
         const target_idx = switch (takes) {
             .ownership => |i| i,
+            // ownership_field is a SEPARATE call-site path
+            // (`takesOwnershipFreedReceiverField`) — emits
+            // .field_heap_free rather than .heap_free.  Skip here.
+            .ownership_field => return null,
         };
 
         // For cross-file namespace calls (`lib.dispose(g, buf)`), the
@@ -2427,6 +2456,10 @@ const Builder = struct {
         };
         switch (takes) {
             .ownership => |idx| if (idx != 0) return null,
+            // ownership_field on `<local>.<field>.<method>()` shape
+            // would describe a chain three levels deep — not yet
+            // tracked.  Skip rather than misinterpret.
+            .ownership_field => return null,
         }
         return .{ .parent = parent, .name = field_name };
     }
@@ -2442,6 +2475,46 @@ const Builder = struct {
         const name = tree.tokenSlice(tree.nodeMainToken(node));
         const lid = self.name_to_local.get(name) orelse return null;
         return self.locals.items[@intFromEnum(lid)].type_name;
+    }
+
+    /// `<recv>.<method>(...)` where method's @takes is
+    /// `ownership_field { param=0, field=F }` — the call frees
+    /// `<recv>.F`.  Returns the FieldRef on the recv local.  Null
+    /// when the shape doesn't match or no annotation propagates.
+    fn takesOwnershipFreedReceiverField(self: *Builder, call_node: Ast.Node.Index) ?FieldRef {
+        const tree = self.tree;
+        var buf: [1]Ast.Node.Index = undefined;
+        const call_full = tree.fullCall(&buf, call_node) orelse return null;
+        const callee = call_full.ast.fn_expr;
+        if (tree.nodeTag(callee) != .field_access) return null;
+        const fa = tree.nodeData(callee).node_and_token;
+        const recv = fa[0];
+        if (tree.nodeTag(recv) != .identifier) return null;
+        const recv_name = tree.tokenSlice(tree.nodeMainToken(recv));
+        const parent = self.name_to_local.get(recv_name) orelse return null;
+        const method_name = tree.tokenSlice(fa[1]);
+        // Resolve method's @takes: typed local → cross-file → null.
+        const recv_ty = self.receiverTypeOfNode(recv);
+        const takes = blk: {
+            if (self.db) |db| {
+                if (db.lookupTyped(recv_ty, method_name)) |entry| {
+                    if (entry.takes) |t| break :blk t;
+                }
+            }
+            if (recv_ty) |ty| {
+                if (self.lookupCrossFileMethod(ty, method_name)) |entry| {
+                    if (entry.takes) |t| break :blk t;
+                }
+            }
+            return null;
+        };
+        return switch (takes) {
+            .ownership => null,
+            .ownership_field => |f| if (f.param == 0)
+                .{ .parent = parent, .name = f.field }
+            else
+                null,
+        };
     }
 
     /// Cross-file method lookup by (containing_type, method_name).
