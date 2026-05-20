@@ -235,35 +235,88 @@ fn inferReturnsHeap(
     return callTextMatchesAny(tree, expr, alloc_patterns);
 }
 
-/// R8b: body is `{ <EXPR>; }` where EXPR is a call matching any free
-/// pattern AND one of the call's args resolves to one of our params.
+/// R8b: any top-level body stmt is a call matching a free pattern
+/// whose last explicit arg resolves to one of our params.  Doesn't
+/// recurse into branches — the body's TOP level must contain the
+/// free call (which is the canonical free-wrapper shape; conditional
+/// frees are caller responsibility).
 fn inferTakesOwnership(
     tree: *const Ast,
     fn_proto: Ast.full.FnProto,
     body_node: Ast.Node.Index,
     free_patterns: []const []const u8,
 ) ?TakesAnnotation {
-    // Body must be one stmt that's a bare call expression.
-    const stmt = singleStmt(tree, body_node) orelse return null;
-    const is_call = switch (tree.nodeTag(stmt)) {
-        .call, .call_one, .call_comma, .call_one_comma => true,
-        else => false,
-    };
-    if (!is_call) return null;
-    if (!callTextMatchesAny(tree, stmt, free_patterns)) return null;
+    var it = topLevelStmts(tree, body_node);
+    while (it.next()) |stmt| {
+        const is_call = switch (tree.nodeTag(stmt)) {
+            .call, .call_one, .call_comma, .call_one_comma => true,
+            else => false,
+        };
+        if (!is_call) continue;
+        if (!callTextMatchesAny(tree, stmt, free_patterns)) continue;
 
-    // For free/destroy patterns the freed thing is the LAST
-    // explicit arg (`g.free(p)` → p; `gpa.destroy(p)` → p).  Don't
-    // consider the receiver — that's the allocator, never the
-    // freed local.
-    var buf: [1]Ast.Node.Index = undefined;
-    const call_full = tree.fullCall(&buf, stmt) orelse return null;
-    if (call_full.ast.params.len == 0) return null;
-    const last_arg = call_full.ast.params[call_full.ast.params.len - 1];
-    if (tree.nodeTag(last_arg) != .identifier) return null;
-    const n = tree.tokenSlice(tree.nodeMainToken(last_arg));
-    const idx = resolveParamIndex(tree, fn_proto, n) orelse return null;
-    return .{ .ownership = idx };
+        var buf: [1]Ast.Node.Index = undefined;
+        const call_full = tree.fullCall(&buf, stmt) orelse continue;
+        if (call_full.ast.params.len == 0) continue;
+        const last_arg = call_full.ast.params[call_full.ast.params.len - 1];
+        if (tree.nodeTag(last_arg) != .identifier) continue;
+        const n = tree.tokenSlice(tree.nodeMainToken(last_arg));
+        const idx = resolveParamIndex(tree, fn_proto, n) orelse continue;
+        return .{ .ownership = idx };
+    }
+    return null;
+}
+
+/// Iterator over the top-level statements of a block body.
+const TopLevelStmts = struct {
+    tree: *const Ast,
+    kind: enum { two_a, two_b, two_done, range, done },
+    stmt_a: Ast.Node.Index = undefined,
+    stmt_b: ?Ast.Node.Index = null,
+    range_pos: u32 = 0,
+    range_end: u32 = 0,
+
+    fn next(self: *TopLevelStmts) ?Ast.Node.Index {
+        switch (self.kind) {
+            .two_a => {
+                self.kind = if (self.stmt_b != null) .two_b else .done;
+                return self.stmt_a;
+            },
+            .two_b => {
+                self.kind = .two_done;
+                return self.stmt_b.?;
+            },
+            .two_done, .done => return null,
+            .range => {
+                if (self.range_pos >= self.range_end) return null;
+                const idx: Ast.Node.Index = @enumFromInt(self.tree.extra_data[self.range_pos]);
+                self.range_pos += 1;
+                return idx;
+            },
+        }
+    }
+};
+
+fn topLevelStmts(tree: *const Ast, body_node: Ast.Node.Index) TopLevelStmts {
+    switch (tree.nodeTag(body_node)) {
+        .block_two, .block_two_semicolon => {
+            const d = tree.nodeData(body_node).opt_node_and_opt_node;
+            const a_opt = d[0].unwrap();
+            const b_opt = d[1].unwrap();
+            if (a_opt == null) return .{ .tree = tree, .kind = .done };
+            return .{ .tree = tree, .kind = .two_a, .stmt_a = a_opt.?, .stmt_b = b_opt };
+        },
+        .block, .block_semicolon => {
+            const d = tree.nodeData(body_node).extra_range;
+            return .{
+                .tree = tree,
+                .kind = .range,
+                .range_pos = @intFromEnum(d.start),
+                .range_end = @intFromEnum(d.end),
+            };
+        },
+        else => return .{ .tree = tree, .kind = .done },
+    }
 }
 
 /// Returns true iff `call_node`'s source-text span contains any of

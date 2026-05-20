@@ -591,6 +591,15 @@ const Builder = struct {
             .@"catch" => try self.lowerCatchStmt(stmt_node, cur),
             .@"break" => try self.lowerBreakOrContinue(cur, .@"break", stmt_node),
             .@"continue" => try self.lowerBreakOrContinue(cur, .@"continue", stmt_node),
+            // Divergent stmts: replace cur with a fresh dead block so
+            // any caller-added edge from cur to a successor (e.g.
+            // emitCatchFork wiring catch-body→merge after `catch
+            // unreachable`) flows from an unreachable block.  Without
+            // this, the diverged path's stale state pollutes the
+            // merge join — e.g. `const buf = alloc(...) catch
+            // unreachable; free(buf);` would lose buf's .heap origin
+            // at the merge because the catch arm collapses to .plain.
+            .unreachable_literal => cur.* = try self.newBlock(),
             // Nested blocks: recurse so empty blocks DON'T trigger
             // the conservative .plain collapse via lowering_gap.
             // Labeled forms (`blk: { ... break :blk; }`) get the

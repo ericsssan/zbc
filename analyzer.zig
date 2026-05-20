@@ -709,6 +709,50 @@ test "heap_use_after_free: composite with live alloc is clean (ownership transfe
     try std.testing.expectEqual(@as(usize, 0), problems.items.len);
 }
 
+test "R8 inference: multi-stmt free wrapper still infers @takes ownership" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const std = @import("std");
+        \\pub fn dispose_clear(g: std.mem.Allocator, p: []u8) void {
+        \\    @memset(p, 0);
+        \\    g.free(p);
+        \\}
+        \\pub fn caller(g: std.mem.Allocator) []u8 {
+        \\    const buf = g.alloc(u8, 16) catch unreachable;
+        \\    dispose_clear(g, buf);
+        \\    return buf;
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    var found = false;
+    for (problems.items) |p| {
+        if (std.mem.indexOf(u8, p.message, "after free") != null) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "CFG: `catch unreachable` is a terminator; success state survives the merge" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const std = @import("std");
+        \\// Without `unreachable` being a terminator, the catch arm's
+        \\// state collapses buf at the merge, masking the UAF.
+        \\pub fn foo(g: std.mem.Allocator) []u8 {
+        \\    const buf = g.alloc(u8, 16) catch unreachable;
+        \\    g.free(buf);
+        \\    return buf;
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    var found = false;
+    for (problems.items) |p| {
+        if (std.mem.indexOf(u8, p.message, "after free") != null) found = true;
+    }
+    try std.testing.expect(found);
+}
+
 test "R8 inference: alloc-wrapper + free-wrapper without explicit annotations" {
     const gpa = std.testing.allocator;
     var problems = try analyze(gpa,
