@@ -156,6 +156,17 @@ pub const Db = struct {
         return self.containing_types.get(fn_decl);
     }
 
+    /// True iff this file declares any fn inside the struct/union/
+    /// enum named `type_name`.  Used by cross-file type-aware
+    /// lookups to skip imports that don't define the type.
+    pub fn hasType(self: *const Db, type_name: []const u8) bool {
+        var it = self.containing_types.valueIterator();
+        while (it.next()) |v| {
+            if (std.mem.eql(u8, v.*, type_name)) return true;
+        }
+        return false;
+    }
+
     /// Look up by name only.  Counts entries with at least one signal
     /// (annotation, takes, or is_noreturn).  Returns the single
     /// signal-carrying entry, or null when count != 1.
@@ -461,7 +472,7 @@ pub fn buildFull(
             if (existing != null and existing.?.takes != null) continue;
 
             const body = tree.nodeData(node).node_and_node[1];
-            const inferred = inferTakesViaReceiverCall(tree, fn_proto, body, &db, ct) orelse continue;
+            const inferred = inferTakesViaReceiverCall(tree, fn_proto, body, &db, ct, remote) orelse continue;
             const ep = try putOrUpdate(&db, gpa, name, ct, .{
                 .name = name,
                 .containing_type = ct,
@@ -526,6 +537,7 @@ fn inferTakesViaReceiverCall(
     body_node: Ast.Node.Index,
     db: *const Db,
     self_type: ?[]const u8,
+    remote: ?RemoteCtx,
 ) ?TakesAnnotation {
     const first = tree.firstToken(body_node);
     const last = tree.lastToken(body_node);
@@ -551,7 +563,15 @@ fn inferTakesViaReceiverCall(
         // type.  Lets `lookupTyped` route to the right overload
         // when `method_name` is shared across types.
         const recv_ty = paramTypeName(tree, fn_proto, param_idx, self_type);
-        const callee = db.lookupTyped(recv_ty, method_name) orelse continue;
+        // Local DB first; cross-file when the recv's type lives in
+        // an imported file (e.g. our `caller(x: *lib.HTMLRewriter)`
+        // calls `x.finalize()` and HTMLRewriter is defined in lib.zig).
+        const callee: FnEntry = if (db.lookupTyped(recv_ty, method_name)) |e|
+            e
+        else if (recv_ty != null and remote != null)
+            (lookupCrossFile(remote.?, recv_ty.?, method_name) orelse continue)
+        else
+            continue;
         const callee_takes = callee.takes orelse continue;
         switch (callee_takes) {
             .ownership => |i| {
@@ -561,6 +581,24 @@ fn inferTakesViaReceiverCall(
                 if (i == 0) return .{ .ownership = param_idx };
             },
         }
+    }
+    return null;
+}
+
+/// Cross-file equivalent of `Db.lookupTyped` — walks remote's imap
+/// for a file that declares `type_name`, then looks up
+/// `(type_name, method_name)` there.  Used by R10's inference and
+/// by callers needing pre-build cross-file resolution.
+fn lookupCrossFile(
+    remote: RemoteCtx,
+    type_name: []const u8,
+    method_name: []const u8,
+) ?FnEntry {
+    var it = remote.imap.entries.iterator();
+    while (it.next()) |kv| {
+        const file = (remote.cache.loadOrLookup(remote.base_dir, kv.value_ptr.path) catch continue) orelse continue;
+        if (!file.db.hasType(type_name)) continue;
+        if (file.db.lookupTyped(type_name, method_name)) |e| return e;
     }
     return null;
 }
@@ -585,10 +623,10 @@ fn paramTypeName(
     return null;
 }
 
-/// Strip leading `?`, `*`, `const` tokens; return the first
-/// identifier as the base type name.  Resolves `Self` and `@This()`
-/// to `self_type`.  Returns null for slices, arrays, function ptrs,
-/// or anonymous types.
+/// Strip leading `?`, `*`, `const` tokens; return the LAST
+/// identifier in a dotted chain (`*lib.Foo` → "Foo").  Resolves
+/// `Self` and `@This()` to `self_type`.  Returns null for slices,
+/// arrays, function ptrs, or anonymous types.
 fn stripTypeWrappers(
     tree: *const Ast,
     type_node: Ast.Node.Index,
@@ -602,20 +640,34 @@ fn stripTypeWrappers(
         switch (tags[t]) {
             .question_mark, .asterisk, .keyword_const => continue,
             .l_bracket => return null,
-            .identifier => {
-                const name = tree.tokenSlice(t);
-                if (std.mem.eql(u8, name, "Self")) return self_type;
-                return name;
-            },
-            .builtin => {
-                const name = tree.tokenSlice(t);
-                if (std.mem.eql(u8, name, "@This")) return self_type;
-                return null;
-            },
+            .identifier, .builtin => break,
             else => return null,
         }
     }
-    return null;
+    if (t > last) return null;
+    var last_name: ?[]const u8 = null;
+    var expecting_ident = true;
+    while (t <= last) : (t += 1) {
+        const tag = tags[t];
+        if (expecting_ident) {
+            if (tag == .identifier) {
+                const n = tree.tokenSlice(t);
+                last_name = if (std.mem.eql(u8, n, "Self")) self_type else n;
+                expecting_ident = false;
+            } else if (tag == .builtin) {
+                const n = tree.tokenSlice(t);
+                if (std.mem.eql(u8, n, "@This")) {
+                    last_name = self_type;
+                    expecting_ident = false;
+                } else return null;
+            } else return null;
+        } else {
+            if (tag == .period) {
+                expecting_ident = true;
+            } else break;
+        }
+    }
+    return last_name;
 }
 
 /// R8b: any free-pattern call anywhere in the body whose target

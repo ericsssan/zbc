@@ -329,6 +329,121 @@ test "lib API: cross-file R8 inference fires UAF through imported alloc/free wra
     try std.testing.expect(found);
 }
 
+test "lib API: cross-file R10 chain — wrapper fn calls cross-file destroying method" {
+    const gpa = std.testing.allocator;
+    const tio = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // lib.zig: T.finalize destroys self.
+    try tmp.dir.writeFile(tio, .{ .sub_path = "lib.zig", .data =
+        \\const bun = struct { pub fn destroy(_: anytype) void {} };
+        \\pub const T = struct {
+        \\    x: u32 = 0,
+        \\    pub fn finalize(this: *T) void { bun.destroy(this); }
+        \\};
+        \\
+    });
+    // caller.zig:
+    //   `destroyT(t)` calls `t.finalize()` — cross-file method call.
+    //   R10 should infer @takes(0) on destroyT by resolving
+    //   t.finalize → lib.T.finalize (which IS @takes(0)).
+    //   Caller `buggy` then sees destroyT(t) as a free and flags
+    //   the subsequent use of t.
+    try tmp.dir.writeFile(tio, .{ .sub_path = "caller.zig", .data =
+        \\const lib = @import("lib.zig");
+        \\pub fn destroyT(t: *lib.T) void {
+        \\    t.finalize();
+        \\}
+        \\pub fn buggy(t: *lib.T) void {
+        \\    destroyT(t);
+        \\    const v = t.x;
+        \\    _ = v;
+        \\}
+        \\
+    });
+
+    const base_dir = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer gpa.free(base_dir);
+    const path = try std.fs.path.join(gpa, &.{ base_dir, "caller.zig" });
+    defer gpa.free(path);
+
+    var cache = Cache.init(gpa, tio);
+    defer cache.deinit();
+
+    const problems = try analyzeEscape(gpa, tio, path, &cache, &DefaultConfig);
+    defer freeProblems(gpa, problems);
+
+    var found = false;
+    for (problems) |p| {
+        if (std.mem.indexOf(u8, p.message, "after free") != null) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "lib API: cross-file type-aware lookup disambiguates method overloads" {
+    const gpa = std.testing.allocator;
+    const tio = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // lib.zig defines two types with same-named `finalize` method.
+    // Only HTMLRewriter.finalize destroys self.
+    try tmp.dir.writeFile(tio, .{ .sub_path = "lib.zig", .data =
+        \\const bun = struct { pub fn destroy(_: anytype) void {} };
+        \\pub const HTMLRewriter = struct {
+        \\    pub fn finalize(this: *HTMLRewriter) void { bun.destroy(this); }
+        \\};
+        \\pub const HTMLRewriterLoader = struct {
+        \\    finalized: bool = false,
+        \\    pub fn finalize(this: *HTMLRewriterLoader) void { this.finalized = true; }
+        \\};
+        \\
+    });
+    // caller.zig uses both — only `r.finalize()` is a real UAF;
+    // `l.finalize()` must NOT fire.
+    try tmp.dir.writeFile(tio, .{ .sub_path = "caller.zig", .data =
+        \\const lib = @import("lib.zig");
+        \\pub fn use_rewriter(r: *lib.HTMLRewriter) void {
+        \\    r.finalize();
+        \\    const x = r;
+        \\    _ = x;
+        \\}
+        \\pub fn use_loader(l: *lib.HTMLRewriterLoader) void {
+        \\    l.finalize();
+        \\    const x = l;
+        \\    _ = x;
+        \\}
+        \\
+    });
+
+    const base_dir = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer gpa.free(base_dir);
+    const path = try std.fs.path.join(gpa, &.{ base_dir, "caller.zig" });
+    defer gpa.free(path);
+
+    var cache = Cache.init(gpa, tio);
+    defer cache.deinit();
+
+    const problems = try analyzeEscape(gpa, tio, path, &cache, &DefaultConfig);
+    defer freeProblems(gpa, problems);
+
+    // Exactly one rewriter UAF site (the `const x = r;` use; the
+    // `_ = x;` use is on the alias).  Loader uses must not fire.
+    var rewriter_uaf_count: usize = 0;
+    var loader_fp_count: usize = 0;
+    for (problems) |p| {
+        if (std.mem.indexOf(u8, p.message, "use of `r`") != null or
+            std.mem.indexOf(u8, p.message, "use of `x`") != null)
+        {
+            rewriter_uaf_count += 1;
+        }
+        if (std.mem.indexOf(u8, p.message, "use of `l`") != null) loader_fp_count += 1;
+    }
+    try std.testing.expect(rewriter_uaf_count >= 1);
+    try std.testing.expectEqual(@as(usize, 0), loader_fp_count);
+}
+
 test "lib API: analyzeEscape with null cache still works on same-file annotations" {
     const gpa = std.testing.allocator;
     const tio = std.testing.io;

@@ -635,10 +635,12 @@ const Builder = struct {
     }
 
     /// Walk the type expression's tokens, stripping pointer / optional
-    /// / const wrappers, and return the BASE identifier (e.g. "Foo"
-    /// for `*Foo`, `*const Foo`, `?*Foo`, `*const ?Foo`).  Returns
-    /// null when no plain identifier is found — e.g. slice `[]T`,
-    /// function pointer, anonymous struct, etc.
+    /// / const wrappers, and return the BASE identifier — the LAST
+    /// component of a dotted chain.  `*Foo` → "Foo"; `*const Foo` →
+    /// "Foo"; `?*Foo` → "Foo"; `*lib.Foo` → "Foo" (the namespace
+    /// prefix is discarded — the type identity is what matters for
+    /// method dispatch).  Returns null when no plain identifier is
+    /// found — e.g. slice `[]T`, function pointer, anonymous struct.
     ///
     /// `Self` / `@This()` resolves to the enclosing fn's containing
     /// type when `self_type` is supplied.
@@ -648,28 +650,41 @@ const Builder = struct {
         const last = tree.lastToken(type_node);
         const tags = tree.tokens.items(.tag);
         var t: Ast.TokenIndex = first;
-        // Strip leading `?`, `*`, `const` tokens.  Stop at the first
-        // identifier and treat it as the base type.
+        // Strip leading `?`, `*`, `const` tokens.
         while (t <= last) : (t += 1) {
             switch (tags[t]) {
                 .question_mark, .asterisk, .keyword_const => continue,
-                // `[*]T`, `[]T`, `[N]T` — slice / pointer-with-len /
-                // array.  Not a struct receiver; bail.
                 .l_bracket => return null,
-                .identifier => {
-                    const name = tree.tokenSlice(t);
-                    if (std.mem.eql(u8, name, "Self")) return self_type;
-                    return name;
-                },
-                .builtin => {
-                    const name = tree.tokenSlice(t);
-                    if (std.mem.eql(u8, name, "@This")) return self_type;
-                    return null;
-                },
+                .identifier, .builtin => break,
                 else => return null,
             }
         }
-        return null;
+        if (t > last) return null;
+        // Walk identifiers/builtins separated by dots; remember the
+        // last identifier seen.  `lib.HTMLRewriter` → "HTMLRewriter".
+        var last_name: ?[]const u8 = null;
+        var expecting_ident = true;
+        while (t <= last) : (t += 1) {
+            const tag = tags[t];
+            if (expecting_ident) {
+                if (tag == .identifier) {
+                    const n = tree.tokenSlice(t);
+                    last_name = if (std.mem.eql(u8, n, "Self")) self_type else n;
+                    expecting_ident = false;
+                } else if (tag == .builtin) {
+                    const n = tree.tokenSlice(t);
+                    if (std.mem.eql(u8, n, "@This")) {
+                        last_name = self_type;
+                        expecting_ident = false;
+                    } else return null;
+                } else return null;
+            } else {
+                if (tag == .period) {
+                    expecting_ident = true;
+                } else break;
+            }
+        }
+        return last_name;
     }
 
     /// Register `|x|` / `|x, y|` / `|*x, idx|` capture identifiers
@@ -2311,12 +2326,18 @@ const Builder = struct {
         else
             null;
 
-        // Look up @takes annotation.  Try same-file first.  For
-        // `lib.dispose(...)` shape (recv is an imported namespace),
-        // also try the remote file's DB.
+        // Look up @takes annotation.  Try same-file first; then
+        // cross-file by recv's type (when the type is defined in an
+        // imported file); then the remote-namespace path (for
+        // `lib.method(...)` where recv IS the namespace).
         const takes = blk: {
             if (self.db) |db| {
                 if (db.lookupTyped(recv_ty, callee_name)) |entry| {
+                    if (entry.takes) |t| break :blk t;
+                }
+            }
+            if (recv_ty) |ty| {
+                if (self.lookupCrossFileMethod(ty, callee_name)) |entry| {
                     if (entry.takes) |t| break :blk t;
                 }
             }
@@ -2394,6 +2415,14 @@ const Builder = struct {
                     if (entry.takes) |t| break :blk t;
                 }
             }
+            // Cross-file: the field's type may be defined in an
+            // imported file (e.g. `r.foo: *RemoteType; r.foo.method()`
+            // where RemoteType lives in lib.zig).
+            if (recv_ty) |ty| {
+                if (self.lookupCrossFileMethod(ty, method_name)) |entry| {
+                    if (entry.takes) |t| break :blk t;
+                }
+            }
             return null;
         };
         switch (takes) {
@@ -2413,6 +2442,38 @@ const Builder = struct {
         const name = tree.tokenSlice(tree.nodeMainToken(node));
         const lid = self.name_to_local.get(name) orelse return null;
         return self.locals.items[@intFromEnum(lid)].type_name;
+    }
+
+    /// Cross-file method lookup by (containing_type, method_name).
+    /// Walks every imap entry, loads the file, checks if that file
+    /// declares `type_name` (via Db.hasType), and if so does the
+    /// typed lookup there.  Returns the first matching entry.
+    ///
+    /// Used when a local has a type name that isn't defined in the
+    /// caller's file — e.g. `var loader: *lib.HTMLRewriterLoader =
+    /// ...; loader.finalize();` where HTMLRewriterLoader lives in
+    /// lib.zig.  The local db can't find HTMLRewriterLoader; this
+    /// helper walks imports and tries each remote db.
+    ///
+    /// Ambiguity: if MULTIPLE imported files define a type with the
+    /// same name, only the FIRST match is returned.  Bun's codebase
+    /// shouldn't hit this in practice (struct names are unique
+    /// per-file by convention), but the alternative — return null
+    /// on multi-match — would silently drop catches.  First-match
+    /// is the pragmatic choice.
+    fn lookupCrossFileMethod(
+        self: *Builder,
+        type_name: []const u8,
+        method_name: []const u8,
+    ) ?annotations.FnEntry {
+        const remote = self.remote orelse return null;
+        var it = remote.imap.entries.iterator();
+        while (it.next()) |kv| {
+            const remote_file = (remote.cache.loadOrLookup(remote.base_dir, kv.value_ptr.path) catch continue) orelse continue;
+            if (!remote_file.db.hasType(type_name)) continue;
+            if (remote_file.db.lookupTyped(type_name, method_name)) |e| return e;
+        }
+        return null;
     }
 
     /// Cross-file `@takes` lookup — see lookupRemoteMethod for the
