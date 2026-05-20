@@ -1240,6 +1240,53 @@ test "heap_use_after_free: assign rhs read of freed pointer is flagged" {
     try std.testing.expect(found);
 }
 
+test "arena_use_after_kill: alloc via arena.allocator() propagates arena origin" {
+    // Allocator-provenance: when `allocator` is bound from
+    // `arena.allocator()`, a `.alloc(...)` call through `allocator`
+    // produces arena-borrowed memory (not a fresh heap allocation).
+    // Without this, `arena.deinit(); return buf;` would silently
+    // pass — buf would carry a .heap origin unrelated to arena.
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const std = @import("std");
+        \\pub fn f() ![]const u8 {
+        \\    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        \\    const allocator = arena.allocator();
+        \\    const buf = try allocator.alloc(u8, 10);
+        \\    arena.deinit();
+        \\    return buf;
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    var found = false;
+    for (problems.items) |p| {
+        if (std.mem.indexOf(u8, p.message, "arena") != null) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "arena_use_after_kill: chained `arena.allocator().alloc()` is flagged" {
+    // Same as above but without the named-intermediate alias.
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const std = @import("std");
+        \\pub fn f() ![]const u8 {
+        \\    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        \\    const buf = try arena.allocator().alloc(u8, 10);
+        \\    arena.deinit();
+        \\    return buf;
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    var found = false;
+    for (problems.items) |p| {
+        if (std.mem.indexOf(u8, p.message, "arena") != null) found = true;
+    }
+    try std.testing.expect(found);
+}
+
 test "arena_use_after_kill: read after deinit in call arg is flagged" {
     const gpa = std.testing.allocator;
     var problems = try analyze(gpa,

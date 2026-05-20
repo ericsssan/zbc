@@ -119,7 +119,16 @@ pub const StmtKind = union(enum) {
 
     /// Use of a local (to read it).  Generates "is origin still live?"
     /// checks in the analyzer.
-    use: struct { local: LocalId },
+    use: struct {
+        local: LocalId,
+        /// True when this .use was emitted by a method-call walker
+        /// pass (`x.method(...)`).  Method-call receivers on a local
+        /// whose current origin is .undef are almost certainly init
+        /// calls (you don't read garbage); transferUse clears .undef
+        /// to .plain instead of firing use_undefined.  For .heap /
+        /// .arena origins, the call still counts as a real use.
+        from_method_call: bool = false,
+    },
 
     /// Statement shape we couldn't lower precisely.  Conservative:
     /// analyzer collapses every local's origin to .plain.
@@ -234,7 +243,22 @@ pub const LocalInfo = struct {
     bound_fn_name: ?[]const u8 = null,
 };
 
-pub const InitHint = enum { other, arena_local, heap_local, noreturn_alias };
+pub const InitHint = enum {
+    other,
+    /// Local was initialized from `ArenaAllocator.init(...)` — IS the arena.
+    arena_local,
+    /// Local was initialized from `<arena_local>.allocator()` (directly
+    /// or via copy of another arena_allocator local).  Tracks "this
+    /// std.mem.Allocator value's storage dies with arena X" so calls
+    /// to `.alloc()` / `.create()` / etc. through this allocator
+    /// produce arena-bound memory (.arena origin), not a fresh .heap
+    /// allocation.  Without this, arena-UAK on the standard pattern
+    /// `const a = arena.allocator(); buf = a.alloc(...); arena.deinit(); use(buf);`
+    /// would never fire — buf would carry a heap id unrelated to arena.
+    arena_allocator,
+    heap_local,
+    noreturn_alias,
+};
 
 /// Known-stdlib noreturn callee chains.  Hoisted so both the
 /// call-site detector (calleeIsNoreturn) and the alias detector
@@ -1255,6 +1279,18 @@ const Builder = struct {
             switch (init_kind) {
                 .arena_init => break :blk .arena_local,
                 .heap_alloc => break :blk .heap_local,
+                // Allocator-provenance: when init_kind is .copy_of(src)
+                // (set by classifyExpr's .allocator()-detection path,
+                // or by simple aliasing `const a2 = a;`), inherit
+                // .arena_allocator from the source if it's arena-bound.
+                // Lets `.alloc()` calls through any depth of allocator
+                // alias produce arena memory.
+                .copy_of => |src| {
+                    const src_hint = self.locals.items[@intFromEnum(src)].init_hint;
+                    if (src_hint == .arena_local or src_hint == .arena_allocator) {
+                        break :blk .arena_allocator;
+                    }
+                },
                 else => {},
             }
             // Aliased noreturn fn: `const exit = std.process.exit;`
@@ -2030,9 +2066,48 @@ const Builder = struct {
             return .{ .arena_init = aid };
         }
         if (anyPatternMatches(text, self.config.heap_alloc_patterns)) {
+            // Allocator-provenance check: if the call's immediate
+            // receiver is a local known to be an arena_allocator (or
+            // the arena itself, for direct `arena.allocator().alloc()`
+            // is handled via .allocator() classification below), the
+            // result is arena-bound memory, NOT a fresh heap
+            // allocation.  Catches the canonical pattern
+            //   const a = arena.allocator(); buf = a.alloc(...);
+            //   arena.deinit(); use(buf);  // UAK
+            if (self.arenaBoundReceiverOfCall(expr_node)) |arena_src| {
+                return .{ .copy_of = arena_src };
+            }
             const hid: abstract_state.HeapId = @enumFromInt(self.next_heap);
             self.next_heap += 1;
             return .{ .heap_alloc = hid };
+        }
+
+        // `<arena_local>.allocator()` — return an Allocator value
+        // bound to the arena's lifetime.  Returning .copy_of(arena)
+        // gives the receiving local the arena's origin; lowerVarDecl
+        // additionally sets init_hint = .arena_allocator so .alloc
+        // calls through the alias also produce arena memory.
+        if (std.mem.indexOf(u8, text, ".allocator(") != null) {
+            if (self.arenaLocalDotAllocatorReceiver(expr_node)) |arena_local| {
+                return .{ .copy_of = arena_local };
+            }
+        }
+
+        // Constructor-style call taking an arena-bound allocator as
+        // its first arg: `Type.init(arena_alloc, ...)`,
+        // `Type.create(arena_alloc, ...)`, etc.  The returned value
+        // very likely embeds storage from that allocator, so its
+        // lifetime is bound to the arena.  Heuristic R7-lite for
+        // user-defined types we have no annotation for — without it,
+        // canonical patterns like
+        //   var log = Log.init(arena.allocator());
+        //   arena.deinit();
+        //   log.toJS();   // UAK — log's internals were arena-backed
+        // would never fire.  Trigger only on conventional constructor
+        // method names so we don't propagate arena origin to e.g.
+        // `globalThis.throwValue(alloc, ...)` which doesn't embed.
+        if (self.constructorWithArenaArg(expr_node)) |arena_src| {
+            return .{ .copy_of = arena_src };
         }
 
         // `obj.field` where obj is a known local → .field_copy_of.
@@ -2368,6 +2443,119 @@ const Builder = struct {
         return null;
     }
 
+    /// For a call expression `<recv>.method(...)`, if `recv` resolves
+    /// to a known local whose init_hint marks it as arena-bound
+    /// (.arena_local or .arena_allocator), return that local.
+    /// Receiver may itself be a chained field access (`x.y.method()`),
+    /// in which case we walk to the head identifier.
+    fn arenaBoundReceiverOfCall(self: *Builder, call_node: Ast.Node.Index) ?LocalId {
+        const tree = self.tree;
+        var buf: [1]Ast.Node.Index = undefined;
+        const call_full = tree.fullCall(&buf, call_node) orelse return null;
+        const callee = call_full.ast.fn_expr;
+        if (tree.nodeTag(callee) != .field_access) return null;
+        const fa = tree.nodeData(callee).node_and_token;
+        var cur = fa[0];
+        while (true) {
+            switch (tree.nodeTag(cur)) {
+                .identifier => {
+                    const name = tree.tokenSlice(tree.nodeMainToken(cur));
+                    const id = self.name_to_local.get(name) orelse return null;
+                    const hint = self.locals.items[@intFromEnum(id)].init_hint;
+                    if (hint == .arena_local or hint == .arena_allocator) return id;
+                    return null;
+                },
+                .field_access => {
+                    cur = tree.nodeData(cur).node_and_token[0];
+                },
+                // Chained call: `arena.allocator().alloc(...)`.  If
+                // the inner call is `<arena_local>.allocator()`,
+                // treat the outer call's receiver as arena_local.
+                .call, .call_one, .call_comma, .call_one_comma => {
+                    if (self.arenaLocalDotAllocatorReceiver(cur)) |arena_local| {
+                        return arena_local;
+                    }
+                    return null;
+                },
+                else => return null,
+            }
+        }
+    }
+
+    /// Constructor-style call (method `init` / `create` / etc.) on a
+    /// type, whose first argument is an arena-bound local.  Treats
+    /// the return value as bound to that arena's lifetime — covers
+    /// user-defined types like `Log.init(arena.allocator())` where
+    /// the constructed value embeds storage from the allocator.
+    ///
+    /// Triggered only on conventional constructor names so we don't
+    /// misclassify ordinary calls that happen to take an allocator
+    /// for transient internal use (e.g. `vm.execute(allocator, src)`
+    /// which returns a value unrelated to allocator's arena).
+    fn constructorWithArenaArg(self: *Builder, call_node: Ast.Node.Index) ?LocalId {
+        const tree = self.tree;
+        var buf: [1]Ast.Node.Index = undefined;
+        const call_full = tree.fullCall(&buf, call_node) orelse return null;
+        const callee = call_full.ast.fn_expr;
+        if (tree.nodeTag(callee) != .field_access) return null;
+        const fa = tree.nodeData(callee).node_and_token;
+        const method = tree.tokenSlice(fa[1]);
+        if (!isConstructorName(method)) return null;
+        const args = call_full.ast.params;
+        if (args.len == 0) return null;
+        // Walk the first arg: bare ident, or `arena.allocator()` chain.
+        return self.argResolvesToArenaBound(args[0]);
+    }
+
+    fn isConstructorName(name: []const u8) bool {
+        const list = [_][]const u8{
+            "init", "create", "new", "open",
+            "fromOwnedSlice", "fromSlice",
+        };
+        for (list) |n| if (std.mem.eql(u8, n, name)) return true;
+        return false;
+    }
+
+    /// Resolve an expression node to an arena-bound LocalId if
+    /// possible: bare identifier whose init_hint is arena_local /
+    /// arena_allocator, OR a call `<arena_local>.allocator()`.
+    fn argResolvesToArenaBound(self: *Builder, arg_node: Ast.Node.Index) ?LocalId {
+        const tree = self.tree;
+        switch (tree.nodeTag(arg_node)) {
+            .identifier => {
+                const name = tree.tokenSlice(tree.nodeMainToken(arg_node));
+                const id = self.name_to_local.get(name) orelse return null;
+                const hint = self.locals.items[@intFromEnum(id)].init_hint;
+                if (hint == .arena_local or hint == .arena_allocator) return id;
+                return null;
+            },
+            .call, .call_one, .call_comma, .call_one_comma => {
+                return self.arenaLocalDotAllocatorReceiver(arg_node);
+            },
+            else => return null,
+        }
+    }
+
+    /// Specifically detect `<arena_local>.allocator()` — receiver
+    /// must be a bare identifier resolving to an arena_local.  Used
+    /// to mint the .arena_allocator alias.
+    fn arenaLocalDotAllocatorReceiver(self: *Builder, call_node: Ast.Node.Index) ?LocalId {
+        const tree = self.tree;
+        var buf: [1]Ast.Node.Index = undefined;
+        const call_full = tree.fullCall(&buf, call_node) orelse return null;
+        const callee = call_full.ast.fn_expr;
+        if (tree.nodeTag(callee) != .field_access) return null;
+        const fa = tree.nodeData(callee).node_and_token;
+        const method = tree.tokenSlice(fa[1]);
+        if (!std.mem.eql(u8, method, "allocator")) return null;
+        const recv = fa[0];
+        if (tree.nodeTag(recv) != .identifier) return null;
+        const name = tree.tokenSlice(tree.nodeMainToken(recv));
+        const id = self.name_to_local.get(name) orelse return null;
+        if (self.locals.items[@intFromEnum(id)].init_hint != .arena_local) return null;
+        return id;
+    }
+
     fn classifyCall(self: *Builder, call_node: Ast.Node.Index) ExprKind {
         const tree = self.tree;
 
@@ -2599,6 +2787,7 @@ const Builder = struct {
             // positives on stack buffers declared `= undefined` and
             // on identifiers that shadow an outer local inside an
             // anonymous struct type.
+            var ident_in_method_recv_pos = false;
             if (t + 1 <= last) {
                 const next = tags[t + 1];
                 if (next == .l_bracket) continue;
@@ -2606,17 +2795,43 @@ const Builder = struct {
                 if (next == .period and t + 2 <= last and tags[t + 2] == .identifier) {
                     const field = tree.tokenSlice(t + 2);
                     if (std.mem.eql(u8, field, "len") or std.mem.eql(u8, field, "ptr")) continue;
-                    // `id.field` where id is a known local — emit
-                    // .field_use so the field's tracked origin (not
-                    // the parent local's) is checked.  Skip the
-                    // .use(id) below since we've handled the read.
+                    // Distinguish field access (`x.f`), accessor
+                    // method (`x.f()` reads x), and mutator method
+                    // (`x.init(...)` writes x — common pattern is
+                    // `var s: T = undefined; s.init(...);`).
+                    const is_method_call = t + 3 <= last and tags[t + 3] == .l_paren;
+                    ident_in_method_recv_pos = is_method_call;
                     const name = tree.tokenSlice(t);
                     if (self.name_to_local.get(name)) |id| {
-                        try self.appendStmt(cur, .{
-                            .kind = .{ .field_use = .{ .parent = id, .name = field } },
-                            .pos = pos,
-                            .end_pos = end_pos,
-                        });
+                        if (is_method_call) {
+                            if (isMutatorMethodName(field)) {
+                                // Treat as write: clear undef.  Same
+                                // shape as &<local> address-of write.
+                                if (skip_local == null or skip_local.? != id) {
+                                    const hint = self.locals.items[@intFromEnum(id)].init_hint;
+                                    if (hint == .other) {
+                                        const gop = try aw.getOrPut(self.gpa, id);
+                                        if (!gop.found_existing) {
+                                            try self.appendStmt(cur, .{
+                                                .kind = .{ .assign = .{ .target = id, .rhs_kind = .unknown } },
+                                                .pos = pos,
+                                                .end_pos = end_pos,
+                                            });
+                                        }
+                                    }
+                                }
+                                continue;
+                            }
+                            // Accessor: fall through to .use emission.
+                        } else {
+                            try self.appendStmt(cur, .{
+                                .kind = .{ .field_use = .{ .parent = id, .name = field } },
+                                .pos = pos,
+                                .end_pos = end_pos,
+                            });
+                            continue;
+                        }
+                    } else if (!is_method_call) {
                         continue;
                     }
                 }
@@ -2627,7 +2842,7 @@ const Builder = struct {
             const gop = try used.getOrPut(self.gpa, id);
             if (gop.found_existing) continue;
             try self.appendStmt(cur, .{
-                .kind = .{ .use = .{ .local = id } },
+                .kind = .{ .use = .{ .local = id, .from_method_call = ident_in_method_recv_pos } },
                 .pos = pos,
                 .end_pos = end_pos,
             });
@@ -2723,6 +2938,31 @@ const Builder = struct {
         if (i == start) return null;
         const name = text[start..i];
         return self.name_to_local.get(name);
+    }
+
+    /// Method names that conventionally MUTATE the receiver via
+    /// `&self` pointer — `init`/`reset` initialize, `deinit`/`destroy`
+    /// invalidate, etc.  These don't READ the receiver's current
+    /// contents (init explicitly overwrites garbage), so emitting
+    /// .use on them would spuriously fire `use of x while still
+    /// undefined` for the canonical pattern:
+    ///   var s: T = undefined;
+    ///   s.init(...);
+    fn isMutatorMethodName(name: []const u8) bool {
+        // Prefix conventions: `init*` initializes, `set*` writes,
+        // `reset*` reinitializes.  Covers `initEmpty`, `initBuffer`,
+        // `initCapacity`, `setValue`, `resetState`, etc.
+        if (std.mem.startsWith(u8, name, "init")) return true;
+        if (std.mem.startsWith(u8, name, "set")) return true;
+        if (std.mem.startsWith(u8, name, "reset")) return true;
+        const list = [_][]const u8{
+            "clear", "clearRetainingCapacity", "clearAndFree",
+            "deinit", "destroy", "close",
+            "open", "load", "loadFromDisk", "loadFromBytes",
+            "fillFromPackageJSON",
+        };
+        for (list) |n| if (std.mem.eql(u8, n, name)) return true;
+        return false;
     }
 
     /// Type-introspection / size-query builtins whose argument is

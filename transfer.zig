@@ -178,7 +178,7 @@ fn transferRet(
     const apply_check = r.is_borrowed_return_type or is_composite;
     if (!apply_check) return;
     switch (origin) {
-        .arena => |aid| {
+        .arena, .arena_borrow => |aid| {
             if (!config_mod.isEnabled(ctx.config, .arena_escape)) return;
             if (state.arenas.contains(aid)) {
                 if (is_composite) {
@@ -264,7 +264,7 @@ fn transferFieldUse(
     const origin = state.fields.getContext(key, .{}) orelse return;
     const parent_name = ctx.locals[@intFromEnum(u.parent)].name;
     switch (origin) {
-        .arena => |aid| {
+        .arena, .arena_borrow => |aid| {
             if (!config_mod.isEnabled(ctx.config, .arena_use_after_kill)) return;
             const st = state.arenas.get(aid) orelse return;
             if (st.state == .dead) {
@@ -322,6 +322,16 @@ fn transferUse(
     end_pos: cfg.SrcPos,
 ) !void {
     const origin = state.locals.get(u.local) orelse return;
+    // Method-call on a still-undef local: not a read of garbage,
+    // it's the conventional init pattern (`var x: T = undefined;
+    // x.decodeInternal(...);`).  Treat as a write that clears
+    // .undef → .plain, suppressing the spurious use_undefined.
+    // For .heap / .arena / .stack origins the call IS a real
+    // use — fall through to the normal liveness check.
+    if (u.from_method_call and origin == .undef) {
+        try state.locals.put(ctx.gpa, u.local, .plain);
+        return;
+    }
     try checkOriginAlive(ctx, state, origin, pos, end_pos, ctx.locals[@intFromEnum(u.local)].name);
 }
 
@@ -383,7 +393,15 @@ fn originOfInit(
         },
         .undef => .undef,
         .borrowed_from => |src_local| state.locals.get(src_local) orelse .plain,
-        .copy_of => |src_local| state.locals.get(src_local) orelse .plain,
+        .copy_of => |src_local| blk: {
+            const src_origin = state.locals.get(src_local) orelse break :blk .plain;
+            // A copy / view of an .arena (the arena itself) yields a
+            // BORROW, not a second reference to the arena identity.
+            // Without this, `dep.deinit()` on a derived list would
+            // kill the underlying arena.
+            if (src_origin == .arena) break :blk .{ .arena_borrow = src_origin.arena };
+            break :blk src_origin;
+        },
         .field_copy_of => |fc| blk: {
             const key: state_mod.FieldKey = .{ .parent = fc.parent, .name = fc.name };
             break :blk state.fields.getContext(key, .{}) orelse .plain;
@@ -402,7 +420,7 @@ fn checkOriginAlive(
     local_name: []const u8,
 ) !void {
     switch (origin) {
-        .arena => |aid| {
+        .arena, .arena_borrow => |aid| {
             if (!config_mod.isEnabled(ctx.config, .arena_use_after_kill)) return;
             const st = state.arenas.get(aid) orelse return;
             if (st.state == .dead) {

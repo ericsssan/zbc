@@ -36,6 +36,14 @@ pub const Origin = union(enum) {
     /// the arena is dead; return is invalid when the arena is
     /// function-local (escape).
     arena: ArenaId,
+    /// Value whose storage lives inside the arena (e.g. allocator
+    /// returned from `arena.allocator()`, list initialized from such
+    /// an allocator, slice duped through it).  Distinct from .arena
+    /// so that `.deinit()` on the borrowed value does NOT kill the
+    /// underlying arena — only deinit on the arena ITSELF (.arena)
+    /// fires arena_kill.  Use-after-deinit semantics are identical
+    /// to .arena.
+    arena_borrow: ArenaId,
     /// Pointer/slice to a function-local stack variable.  Returning
     /// such a value past the function's frame is undefined behavior
     /// — the storage is reclaimed on return.  LocalId is the source
@@ -57,6 +65,7 @@ pub const Origin = union(enum) {
         return switch (a) {
             .plain => true,
             .arena => |x| x == b.arena,
+            .arena_borrow => |x| x == b.arena_borrow,
             .stack => |x| x == b.stack,
             .heap => |x| x == b.heap,
             .undef => true,
