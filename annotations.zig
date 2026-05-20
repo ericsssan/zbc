@@ -266,34 +266,63 @@ fn inferReturnsHeap(
     return callTextMatchesAny(tree, expr, alloc_patterns);
 }
 
-/// R8b: any top-level body stmt is a call matching a free pattern
-/// whose last explicit arg resolves to one of our params.  Doesn't
-/// recurse into branches — the body's TOP level must contain the
-/// free call (which is the canonical free-wrapper shape; conditional
-/// frees are caller responsibility).
+/// R8b: any free-pattern call anywhere in the body whose target
+/// identifier is one of our params → infer `@takes ownership(p)`.
+///
+/// Walks tokens, not just top-level stmts, so conditional / looped /
+/// nested free calls also match.  For UAF detection the conservative
+/// direction is "assume the callee MAY free" — false positives at
+/// call sites where the runtime condition was false are preferred
+/// over silently missing real double-frees and UAFs through
+/// conditional-free wrappers.
 fn inferTakesOwnership(
     tree: *const Ast,
     fn_proto: Ast.full.FnProto,
     body_node: Ast.Node.Index,
     free_patterns: []const []const u8,
 ) ?TakesAnnotation {
-    var it = topLevelStmts(tree, body_node);
-    while (it.next()) |stmt| {
-        const is_call = switch (tree.nodeTag(stmt)) {
-            .call, .call_one, .call_comma, .call_one_comma => true,
-            else => false,
-        };
-        if (!is_call) continue;
-        if (!callTextMatchesAny(tree, stmt, free_patterns)) continue;
+    _ = free_patterns;
+    const first = tree.firstToken(body_node);
+    const last = tree.lastToken(body_node);
+    const tags = tree.tokens.items(.tag);
 
-        var buf: [1]Ast.Node.Index = undefined;
-        const call_full = tree.fullCall(&buf, stmt) orelse continue;
-        if (call_full.ast.params.len == 0) continue;
-        const last_arg = call_full.ast.params[call_full.ast.params.len - 1];
-        if (tree.nodeTag(last_arg) != .identifier) continue;
-        const n = tree.tokenSlice(tree.nodeMainToken(last_arg));
-        const idx = resolveParamIndex(tree, fn_proto, n) orelse continue;
-        return .{ .ownership = idx };
+    var t: Ast.TokenIndex = first;
+    while (t + 3 <= last) : (t += 1) {
+        // Match `.free(` or `.destroy(` at the token level — the
+        // free-pattern text match operates on substrings, but the
+        // token-level form is `.` `identifier` `(`.
+        if (tags[t] != .period) continue;
+        if (tags[t + 1] != .identifier) continue;
+        if (tags[t + 2] != .l_paren) continue;
+        const method_name = tree.tokenSlice(t + 1);
+        if (!std.mem.eql(u8, method_name, "free") and
+            !std.mem.eql(u8, method_name, "destroy")) continue;
+
+        // The freed arg is between `(` and the next `)` at the same
+        // paren depth.  For the common `g.free(p)` shape the FIRST
+        // identifier after `(` is the freed thing; for the slice
+        // variant `g.free(buf[0..n])` we'd want the head of the
+        // slicee — but param-name matching naturally filters that.
+        // We pick the LAST IDENTIFIER inside the parens that matches
+        // a param name; covers both `.free(p)` and `.free(T, p)`.
+        var depth: u32 = 1;
+        var k: Ast.TokenIndex = t + 3;
+        var match: ?u32 = null;
+        while (k <= last and depth > 0) : (k += 1) {
+            switch (tags[k]) {
+                .l_paren => depth += 1,
+                .r_paren => depth -= 1,
+                .identifier => {
+                    if (k > 0 and tags[k - 1] == .period) continue;
+                    const name = tree.tokenSlice(k);
+                    if (resolveParamIndex(tree, fn_proto, name)) |idx| {
+                        match = idx;
+                    }
+                },
+                else => {},
+            }
+        }
+        if (match) |idx| return .{ .ownership = idx };
     }
     return null;
 }

@@ -730,6 +730,28 @@ test "heap_use_after_free: composite with live alloc is clean (ownership transfe
     try std.testing.expectEqual(@as(usize, 0), problems.items.len);
 }
 
+test "R8 inference: conditional free wrapper still infers @takes ownership" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const std = @import("std");
+        \\pub fn maybe_free(g: std.mem.Allocator, p: []u8, cond: bool) void {
+        \\    if (cond) g.free(p);
+        \\}
+        \\pub fn caller(g: std.mem.Allocator) []u8 {
+        \\    const buf = g.alloc(u8, 16) catch unreachable;
+        \\    maybe_free(g, buf, true);
+        \\    return buf;
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    var found = false;
+    for (problems.items) |p| {
+        if (std.mem.indexOf(u8, p.message, "after free") != null) found = true;
+    }
+    try std.testing.expect(found);
+}
+
 test "R8 inference: multi-stmt free wrapper still infers @takes ownership" {
     const gpa = std.testing.allocator;
     var problems = try analyze(gpa,
