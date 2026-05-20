@@ -14,6 +14,19 @@
 
 const std = @import("std");
 const Ast = std.zig.Ast;
+const config_mod = @import("config.zig");
+
+/// R8 inference uses these to recognize alloc/free wrappers.
+/// Default to the canonical std allocator surface so callers that
+/// pass `null` get the common patterns out of the box.
+const default_heap_alloc_patterns: []const []const u8 = &.{
+    ".alloc(",        ".allocSentinel(", ".create(",
+    ".dupe(",         ".dupeZ(",         ".allocPrint(",
+    ".allocPrintZ(",
+};
+const default_heap_free_patterns: []const []const u8 = &.{
+    ".free(", ".destroy(",
+};
 
 pub const ReturnsAnnotation = union(enum) {
     /// `/// @returns owned` — caller owns, no lifetime constraint.
@@ -67,8 +80,21 @@ pub const Db = struct {
 };
 
 /// Walk every fn_decl in `tree`, extract any explicit `@returns`
-/// annotation, then run inference (R6, R7) to fill obvious holes.
+/// annotation, then run inference (R6, R7, R8) to fill obvious holes.
+/// `config` is consulted for the alloc/free text patterns used by R8;
+/// pass null to fall back to the std-allocator defaults.
 pub fn build(gpa: std.mem.Allocator, tree: *const Ast) !Db {
+    return buildWithConfig(gpa, tree, null);
+}
+
+pub fn buildWithConfig(
+    gpa: std.mem.Allocator,
+    tree: *const Ast,
+    config: ?*const config_mod.Config,
+) !Db {
+    const alloc_patterns = if (config) |c| c.heap_alloc_patterns else default_heap_alloc_patterns;
+    const free_patterns = if (config) |c| c.heap_free_patterns else default_heap_free_patterns;
+
     var db: Db = .{ .fns = .empty };
     errdefer db.deinit(gpa);
 
@@ -141,7 +167,141 @@ pub fn build(gpa: std.mem.Allocator, tree: *const Ast) !Db {
         if (!added) break;
     }
 
+        // Pass 3 — R8: alloc-wrapper and free-wrapper inference.
+    //   `fn xalloc(g, n) []u8 { return g.alloc(u8, n) catch ...; }`
+    //     → infer @returns heap
+    //   `fn dispose(g, p) void { g.free(p); }`
+    //     → infer @takes ownership(p)
+    node_idx = 1;
+    while (node_idx < tree.nodes.len) : (node_idx += 1) {
+        const node: Ast.Node.Index = @enumFromInt(node_idx);
+        if (tree.nodeTag(node) != .fn_decl) continue;
+        var buf: [1]Ast.Node.Index = undefined;
+        const fn_proto = fullFnProto(tree, &buf, node) orelse continue;
+        const name_tok = fn_proto.name_token orelse continue;
+        const name = tree.tokenSlice(name_tok);
+        const body = tree.nodeData(node).node_and_node[1];
+
+        var entry = db.fns.get(name) orelse FnEntry{
+            .name = name,
+            .annotation = null,
+            .takes = null,
+        };
+        var changed = false;
+
+        // R8 .heap overrides R6's .owned because it carries more
+        // information (the caller mints a HeapId so free/UAF can
+        // fire).  Other annotations (.borrowed_from, .owns_locals,
+        // explicit .heap already, R7 outputs) are kept as-is.
+        const can_set_heap = entry.annotation == null or entry.annotation.? == .owned;
+        if (can_set_heap and inferReturnsHeap(tree, body, alloc_patterns)) {
+            entry.annotation = .heap;
+            changed = true;
+        }
+        if (entry.takes == null) {
+            if (inferTakesOwnership(tree, fn_proto, body, free_patterns)) |t| {
+                entry.takes = t;
+                changed = true;
+            }
+        }
+        if (changed) try db.fns.put(gpa, name, entry);
+    }
+
     return db;
+}
+
+/// R8a: body is `{ return EXPR; }` or `{ var x = EXPR; return x; }`
+/// AND EXPR's leading-token text contains any alloc pattern.
+/// EXPR may be wrapped in `try`/`catch` — we already see through both
+/// at classifyExpr time, so detect them here too.
+fn inferReturnsHeap(
+    tree: *const Ast,
+    body_node: Ast.Node.Index,
+    alloc_patterns: []const []const u8,
+) bool {
+    var expr = singleReturnExpr(tree, body_node) orelse return false;
+    while (true) {
+        switch (tree.nodeTag(expr)) {
+            .@"try" => expr = tree.nodeData(expr).node,
+            .@"catch" => expr = tree.nodeData(expr).node_and_node[0],
+            else => break,
+        }
+    }
+    const is_call = switch (tree.nodeTag(expr)) {
+        .call, .call_one, .call_comma, .call_one_comma => true,
+        else => false,
+    };
+    if (!is_call) return false;
+    return callTextMatchesAny(tree, expr, alloc_patterns);
+}
+
+/// R8b: body is `{ <EXPR>; }` where EXPR is a call matching any free
+/// pattern AND one of the call's args resolves to one of our params.
+fn inferTakesOwnership(
+    tree: *const Ast,
+    fn_proto: Ast.full.FnProto,
+    body_node: Ast.Node.Index,
+    free_patterns: []const []const u8,
+) ?TakesAnnotation {
+    // Body must be one stmt that's a bare call expression.
+    const stmt = singleStmt(tree, body_node) orelse return null;
+    const is_call = switch (tree.nodeTag(stmt)) {
+        .call, .call_one, .call_comma, .call_one_comma => true,
+        else => false,
+    };
+    if (!is_call) return null;
+    if (!callTextMatchesAny(tree, stmt, free_patterns)) return null;
+
+    // For free/destroy patterns the freed thing is the LAST
+    // explicit arg (`g.free(p)` → p; `gpa.destroy(p)` → p).  Don't
+    // consider the receiver — that's the allocator, never the
+    // freed local.
+    var buf: [1]Ast.Node.Index = undefined;
+    const call_full = tree.fullCall(&buf, stmt) orelse return null;
+    if (call_full.ast.params.len == 0) return null;
+    const last_arg = call_full.ast.params[call_full.ast.params.len - 1];
+    if (tree.nodeTag(last_arg) != .identifier) return null;
+    const n = tree.tokenSlice(tree.nodeMainToken(last_arg));
+    const idx = resolveParamIndex(tree, fn_proto, n) orelse return null;
+    return .{ .ownership = idx };
+}
+
+/// Returns true iff `call_node`'s source-text span contains any of
+/// the given substrings.
+fn callTextMatchesAny(tree: *const Ast, call_node: Ast.Node.Index, patterns: []const []const u8) bool {
+    const first = tree.firstToken(call_node);
+    const last = tree.lastToken(call_node);
+    const start = tree.tokens.items(.start)[first];
+    const last_start = tree.tokens.items(.start)[last];
+    const last_len = tree.tokenSlice(last).len;
+    const end: usize = last_start + last_len;
+    const text = tree.source[start..end];
+    for (patterns) |p| {
+        if (std.mem.indexOf(u8, text, p) != null) return true;
+    }
+    return false;
+}
+
+/// Like singleReturnExpr but for the "single statement" form
+/// (no return required — used by R8b which matches bare-call bodies).
+fn singleStmt(tree: *const Ast, body_node: Ast.Node.Index) ?Ast.Node.Index {
+    return switch (tree.nodeTag(body_node)) {
+        .block_two, .block_two_semicolon => blk: {
+            const d = tree.nodeData(body_node).opt_node_and_opt_node;
+            const first = d[0].unwrap() orelse return null;
+            if (d[1].unwrap() != null) return null;
+            break :blk first;
+        },
+        .block, .block_semicolon => blk: {
+            const d = tree.nodeData(body_node).extra_range;
+            const s: u32 = @intFromEnum(d.start);
+            const e: u32 = @intFromEnum(d.end);
+            if (e - s != 1) return null;
+            const idx: Ast.Node.Index = @enumFromInt(tree.extra_data[s]);
+            break :blk idx;
+        },
+        else => null,
+    };
 }
 
 /// R7 helper.  Returns a `borrowed_from(param_idx)` annotation if
@@ -482,7 +642,10 @@ test "R6: slice return + body allocates → @returns owned inferred" {
         \\
     );
     defer r.deinit(gpa);
-    try std.testing.expect(r.db.lookup("dupString").?.annotation.? == .owned);
+    // R8 fires on top of R6: dupString's body is `g.dupe(...)` which
+    // matches a heap-alloc pattern, so the more-specific .heap
+    // annotation wins over R6's .owned.
+    try std.testing.expect(r.db.lookup("dupString").?.annotation.? == .heap);
 }
 
 test "R6: no allocation in body → no inference" {

@@ -709,6 +709,32 @@ test "heap_use_after_free: composite with live alloc is clean (ownership transfe
     try std.testing.expectEqual(@as(usize, 0), problems.items.len);
 }
 
+test "R8 inference: alloc-wrapper + free-wrapper without explicit annotations" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const std = @import("std");
+        \\// No annotations — R8 should infer @returns heap and @takes ownership(p).
+        \\pub fn xalloc(g: std.mem.Allocator, n: usize) []u8 {
+        \\    return g.alloc(u8, n) catch unreachable;
+        \\}
+        \\pub fn dispose(g: std.mem.Allocator, p: []u8) void {
+        \\    g.free(p);
+        \\}
+        \\pub fn caller(g: std.mem.Allocator) []u8 {
+        \\    const buf = xalloc(g, 16);
+        \\    dispose(g, buf);
+        \\    return buf;
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    var found = false;
+    for (problems.items) |p| {
+        if (std.mem.indexOf(u8, p.message, "after free") != null) found = true;
+    }
+    try std.testing.expect(found);
+}
+
 test "heap_use_after_free: @returns heap wrapper + @takes ownership wrapper" {
     const gpa = std.testing.allocator;
     var problems = try analyze(gpa,

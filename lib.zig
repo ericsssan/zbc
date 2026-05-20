@@ -45,7 +45,7 @@ pub fn analyzeEscape(
     var tree = try Ast.parse(gpa, src, .zig);
     defer tree.deinit(gpa);
 
-    var db = try annotations_mod.build(gpa, &tree);
+    var db = try annotations_mod.buildWithConfig(gpa, &tree, config);
     defer db.deinit(gpa);
 
     var imap_storage: ?imports_mod.Map = null;
