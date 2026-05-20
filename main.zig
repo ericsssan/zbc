@@ -210,7 +210,10 @@ pub fn main(init: std.process.Init) !void {
     std.mem.sort(IndexedProblem, all_problems.items, {}, indexedProblemLess);
 
     if (all_problems.items.len > 0) any_problems = true;
-    const use_color = !color_off and std.posix.system.isatty(std.posix.STDERR_FILENO) != 0;
+    // `std.posix.system.isatty` is only exposed on platforms whose
+    // system layer carries it (macOS/Darwin); Linux's posix.system
+    // omits it.  Use the cross-platform `Io.File.isTty` instead.
+    const use_color = !color_off and (std.Io.File.stderr().isTty(io) catch false);
     var src_cache: SourceCache = .{ .gpa = gpa, .io = io };
     defer src_cache.deinit();
     switch (format) {
