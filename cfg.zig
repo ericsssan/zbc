@@ -1357,13 +1357,13 @@ const Builder = struct {
     }
 
     /// True for builtin calls that don't return — these terminate
-    /// the basic block.  Currently: `@panic(...)`.  `unreachable` is
-    /// already handled as a literal one level up in lowerStmt.
+    /// the basic block.  `unreachable` is already handled as a
+    /// literal one level up in lowerStmt.
     fn builtinIsDivergent(self: *Builder, call_node: Ast.Node.Index) bool {
         const tree = self.tree;
         const tok = tree.nodeMainToken(call_node);
         const slice = tree.tokenSlice(tok);
-        return std.mem.eql(u8, slice, "@panic");
+        return std.mem.eql(u8, slice, "@panic") or std.mem.eql(u8, slice, "@trap");
     }
 
     fn lowerCallStmt(self: *Builder, call_node: Ast.Node.Index, cur: *BlockId) !void {
@@ -1444,8 +1444,11 @@ const Builder = struct {
     }
 
     /// True iff the call's callee resolves to a fn whose DB entry
-    /// carries is_noreturn=true.  Consults same-file DB and (when
-    /// remote ctx exists) the imported file's DB.
+    /// carries is_noreturn=true, OR the call's source text matches
+    /// a known-stdlib noreturn pattern (`std.process.exit`,
+    /// `std.os.abort`, `std.posix.exit`, etc.).  The stdlib list
+    /// avoids needing zbc to parse std itself — these signatures
+    /// don't change.
     fn calleeIsNoreturn(self: *Builder, call_node: Ast.Node.Index) bool {
         const tree = self.tree;
         var buf: [1]Ast.Node.Index = undefined;
@@ -1463,6 +1466,29 @@ const Builder = struct {
         if (tree.nodeTag(callee) == .field_access) {
             const recv = tree.nodeData(callee).node_and_token[0];
             if (self.lookupRemoteEntry(recv, name)) |entry| if (entry.is_noreturn) return true;
+        }
+        // Known-stdlib noreturn callees.  Match against the leading
+        // tokens of the callee chain (not the full call text) so an
+        // arg shape like `(exitcode)` doesn't pull patterns from
+        // arbitrary user text into the match window.
+        const first = tree.firstToken(call_node);
+        // Last token of the CALLEE (not the call).  We need to stop
+        // at the `(` to avoid matching pattern fragments in args.
+        const callee_last = tree.lastToken(callee);
+        const start = tree.tokens.items(.start)[first];
+        const end_tok_start = tree.tokens.items(.start)[callee_last];
+        const end_tok_len = tree.tokenSlice(callee_last).len;
+        const callee_text = tree.source[start .. end_tok_start + end_tok_len];
+        // Builtins like @trap go through lowerStmt's builtin_call
+        // dispatch, not here — only list non-builtin chains.
+        const known_noreturn = [_][]const u8{
+            "process.exit",
+            "posix.exit",
+            "os.abort",
+            "process.abort",
+        };
+        for (known_noreturn) |pat| {
+            if (std.mem.endsWith(u8, callee_text, pat)) return true;
         }
         return false;
     }

@@ -751,6 +751,31 @@ test "CFG: `@panic(...)` in catch arm is a terminator" {
     try std.testing.expect(found);
 }
 
+test "CFG: stdlib std.process.exit / std.os.abort recognized as terminators" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const std = @import("std");
+        \\pub fn a(g: std.mem.Allocator) []u8 {
+        \\    const buf = g.alloc(u8, 16) catch std.process.exit(1);
+        \\    g.free(buf);
+        \\    return buf;
+        \\}
+        \\pub fn b(g: std.mem.Allocator) []u8 {
+        \\    const buf = g.alloc(u8, 16) catch std.os.abort();
+        \\    g.free(buf);
+        \\    return buf;
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    var count: u32 = 0;
+    for (problems.items) |p| {
+        if (std.mem.indexOf(u8, p.message, "after free") != null) count += 1;
+    }
+    // Each fn fires both `use` and `ret` flavors → 4 problems total.
+    try std.testing.expect(count >= 2);
+}
+
 test "CFG: noreturn user fn in catch arm is a terminator" {
     const gpa = std.testing.allocator;
     var problems = try analyze(gpa,
