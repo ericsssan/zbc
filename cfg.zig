@@ -1557,6 +1557,17 @@ const Builder = struct {
             .end_pos = self.endPosOf(decl_node),
         });
 
+        // Struct-literal RHS: unpack so aliased fields buried in the
+        // literal get their own field_assign keyed by name.  Symmetric
+        // with lowerAssign — `var c: T = .{ .data = buf }` registers
+        // `(c, "data") → buf's origin` so a later `c.data` read sees
+        // buf's freed state.  Skipped for labeled-block inits (the
+        // inner stmts already lowered themselves).
+        if (init_opt) |init| if (!init_was_labeled_block) {
+            try self.unpackStructInitFields(cur.*, local, null, init,
+                self.posOf(decl_node), self.endPosOf(decl_node));
+        };
+
         // Init-position try/catch: now that the decl has emitted, model
         // the same CFG side-effects we'd get if the init had appeared
         // at statement position.  We don't walk arbitrarily-nested try
