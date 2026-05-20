@@ -47,6 +47,7 @@ pub fn transfer(ctx: Ctx, state: *AbstractState, stmt: Stmt) !void {
         .heap_free => |f| try transferHeapFree(ctx, state, f, stmt.pos, stmt.end_pos),
         .ret => |r| try transferRet(ctx, state, r, stmt.pos, stmt.end_pos),
         .use => |u| try transferUse(ctx, state, u, stmt.pos, stmt.end_pos),
+        .composite_escape => |c| try transferCompositeEscape(ctx, state, c, stmt.pos, stmt.end_pos),
         .lowering_gap => |g| try transferGap(ctx, state, g, stmt.pos),
     }
 }
@@ -187,6 +188,29 @@ fn transferRet(
         },
         else => {},
     }
+}
+
+/// Composite-escape check: fires the same escape diagnostics as
+/// transferRet would for a value-shape composite return embedding
+/// this local.  Used for the SECOND, third, ... borrow in a
+/// multi-borrow composite — the first is handled by the surrounding
+/// .ret's value_kind.
+fn transferCompositeEscape(
+    ctx: Ctx,
+    state: *AbstractState,
+    c: @TypeOf(@as(StmtKind, undefined).composite_escape),
+    pos: cfg.SrcPos,
+    end_pos: cfg.SrcPos,
+) !void {
+    _ = state;
+    // Walker only emits this stmt for `&local` / `array[..]`
+    // patterns — those are stack borrows by construction.  Don't
+    // consult state.locals: the address-of-write rule already
+    // collapsed the local's origin to .plain before we get here.
+    if (!config_mod.isEnabled(ctx.config, .stack_escape)) return;
+    const name = ctx.locals[@intFromEnum(c.local)].name;
+    try report(ctx, pos, end_pos, .@"error",
+        "returning a value that holds a pointer to function-local stack variable `{s}` (escapes its frame)", .{name});
 }
 
 fn transferUse(

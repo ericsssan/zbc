@@ -75,6 +75,16 @@ pub const StmtKind = union(enum) {
     /// bound to `freed_local` dead.  Double-free fires here.
     heap_free: struct { freed_local: LocalId },
 
+    /// Synthetic check emitted before a `.ret` when the return-value
+    /// expression contains MORE than one borrow of a local
+    /// (composite literal embedding multiple `&local` / array-slice
+    /// references).  The primary value_kind on `.ret` fires for the
+    /// first; one `.composite_escape` per additional one catches
+    /// the rest.  Fires escape checks against `local`'s current
+    /// origin regardless of return type — same model as transferRet
+    /// for composite-borrow value-shape returns.
+    composite_escape: struct { local: LocalId },
+
     /// `return <expr>;` — function exit.  `value_kind` describes what's
     /// being returned.  `is_borrowed_return_type` tags whether the
     /// enclosing function's signature returns a borrowed-shape type
@@ -1356,6 +1366,30 @@ const Builder = struct {
         else
             .plain;
         if (value_opt) |expr| try self.emitUsesInExpr(expr, cur.*, null);
+
+        // Multi-borrow composite returns: classifyExpr captures only
+        // the first borrow in `value_kind`.  Walk the return value
+        // again for ANY ADDITIONAL borrows (skipping the primary)
+        // and emit a per-local .composite_escape check before the
+        // .ret.  Without this, `return .{ .a = &x, .b = &y };` would
+        // only flag x.
+        //
+        // Only run when value_kind ITSELF is a borrow-shape — that
+        // tells us the return value is a composite-borrow construct,
+        // not a call.  Skipping for .unknown / .owned / etc. avoids
+        // false positives on `return foo(alloc, &local)` where
+        // `&local` is just a call arg, not part of the return value.
+        const primary_local: ?LocalId = switch (value_kind) {
+            .stack_ref => |l| l,
+            .composite_borrow => |l| l,
+            else => null,
+        };
+        if (primary_local != null) {
+            if (value_opt) |expr| {
+                try self.emitAdditionalEscapeChecks(expr, cur.*, primary_local);
+            }
+        }
+
         try self.appendStmt(cur.*, .{
             .kind = .{ .ret = .{
                 .value_kind = value_kind,
@@ -1772,6 +1806,55 @@ const Builder = struct {
         }
 
         return .unknown;
+    }
+
+    /// Walk `expr_node`'s tokens for every borrow shape recognized
+    /// by firstAddressedLocal (`&id`, `array_local[`), skipping
+    /// `primary_local` (already handled by the surrounding .ret).
+    /// Emits one .composite_escape per additional distinct borrow
+    /// so multi-borrow composite returns get fully flagged.
+    fn emitAdditionalEscapeChecks(
+        self: *Builder,
+        expr_node: Ast.Node.Index,
+        cur: BlockId,
+        primary_local: ?LocalId,
+    ) !void {
+        const tree = self.tree;
+        const first = tree.firstToken(expr_node);
+        const last = tree.lastToken(expr_node);
+        const tags = tree.tokens.items(.tag);
+        const pos = self.posOf(expr_node);
+        const end_pos = self.endPosOf(expr_node);
+
+        var seen: std.AutoArrayHashMapUnmanaged(LocalId, void) = .empty;
+        defer seen.deinit(self.gpa);
+        if (primary_local) |p| try seen.put(self.gpa, p, {});
+
+        var t: Ast.TokenIndex = first;
+        while (t <= last) : (t += 1) {
+            const id_opt: ?LocalId = blk: {
+                if (tags[t] == .ampersand and t + 1 <= last and tags[t + 1] == .identifier) {
+                    const name = tree.tokenSlice(t + 1);
+                    break :blk self.name_to_local.get(name);
+                }
+                if (tags[t] == .identifier and t + 1 <= last and tags[t + 1] == .l_bracket) {
+                    if (t > 0 and tags[t - 1] == .period) break :blk null;
+                    const name = tree.tokenSlice(t);
+                    const local = self.name_to_local.get(name) orelse break :blk null;
+                    if (!self.locals.items[@intFromEnum(local)].is_array) break :blk null;
+                    break :blk local;
+                }
+                break :blk null;
+            };
+            const local = id_opt orelse continue;
+            const gop = try seen.getOrPut(self.gpa, local);
+            if (gop.found_existing) continue;
+            try self.appendStmt(cur, .{
+                .kind = .{ .composite_escape = .{ .local = local } },
+                .pos = pos,
+                .end_pos = end_pos,
+            });
+        }
     }
 
     /// Walk `expr_node`'s tokens looking for either:

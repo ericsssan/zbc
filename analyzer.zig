@@ -514,6 +514,27 @@ test "arena_escape: @returns owns_locals suppresses composite-borrow check" {
     try std.testing.expect(!any_arena);
 }
 
+test "stack_escape: composite with TWO stack borrows flags both" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\pub fn foo() struct { a: *const u32, b: *const u32 } {
+        \\    var x: u32 = 1;
+        \\    var y: u32 = 2;
+        \\    return .{ .a = &x, .b = &y };
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    var x_found = false;
+    var y_found = false;
+    for (problems.items) |p| {
+        if (std.mem.indexOf(u8, p.message, "stack variable `x`") != null) x_found = true;
+        if (std.mem.indexOf(u8, p.message, "stack variable `y`") != null) y_found = true;
+    }
+    try std.testing.expect(x_found);
+    try std.testing.expect(y_found);
+}
+
 test "stack_escape: composite — return .{ .p = &local } is flagged" {
     const gpa = std.testing.allocator;
     var problems = try analyze(gpa,
