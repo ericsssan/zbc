@@ -1568,12 +1568,15 @@ const Builder = struct {
         return null;
     }
 
-    /// Walk `expr_node`'s tokens looking for `<local>.<method>(` shape
-    /// where `local` has an arena/heap init_hint AND `method` carries
-    /// `@returns borrowed_from(self)` in the local annotation DB.
-    /// Returns the first matching LocalId — caller propagates as
-    /// `.composite_borrow` so transferRet fires escape checks even
-    /// for value-shape returns.
+    /// Walk `expr_node`'s tokens looking for any
+    ///   `<local> ( . <id> )* . <method> (`
+    /// shape — i.e. a known local at the head, optional field-chain,
+    /// then a method call.  Fires when:
+    ///   - `local` has an arena/heap init_hint
+    ///   - `method`'s annotation (in the same-file DB) is
+    ///     `@returns borrowed_from(self)`
+    /// Caller propagates as `.composite_borrow` so transferRet fires
+    /// escape checks even on value-shape returns.
     fn firstResourceMethodBorrow(self: *Builder, expr_node: Ast.Node.Index) ?LocalId {
         const tree = self.tree;
         const db = self.db orelse return null;
@@ -1586,20 +1589,34 @@ const Builder = struct {
             if (tags[t] != .identifier) continue;
             // Receiver token must not itself be a field (preceded by `.`).
             if (t > 0 and tags[t - 1] == .period) continue;
+            // Must be followed by at least one `.`
             if (tags[t + 1] != .period) continue;
-            if (tags[t + 2] != .identifier) continue;
-            if (tags[t + 3] != .l_paren) continue;
 
             const recv_name = tree.tokenSlice(t);
             const local = self.name_to_local.get(recv_name) orelse continue;
             const hint = self.locals.items[@intFromEnum(local)].init_hint;
             if (hint == .other) continue;
 
-            const method_name = tree.tokenSlice(t + 2);
+            // Walk the dot-chain: every step must be `. <id>`.  The
+            // last `<id>` before `(` is the method we look up.
+            var k: Ast.TokenIndex = t + 1; // current `.`
+            var method_tok: Ast.TokenIndex = 0;
+            while (k + 1 <= last and tags[k] == .period and tags[k + 1] == .identifier) {
+                method_tok = k + 1;
+                k += 2;
+                if (k > last) break;
+                if (tags[k] == .l_paren) break;
+                // Otherwise expect another `.` for next chain step.
+                if (tags[k] != .period) {
+                    method_tok = 0; // not a method-call chain
+                    break;
+                }
+            }
+            if (method_tok == 0) continue;
+            if (k > last or tags[k] != .l_paren) continue;
+
+            const method_name = tree.tokenSlice(method_tok);
             const entry = db.lookup(method_name) orelse continue;
-            // Only `@returns borrowed_from(receiver)` matters — that's
-            // the annotation that says "the result borrows from arg 0
-            // (= self when called as a method)".
             switch (entry.annotation) {
                 .borrowed_from => |idx| if (idx == 0) return local,
                 else => {},
@@ -1725,10 +1742,18 @@ const Builder = struct {
             // rhs so the local's origin collapses to .plain — clears
             // .undef and avoids spurious use-of-undefined findings on
             // common idioms like `var x = undefined; fillOut(&x);`.
+            //
+            // EXCEPTION: arena/heap-bearing locals.  Their resource
+            // identity is stable across `&x` (the address-of doesn't
+            // re-bind the underlying allocator), so clearing would
+            // mask real escape findings — e.g. `return wrap(&arena)`
+            // depends on arena's .arena origin surviving to the .ret.
             if (t > 0 and tags[t - 1] == .ampersand) {
                 const name = tree.tokenSlice(t);
                 const id = self.name_to_local.get(name) orelse continue;
                 if (skip_local) |s| if (id == s) continue;
+                const hint = self.locals.items[@intFromEnum(id)].init_hint;
+                if (hint != .other) continue;
                 const gop = try aw.getOrPut(self.gpa, id);
                 if (gop.found_existing) continue;
                 try self.appendStmt(cur, .{
@@ -1816,12 +1841,22 @@ const Builder = struct {
         }
     }
 
-    /// If `node` is a bare identifier matching a known local, return
-    /// .copy_of(that local) — otherwise .unknown.
+    /// If `node` resolves to a known local, return .copy_of(that
+    /// local).  Looks through `&id` (address-of) so call args like
+    /// `wrap(&local)` propagate the local's origin to the wrapper's
+    /// inferred `borrowed_from`.
     fn identifierToCopyOrUnknown(self: *Builder, node: Ast.Node.Index) ExprKind {
         const tree = self.tree;
-        if (tree.nodeTag(node) != .identifier) return .unknown;
-        const name = tree.tokenSlice(tree.nodeMainToken(node));
+        const target = switch (tree.nodeTag(node)) {
+            .identifier => node,
+            .address_of => blk: {
+                const inner = tree.nodeData(node).node;
+                if (tree.nodeTag(inner) != .identifier) return .unknown;
+                break :blk inner;
+            },
+            else => return .unknown,
+        };
+        const name = tree.tokenSlice(tree.nodeMainToken(target));
         if (self.name_to_local.get(name)) |id| return .{ .copy_of = id };
         return .unknown;
     }

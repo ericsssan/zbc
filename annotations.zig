@@ -50,11 +50,12 @@ pub const Db = struct {
 };
 
 /// Walk every fn_decl in `tree`, extract any explicit `@returns`
-/// annotation, then run inference (R6) to fill obvious holes.
+/// annotation, then run inference (R6, R7) to fill obvious holes.
 pub fn build(gpa: std.mem.Allocator, tree: *const Ast) !Db {
     var db: Db = .{ .fns = .empty };
     errdefer db.deinit(gpa);
 
+    // Pass 1 — explicit annotations + R6 (slice + body allocs → owned).
     var node_idx: u32 = 1;
     while (node_idx < tree.nodes.len) : (node_idx += 1) {
         const node: Ast.Node.Index = @enumFromInt(node_idx);
@@ -64,7 +65,6 @@ pub fn build(gpa: std.mem.Allocator, tree: *const Ast) !Db {
 
         var annotation = parseReturnsAnnotation(tree, fn_proto);
 
-        // R6 inference: returns a slice + body allocates → @returns owned.
         if (annotation == null and tree.nodeTag(node) == .fn_decl) {
             if (fn_proto.ast.return_type.unwrap()) |rt| {
                 if (typeIsSliceShaped(tree, rt)) {
@@ -80,7 +80,113 @@ pub fn build(gpa: std.mem.Allocator, tree: *const Ast) !Db {
         const name = tree.tokenSlice(name_tok);
         try db.fns.put(gpa, name, .{ .name = name, .annotation = annotation.? });
     }
+
+    // Pass 2 — R7: trivial delegators.
+    //   pub fn wrap(p: T, ...) RetT { return p.<chain>.<method>(args); }
+    // where `method` is annotated `@returns borrowed_from(self)`
+    //   →  infer `@returns borrowed_from(p)` for `wrap`.
+    //
+    // Runs after pass 1 so cross-fn lookups see fully-populated db.
+    node_idx = 1;
+    while (node_idx < tree.nodes.len) : (node_idx += 1) {
+        const node: Ast.Node.Index = @enumFromInt(node_idx);
+        if (tree.nodeTag(node) != .fn_decl) continue;
+        var buf: [1]Ast.Node.Index = undefined;
+        const fn_proto = fullFnProto(tree, &buf, node) orelse continue;
+        const name_tok = fn_proto.name_token orelse continue;
+        const name = tree.tokenSlice(name_tok);
+        if (db.fns.contains(name)) continue;
+
+        const body = tree.nodeData(node).node_and_node[1];
+        const inferred = inferDelegatorBorrow(tree, fn_proto, body, &db) orelse continue;
+        try db.fns.put(gpa, name, .{ .name = name, .annotation = inferred });
+    }
+
     return db;
+}
+
+/// R7 helper.  Returns a `borrowed_from(param_idx)` annotation if the
+/// fn body is a single-return-stmt whose value is a chained-method
+/// call rooted at one of `fn_proto`'s params, AND that method is
+/// annotated `borrowed_from(self)` in `db`.
+fn inferDelegatorBorrow(
+    tree: *const Ast,
+    fn_proto: Ast.full.FnProto,
+    body_node: Ast.Node.Index,
+    db: *const Db,
+) ?ReturnsAnnotation {
+    // Find the single return-stmt's expr, if the body is just that.
+    const return_expr = singleReturnExpr(tree, body_node) orelse return null;
+
+    // Must be a call.
+    const is_call = switch (tree.nodeTag(return_expr)) {
+        .call, .call_one, .call_comma, .call_one_comma => true,
+        else => false,
+    };
+    if (!is_call) return null;
+
+    // Walk the call's source tokens for the leading
+    // `<id> ( . <id> )* . <method> (` shape.
+    const first = tree.firstToken(return_expr);
+    const last = tree.lastToken(return_expr);
+    const tags = tree.tokens.items(.tag);
+
+    if (tags[first] != .identifier) return null;
+    if (first + 1 > last or tags[first + 1] != .period) return null;
+
+    // Resolve head identifier to a param index.
+    const head_name = tree.tokenSlice(first);
+    const param_idx = resolveParamIndex(tree, fn_proto, head_name) orelse return null;
+
+    // Walk the dot-chain to find the method name (last id before `(`).
+    var k: Ast.TokenIndex = first + 1;
+    var method_tok: Ast.TokenIndex = 0;
+    while (k + 1 <= last and tags[k] == .period and tags[k + 1] == .identifier) {
+        method_tok = k + 1;
+        k += 2;
+        if (k > last) break;
+        if (tags[k] == .l_paren) break;
+        if (tags[k] != .period) {
+            method_tok = 0;
+            break;
+        }
+    }
+    if (method_tok == 0) return null;
+    if (k > last or tags[k] != .l_paren) return null;
+
+    const method_name = tree.tokenSlice(method_tok);
+    const entry = db.lookup(method_name) orelse return null;
+    switch (entry.annotation) {
+        .borrowed_from => |idx| if (idx == 0) return .{ .borrowed_from = param_idx },
+        else => {},
+    }
+    return null;
+}
+
+/// Returns the inner expression of the lone `return X;` statement in
+/// a body, or null if the body has any other shape.
+fn singleReturnExpr(tree: *const Ast, body_node: Ast.Node.Index) ?Ast.Node.Index {
+    const tag = tree.nodeTag(body_node);
+    const stmts_data = switch (tag) {
+        .block_two, .block_two_semicolon => blk: {
+            const d = tree.nodeData(body_node).opt_node_and_opt_node;
+            // first slot present, second slot absent → 1 stmt.
+            const first = d[0].unwrap() orelse return null;
+            if (d[1].unwrap() != null) return null;
+            break :blk first;
+        },
+        .block, .block_semicolon => blk: {
+            const d = tree.nodeData(body_node).extra_range;
+            const start: u32 = @intFromEnum(d.start);
+            const end: u32 = @intFromEnum(d.end);
+            if (end - start != 1) return null;
+            const idx: Ast.Node.Index = @enumFromInt(tree.extra_data[start]);
+            break :blk idx;
+        },
+        else => return null,
+    };
+    if (tree.nodeTag(stmts_data) != .@"return") return null;
+    return tree.nodeData(stmts_data).opt_node.unwrap();
 }
 
 fn fullFnProto(tree: *const Ast, buf: *[1]Ast.Node.Index, node: Ast.Node.Index) ?Ast.full.FnProto {

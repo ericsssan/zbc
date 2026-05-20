@@ -310,6 +310,32 @@ test "stack_escape: return &local propagated through copy" {
     try std.testing.expect(found);
 }
 
+test "R7 inference: delegator wrap fires escape on local-arena caller" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const std = @import("std");
+        \\const Ctx = struct {
+        \\    inner: std.heap.ArenaAllocator,
+        \\    /// @returns borrowed_from(self)
+        \\    pub fn text(self: *const Ctx) []const u8 { _ = self; return ""; }
+        \\};
+        \\pub fn wrap(c: *const Ctx) []const u8 {
+        \\    return c.text();
+        \\}
+        \\pub fn callerEscape() []const u8 {
+        \\    var local_ctx = Ctx{ .inner = std.heap.ArenaAllocator.init(undefined) };
+        \\    return wrap(&local_ctx);
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    var found = false;
+    for (problems.items) |p| {
+        if (std.mem.indexOf(u8, p.message, "function-local arena") != null) found = true;
+    }
+    try std.testing.expect(found);
+}
+
 test "arena_escape: composite via direct arena_local.method() is flagged" {
     const gpa = std.testing.allocator;
     var problems = try analyze(gpa,
@@ -331,7 +357,7 @@ test "arena_escape: composite via direct arena_local.method() is flagged" {
     try std.testing.expect(found);
 }
 
-test "arena_escape: composite via annotated method on arena local — chained access is a known gap" {
+test "arena_escape: composite via chained field-access then method is flagged" {
     const gpa = std.testing.allocator;
     var problems = try analyze(gpa,
         \\const std = @import("std");
@@ -348,14 +374,14 @@ test "arena_escape: composite via annotated method on arena local — chained ac
         \\
     );
     defer freeProblems(gpa, &problems);
-    // Documents the precision limit: `o.a.text()` involves a chain
-    // through a field before the method, which the simple
-    // `<local>.<method>(` walker doesn't match.  Acceptable v1.
+    // Walker matches `<local> ( . <id> )* . <method> (` — so
+    // `o.a.text()` fires once we recognize the field chain before
+    // the method call.
     var fired = false;
     for (problems.items) |p| {
         if (std.mem.indexOf(u8, p.message, "function-local arena") != null) fired = true;
     }
-    try std.testing.expect(!fired);
+    try std.testing.expect(fired);
 }
 
 test "arena_escape: composite — bare arena in composite is treated as move (no fire)" {
