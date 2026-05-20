@@ -1451,14 +1451,19 @@ const Builder = struct {
 
         }
 
-        // Success-path defers: fire before the return-value check.
-        try self.flushDefers(cur);
-
+        // Zig semantics: the return value is EVALUATED FIRST, then
+        // defers fire, then the function actually exits.  Emit .use
+        // stmts for the return value's reads BEFORE flushing defers
+        // so a `defer free(buf); return use(buf);` pattern doesn't
+        // see buf as already-freed at .use time.
         const value_kind: ExprKind = if (value_opt) |expr|
             self.classifyExpr(expr)
         else
             .plain;
         if (value_opt) |expr| try self.emitUsesInExpr(expr, cur.*, null);
+
+        // Now flush defers — fires after the .use's, before the .ret.
+        try self.flushDefers(cur);
 
         // Multi-borrow composite returns: classifyExpr captures only
         // the first borrow in `value_kind`.  Walk the return value
@@ -2063,11 +2068,18 @@ const Builder = struct {
         // Each produces a value that aliases the underlying storage
         // of its source arg — propagate the source's origin so
         // free-then-use through a cast is caught.
+        //
+        // For ANY OTHER builtin call (`@truncate(...)`, `@intCast(...)`,
+        // `@hash(...)` etc.), the result's lifetime is unrelated to
+        // its args — return .unknown so the composite-fallback walker
+        // doesn't pick up address-of-args buried inside the builtin's
+        // arguments as if they were the return value's shape.
         switch (tag) {
             .builtin_call, .builtin_call_two, .builtin_call_comma, .builtin_call_two_comma => {
                 if (self.transparentCastSource(expr_node)) |src| {
                     return self.classifyExpr(src);
                 }
+                return .unknown;
             },
             else => {},
         }
@@ -2137,6 +2149,15 @@ const Builder = struct {
         while (t <= last) : (t += 1) {
             const id_opt: ?LocalId = blk: {
                 if (tags[t] == .ampersand and t + 1 <= last and tags[t + 1] == .identifier) {
+                    // Skip `&local.field` / `&local[i]` — the
+                    // address-of binds to the whole field/element
+                    // expression, which typically references
+                    // caller-owned storage through the local's
+                    // pointer/slice/etc.
+                    if (t + 2 <= last) {
+                        const next = tags[t + 2];
+                        if (next == .period or next == .l_bracket) break :blk null;
+                    }
                     const name = tree.tokenSlice(t + 1);
                     break :blk self.name_to_local.get(name);
                 }
@@ -2173,8 +2194,15 @@ const Builder = struct {
 
         var t: Ast.TokenIndex = first;
         while (t <= last) : (t += 1) {
-            // Address-of pattern: `& <ident>`
+            // Address-of pattern: `& <ident>` where `<ident>` is the
+            // WHOLE address-of operand (not `&local.field` or
+            // `&local[i]` — those take the address of memory the
+            // local merely points INTO, typically caller-owned).
             if (tags[t] == .ampersand and t + 1 <= last and tags[t + 1] == .identifier) {
+                if (t + 2 <= last) {
+                    const next = tags[t + 2];
+                    if (next == .period or next == .l_bracket) continue;
+                }
                 const name = tree.tokenSlice(t + 1);
                 if (self.name_to_local.get(name)) |local| return local;
                 continue;

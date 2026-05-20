@@ -64,12 +64,28 @@ pub const Cache = struct {
     /// abs-path → loaded file.  Keys are gpa-owned (heap-duped from
     /// std.fs.path.resolve output); values are heap-allocated boxes.
     files: std.StringHashMapUnmanaged(*RemoteFile),
+    /// Currently-loading set.  Cycle detector: if R7 inference inside
+    /// file A triggers loadOrLookup(B) and B's R7 transitively
+    /// triggers loadOrLookup(A), A isn't yet in `files` (we insert
+    /// AFTER buildFull completes), so without this guard we'd
+    /// re-parse + re-build A unboundedly until stack overflow.
+    /// Bun's deeply-imported codebase hit this immediately.  Entries
+    /// added on entry to the slow path and removed on completion.
+    loading: std.StringHashMapUnmanaged(void),
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io) Cache {
-        return .{ .gpa = gpa, .io = io, .mutex = .init, .files = .empty };
+        return .{ .gpa = gpa, .io = io, .mutex = .init, .files = .empty, .loading = .empty };
+    }
+
+    pub fn deinitLoading(self: *Cache) void {
+        // Free loading-set keys we own (gpa-duped abs paths).
+        var it = self.loading.iterator();
+        while (it.next()) |entry| self.gpa.free(entry.key_ptr.*);
+        self.loading.deinit(self.gpa);
     }
 
     pub fn deinit(self: *Cache) void {
+        self.deinitLoading();
         var it = self.files.iterator();
         while (it.next()) |entry| {
             entry.value_ptr.*.deinit(self.gpa);
@@ -104,7 +120,8 @@ pub const Cache = struct {
         const abs = try std.fs.path.resolve(self.gpa, &.{ base_dir, import_path });
         errdefer self.gpa.free(abs);
 
-        // Fast path: lock just long enough to check + return on hit.
+        // Fast path: lock just long enough to check + return on hit
+        // or bail on a re-entry (cycle).
         {
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
@@ -112,6 +129,34 @@ pub const Cache = struct {
                 self.gpa.free(abs);
                 return hit;
             }
+            if (self.loading.contains(abs)) {
+                // Reentrant load — cycle.  Return null so the caller
+                // (R7 inference looking up a cross-file annotation)
+                // treats this as a miss for THIS pass.  Stable
+                // annotations from a later non-recursive load will
+                // be picked up the next time the file is queried.
+                self.gpa.free(abs);
+                return null;
+            }
+            // Mark loading.  Duplicate ownership: the loading-set
+            // owns its own copy of the abs path; the `files` entry
+            // (on success) gets the original.  Free on the failure
+            // / completion paths below.
+            const loading_key = self.gpa.dupe(u8, abs) catch {
+                self.gpa.free(abs);
+                return null;
+            };
+            self.loading.put(self.gpa, loading_key, {}) catch {
+                self.gpa.free(loading_key);
+                self.gpa.free(abs);
+                return null;
+            };
+        }
+        // Remove from loading-set on every exit path.
+        defer {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            if (self.loading.fetchRemove(abs)) |kv| self.gpa.free(kv.key);
         }
 
         const src_bytes = std.Io.Dir.cwd().readFileAlloc(
