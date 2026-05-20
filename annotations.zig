@@ -448,6 +448,58 @@ fn lookupBorrowedFromImport(
     };
 }
 
+/// AST-level type-name resolution.  Read the named param's type
+/// annotation tokens, strip leading `*`/`?`/`const`/`[]`/whitespace,
+/// and if the leaf form is `<ns>.<Type>` where `<ns>` is in the
+/// caller's imap, look up `method_name` in `<ns>.zig`'s DB.
+///
+/// Why this works without semantic types: every step uses AST text
+/// and imap entries we already build.  Limited shape (single-hop
+/// `ns.Type` with at most a wrapping pointer chain), but covers
+/// the common `pub fn wrap(c: *const ns.Type) RetT { return c.method(); }`
+/// shape that real wrappers use.
+fn lookupBorrowedFromParamType(
+    tree: *const Ast,
+    fn_proto: Ast.full.FnProto,
+    param_idx: u32,
+    method_name: []const u8,
+    remote: ?RemoteCtx,
+) ?u32 {
+    const r = remote orelse return null;
+
+    var idx: u32 = 0;
+    var it = fn_proto.iterate(tree);
+    const param = while (it.next()) |p| : (idx += 1) {
+        if (idx == param_idx) break p;
+    } else return null;
+    const type_node = param.type_expr orelse return null;
+
+    // Walk the type's tokens.  Skip pointer/const/optional/slice
+    // qualifiers; look for the first `<id>.<id>` pair as the leaf
+    // namespace.Type form.
+    const first = tree.firstToken(type_node);
+    const last = tree.lastToken(type_node);
+    const tags = tree.tokens.items(.tag);
+    var t: Ast.TokenIndex = first;
+    while (t < last) : (t += 1) {
+        if (tags[t] != .identifier) continue;
+        // `<id> . <id>` — `id` must NOT be preceded by `.` itself.
+        if (t > first and tags[t - 1] == .period) continue;
+        if (t + 2 > last) break;
+        if (tags[t + 1] != .period) continue;
+        if (tags[t + 2] != .identifier) continue;
+        const ns = tree.tokenSlice(t);
+        // We don't actually need the type name — only the namespace
+        // tells us which remote file to consult.  The method lookup
+        // is by name in that file's full annotation DB.
+        return lookupBorrowedFromImport(r, ns, method_name);
+    }
+    // Bare-identifier leaf type (`const Foo = struct {...};` in the
+    // SAME file).  Same-file path would have already caught the
+    // method via lookupBorrowedFromSameFile; nothing more to do.
+    return null;
+}
+
 fn inferMethodStyle(
     tree: *const Ast,
     fn_proto: Ast.full.FnProto,
@@ -481,13 +533,21 @@ fn inferMethodStyle(
     if (k > last or tags[k] != .l_paren) return null;
 
     const method_name = tree.tokenSlice(method_tok);
-    // Same-file DB only.  Method-style `c.method()` can't safely
-    // resolve cross-file without type info — `c`'s type could be in
-    // any imported file, and scanning every import per call site
-    // is too costly.
-    _ = remote;
-    const target_idx = lookupBorrowedFromSameFile(db, method_name) orelse return null;
-    if (target_idx == 0) return .{ .borrowed_from = param_idx };
+    // Same-file first.  Then AST-level type resolution: read the
+    // param's declared type, strip pointer/const, and if the leaf
+    // is `<namespace>.<TypeName>` where namespace is in our imap,
+    // try to find the method on TypeName in that file.
+    var target_idx = lookupBorrowedFromSameFile(db, method_name);
+    if (target_idx == null) {
+        target_idx = lookupBorrowedFromParamType(
+            tree,
+            fn_proto,
+            param_idx,
+            method_name,
+            remote,
+        );
+    }
+    if ((target_idx orelse return null) == 0) return .{ .borrowed_from = param_idx };
     return null;
 }
 
