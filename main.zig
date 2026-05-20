@@ -21,6 +21,8 @@
 //!                        arena (default: .deinit().
 //!   --format=text|json   Output format (default: text).
 //!   --list-invariants    Print known invariant names and exit 0.
+//!   --list-rules         Print every rule id + title and exit 0.
+//!   --explain <id>       Print the full explainer for one rule.
 //!   -h / --help          Print usage and exit 0.
 
 const std = @import("std");
@@ -62,6 +64,22 @@ pub fn main(init: std.process.Init) !void {
                 std.debug.print("{s}\n", .{f.name});
             }
             std.process.exit(0);
+        }
+        if (std.mem.eql(u8, a, "--list-rules")) {
+            for (lib.rule_catalog) |r| {
+                std.debug.print("{s} — {s}\n", .{ r.id, r.title });
+            }
+            std.process.exit(0);
+        }
+        if (std.mem.startsWith(u8, a, "--explain=")) {
+            explainAndExit(a["--explain=".len..]);
+        }
+        if (std.mem.eql(u8, a, "--explain")) {
+            const id = arg_it.next() orelse {
+                std.debug.print("zbc: --explain requires a rule id (see --list-rules)\n", .{});
+                std.process.exit(2);
+            };
+            explainAndExit(id);
         }
         if (std.mem.eql(u8, a, "--hygiene")) {
             mode = .hygiene;
@@ -297,6 +315,15 @@ fn containsInvariant(slice: []const lib.Invariant, inv: lib.Invariant) bool {
     return false;
 }
 
+fn explainAndExit(id: []const u8) noreturn {
+    if (lib.lookupRule(id)) |r| {
+        std.debug.print("{s}", .{r.body});
+        std.process.exit(0);
+    }
+    std.debug.print("zbc: no rule named `{s}` (see --list-rules)\n", .{id});
+    std.process.exit(2);
+}
+
 fn printUsage() void {
     std.debug.print(
         \\usage: zbc [options] <file.zig>...
@@ -318,6 +345,10 @@ fn printUsage() void {
         \\                        `compact` is single-line grep-friendly.
         \\  --no-color            Disable ANSI color in `rich` output.
         \\  --list-invariants     Print known invariant names and exit.
+        \\  --list-rules          Print every rule id and one-line title
+        \\                        and exit.
+        \\  --explain <id>        Print the full explainer for one rule
+        \\                        (use --list-rules for valid ids).
         \\  -h, --help            Print this help.
         \\
     , .{});
@@ -502,6 +533,18 @@ fn printOneProblemRich(
                 c.blue, c.reset, n.label, path, n.start.line, n.start.column,
             });
         }
+    }
+
+    // = help: footer — point at the catalog when the rule is in it.
+    // Matches Rustc's `= help: for more information about this error,
+    // try \`rustc --explain E0382\`.` line.  Only print when the rule
+    // actually has an explainer; suppress otherwise so internal /
+    // experimental rules don't promise docs that don't exist.
+    if (lib.lookupRule(p.rule_id) != null) {
+        pad(gutter_width);
+        std.debug.print("{s}={s} {s}help{s}: for more information, run `zbc --explain {s}`\n", .{
+            c.blue, c.reset, c.bold, c.reset, p.rule_id,
+        });
     }
 
     std.debug.print("\n", .{});

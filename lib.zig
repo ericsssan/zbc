@@ -12,6 +12,7 @@ const config_mod = @import("config.zig");
 const problem_mod = @import("problem.zig");
 
 const require_borrowed_from = @import("rules/require_borrowed_from.zig");
+const rule_catalog_mod = @import("rule_catalog.zig");
 
 pub const Config = config_mod.Config;
 pub const DefaultConfig = config_mod.Default;
@@ -24,6 +25,9 @@ pub const Note = problem_mod.Note;
 pub const Pos = problem_mod.Pos;
 pub const Severity = problem_mod.Severity;
 pub const Cache = remote_resolver_mod.Cache;
+pub const Rule = rule_catalog_mod.Rule;
+pub const rule_catalog = rule_catalog_mod.all;
+pub const lookupRule = rule_catalog_mod.lookup;
 
 pub fn analyzeEscape(
     gpa: std.mem.Allocator,
@@ -370,5 +374,6 @@ test {
     _ = @import("abstract_state.zig");
     _ = @import("transfer.zig");
     _ = require_borrowed_from;
+    _ = rule_catalog_mod;
     std.testing.refAllDecls(@This());
 }

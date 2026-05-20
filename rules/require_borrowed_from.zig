@@ -1,4 +1,4 @@
-//! `ez/require-borrowed-from` — Layer 1 annotation hygiene rule.
+//! `require-borrowed-from` — Layer 1 annotation hygiene rule.
 //!
 //! Flags public functions that return a borrowed-shape type (`[]const u8`,
 //! `[]const T`, `*const T`, `*T`) from a borrowed-source parameter
@@ -18,7 +18,7 @@ const problem_mod = @import("../problem.zig");
 const Problem = problem_mod.Problem;
 const Pos = problem_mod.Pos;
 
-const RULE_ID = "ez/require-borrowed-from";
+const RULE_ID = "require-borrowed-from";
 
 pub const Config = struct {
     severity: problem_mod.Severity = .@"error",
