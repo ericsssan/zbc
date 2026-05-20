@@ -487,6 +487,20 @@ fn lookupBorrowedFromImport(
 /// `ns.Type` with at most a wrapping pointer chain), but covers
 /// the common `pub fn wrap(c: *const ns.Type) RetT { return c.method(); }`
 /// shape that real wrappers use.
+///
+/// What this DOESN'T resolve (and why it's not worth fixing):
+///   - `anytype` params — Zig's duck-typed generic.  Resolving
+///     these would require per-call-site monomorphization, doubling
+///     analysis cost.  Empirically rare in real codebases as
+///     wrappers (most anytype params are `writer: anytype` /
+///     `stream: anytype` returning void or error union).
+///   - Inline anonymous struct types (`c: struct { ... }`) — no
+///     name in our imap; resolving methods would need to walk the
+///     param type's AST.  Even rarer in idiomatic Zig where named
+///     types are the convention.
+/// Both fall back to same-file lookup only.  The Zig style of
+/// "name your types explicitly so they can be `@import`-ed" makes
+/// this a theoretical rather than practical limit.
 fn lookupBorrowedFromParamType(
     tree: *const Ast,
     fn_proto: Ast.full.FnProto,
