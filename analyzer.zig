@@ -1361,6 +1361,63 @@ test "lowering_gap collapses locals to plain — no spurious reports" {
     try std.testing.expectEqual(@as(usize, 0), problems.items.len);
 }
 
+test "errdefer fires on `return error.X` — explicit free then literal-error return is a double-free" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const std = @import("std");
+        \\pub fn foo(allocator: std.mem.Allocator) ![]u8 {
+        \\    const buf = try allocator.alloc(u8, 32);
+        \\    errdefer allocator.free(buf);
+        \\    allocator.free(buf);
+        \\    return error.SomeError;
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 1), problems.items.len);
+    try std.testing.expectEqualStrings("heap-double-free", problems.items[0].rule_id);
+}
+
+test "return switch (...) { .err => { free; return error.X } } — errdefer fires inside arm" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const std = @import("std");
+        \\const Result = union(enum) { ok: u32, err: void };
+        \\fn decompress(_: []u8) Result { return .{ .ok = 0 }; }
+        \\pub fn foo(allocator: std.mem.Allocator) ![]u8 {
+        \\    const output = try allocator.alloc(u8, 16);
+        \\    errdefer allocator.free(output);
+        \\    const result = decompress(output);
+        \\    return switch (result) {
+        \\        .ok => |n| output[0..n],
+        \\        .err => {
+        \\            allocator.free(output);
+        \\            return error.DecompressionFailed;
+        \\        },
+        \\    };
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 1), problems.items.len);
+    try std.testing.expectEqualStrings("heap-double-free", problems.items[0].rule_id);
+}
+
+test "return error.X without prior explicit free — clean (errdefer is the SOLE free)" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const std = @import("std");
+        \\pub fn foo(allocator: std.mem.Allocator) ![]u8 {
+        \\    const buf = try allocator.alloc(u8, 32);
+        \\    errdefer allocator.free(buf);
+        \\    return error.SomeError;
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
 test {
     _ = imports_mod;
     _ = remote_resolver_mod;

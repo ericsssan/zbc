@@ -1700,6 +1700,15 @@ const Builder = struct {
             // ret then emits there.
             if (try self.maybeLowerLabeledBlockExpr(expr, cur)) {}
 
+            // Top-level switch return (`return switch (x) { ... .err
+            // => { free; return error.Y } ... };`) — fork each arm's
+            // body off `cur` as its own basic block so diverging arms
+            // (those whose bodies `return` / `unreachable`) get their
+            // errdefer/defer flushes and any UAF/double-free in their
+            // statements modeled.  The outer .ret still emits from
+            // `cur`, but arm-side-effects no longer hide inside an
+            // unwalked expression.
+            try self.maybeLowerReturnSwitchArms(expr, cur);
         }
 
         // Zig semantics: the return value is EVALUATED FIRST, then
@@ -1714,7 +1723,25 @@ const Builder = struct {
         if (value_opt) |expr| try self.emitUsesInExpr(expr, cur.*, null);
 
         // Now flush defers — fires after the .use's, before the .ret.
-        try self.flushDefers(cur);
+        //
+        // `return error.X` (or `return .{...}` resolving to an error-only
+        // path) returns an error value, so Zig fires errdefers too.
+        // Detect the syntactic `error.X` shape and use the error-path
+        // flush; everything else uses the normal-only flush.  This is
+        // conservative — `return foo()` where `foo()` returns an error
+        // also fires errdefers, but we can't tell that from the AST
+        // without callee resolution.  Catching the literal case is the
+        // common bug shape (`errdefer free(p); return error.X` after an
+        // explicit free of `p` is a textbook double-free).
+        const value_is_literal_error = if (value_opt) |expr|
+            isLiteralErrorReturn(tree, expr)
+        else
+            false;
+        if (value_is_literal_error) {
+            try self.flushErrAndNormalDefers(cur);
+        } else {
+            try self.flushDefers(cur);
+        }
 
         // Multi-borrow composite returns: classifyExpr captures only
         // the first borrow in `value_kind`.  Walk the return value
@@ -2889,6 +2916,69 @@ const Builder = struct {
         if (args.len == 0) return null;
         // Walk the first arg: bare ident, or `arena.allocator()` chain.
         return self.argResolvesToArenaBound(args[0]);
+    }
+
+    /// `return switch (x) { ... }` — fork each arm's body off `cur`
+    /// as its own basic block.  Diverging arms (those whose body
+    /// `return` / `unreachable`) emit their own .ret with the right
+    /// defer/errdefer flushes.  Non-diverging arms still produce a
+    /// value that the outer .ret consumes; we don't try to thread
+    /// that value back (the goal is bug detection, not type-check),
+    /// so we just leak the forked block — it has no successor.
+    ///
+    /// No-op when `expr` isn't a switch.  Idempotent — called from
+    /// lowerReturn after the try/catch/labeled-block dispatch.
+    fn maybeLowerReturnSwitchArms(
+        self: *Builder,
+        expr: Ast.Node.Index,
+        cur: *BlockId,
+    ) (std.mem.Allocator.Error)!void {
+        const tree = self.tree;
+        switch (tree.nodeTag(expr)) {
+            .@"switch", .switch_comma => {},
+            else => return,
+        }
+        const sw = tree.fullSwitch(expr) orelse return;
+
+        // Discriminant uses fire from the outer cur (before any arm).
+        try self.emitUsesInExpr(sw.ast.condition, cur.*, null);
+
+        for (sw.ast.cases) |case_node| {
+            const case_full = tree.fullSwitchCase(case_node) orelse continue;
+            const case_block = try self.newBlock();
+            try self.addEdge(cur.*, case_block);
+            if (case_full.payload_token) |pt| try self.registerCaptures(pt);
+            var case_cur = case_block;
+            // The arm body is the case's target_expr.  Block bodies
+            // (`.err => { ... }`) lower naturally; naked expressions
+            // (`.success => v`) end up as a lowering_gap, which is
+            // harmless for state preservation.
+            try self.lowerStmt(case_full.ast.target_expr, &case_cur);
+            // Don't add an edge back to cur or anywhere — the arm is
+            // a forked side-path used purely to surface bugs inside
+            // diverging branches.  Adding an edge would propagate
+            // arm-local state (free, deinit) back into the outer
+            // return, causing spurious "use after free" downstream.
+        }
+    }
+
+    /// True iff `expr` is syntactically a literal error return value
+    /// (`error.X`).  Used by lowerReturn to decide whether to flush
+    /// errdefers along with normal defers.  Conservative — only the
+    /// directly-recognisable case; `return foo()` returning an error
+    /// type stays as normal-only flush to avoid speculation.
+    ///
+    /// Also handles `try expr` wrapping a literal error (rare but
+    /// possible: `return try error.X`).
+    fn isLiteralErrorReturn(tree: *const Ast, expr: Ast.Node.Index) bool {
+        switch (tree.nodeTag(expr)) {
+            .error_value => return true,
+            .@"try" => {
+                const inner = tree.nodeData(expr).node;
+                return isLiteralErrorReturn(tree, inner);
+            },
+            else => return false,
+        }
     }
 
     fn isConstructorName(name: []const u8) bool {
