@@ -1586,12 +1586,21 @@ const Builder = struct {
         // annotation / takes / is_noreturn.
         const bound_fn_name: ?[]const u8 = if (init_opt) |i| self.boundFnName(i) else null;
         // Type annotation on the decl (`var x: Foo = ...`) — extracted
-        // for receiver-type tracking.  Implicit-typed decls leave
-        // type_name null; the lookup will fall back to bare-name.
-        const decl_type_name: ?[]const u8 = if (var_decl.ast.type_node.unwrap()) |tn|
-            self.extractTypeName(tn, self.self_type)
-        else
-            null;
+        // for receiver-type tracking.  When absent, fall back to
+        // inferring the type from the init expression — recognises
+        // `T.init(...)` / `try T.init(...)` and `T{...}` shapes so
+        // `var owner = try Owner.init(...)` still resolves to "Owner".
+        // Implicit-typed decls without a recognisable constructor
+        // leave type_name null; the lookup falls back to bare-name.
+        const decl_type_name: ?[]const u8 = blk: {
+            if (var_decl.ast.type_node.unwrap()) |tn| {
+                break :blk self.extractTypeName(tn, self.self_type);
+            }
+            if (init_opt) |init| {
+                break :blk self.inferTypeNameFromInit(init);
+            }
+            break :blk null;
+        };
         const local = try self.registerLocalWithPointerHint(
             name,
             self.posOfToken(name_tok),
@@ -3435,6 +3444,73 @@ const Builder = struct {
         };
         for (list) |n| if (std.mem.eql(u8, n, name)) return true;
         return false;
+    }
+
+    /// Infer the declared type of `var x = <init>` for the case where
+    /// the var_decl has no explicit type annotation.  Lets call sites
+    /// later resolve `x.method()` / `x.<borrowed_field>` via the type
+    /// of the constructor's receiver, even when the user wrote no
+    /// `: T` annotation.
+    ///
+    /// Recognises:
+    ///   - `T.init(...)` / `T.create(...)` / `T.new(...)` / `T.open(...)`
+    ///     and the other constructor-method names.
+    ///   - `try <constructor-call>` — recurses past `try`.
+    ///   - `T{ ... }` and `T.{ ... }` struct literals — but NOT
+    ///     anonymous `.{ ... }`, which needs the surrounding context's
+    ///     type that we don't have.
+    /// Returns the LAST identifier in a dotted chain
+    /// (`lib.Owner.init(...)` → "Owner"), matching extractTypeName's
+    /// namespace-stripping rule.
+    fn inferTypeNameFromInit(self: *Builder, init_node: Ast.Node.Index) ?[]const u8 {
+        const tree = self.tree;
+        var node = init_node;
+        // Unwrap `try` and `<lhs> catch <fallback>` — both leave the
+        // success-path value with the inner call's identity.
+        while (true) {
+            switch (tree.nodeTag(node)) {
+                .@"try" => node = tree.nodeData(node).node,
+                .@"catch" => node = tree.nodeData(node).node_and_node[0],
+                else => break,
+            }
+        }
+        switch (tree.nodeTag(node)) {
+            .call, .call_one, .call_comma, .call_one_comma => {
+                var buf: [1]Ast.Node.Index = undefined;
+                const call = tree.fullCall(&buf, node) orelse return null;
+                const callee = call.ast.fn_expr;
+                if (tree.nodeTag(callee) != .field_access) return null;
+                const fa = tree.nodeData(callee).node_and_token;
+                const method_name = tree.tokenSlice(fa[1]);
+                if (!isConstructorName(method_name)) return null;
+                return self.lastIdentInDottedChain(fa[0]);
+            },
+            .struct_init,
+            .struct_init_comma,
+            .struct_init_one,
+            .struct_init_one_comma,
+            => {
+                var buf: [2]Ast.Node.Index = undefined;
+                const si = tree.fullStructInit(&buf, node) orelse return null;
+                const type_expr = si.ast.type_expr.unwrap() orelse return null;
+                return self.lastIdentInDottedChain(type_expr);
+            },
+            else => return null,
+        }
+    }
+
+    /// Return the LAST identifier token slice in a dotted chain.
+    /// `lib.Owner` → "Owner", `Owner` → "Owner", anything else → null.
+    fn lastIdentInDottedChain(self: *Builder, node: Ast.Node.Index) ?[]const u8 {
+        const tree = self.tree;
+        switch (tree.nodeTag(node)) {
+            .identifier => return tree.tokenSlice(tree.nodeMainToken(node)),
+            .field_access => {
+                const fa = tree.nodeData(node).node_and_token;
+                return tree.tokenSlice(fa[1]);
+            },
+            else => return null,
+        }
     }
 
     /// Resolve an expression node to an arena-bound LocalId if
