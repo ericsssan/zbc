@@ -45,22 +45,30 @@ pub fn analyzeEscape(
     var tree = try Ast.parse(gpa, src, .zig);
     defer tree.deinit(gpa);
 
-    var db = try annotations_mod.buildWithConfig(gpa, &tree, config);
-    defer db.deinit(gpa);
-
+    // Build imap first so the annotation pass (R7) can do cross-file
+    // lookups when a remote cache is provided.
     var imap_storage: ?imports_mod.Map = null;
     defer if (imap_storage) |*m| m.deinit(gpa);
     var remote_ctx_storage: ?cfg_mod.RemoteCtx = null;
+    var anno_remote: ?annotations_mod.RemoteCtx = null;
+    const base_dir = std.fs.path.dirname(path) orelse ".";
 
     if (cache) |c| {
         imap_storage = try imports_mod.build(gpa, &tree);
-        const base_dir = std.fs.path.dirname(path) orelse ".";
         remote_ctx_storage = .{
             .imap = &imap_storage.?,
             .base_dir = base_dir,
             .cache = c,
         };
+        anno_remote = .{
+            .imap = &imap_storage.?,
+            .base_dir = base_dir,
+            .cache = c,
+        };
     }
+
+    var db = try annotations_mod.buildFull(gpa, &tree, config, anno_remote);
+    defer db.deinit(gpa);
 
     var problems: std.ArrayListUnmanaged(Problem) = .empty;
     errdefer freeProblemsArrayList(gpa, &problems);

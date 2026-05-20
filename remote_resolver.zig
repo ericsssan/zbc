@@ -142,22 +142,31 @@ pub const Cache = struct {
         };
         errdefer tree.deinit(self.gpa);
 
-        var db = annotations.build(self.gpa, &tree) catch {
-            tree.deinit(self.gpa);
-            self.gpa.free(src_z);
-            self.gpa.free(abs);
-            return null;
-        };
-        errdefer db.deinit(self.gpa);
-
+        // Build the remote file's imap FIRST so R7 inference can do
+        // cross-file lookups inside this file's body too — same cache,
+        // resolved against this file's own directory.
         var imap = imports_mod.build(self.gpa, &tree) catch {
-            db.deinit(self.gpa);
             tree.deinit(self.gpa);
             self.gpa.free(src_z);
             self.gpa.free(abs);
             return null;
         };
         errdefer imap.deinit(self.gpa);
+
+        const remote_base_dir = std.fs.path.dirname(abs) orelse ".";
+        const anno_remote: annotations.RemoteCtx = .{
+            .imap = &imap,
+            .base_dir = remote_base_dir,
+            .cache = self,
+        };
+        var db = annotations.buildFull(self.gpa, &tree, null, anno_remote) catch {
+            imap.deinit(self.gpa);
+            tree.deinit(self.gpa);
+            self.gpa.free(src_z);
+            self.gpa.free(abs);
+            return null;
+        };
+        errdefer db.deinit(self.gpa);
 
         const box = try self.gpa.create(RemoteFile);
         box.* = .{
