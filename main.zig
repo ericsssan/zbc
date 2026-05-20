@@ -514,7 +514,7 @@ fn printOneProblemRich(
     if (src_opt) |src| {
         // Blank gutter row before the primary span.
         pad(gutter_width);
-        std.debug.print("{s}|{s}\n", .{ c.blue, c.reset });
+        std.debug.print(" {s}|{s}\n", .{ c.blue, c.reset });
 
         renderSpan(src, p.start, p.end, "", sev_color, '^', c, gutter_width);
 
@@ -524,7 +524,7 @@ fn printOneProblemRich(
             // (none today, but cheap to support) would print their own
             // path lines.
             pad(gutter_width);
-            std.debug.print("{s}|{s}\n", .{ c.blue, c.reset });
+            std.debug.print(" {s}|{s}\n", .{ c.blue, c.reset });
             renderSpan(src, n.start, n.end, n.label, c.blue, '-', c, gutter_width);
         }
     } else {
@@ -532,7 +532,7 @@ fn printOneProblemRich(
         // textually so we don't drop the info.
         for (p.notes) |n| {
             pad(gutter_width);
-            std.debug.print("{s}={s} {s} at {s}:{}:{}\n", .{
+            std.debug.print(" {s}={s} {s} at {s}:{}:{}\n", .{
                 c.blue, c.reset, n.label, path, n.start.line, n.start.column,
             });
         }
@@ -545,7 +545,7 @@ fn printOneProblemRich(
     // experimental rules don't promise docs that don't exist.
     if (lib.lookupRule(p.rule_id) != null) {
         pad(gutter_width);
-        std.debug.print("{s}={s} {s}help{s}: for more information, run `zbc --explain {s}`\n", .{
+        std.debug.print(" {s}={s} {s}help{s}: for more information, run `zbc --explain {s}`\n", .{
             c.blue, c.reset, c.bold, c.reset, p.rule_id,
         });
     }
@@ -598,7 +598,7 @@ fn renderSpan(
     std.debug.print("{s}{s} |{s} {s}\n", .{ c.blue, ln_str, c.reset, line_text });
     // Underline row.  Columns are 1-indexed.
     pad(gutter_width);
-    std.debug.print("{s}|{s} ", .{ c.blue, c.reset });
+    std.debug.print(" {s}|{s} ", .{ c.blue, c.reset });
     // Pad to start column.
     if (start.column > 1) {
         var i: u32 = 1;
