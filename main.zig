@@ -341,7 +341,9 @@ fn printUsage() void {
         \\                        (default: .deinit().
         \\  --format=rich|compact|json
         \\                        Output format.  Default `rich` shows
-        \\                        Rustc-style source context and labels.
+        \\                        gcc/clang-style header (path:line:col:
+        \\                        error(rule-id): message) plus a
+        \\                        Rust-style source-context block.
         \\                        `compact` is single-line grep-friendly.
         \\  --no-color            Disable ANSI color in `rich` output.
         \\  --list-invariants     Print known invariant names and exit.
@@ -393,11 +395,15 @@ fn runOne(t: *Task) std.Io.Cancelable!void {
 }
 
 fn printOneProblemCompact(path: []const u8, p: lib.Problem) void {
-    std.debug.print("{s}:{}:{}: {s}: {s}", .{
+    // gcc/clang-style header — path:line:col first, then
+    // `severity(rule-id):`, then message.  Grep-friendly because the
+    // file:line:col leads, and the rule_id is parenthesised inline.
+    std.debug.print("{s}:{}:{}: {s}({s}): {s}", .{
         path,
         p.start.line,
         p.start.column,
         severityName(p.severity),
+        p.rule_id,
         p.message,
     });
     // Tack each note's location and label onto the same line so the
@@ -408,10 +414,10 @@ fn printOneProblemCompact(path: []const u8, p: lib.Problem) void {
             n.label, path, n.start.line, n.start.column,
         });
     }
-    std.debug.print(" [{s}]\n", .{p.rule_id});
+    std.debug.print("\n", .{});
 }
 
-// ── Rich (Rustc-style) renderer ──────────────────────────────────
+// ── Rich renderer (gcc/clang header + Rust source-context block) ─────
 
 const SourceCache = struct {
     gpa: std.mem.Allocator,
@@ -488,25 +494,22 @@ fn printOneProblemRich(
         .off => c.cyan,
     };
 
-    // Header:  error[zbc/heap-use-after-free]: use of `x` after free
-    std.debug.print(
-        "{s}{s}{s}{s}{s}[{s}]{s}: {s}{s}{s}\n",
-        .{
-            c.bold,        sev_color, severityName(p.severity), c.reset,
-            c.bold,        p.rule_id, c.reset,
-            c.bold,        p.message, c.reset,
-        },
-    );
+    // Header:  path:line:col: error(heap-use-after-free): use of `x` after free
+    //
+    // gcc/clang-style: file location leads, then `severity(rule-id):`,
+    // then the message.  Editors / `grep -E` patterns / IDE jump-to-
+    // diagnostic tooling all parse `path:line:col` at the start of
+    // the line, so the rich format keeps the same shape as compact —
+    // just with source context underneath.
+    std.debug.print("{s}:{}:{}: ", .{ path, p.start.line, p.start.column });
+    std.debug.print("{s}{s}{s}{s}", .{ c.bold, sev_color, severityName(p.severity), c.reset });
+    std.debug.print("({s}{s}{s})", .{ c.cyan, p.rule_id, c.reset });
+    std.debug.print(": {s}{s}{s}\n", .{ c.bold, p.message, c.reset });
 
-    // Source-context block.
+    // Source-context block — no separate `--> path:line:col` line,
+    // since the gcc/clang-style header already carries it.
     const src_opt = cache.get(path);
     const gutter_width = pickGutterWidth(p);
-
-    // Location line:  --> path:line:col
-    pad(gutter_width);
-    std.debug.print("{s}--> {s}{s}:{}:{}\n", .{
-        c.blue, c.reset, path, p.start.line, p.start.column,
-    });
 
     if (src_opt) |src| {
         // Blank gutter row before the primary span.

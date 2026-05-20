@@ -89,6 +89,17 @@ pub const FnEntry = struct {
 
 pub const Db = struct {
     fns: std.StringHashMapUnmanaged(FnEntry),
+    /// Set of fn names that appear MORE THAN ONCE as fn_decl in the
+    /// source file (e.g. `finalize` defined on both `HTMLRewriter`
+    /// and `HTMLRewriterLoader`).  zbc's annotation DB is keyed by
+    /// bare name — no struct scoping — so the second definition
+    /// silently overwrites the first.  Marking names as ambiguous
+    /// disables `@takes` / `@returns` propagation through `lookup`
+    /// for them, preventing the kind of FP where R8b infers
+    /// `@takes(0)` on the destroy-flavoured `finalize` and every
+    /// unrelated `<recv>.finalize()` call site then looks like a
+    /// destruction.
+    ambiguous: std.StringHashMapUnmanaged(void) = .empty,
 
     pub fn deinit(self: *Db, gpa: std.mem.Allocator) void {
         var it = self.fns.valueIterator();
@@ -96,9 +107,24 @@ pub const Db = struct {
             if (e.may_free_fields.len > 0) gpa.free(e.may_free_fields);
         }
         self.fns.deinit(gpa);
+        self.ambiguous.deinit(gpa);
     }
 
+    /// True iff the name has multiple fn_decl definitions in the
+    /// file (e.g. method overload across types).  Callers that
+    /// depend on cross-fn semantics — R10 inference, call-site
+    /// `@takes` resolution — should skip ambiguous names rather
+    /// than guess which overload is being called.
+    pub fn isAmbiguous(self: *const Db, name: []const u8) bool {
+        return self.ambiguous.contains(name);
+    }
+
+    /// Look up a fn's annotations.  Returns null for ambiguous names
+    /// (multiple definitions) so callers don't latch onto the
+    /// arbitrary "last writer wins" entry and propagate annotations
+    /// that belong to a sibling overload.
     pub fn lookup(self: *const Db, name: []const u8) ?FnEntry {
+        if (self.ambiguous.contains(name)) return null;
         return self.fns.get(name);
     }
 };
@@ -139,6 +165,29 @@ pub fn buildFull(
 
     var db: Db = .{ .fns = .empty };
     errdefer db.deinit(gpa);
+
+    // Pre-pass — count fn_decl name occurrences to detect overloads.
+    // Names with >1 definition go into db.ambiguous; subsequent
+    // inference passes and call-site lookups skip them.
+    {
+        var name_count: std.StringHashMapUnmanaged(u32) = .empty;
+        defer name_count.deinit(gpa);
+        var ni: u32 = 1;
+        while (ni < tree.nodes.len) : (ni += 1) {
+            const n: Ast.Node.Index = @enumFromInt(ni);
+            if (tree.nodeTag(n) != .fn_decl) continue;
+            var nbuf: [1]Ast.Node.Index = undefined;
+            const np = fullFnProto(tree, &nbuf, n) orelse continue;
+            const nt = np.name_token orelse continue;
+            const nn = tree.tokenSlice(nt);
+            const gop = try name_count.getOrPut(gpa, nn);
+            if (gop.found_existing) gop.value_ptr.* += 1 else gop.value_ptr.* = 1;
+        }
+        var it = name_count.iterator();
+        while (it.next()) |e| {
+            if (e.value_ptr.* > 1) try db.ambiguous.put(gpa, e.key_ptr.*, {});
+        }
+    }
 
     // Pass 1 — explicit annotations + R6 (slice + body allocs → owned).
     var node_idx: u32 = 1;
@@ -256,6 +305,43 @@ pub fn buildFull(
         if (changed) try db.fns.put(gpa, name, entry);
     }
 
+    // Pass 4 — R10: transitive receiver-freeing inference.
+    //   `fn outer(this: *T) void { this.finalize(); }` where finalize
+    //   is @takes ownership(0) (R8b inferred or annotated)  →  outer
+    //   is also @takes ownership(0).
+    //
+    // Iterate to fixed point so chains resolve regardless of source
+    // order (`onFinish` calls `finalize` which calls `bun.destroy(self)`
+    // — three levels deep).  Conservative direction matches R8b:
+    // "MAY free" is the safe answer for UAF detection.
+    while (true) {
+        var added = false;
+        node_idx = 1;
+        while (node_idx < tree.nodes.len) : (node_idx += 1) {
+            const node: Ast.Node.Index = @enumFromInt(node_idx);
+            if (tree.nodeTag(node) != .fn_decl) continue;
+            var buf: [1]Ast.Node.Index = undefined;
+            const fn_proto = fullFnProto(tree, &buf, node) orelse continue;
+            const name_tok = fn_proto.name_token orelse continue;
+            const name = tree.tokenSlice(name_tok);
+            const existing = db.fns.get(name);
+            // Skip if already has a `takes` — don't overwrite explicit
+            // annotations or R8b's direct-free inference.
+            if (existing != null and existing.?.takes != null) continue;
+
+            const body = tree.nodeData(node).node_and_node[1];
+            const inferred = inferTakesViaReceiverCall(tree, fn_proto, body, &db) orelse continue;
+            try db.fns.put(gpa, name, .{
+                .name = name,
+                .annotation = if (existing) |e| e.annotation else null,
+                .takes = inferred,
+                .is_noreturn = if (existing) |e| e.is_noreturn else false,
+            });
+            added = true;
+        }
+        if (!added) break;
+    }
+
     return db;
 }
 
@@ -282,6 +368,65 @@ fn inferReturnsHeap(
     };
     if (!is_call) return false;
     return callTextMatchesAny(tree, expr, alloc_patterns);
+}
+
+/// R10: transitive receiver-freeing inference.
+///
+/// Walk `body_node`'s tokens for `<param>.<method>(` shape — a method
+/// call where the receiver is one of our function's parameters.  If
+/// `<method>` resolves to a fn in `db` with `takes = .ownership(0)`
+/// (the callee frees its receiver), infer `@takes ownership(<param>)`
+/// on this function.
+///
+/// Same conservative direction as R8b: "MAY free" is the safe answer
+/// for UAF detection.  Conditional / loop-nested receiver-freeing
+/// calls are intentionally included — the caller can't tell the
+/// runtime branch ahead of time, and missing real UAFs is worse than
+/// over-reporting on cold paths.
+///
+/// Does NOT recurse through deeper chains like `this.field.method()`
+/// — only direct `<param>.<method>()`.  Deeper field chains would
+/// require type info zbc doesn't track.
+fn inferTakesViaReceiverCall(
+    tree: *const Ast,
+    fn_proto: Ast.full.FnProto,
+    body_node: Ast.Node.Index,
+    db: *const Db,
+) ?TakesAnnotation {
+    const first = tree.firstToken(body_node);
+    const last = tree.lastToken(body_node);
+    const tags = tree.tokens.items(.tag);
+
+    var t: Ast.TokenIndex = first;
+    while (t + 3 <= last) : (t += 1) {
+        // Pattern: <identifier> `.` <identifier> `(`
+        if (tags[t] != .identifier) continue;
+        if (tags[t + 1] != .period) continue;
+        if (tags[t + 2] != .identifier) continue;
+        if (tags[t + 3] != .l_paren) continue;
+        // Reject longer-chain heads — `a.b.c(...)` where we'd match
+        // at `b.c(` but `b` isn't a function param.  Skip if the
+        // token BEFORE our receiver is `.` (we're mid-chain).
+        if (t > 0 and tags[t - 1] == .period) continue;
+
+        const recv_name = tree.tokenSlice(t);
+        const method_name = tree.tokenSlice(t + 2);
+        const param_idx = resolveParamIndex(tree, fn_proto, recv_name) orelse continue;
+        // `lookup` (not `fns.get`) filters ambiguous names — names with
+        // multiple definitions across types — so R10 doesn't propagate
+        // a `@takes(0)` that was inferred on a sibling overload.
+        const callee = db.lookup(method_name) orelse continue;
+        const callee_takes = callee.takes orelse continue;
+        switch (callee_takes) {
+            .ownership => |i| {
+                // Callee frees its arg at index `i`.  For receiver
+                // -calls the receiver is arg 0, so only callees that
+                // free arg 0 propagate self-freeing-ness.
+                if (i == 0) return .{ .ownership = param_idx };
+            },
+        }
+    }
+    return null;
 }
 
 /// R8b: any free-pattern call anywhere in the body whose target

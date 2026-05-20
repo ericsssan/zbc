@@ -48,9 +48,25 @@ pub fn check(
         scratch.deinit(gpa);
     }
 
+    // Seed the worklist with every reachable block in reverse
+    // postorder (RPO).  LIFO `.pop()` then visits them in RPO —
+    // predecessors before successors for the acyclic skeleton — so
+    // each block's first processing sees its predecessors' real
+    // out-states, not the initial empty state.
+    //
+    // Why this matters: the "changed in-state" guard re-queues a
+    // successor only when a predecessor's out-state actually
+    // mutated.  If entry has no state-changing stmts (e.g. just
+    // `if (cond) BODY`), joining its empty out-state into successors'
+    // empty in-states is a no-op — so they never get added, even
+    // though their OWN stmts might introduce state (a heap_free in
+    // the conditional branch).  Seeding all reachable blocks fixes
+    // that; using RPO ensures inter-procedural fallback heap ids
+    // don't conflict with real ones minted upstream by an allocation
+    // that wasn't visible yet.
     var worklist: std.ArrayListUnmanaged(BlockId) = .empty;
     defer worklist.deinit(gpa);
-    try worklist.append(gpa, cfg.entry);
+    try computeRpoSeed(gpa, cfg, &worklist);
 
     var iter_guard: u32 = 0;
     const MAX_ITERS: u32 = 200_000;
@@ -107,6 +123,48 @@ pub fn check(
 
         for (block.stmts) |stmt| {
             try transfer.transfer(ctx, &state, stmt);
+        }
+    }
+}
+
+/// Iterative DFS from `cfg.entry` to compute postorder, then append
+/// to `out` so that LIFO popping visits blocks in reverse postorder.
+/// Unreachable blocks are intentionally NOT included — they have no
+/// predecessor edges, so processing them contributes nothing useful
+/// to fixed-point convergence.
+fn computeRpoSeed(
+    gpa: std.mem.Allocator,
+    cfg: *const Cfg,
+    out: *std.ArrayListUnmanaged(BlockId),
+) !void {
+    if (cfg.blocks.len == 0) return;
+    var visited = try gpa.alloc(bool, cfg.blocks.len);
+    defer gpa.free(visited);
+    @memset(visited, false);
+
+    const Frame = struct { block: BlockId, next_succ: u32 };
+    var stack: std.ArrayListUnmanaged(Frame) = .empty;
+    defer stack.deinit(gpa);
+
+    visited[@intFromEnum(cfg.entry)] = true;
+    try stack.append(gpa, .{ .block = cfg.entry, .next_succ = 0 });
+
+    while (stack.items.len > 0) {
+        const top = &stack.items[stack.items.len - 1];
+        const block = cfg.blocks[@intFromEnum(top.block)];
+        if (top.next_succ < block.successors.len) {
+            const succ = block.successors[top.next_succ];
+            top.next_succ += 1;
+            const succ_idx = @intFromEnum(succ);
+            if (!visited[succ_idx]) {
+                visited[succ_idx] = true;
+                try stack.append(gpa, .{ .block = succ, .next_succ = 0 });
+            }
+        } else {
+            // Finished — emit in postorder.  Worklist consumes via
+            // LIFO `.pop()`, so postorder-pushed → RPO-popped.
+            const finished = stack.pop().?;
+            try out.append(gpa, finished.block);
         }
     }
 }
