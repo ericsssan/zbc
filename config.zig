@@ -122,9 +122,16 @@ pub const Invariant = enum {
     /// the intended size on every call.  Catches PR #29452 class:
     /// `SmallList.tryGrow` over-allocated.
     realloc_byte_count,
+    /// A type's destructor (`deinit` / `finalize` / `destroy`)
+    /// mentions some same-typed sibling fields but omits others.
+    /// E.g. fields `query_string_map: ?QueryStringMap` and
+    /// `param_map: ?QueryStringMap` — destructor handles the
+    /// first but forgets the second.  Catches PR #29853 class:
+    /// `MatchedRoute.deinit` forgot to free `param_map`.
+    asymmetric_field_free,
 };
 
-pub const all_invariants: [13]Invariant = .{
+pub const all_invariants: [14]Invariant = .{
     .arena_escape,
     .stack_escape,
     .use_undefined,
@@ -138,6 +145,7 @@ pub const all_invariants: [13]Invariant = .{
     .aliased_heap_dupe,
     .clobbered_by_struct_reset,
     .realloc_byte_count,
+    .asymmetric_field_free,
 };
 
 pub const Default: Config = .{};

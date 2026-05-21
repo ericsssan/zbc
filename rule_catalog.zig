@@ -94,6 +94,11 @@ pub const all = [_]Rule{
         .title = "`allocator.realloc(slice, n * @sizeOf(T))` — Zig's realloc takes ELEMENT count, not bytes",
         .body = @embedFile("rules/realloc-byte-count.md"),
     },
+    .{
+        .id = "asymmetric-field-free",
+        .title = "destructor handles some same-typed fields but omits others — the omitted ones leak",
+        .body = @embedFile("rules/asymmetric-field-free.md"),
+    },
 };
 
 /// Look up a rule by id.  Returns null on unknown id so callers can
