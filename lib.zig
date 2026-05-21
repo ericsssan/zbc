@@ -34,6 +34,7 @@ const union_deinit_without_inert_reset_mod = @import("union_deinit_without_inert
 const self_undefined_after_destroy_mod = @import("self_undefined_after_destroy.zig");
 const missing_errdefer_on_out_param_mod = @import("missing_errdefer_on_out_param.zig");
 const reset_skips_pooled_resource_release_mod = @import("reset_skips_pooled_resource_release.zig");
+const return_borrowed_payload_mod = @import("return_borrowed_payload.zig");
 const rule_catalog_mod = @import("rule_catalog.zig");
 
 pub const Config = config_mod.Config;
@@ -232,6 +233,11 @@ pub fn analyzeEscape(
     // pool/handle resources but sibling `reset` doesn't.  Callers
     // using `reset` leak the pool slots.
     try reset_skips_pooled_resource_release_mod.check(gpa, &tree, config, &problems);
+
+    // Return-borrowed-payload — `return switch (...) { .Tag =>
+    // |v| v, .Other => |v| try alloc.dupe(u8, v) };` — sibling-
+    // arm asymmetry; bare-return arm escapes caller's lifetime.
+    try return_borrowed_payload_mod.check(gpa, &tree, config, &problems);
 
     return problems.toOwnedSlice(gpa);
 }
@@ -701,5 +707,6 @@ test {
     _ = self_undefined_after_destroy_mod;
     _ = missing_errdefer_on_out_param_mod;
     _ = reset_skips_pooled_resource_release_mod;
+    _ = return_borrowed_payload_mod;
     std.testing.refAllDecls(@This());
 }

@@ -189,6 +189,11 @@ pub const all = [_]Rule{
         .title = "`deinit` releases pool/handle resources but sibling `reset` doesn't — callers using `reset` leak slots",
         .body = @embedFile("rules/reset-skips-pooled-resource-release.md"),
     },
+    .{
+        .id = "return-borrowed-payload",
+        .title = "`return switch (...) { .<Tag> => |v| v, ... }` — bare payload return while sibling arm clones; borrowed value escapes caller's lifetime",
+        .body = @embedFile("rules/return-borrowed-payload.md"),
+    },
 };
 
 /// Look up a rule by id.  Returns null on unknown id so callers can

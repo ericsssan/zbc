@@ -304,9 +304,16 @@ pub const Invariant = enum {
     /// "freed" after `reset` but the slots are still held.
     /// Catches tigerbeetle/tigerbeetle#3436 + #1734 class.
     reset_skips_pooled_resource_release,
+    /// `return switch (<expr>) { .<Tag1> => |v| v, .<Tag2> => |v|
+    /// try alloc.dupe(u8, v), ... };` — sibling-arm asymmetry.
+    /// One arm clones / allocates the payload to give the caller
+    /// ownership; the other arm returns the captured payload bare,
+    /// which is a slice/pointer borrowed from the caller's input.
+    /// Catches ghostty-org/ghostty#8358 + #7711 class.
+    return_borrowed_payload,
 };
 
-pub const all_invariants: [32]Invariant = .{
+pub const all_invariants: [33]Invariant = .{
     .arena_escape,
     .stack_escape,
     .use_undefined,
@@ -339,6 +346,7 @@ pub const all_invariants: [32]Invariant = .{
     .self_undefined_after_destroy,
     .missing_errdefer_on_out_param,
     .reset_skips_pooled_resource_release,
+    .return_borrowed_payload,
 };
 
 pub const Default: Config = .{};

@@ -41,6 +41,7 @@ Bun's.
 | `self_undefined_after_destroy.zig` | `self-undefined-after-destroy` | [tigerbeetle/tigerbeetle#2687](https://github.com/tigerbeetle/tigerbeetle/pull/2687) |
 | `missing_errdefer_on_out_param.zig` | `missing-errdefer-on-out-param` | [ghostty-org/ghostty#10401](https://github.com/ghostty-org/ghostty/pull/10401) |
 | `reset_skips_pooled_resource_release.zig` | `reset-skips-pooled-resource-release` | [tigerbeetle/tigerbeetle#3436](https://github.com/tigerbeetle/tigerbeetle/pull/3436), [tigerbeetle/tigerbeetle#1734](https://github.com/tigerbeetle/tigerbeetle/pull/1734) |
+| `return_borrowed_payload.zig` | `return-borrowed-payload` | [ghostty-org/ghostty#8358](https://github.com/ghostty-org/ghostty/pull/8358), [ghostty-org/ghostty#7711](https://github.com/ghostty-org/ghostty/pull/7711) |
 
 ## Re-fetching the actual pre-merge buggy files
 
