@@ -69,6 +69,11 @@ pub const all = [_]Rule{
         .title = "calling a destructor on an interior pointer into a container's storage",
         .body = @embedFile("rules/interior-pointer-destroy.md"),
     },
+    .{
+        .id = "heap-leak",
+        .title = "destructor of a heap-allocated type never frees `self`",
+        .body = @embedFile("rules/heap-leak.md"),
+    },
 };
 
 /// Look up a rule by id.  Returns null on unknown id so callers can

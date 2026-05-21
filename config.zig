@@ -81,9 +81,16 @@ pub const Invariant = enum {
     /// typical allocators.  Catches the PR #30166 class:
     /// `for (entries.items) |*r| r.destroy();`.
     interior_pointer_destroy,
+    /// A type with a heap-creator method (`<x>.create(Self)`) has
+    /// a destructor (finalize / deinit / destroy) that doesn't
+    /// free `self` — every instance leaks the heap descriptor.
+    /// Catches PR #29840 class: `ResolveMessage.create` allocates
+    /// self via `allocator.create(...)` but `finalize()` never
+    /// calls `allocator.destroy(this)`.
+    heap_leak,
 };
 
-pub const all_invariants: [8]Invariant = .{
+pub const all_invariants: [9]Invariant = .{
     .arena_escape,
     .stack_escape,
     .use_undefined,
@@ -92,6 +99,7 @@ pub const all_invariants: [8]Invariant = .{
     .arena_use_after_kill,
     .allocator_mismatch,
     .interior_pointer_destroy,
+    .heap_leak,
 };
 
 pub const Default: Config = .{};

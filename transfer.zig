@@ -75,8 +75,21 @@ pub fn transfer(ctx: Ctx, state: *AbstractState, stmt: Stmt) !void {
         .field_use => |u| try transferFieldUse(ctx, state, u, stmt.pos, stmt.end_pos),
         .out_param_write => |w| try transferOutParamWrite(ctx, state, w, stmt.pos, stmt.end_pos),
         .interior_pointer_destroy => |i| try transferInteriorPointerDestroy(ctx, state, i, stmt.pos, stmt.end_pos),
+        .leak_warning => |l| try transferLeakWarning(ctx, l, stmt.pos, stmt.end_pos),
         .lowering_gap => |g| try transferGap(ctx, state, g, stmt.pos),
     }
+}
+
+fn transferLeakWarning(
+    ctx: Ctx,
+    l: @TypeOf(@as(StmtKind, undefined).leak_warning),
+    pos: cfg.SrcPos,
+    end_pos: cfg.SrcPos,
+) !void {
+    if (!config_mod.isEnabled(ctx.config, .heap_leak)) return;
+    try report(ctx, "heap-leak", pos, end_pos, .@"error",
+        "destructor for `{s}` does not free `self` — instances allocated by the type's heap-creator leak (no `allocator.destroy(self)` reachable from this destructor)",
+        .{l.type_name});
 }
 
 fn transferInteriorPointerDestroy(

@@ -168,6 +168,13 @@ pub const StmtKind = union(enum) {
     /// the interior pointer local; `container` is the source
     /// container it borrows from (recorded at for-loop capture).
     interior_pointer_destroy: struct { receiver: LocalId, container: LocalId },
+    /// Type T has a heap creator (`<x>.create(T)`) and a
+    /// destructor (finalize / deinit / destroy) but the
+    /// destructor doesn't free `self` — every instance of T
+    /// leaks the heap-allocated descriptor.  PR #29840 class.
+    /// `type_name` is the bare ident of T (source slice); used
+    /// in the diagnostic.
+    leak_warning: struct { type_name: []const u8 },
     /// Re-bind a local to .plain.  Emitted at loop body entry for
     /// `while (it) |n|` / `for (xs) |x|` captures so back-edges
     /// don't carry one iteration's `free(n)` state into the next —
@@ -884,6 +891,20 @@ const Builder = struct {
         // resolve `b` to a LocalId, so .field_heap_free / .field_use
         // emissions silently drop.
         try self.registerFnParams();
+        // Leaky-destructor check: when this fn is a destructor
+        // (finalize / deinit / destroy) on type T AND another fn
+        // on T heap-allocates an instance (`<x>.create(T)`) AND
+        // this fn doesn't have inferred @takes(self), the
+        // destructor LEAKS instances of T.  Catches PR #29840
+        // class.  Emits a leak_warning stmt at body start;
+        // transferLeakWarning fires the diagnostic.
+        if (self.leakyDestructorTypeName()) |type_name| {
+            try self.appendStmt(cur.*, .{
+                .kind = .{ .leak_warning = .{ .type_name = type_name } },
+                .pos = self.posOfToken(self.tree.firstToken(body_node)),
+                .end_pos = self.posOfTokenEnd(self.tree.firstToken(body_node)),
+            });
+        }
         try self.lowerBlock(body_node, cur);
         // Synthetic implicit-return at fn-body end.  Void fns that
         // fall through without an explicit `return` still need
@@ -1184,6 +1205,56 @@ const Builder = struct {
     /// origin (would need to track input's element-lifetime per item);
     /// the iterator binding gets registered as a fresh local with .plain
     /// init so subsequent uses are conservative.
+    /// If the fn being lowered is a destructor (finalize / deinit
+    /// / destroy) of a type that has a heap-creator method
+    /// elsewhere in the same file AND this fn's @takes annotation
+    /// doesn't claim it frees self, return the type's name.  Used
+    /// by `lowerFunctionBody` to emit a leak_warning stmt at body
+    /// start.  Returns null in all other cases.
+    fn leakyDestructorTypeName(self: *Builder) ?[]const u8 {
+        const tree = self.tree;
+        const proto = self.fn_proto orelse return null;
+        const name_tok = proto.name_token orelse return null;
+        const fn_name = tree.tokenSlice(name_tok);
+        const is_destructor = std.mem.eql(u8, fn_name, "finalize") or
+            std.mem.eql(u8, fn_name, "deinit") or
+            std.mem.eql(u8, fn_name, "destroy");
+        if (!is_destructor) return null;
+
+        // Must have a containing type (self-typed first param resolved
+        // by Builder.self_type at fn lowering setup).
+        const ct = self.self_type orelse return null;
+
+        const db = self.db orelse return null;
+        // Find any entry on type T that has heap_allocates_self.
+        // db.fns is a multi-map; iterate all entries.
+        var creator_found = false;
+        var it = db.fns.valueIterator();
+        while (it.next()) |list| {
+            for (list.items) |e| {
+                if (e.heap_allocates_self) {
+                    if (e.containing_type) |ect| {
+                        if (std.mem.eql(u8, ect, ct)) {
+                            creator_found = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (creator_found) break;
+        }
+        if (!creator_found) return null;
+
+        // The destructor must NOT have @takes(self) — that would
+        // mean it does free self, no leak.  Look up this fn's own
+        // entry in the db.
+        const this_entry = db.lookupTyped(ct, fn_name) orelse return ct;
+        if (this_entry.takes) |t| switch (t) {
+            .ownership => |idx| if (idx == 0) return null,
+        };
+        return ct;
+    }
+
     /// For each `for (input_i) |capture_i|` pair, if input_i is
     /// `<container_ident>.<field>` AND capture_i is by-pointer
     /// (preceded by `*` inside the payload), set

@@ -115,6 +115,15 @@ pub const FnEntry = struct {
     /// field's UAF state.  Slices borrow from source; outer slice
     /// is owned by Db.deinit.
     result_heap_fields: []const []const u8 = &.{},
+    /// True iff the fn's body contains `<allocator>.create(<Self>)`
+    /// — i.e. allocates a heap instance of its containing type.
+    /// Used by cross-fn leak detection: when type T has a
+    /// heap-creator AND a destructor (finalize / deinit / destroy)
+    /// AND the destructor doesn't free `self`, flag the
+    /// destructor as leaking instances.  Catches the PR #29840
+    /// `ResolveMessage.create` / `ResolveMessage.finalize`-no-free
+    /// pattern.
+    heap_allocates_self: bool = false,
 };
 
 pub const Db = struct {
@@ -458,11 +467,20 @@ pub fn buildFull(
         // T1's @takes — the classic html_rewriter FP.
         const name = tree.tokenSlice(name_tok);
         const ct = fn_to_type.get(node);
+        // Heap-self-allocator detection: body contains
+        // `<x>.create(<ct>)` — i.e. heap-allocates an instance of
+        // its containing type.  Used downstream by leak detection
+        // (see `inferLeakyDestructors`).
+        const heap_allocates_self = if (ct) |t| blk: {
+            const body = tree.nodeData(node).node_and_node[1];
+            break :blk bodyContainsCreateOfSelf(tree, body, t);
+        } else false;
         _ = try putOrUpdate(&db, gpa, name, ct, .{
             .name = name,
             .containing_type = ct,
             .annotation = annotation,
             .takes = takes_anno,
+            .heap_allocates_self = heap_allocates_self,
             .is_noreturn = is_noreturn,
         });
     }
@@ -2610,6 +2628,36 @@ fn bodyContainsAllocation(tree: *const Ast, body_node: Ast.Node.Index) bool {
         if (tags[t + 1] != .identifier) continue;
         if (tags[t + 2] != .l_paren) continue;
         if (isAllocatorMethodName(tree.tokenSlice(t + 1))) return true;
+    }
+    return false;
+}
+
+/// True iff `body_node` contains `<x>.create(<type_name>)` or
+/// `<x>.create(Self)` — i.e. the fn heap-allocates an instance
+/// of its containing type.
+fn bodyContainsCreateOfSelf(tree: *const Ast, body_node: Ast.Node.Index, type_name: []const u8) bool {
+    const first = tree.firstToken(body_node);
+    const last = tree.lastToken(body_node);
+    const tags = tree.tokens.items(.tag);
+    var t: Ast.TokenIndex = first;
+    while (t + 4 <= last) : (t += 1) {
+        if (tags[t] != .period) continue;
+        if (tags[t + 1] != .identifier) continue;
+        if (!std.mem.eql(u8, tree.tokenSlice(t + 1), "create")) continue;
+        if (tags[t + 2] != .l_paren) continue;
+        // Allow optional namespace prefix: `<x>.create(ns.Type)` or
+        // `<x>.create(Type)`.  Walk forward through `.<ident>` chain
+        // looking for the type-name match (or `Self` / `@This()`).
+        var k = t + 3;
+        var last_ident_tok: ?Ast.TokenIndex = null;
+        while (k <= last and tags[k] != .r_paren and tags[k] != .comma) : (k += 1) {
+            if (tags[k] == .identifier) last_ident_tok = k;
+        }
+        if (last_ident_tok) |it| {
+            const text = tree.tokenSlice(it);
+            if (std.mem.eql(u8, text, type_name)) return true;
+            if (std.mem.eql(u8, text, "Self")) return true;
+        }
     }
     return false;
 }
