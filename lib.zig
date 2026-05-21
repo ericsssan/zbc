@@ -21,6 +21,7 @@ const free_then_try_realloc_mod = @import("free_then_try_realloc.zig");
 const destroy_after_deinit_in_loop_mod = @import("destroy_after_deinit_in_loop.zig");
 const dead_errdefer_in_result_fn_mod = @import("dead_errdefer_in_result_fn.zig");
 const duplicate_errdefer_mod = @import("duplicate_errdefer.zig");
+const overwrite_without_deinit_mod = @import("overwrite_without_deinit.zig");
 const rule_catalog_mod = @import("rule_catalog.zig");
 
 pub const Config = config_mod.Config;
@@ -148,6 +149,11 @@ pub fn analyzeEscape(
     // `errdefer X.deinit();` for the same receiver fire twice on
     // the error path → double-free / assert.
     try duplicate_errdefer_mod.check(gpa, &tree, config, &problems);
+
+    // Overwrite-without-deinit (oven-sh/bun#28633, #29864) —
+    // single-field reassignment to a deinit-able field without
+    // prior cleanup leaks the old value.
+    try overwrite_without_deinit_mod.check(gpa, &tree, &db, config, &problems);
 
     return problems.toOwnedSlice(gpa);
 }
@@ -604,5 +610,6 @@ test {
     _ = destroy_after_deinit_in_loop_mod;
     _ = dead_errdefer_in_result_fn_mod;
     _ = duplicate_errdefer_mod;
+    _ = overwrite_without_deinit_mod;
     std.testing.refAllDecls(@This());
 }

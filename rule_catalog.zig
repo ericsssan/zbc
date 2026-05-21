@@ -124,6 +124,11 @@ pub const all = [_]Rule{
         .title = "two `errdefer X.<cleanup>();` for the same receiver — cleanup runs twice on error → double-free / assert",
         .body = @embedFile("rules/duplicate-errdefer.md"),
     },
+    .{
+        .id = "overwrite-without-deinit",
+        .title = "`this.field = X;` for a deinit-able field without prior `this.field.deinit();` — old value leaks",
+        .body = @embedFile("rules/overwrite-without-deinit.md"),
+    },
 };
 
 /// Look up a rule by id.  Returns null on unknown id so callers can

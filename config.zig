@@ -177,9 +177,18 @@ pub const Invariant = enum {
     /// twice; second `IO.deinit()` hit
     /// `assert(self.fd >= 0)` in `IoUring.deinit`.
     duplicate_errdefer,
+    /// `<this>.<field> = <RHS>;` where `<field>`'s declared type
+    /// has a `deinit` method — but no `<this>.<field>.deinit();`
+    /// (or `.deref()` / `.free()`) appears in the preceding few
+    /// statements.  Each reassignment leaks the prior allocation.
+    /// Single-field counterpart to `clobbered-by-struct-reset`
+    /// (whole-struct overwrite).  Catches oven-sh/bun#28633 /
+    /// oven-sh/bun#29864 class: protocol decoders and re-execute
+    /// paths overwriting heap-owning fields without cleanup.
+    overwrite_without_deinit,
 };
 
-pub const all_invariants: [19]Invariant = .{
+pub const all_invariants: [20]Invariant = .{
     .arena_escape,
     .stack_escape,
     .use_undefined,
@@ -199,6 +208,7 @@ pub const all_invariants: [19]Invariant = .{
     .destroy_after_deinit_in_loop,
     .dead_errdefer_in_result_fn,
     .duplicate_errdefer,
+    .overwrite_without_deinit,
 };
 
 pub const Default: Config = .{};
