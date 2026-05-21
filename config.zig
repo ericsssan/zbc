@@ -71,15 +71,21 @@ pub const Invariant = enum {
     /// arena is deinit'd.  Complements arena_escape (which catches
     /// the special case of leaking the borrow past return).
     arena_use_after_kill,
+    /// A heap allocation must be freed with the same allocator
+    /// that produced it.  Catches the PR #29840 class:
+    /// `mimalloc_arena.alloc(...)` then `default.free(...)` (UB
+    /// under any reasonable allocator implementation).
+    allocator_mismatch,
 };
 
-pub const all_invariants: [6]Invariant = .{
+pub const all_invariants: [7]Invariant = .{
     .arena_escape,
     .stack_escape,
     .use_undefined,
     .heap_double_free,
     .heap_use_after_free,
     .arena_use_after_kill,
+    .allocator_mismatch,
 };
 
 pub const Default: Config = .{};

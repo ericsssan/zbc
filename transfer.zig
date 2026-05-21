@@ -176,9 +176,30 @@ fn transferHeapFree(
                     }
                     return;
                 }
+                // Allocator-mismatch check.  Only fire when BOTH
+                // sides resolve to a known local AND those locals
+                // differ.  Same-local: definitely-same allocator;
+                // either-side-null: unknown, no fire.  Different
+                // locals: possible mismatch (might be aliased via
+                // `var a2 = a;` but we accept that conservative FP
+                // class — the user can rebind or skip the check).
+                if (st.allocator_local != null and f.allocator_local != null and
+                    st.allocator_local.? != f.allocator_local.?)
+                {
+                    if (config_mod.isEnabled(ctx.config, .allocator_mismatch)) {
+                        const freed_name = ctx.locals[@intFromEnum(f.freed_local)].name;
+                        const alloc_alloc = ctx.locals[@intFromEnum(st.allocator_local.?)].name;
+                        const free_alloc = ctx.locals[@intFromEnum(f.allocator_local.?)].name;
+                        try report(ctx, "allocator-mismatch", pos, end_pos, .@"error",
+                            "`{s}` was allocated by `{s}` but freed by `{s}` — allocators must match",
+                            .{ freed_name, alloc_alloc, free_alloc });
+                    }
+                    return;
+                }
                 try state.heaps.put(ctx.gpa, hid, .{
                     .state = .dead,
                     .killed_at = killSiteOf(pos, end_pos),
+                    .allocator_local = st.allocator_local,
                 });
                 return;
             },
@@ -648,10 +669,13 @@ fn originOfInit(
         },
         .stack_ref => |src_local| .{ .stack = src_local },
         .composite_borrow => |src_local| state.locals.get(src_local) orelse .plain,
-        .heap_alloc => |hid| blk: {
+        .heap_alloc => |info| blk: {
             const mut_state: *AbstractState = @constCast(state);
-            try mut_state.heaps.put(ctx.gpa, hid, .{ .state = .live });
-            break :blk .{ .heap = hid };
+            try mut_state.heaps.put(ctx.gpa, info.id, .{
+                .state = .live,
+                .allocator_local = info.allocator_local,
+            });
+            break :blk .{ .heap = info.id };
         },
         .undef => .undef,
         .borrowed_from => |src_local| state.locals.get(src_local) orelse .plain,

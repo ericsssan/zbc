@@ -83,6 +83,12 @@ pub const StmtKind = union(enum) {
         /// undefined regardless).  Same shape as
         /// .field_heap_free.fallback_hid.
         fallback_hid: abstract_state.HeapId,
+        /// The allocator local that's freeing — `gpa` in
+        /// `gpa.free(p)`.  Compared against the original alloc
+        /// site's allocator to detect mismatch (PR #29840 class).
+        /// Null when the free's receiver isn't a known local
+        /// (dotted chain, stdlib reference, etc.).
+        allocator_local: ?LocalId = null,
     },
 
     /// `obj.field = RHS;` — write to a struct field.  We track field
@@ -217,7 +223,11 @@ pub const ExprKind = union(enum) {
     arena_init: struct { id: abstract_state.ArenaId, is_heap_allocated: bool = false },
     /// Heap allocation call (gpa.alloc / gpa.create / dupe / ...).
     /// HeapId is minted at lowering time, same reasoning as arena_init.
-    heap_alloc: abstract_state.HeapId,
+    /// `allocator_local` records the receiver of the call (e.g.
+    /// `gpa` in `gpa.alloc(...)`) — null when the receiver isn't a
+    /// known local.  Used at the matching free site to detect
+    /// allocator-mismatch.
+    heap_alloc: struct { id: abstract_state.HeapId, allocator_local: ?LocalId = null },
     /// `&<local>` — address-of a function-local.  Produces a pointer
     /// whose lifetime is bound to that local's stack frame.
     stack_ref: LocalId,
@@ -2300,7 +2310,7 @@ const Builder = struct {
                 .kind = .{ .field_assign = .{
                     .parent = local,
                     .name = fname,
-                    .rhs_kind = .{ .heap_alloc = hid },
+                    .rhs_kind = .{ .heap_alloc = .{ .id = hid } },
                 } },
                 .pos = pos,
                 .end_pos = end_pos,
@@ -2434,7 +2444,11 @@ const Builder = struct {
             }
             if (self.heapFreedLocal(call_node)) |freed| {
                 try self.appendStmt(cur.*, .{
-                    .kind = .{ .heap_free = .{ .freed_local = freed, .fallback_hid = blk_h: { const h: abstract_state.HeapId = @enumFromInt(self.next_heap); self.next_heap += 1; break :blk_h h; } } },
+                    .kind = .{ .heap_free = .{
+                        .freed_local = freed,
+                        .fallback_hid = blk_h: { const h: abstract_state.HeapId = @enumFromInt(self.next_heap); self.next_heap += 1; break :blk_h h; },
+                        .allocator_local = self.allocReceiverLocal(call_node),
+                    } },
                     .pos = self.posOf(call_node),
                     .end_pos = self.endPosOf(call_node),
                 });
@@ -3089,7 +3103,14 @@ const Builder = struct {
                 }
                 const hid: abstract_state.HeapId = @enumFromInt(self.next_heap);
                 self.next_heap += 1;
-                return .{ .heap_alloc = hid };
+                // Record the allocator local — the leftmost ident
+                // of the callee chain (e.g. `gpa` in
+                // `gpa.alloc(...)`).  Null when the receiver isn't
+                // a known local (stdlib reference, dotted chain,
+                // etc.); the matching free site will skip the
+                // mismatch check.
+                const allocator_local = self.allocReceiverLocal(expr_node);
+                return .{ .heap_alloc = .{ .id = hid, .allocator_local = allocator_local } };
             }
         }
 
@@ -3514,6 +3535,34 @@ const Builder = struct {
     /// (.arena_local or .arena_allocator), return that local.
     /// Receiver may itself be a chained field access (`x.y.method()`),
     /// in which case we walk to the head identifier.
+    /// For a call like `<recv>.alloc(...)`, `<recv>.free(...)`,
+    /// `<recv>.destroy(...)`, return the LocalId of `<recv>` when
+    /// it's a bare identifier resolving to a known local.  Walks
+    /// through `.allocator()` chains so `arena.allocator().alloc(...)`
+    /// returns `arena`.  Returns null when the receiver is itself
+    /// a call (other than `.allocator()`), a stdlib namespace
+    /// (`std.heap.page_allocator`), or anything else not resolvable
+    /// to a single local.
+    fn allocReceiverLocal(self: *Builder, call_node: Ast.Node.Index) ?LocalId {
+        const tree = self.tree;
+        var buf: [1]Ast.Node.Index = undefined;
+        const call_full = tree.fullCall(&buf, call_node) orelse return null;
+        const callee = call_full.ast.fn_expr;
+        if (tree.nodeTag(callee) != .field_access) return null;
+        const fa = tree.nodeData(callee).node_and_token;
+        const cur = fa[0];
+        switch (tree.nodeTag(cur)) {
+            .identifier => {
+                const name = tree.tokenSlice(tree.nodeMainToken(cur));
+                return self.name_to_local.get(name);
+            },
+            .call, .call_one, .call_comma, .call_one_comma => {
+                return self.arenaLocalDotAllocatorReceiver(cur);
+            },
+            else => return null,
+        }
+    }
+
     fn arenaBoundReceiverOfCall(self: *Builder, call_node: Ast.Node.Index) ?LocalId {
         const tree = self.tree;
         var buf: [1]Ast.Node.Index = undefined;
@@ -4290,7 +4339,7 @@ const Builder = struct {
             .heap => {
                 const hid: abstract_state.HeapId = @enumFromInt(self.next_heap);
                 self.next_heap += 1;
-                return .{ .heap_alloc = hid };
+                return .{ .heap_alloc = .{ .id = hid } };
             },
         }
     }

@@ -116,6 +116,16 @@ pub const ArenaState = struct {
     /// writing its pointer through `*T` is ownership transfer,
     /// not escape.
     is_heap_allocated: bool = false,
+    /// The allocator local that produced this heap allocation —
+    /// e.g. for `var buf = gpa.alloc(...)`, the LocalId of `gpa`.
+    /// Compared against the free-site allocator at
+    /// `transferHeapFree` to surface allocator-mismatch bugs
+    /// (PR #29840 class: `mimalloc_arena.alloc(...)` then
+    /// `default.free(...)`).  Null when the alloc receiver
+    /// wasn't a known local (dotted chain, stdlib reference,
+    /// fallback heap from inter-procedural @takes, etc.) — no
+    /// check fires in that case.
+    allocator_local: ?LocalId = null,
 };
 
 // ── AbstractState ──────────────────────────────────────────
