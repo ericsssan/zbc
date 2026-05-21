@@ -71,6 +71,15 @@ fn checkStruct(
     var deinit_fn: ?FnInfo = null;
     var reset_fn: ?FnInfo = null;
 
+    // Cross-fn analysis input: bodies of all non-lifecycle methods
+    // (everything that isn't init/deinit/reset/clear).  If one of
+    // these methods re-acquires the resource, then it's per-cycle
+    // and reset MUST release.  If no non-lifecycle method touches
+    // the resource, the resource is pool-lifetime and reset's
+    // omission is intentional.
+    var other_fns: std.ArrayListUnmanaged(FnInfo) = .empty;
+    defer other_fns.deinit(gpa);
+
     var t: Ast.TokenIndex = start;
     while (t + 2 <= end) : (t += 1) {
         if (tags[t] == .l_brace) {
@@ -82,7 +91,10 @@ fn checkStruct(
         const name = tree.tokenSlice(t + 1);
         const is_deinit = std.mem.eql(u8, name, "deinit");
         const is_reset = std.mem.eql(u8, name, "reset");
-        if (!is_deinit and !is_reset) continue;
+        const is_init = std.mem.eql(u8, name, "init");
+        const is_clear = std.mem.eql(u8, name, "clear") or
+            std.mem.eql(u8, name, "clearRetainingCapacity") or
+            std.mem.eql(u8, name, "clearAndFree");
         // Find the body `{` for this fn.
         var u: Ast.TokenIndex = t + 2;
         while (u <= end and tags[u] != .l_brace) : (u += 1) {}
@@ -95,6 +107,9 @@ fn checkStruct(
         };
         if (is_deinit and deinit_fn == null) deinit_fn = info;
         if (is_reset and reset_fn == null) reset_fn = info;
+        if (!is_deinit and !is_reset and !is_init and !is_clear) {
+            try other_fns.append(gpa, info);
+        }
         t = fn_body_end;
     }
 
@@ -111,24 +126,72 @@ fn checkStruct(
     // Find cleanups in deinit that aren't in reset.  Match by
     // RECEIVER only — `cache.deinit(alloc)` in deinit and
     // `cache.reset()` / `cache.clearRetainingCapacity()` in reset
-    // both qualify as "cleanup on the same receiver", which is
-    // semantically equivalent for the bug shape we're targeting
-    // (preventing pool/handle leaks).  Method-name mismatches
-    // between deinit and reset are not bugs by themselves —
-    // authors deliberately pick different methods for the two
-    // lifecycle endpoints.
+    // both qualify as "cleanup on the same receiver".
+    //
+    // Cross-fn gate: before firing on a missing-from-reset cleanup,
+    // check whether any non-lifecycle method in the struct calls
+    // `<recv>.<acquire-method>(...)` matching the cleanup receiver.
+    // If yes, the resource is acquired per-cycle and reset MUST
+    // release it (fire).  If no, the resource is pool-lifetime
+    // (acquired once in init, released in deinit, persists across
+    // resets) — suppress.
     for (deinit_cleanups.items) |dc| {
-        var found = false;
+        var matched_in_reset = false;
         for (reset_cleanups.items) |rc| {
             if (std.mem.eql(u8, dc.recv, rc.recv)) {
-                found = true;
+                matched_in_reset = true;
                 break;
             }
         }
-        if (!found) {
-            try report(gpa, problems, tree, reset_fn.?.name_tok, dc);
+        if (matched_in_reset) continue;
+        if (!receiverReacquiredElsewhere(tree, other_fns.items, dc.recv)) continue;
+        try report(gpa, problems, tree, reset_fn.?.name_tok, dc);
+    }
+}
+
+/// True iff some non-lifecycle method body contains a call
+/// `<recv>.<acquire-method>(` matching the cleanup's receiver.
+/// `<acquire-method>` allowlist: methods that conventionally take a
+/// fresh ref / pool slot, paired with the cleanup-release methods.
+fn receiverReacquiredElsewhere(
+    tree: *const Ast,
+    others: []const FnInfo,
+    recv: []const u8,
+) bool {
+    const tags = tree.tokens.items(.tag);
+    for (others) |fn_info| {
+        var t: Ast.TokenIndex = fn_info.body_start;
+        while (t + 3 <= fn_info.body_end) : (t += 1) {
+            if (tags[t] != .identifier) continue;
+            if (!std.mem.eql(u8, tree.tokenSlice(t), recv)) continue;
+            if (tags[t + 1] != .period) continue;
+            if (tags[t + 2] != .identifier) continue;
+            if (tags[t + 3] != .l_paren) continue;
+            const m = tree.tokenSlice(t + 2);
+            if (isAcquireMethodName(m)) return true;
         }
     }
+    return false;
+}
+
+fn isAcquireMethodName(name: []const u8) bool {
+    return std.mem.eql(u8, name, "acquire") or
+        std.mem.eql(u8, name, "reference") or
+        std.mem.eql(u8, name, "retain") or
+        std.mem.eql(u8, name, "addRef") or
+        std.mem.eql(u8, name, "addref") or
+        std.mem.eql(u8, name, "ref") or
+        std.mem.eql(u8, name, "take") or
+        std.mem.eql(u8, name, "grab") or
+        std.mem.eql(u8, name, "request") or
+        std.mem.eql(u8, name, "alloc") or
+        std.mem.eql(u8, name, "create") or
+        std.mem.eql(u8, name, "init") or
+        std.mem.eql(u8, name, "get_block") or
+        std.mem.eql(u8, name, "get_node") or
+        std.mem.eql(u8, name, "get_buffer") or
+        std.mem.eql(u8, name, "append") or
+        std.mem.eql(u8, name, "appendSlice");
 }
 
 const Cleanup = struct {
@@ -196,11 +259,16 @@ fn isCleanupMethodName(name: []const u8) bool {
         std.mem.eql(u8, name, "unref") or
         std.mem.eql(u8, name, "deref") or
         // Reset-side equivalents: receiver-matching against these
-        // counts as "reset cleans up this resource."
+        // counts as "reset cleans up this resource."  Includes
+        // common variants across std and project-specific naming
+        // (`clearAndRetainCapacity` is Ghostty's variant).
         std.mem.eql(u8, name, "reset") or
         std.mem.eql(u8, name, "clear") or
         std.mem.eql(u8, name, "clearRetainingCapacity") or
-        std.mem.eql(u8, name, "clearAndFree");
+        std.mem.eql(u8, name, "clearAndRetainCapacity") or
+        std.mem.eql(u8, name, "clearAndFree") or
+        std.mem.eql(u8, name, "shrinkRetainingCapacity") or
+        std.mem.eql(u8, name, "shrinkAndFree");
 }
 
 fn matchBrace(
@@ -263,11 +331,12 @@ fn freeProblems(gpa: std.mem.Allocator, p: *std.ArrayListUnmanaged(Problem)) voi
     p.deinit(gpa);
 }
 
-test "reset-skips: deinit releases pool, reset doesn't — fires" {
+test "reset-skips: deinit releases pool, reset doesn't, AND per-cycle acquire elsewhere — fires" {
     const gpa = std.testing.allocator;
     var problems = try runOn(gpa,
         \\const std = @import("std");
         \\const NodePool = struct {
+        \\    pub fn acquire(_: *NodePool) *u8 { return undefined; }
         \\    pub fn release(_: *NodePool, _: anytype) void {}
         \\};
         \\const SegmentedArray = struct {
@@ -280,12 +349,55 @@ test "reset-skips: deinit releases pool, reset doesn't — fires" {
         \\    pub fn reset(self: *SegmentedArray) void {
         \\        self.node_count = 0;
         \\    }
+        \\    pub fn grow(self: *SegmentedArray, node_pool: *NodePool) void {
+        \\        self.nodes[self.node_count] = node_pool.acquire();
+        \\        self.node_count += 1;
+        \\    }
         \\};
         \\
     );
     defer freeProblems(gpa, &problems);
     try std.testing.expect(problems.items.len >= 1);
     try std.testing.expectEqualStrings("reset-skips-pooled-resource-release", problems.items[0].rule_id);
+}
+
+test "reset-skips: pool-lifetime asymmetry (no non-init acquire) is suppressed" {
+    // Canonical ScanBufferPool shape — resources are acquired once
+    // in init, released in deinit; reset just zeros the counter.
+    // No other method re-acquires, so the asymmetry is intentional
+    // and must NOT fire.
+    const gpa = std.testing.allocator;
+    var problems = try runOn(gpa,
+        \\const std = @import("std");
+        \\const Grid = struct { pub fn block_unref(_: *Grid, _: anytype) void {} };
+        \\const ScanBuffer = struct {
+        \\    index_block: u32,
+        \\    pub fn init(self: *ScanBuffer, _: *Grid) void { self.* = .{ .index_block = 0 }; }
+        \\    pub fn deinit(self: *ScanBuffer, grid: *Grid) void { grid.block_unref(self.index_block); }
+        \\};
+        \\const ScanBufferPool = struct {
+        \\    scan_buffers: [4]ScanBuffer,
+        \\    scan_buffer_used: u8,
+        \\    pub fn init(self: *ScanBufferPool, grid: *Grid) void {
+        \\        self.scan_buffer_used = 0;
+        \\        for (&self.scan_buffers) |*sb| sb.init(grid);
+        \\    }
+        \\    pub fn deinit(self: *ScanBufferPool, grid: *Grid) void {
+        \\        for (&self.scan_buffers) |*sb| sb.deinit(grid);
+        \\    }
+        \\    pub fn reset(self: *ScanBufferPool) void {
+        \\        self.scan_buffer_used = 0;
+        \\    }
+        \\    pub fn acquire(self: *ScanBufferPool) *ScanBuffer {
+        \\        const r = &self.scan_buffers[self.scan_buffer_used];
+        \\        self.scan_buffer_used += 1;
+        \\        return r;
+        \\    }
+        \\};
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
 }
 
 test "reset-skips: deinit and reset both release — doesn't fire" {
@@ -349,21 +461,21 @@ test "reset-skips: pool-release in deinit only — fires (allocator-only deinit 
     try std.testing.expectEqual(@as(usize, 0), problems.items.len);
 }
 
-test "reset-skips: pool-release in deinit, absent in reset — fires" {
+test "reset-skips: pool-release in deinit with per-cycle reference() elsewhere — fires" {
+    // Per-cycle: another method calls `rc.reference()`, so the
+    // resource is acquired per-cycle and reset must release it.
     const gpa = std.testing.allocator;
     var problems = try runOn(gpa,
         \\const std = @import("std");
         \\const Refcount = struct {
+        \\    pub fn reference(_: *Refcount) void {}
         \\    pub fn release(_: *Refcount) void {}
         \\};
         \\const T = struct {
         \\    rc: *Refcount,
-        \\    pub fn deinit(self: *T) void {
-        \\        self.rc.release();
-        \\    }
-        \\    pub fn reset(self: *T) void {
-        \\        _ = self;
-        \\    }
+        \\    pub fn deinit(self: *T) void { self.rc.release(); }
+        \\    pub fn reset(self: *T) void { _ = self; }
+        \\    pub fn use(self: *T) void { self.rc.reference(); }
         \\};
         \\
     );
