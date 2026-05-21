@@ -194,6 +194,11 @@ pub const all = [_]Rule{
         .title = "`return switch (...) { .<Tag> => |v| v, ... }` — bare payload return while sibling arm clones; borrowed value escapes caller's lifetime",
         .body = @embedFile("rules/return-borrowed-payload.md"),
     },
+    .{
+        .id = "unreleased-factory-handle",
+        .title = "`const <X> = device.create*()` without `defer <X>.release()` and `<X>` not returned/stored — refcounted handle leaks",
+        .body = @embedFile("rules/unreleased-factory-handle.md"),
+    },
 };
 
 /// Look up a rule by id.  Returns null on unknown id so callers can

@@ -42,6 +42,7 @@ Bun's.
 | `missing_errdefer_on_out_param.zig` | `missing-errdefer-on-out-param` | [ghostty-org/ghostty#10401](https://github.com/ghostty-org/ghostty/pull/10401) |
 | `reset_skips_pooled_resource_release.zig` | `reset-skips-pooled-resource-release` | [tigerbeetle/tigerbeetle#3436](https://github.com/tigerbeetle/tigerbeetle/pull/3436), [tigerbeetle/tigerbeetle#1734](https://github.com/tigerbeetle/tigerbeetle/pull/1734) |
 | `return_borrowed_payload.zig` | `return-borrowed-payload` | [ghostty-org/ghostty#8358](https://github.com/ghostty-org/ghostty/pull/8358), [ghostty-org/ghostty#7711](https://github.com/ghostty-org/ghostty/pull/7711) |
+| `unreleased_factory_handle.zig` | `unreleased-factory-handle` | hexops/mach `ca08255e` + `3d4888f4` commits (mined; canonical class, no PR — Mach mirror has issues disabled) |
 
 ## Re-fetching the actual pre-merge buggy files
 

@@ -311,9 +311,18 @@ pub const Invariant = enum {
     /// which is a slice/pointer borrowed from the caller's input.
     /// Catches ghostty-org/ghostty#8358 + #7711 class.
     return_borrowed_payload,
+    /// GPU/refcounted-factory leak — `const <X> = [try]
+    /// <device>.<create-method>(...)` returns a refcounted handle
+    /// with initial refcount=1, but the fn body has no `defer
+    /// <X>.release()` AND the handle isn't returned or stored as
+    /// a struct field.  One ref leaks per call.  Catches hexops/mach
+    /// examples (custom-renderer, glyphs/App.zig).  Distinct from
+    /// `unreleased-refs-on-error` which is about loop-side addref
+    /// without paired release.
+    unreleased_factory_handle,
 };
 
-pub const all_invariants: [33]Invariant = .{
+pub const all_invariants: [34]Invariant = .{
     .arena_escape,
     .stack_escape,
     .use_undefined,
@@ -347,6 +356,7 @@ pub const all_invariants: [33]Invariant = .{
     .missing_errdefer_on_out_param,
     .reset_skips_pooled_resource_release,
     .return_borrowed_payload,
+    .unreleased_factory_handle,
 };
 
 pub const Default: Config = .{};
