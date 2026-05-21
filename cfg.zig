@@ -855,6 +855,22 @@ const Builder = struct {
         // emissions silently drop.
         try self.registerFnParams();
         try self.lowerBlock(body_node, cur);
+        // Synthetic implicit-return at fn-body end.  Void fns that
+        // fall through without an explicit `return` still need
+        // transferRet to fire so post-defer checks (e.g. dangling
+        // out-param heap pointers) run.  Cheap idempotent emit —
+        // when the body already returned explicitly, cur is in a
+        // fresh dead block and this stmt sits unreached.
+        const last = self.tree.lastToken(body_node);
+        try self.appendStmt(cur.*, .{
+            .kind = .{ .ret = .{
+                .value_kind = .plain,
+                .is_borrowed_return_type = false,
+                .is_literal_undef = false,
+            } },
+            .pos = self.posOfToken(last),
+            .end_pos = self.posOfTokenEnd(last),
+        });
     }
 
     fn registerFnParams(self: *Builder) !void {

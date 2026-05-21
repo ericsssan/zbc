@@ -126,12 +126,22 @@ pub const AbstractState = struct {
     /// name); lets `s.buf = alloc(); free(s.buf); use(s.buf);` catch
     /// UAF.  Name slices borrow from source — caller keeps it alive.
     fields: std.ArrayHashMapUnmanaged(FieldKey, Origin, FieldKey.Context, true) = .empty,
+    /// `*T` out-parameter writes that carried a heap origin.  Keyed
+    /// by the out-param local; value is the HeapId of the most
+    /// recently written value.  Checked at function exit
+    /// (`transferRet`): if the heap has been freed by a defer
+    /// between the write and the return, the caller's pointee now
+    /// dangles — fire `heap-use-after-free`.  See
+    /// `transferOutParamWrite` and `transferRet` for the producer
+    /// and consumer.
+    out_param_writes: std.AutoArrayHashMapUnmanaged(LocalId, HeapId) = .empty,
 
     pub fn deinit(self: *AbstractState, gpa: std.mem.Allocator) void {
         self.locals.deinit(gpa);
         self.arenas.deinit(gpa);
         self.heaps.deinit(gpa);
         self.fields.deinit(gpa);
+        self.out_param_writes.deinit(gpa);
     }
 
     pub fn clone(self: *const AbstractState, gpa: std.mem.Allocator) !AbstractState {
@@ -151,6 +161,10 @@ pub const AbstractState = struct {
         try out.fields.ensureTotalCapacity(gpa, self.fields.count());
         for (self.fields.keys(), self.fields.values()) |k, v| {
             out.fields.putAssumeCapacityContext(k, v, .{});
+        }
+        try out.out_param_writes.ensureTotalCapacity(gpa, self.out_param_writes.count());
+        for (self.out_param_writes.keys(), self.out_param_writes.values()) |k, v| {
+            out.out_param_writes.putAssumeCapacity(k, v);
         }
         return out;
     }
@@ -232,6 +246,20 @@ pub fn join(
         }
         if (!gop.value_ptr.eql(other_val)) {
             gop.value_ptr.* = .plain;
+            changed = true;
+        }
+    }
+
+    // Out-param writes: a write recorded on ANY merging path is
+    // potentially live at the join.  Keep existing entries; add new
+    // ones from `other`.  When the same out_local maps to different
+    // HeapIds across paths, keep the existing (conservative — at
+    // exit we'll check the kept entry's liveness; missing the
+    // other's heap is acceptable precision loss for v1).
+    for (other.out_param_writes.keys(), other.out_param_writes.values()) |out_local, other_hid| {
+        const gop = try self.out_param_writes.getOrPut(gpa, out_local);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = other_hid;
             changed = true;
         }
     }

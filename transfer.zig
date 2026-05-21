@@ -210,6 +210,47 @@ fn transferRet(
     pos: cfg.SrcPos,
     end_pos: cfg.SrcPos,
 ) !void {
+    try transferRetValueChecks(ctx, state, r, pos, end_pos);
+    try transferRetOutParamDanglingHeaps(ctx, state, pos, end_pos);
+}
+
+/// At function exit, scan `state.out_param_writes` for entries
+/// whose recorded HeapId is now dead.  Fires when a value written
+/// through a `*T` parameter is freed (typically via `defer`) before
+/// the function returns — the caller's pointee dangles.  Closes the
+/// PR #30151-shape gap:
+///
+///     defer buf.deinit();
+///     out.* = buf.slice();      // at write time buf is live
+///     return;                    // at return defer fires → buf dead
+fn transferRetOutParamDanglingHeaps(
+    ctx: Ctx,
+    state: *AbstractState,
+    pos: cfg.SrcPos,
+    end_pos: cfg.SrcPos,
+) !void {
+    if (!config_mod.isEnabled(ctx.config, .heap_use_after_free)) return;
+    for (state.out_param_writes.keys(), state.out_param_writes.values()) |out_local, hid| {
+        const st = state.heaps.get(hid) orelse continue;
+        if (st.state != .dead) continue;
+        const out_name = ctx.locals[@intFromEnum(out_local)].name;
+        try reportWithNote(ctx, "heap-use-after-free", pos, end_pos, .@"error",
+            "value written through `{s}` was freed before return — caller's pointee dangles",
+            .{out_name},
+            if (st.killed_at) |ks|
+                .{ .site = ks, .label = "value freed here" }
+            else
+                null);
+    }
+}
+
+fn transferRetValueChecks(
+    ctx: Ctx,
+    state: *AbstractState,
+    r: @TypeOf(@as(StmtKind, undefined).ret),
+    pos: cfg.SrcPos,
+    end_pos: cfg.SrcPos,
+) !void {
     // Only borrowed-shape return types can leak a borrowed origin.
     // Value-typed returns MOVE the value (and any arena it owns) to
     // the caller — that's idiomatic, not a bug.
@@ -506,6 +547,14 @@ fn transferOutParamWrite(
                 "writing a pointer to function-local stack variable `{s}` through `{s}` (escapes its frame)",
                 .{ src_name, out_name });
         },
+        .heap => |hid| {
+            // Record the write for the deferred check at fn exit
+            // (transferRet).  At write time the heap is live, so
+            // it's not yet an escape — but if a defer subsequently
+            // frees it, the caller's pointee dangles on return.
+            // Last-write-wins per out-param.
+            try state.out_param_writes.put(ctx.gpa, w.out, hid);
+        },
         // .arena / .arena_borrow are NOT checked here yet — zbc's
         // classifier mints the same arena id for both stack-allocated
         // arenas (`var a = ArenaAllocator.init(...)`) and heap-
@@ -513,12 +562,6 @@ fn transferOutParamWrite(
         // we can't tell at this point whether the arena dies with the
         // frame.  Adding heap-shape tracking to ArenaState would let
         // this fire safely; left as next-tier work.
-        //
-        // .heap is intentionally skipped: a fresh heap allocation
-        // written through `out` is an ownership transfer, which is
-        // the canonical out-param-allocator pattern.  Catching
-        // "heap allocation freed via defer THEN written to out" needs
-        // a deferred check at fn exit, also left as next-tier work.
         else => {},
     }
 }
