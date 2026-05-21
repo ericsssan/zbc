@@ -76,9 +76,14 @@ pub const Invariant = enum {
     /// `mimalloc_arena.alloc(...)` then `default.free(...)` (UB
     /// under any reasonable allocator implementation).
     allocator_mismatch,
+    /// Calling a destructor (`destroy` / `deinit` / etc.) on an
+    /// interior pointer into a container's storage is UB under
+    /// typical allocators.  Catches the PR #30166 class:
+    /// `for (entries.items) |*r| r.destroy();`.
+    interior_pointer_destroy,
 };
 
-pub const all_invariants: [7]Invariant = .{
+pub const all_invariants: [8]Invariant = .{
     .arena_escape,
     .stack_escape,
     .use_undefined,
@@ -86,6 +91,7 @@ pub const all_invariants: [7]Invariant = .{
     .heap_use_after_free,
     .arena_use_after_kill,
     .allocator_mismatch,
+    .interior_pointer_destroy,
 };
 
 pub const Default: Config = .{};

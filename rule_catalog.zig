@@ -64,6 +64,11 @@ pub const all = [_]Rule{
         .title = "freeing with an allocator different from the one that allocated",
         .body = @embedFile("rules/allocator-mismatch.md"),
     },
+    .{
+        .id = "interior-pointer-destroy",
+        .title = "calling a destructor on an interior pointer into a container's storage",
+        .body = @embedFile("rules/interior-pointer-destroy.md"),
+    },
 };
 
 /// Look up a rule by id.  Returns null on unknown id so callers can

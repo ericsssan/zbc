@@ -74,8 +74,25 @@ pub fn transfer(ctx: Ctx, state: *AbstractState, stmt: Stmt) !void {
         .field_heap_free => |f| try transferFieldHeapFree(ctx, state, f, stmt.pos, stmt.end_pos),
         .field_use => |u| try transferFieldUse(ctx, state, u, stmt.pos, stmt.end_pos),
         .out_param_write => |w| try transferOutParamWrite(ctx, state, w, stmt.pos, stmt.end_pos),
+        .interior_pointer_destroy => |i| try transferInteriorPointerDestroy(ctx, state, i, stmt.pos, stmt.end_pos),
         .lowering_gap => |g| try transferGap(ctx, state, g, stmt.pos),
     }
+}
+
+fn transferInteriorPointerDestroy(
+    ctx: Ctx,
+    state: *AbstractState,
+    i: @TypeOf(@as(StmtKind, undefined).interior_pointer_destroy),
+    pos: cfg.SrcPos,
+    end_pos: cfg.SrcPos,
+) !void {
+    _ = state;
+    if (!config_mod.isEnabled(ctx.config, .interior_pointer_destroy)) return;
+    const receiver_name = ctx.locals[@intFromEnum(i.receiver)].name;
+    const container_name = ctx.locals[@intFromEnum(i.container)].name;
+    try report(ctx, "interior-pointer-destroy", pos, end_pos, .@"error",
+        "destroying `{s}` — an interior pointer into `{s}` — is undefined behavior under typical allocators (the pointer wasn't returned by allocator.create)",
+        .{ receiver_name, container_name });
 }
 
 fn transferDecl(

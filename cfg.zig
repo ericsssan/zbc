@@ -161,6 +161,13 @@ pub const StmtKind = union(enum) {
     /// is the pointer-typed local; `value_kind` is the RHS
     /// classification used to derive the written value's origin.
     out_param_write: struct { out: LocalId, value_kind: ExprKind },
+    /// Calling a destructor on an interior pointer — UB under
+    /// typical allocators since the pointer wasn't returned by
+    /// `allocator.create()`.  The canonical PR #30166 pattern:
+    /// `for (entries.items) |*r| r.destroy();`.  `receiver` is
+    /// the interior pointer local; `container` is the source
+    /// container it borrows from (recorded at for-loop capture).
+    interior_pointer_destroy: struct { receiver: LocalId, container: LocalId },
     /// Re-bind a local to .plain.  Emitted at loop body entry for
     /// `while (it) |n|` / `for (xs) |x|` captures so back-edges
     /// don't carry one iteration's `free(n)` state into the next —
@@ -325,6 +332,14 @@ pub const LocalInfo = struct {
     /// Used by call-site lookup to disambiguate `<recv>.method()`
     /// across method-name overloads on different types.
     type_name: ?[]const u8 = null,
+    /// Set when this local is an interior pointer captured from a
+    /// for-loop over `<container>.<field>` with `|*p|` capture
+    /// style.  The LocalId names the container the pointer
+    /// references.  Used by `interior_pointer_destroy` detection
+    /// to flag calls like `for (entries.items) |*result|
+    /// result.destroy();` — destroying an interior pointer is UB
+    /// under typical allocators (PR #30166).
+    from_container: ?LocalId = null,
 };
 
 pub const InitHint = enum {
@@ -1169,6 +1184,54 @@ const Builder = struct {
     /// origin (would need to track input's element-lifetime per item);
     /// the iterator binding gets registered as a fresh local with .plain
     /// init so subsequent uses are conservative.
+    /// For each `for (input_i) |capture_i|` pair, if input_i is
+    /// `<container_ident>.<field>` AND capture_i is by-pointer
+    /// (preceded by `*` inside the payload), set
+    /// `capture.from_container = container_local`.
+    ///
+    /// Pure token-walk: payload tokens are `|`, optional `*`,
+    /// ident, [optional `,` and second ident pair], `|`.  Walk
+    /// these alongside `for_data.ast.inputs` to align pairs.
+    fn markInteriorCaptures(self: *Builder, for_data: Ast.full.For, body: BlockId) void {
+        _ = body;
+        const tree = self.tree;
+        const tags = tree.tokens.items(.tag);
+        // Walk payload tokens collecting (is_pointer, capture_name)
+        // pairs in input order.
+        var pt = for_data.payload_token;
+        var input_idx: usize = 0;
+        var is_ptr = false;
+        while (pt < tags.len) : (pt += 1) {
+            switch (tags[pt]) {
+                .pipe => return, // closing `|`
+                .asterisk => is_ptr = true,
+                .identifier => {
+                    if (input_idx >= for_data.ast.inputs.len) return;
+                    const input = for_data.ast.inputs[input_idx];
+                    const name = tree.tokenSlice(pt);
+                    input_idx += 1;
+                    const is_underscore = std.mem.eql(u8, name, "_");
+                    const was_ptr = is_ptr;
+                    is_ptr = false;
+                    if (is_underscore or !was_ptr) continue;
+                    // Resolve <container>.<field> shape on the input.
+                    if (tree.nodeTag(input) != .field_access) continue;
+                    const fa = tree.nodeData(input).node_and_token;
+                    const recv = fa[0];
+                    if (tree.nodeTag(recv) != .identifier) continue;
+                    const recv_name = tree.tokenSlice(tree.nodeMainToken(recv));
+                    const container = self.name_to_local.get(recv_name) orelse continue;
+                    // Find the capture's LocalId (registered just
+                    // above by registerCapturesWith).
+                    const capture_local = self.name_to_local.get(name) orelse continue;
+                    self.locals.items[@intFromEnum(capture_local)].from_container = container;
+                },
+                .comma => {}, // separator between captures
+                else => {},
+            }
+        }
+    }
+
     fn lowerFor(self: *Builder, for_node: Ast.Node.Index, cur: *BlockId) !void {
         const tree = self.tree;
         const for_data = tree.fullFor(for_node) orelse {
@@ -1205,6 +1268,12 @@ const Builder = struct {
         // For-loops always have a payload (`|x|` or `|x, idx|`).
         // Reset on iteration entry — see lowerWhile for rationale.
         try self.registerCapturesWith(for_data.payload_token, body);
+        // Detect interior-pointer captures: when input N is a
+        // `<container>.<field>` access AND capture N is `|*p|`
+        // (by-pointer), mark `p` as borrowing from the container.
+        // Used by destructor-call detection to flag the PR #30176
+        // pattern `for (entries.items) |*r| r.destroy();`.
+        self.markInteriorCaptures(for_data, body);
         var body_cur = body;
         try self.lowerStmt(for_data.ast.then_expr, &body_cur);
         _ = self.loop_stack.pop();
@@ -2392,6 +2461,25 @@ const Builder = struct {
         const end: usize = last_start + last_len;
         const text = tree.source[start..end];
 
+        // Interior-pointer destructor check.  When the receiver is
+        // a local registered as a for-loop pointer-capture into a
+        // container (`for (entries.items) |*r|`), calling a
+        // destructor-shape method on it is UB under typical
+        // allocators — the pointer isn't a fresh allocation.
+        // Emits a diagnostic in transfer; the rest of lowerCallStmt
+        // continues to fire (heap_free, etc.) so cascading
+        // diagnostics still surface.
+        if (self.interiorPointerDestructor(call_node)) |info| {
+            try self.appendStmt(cur.*, .{
+                .kind = .{ .interior_pointer_destroy = .{
+                    .receiver = info.receiver,
+                    .container = info.container,
+                } },
+                .pos = self.posOf(call_node),
+                .end_pos = self.endPosOf(call_node),
+            });
+        }
+
         if (anyPatternMatches(text, self.config.arena_kill_patterns)) {
             const recv_local = self.firstIdentifierLocal(text) orelse {
                 try self.appendStmt(cur.*, .{
@@ -3535,6 +3623,42 @@ const Builder = struct {
     /// (.arena_local or .arena_allocator), return that local.
     /// Receiver may itself be a chained field access (`x.y.method()`),
     /// in which case we walk to the head identifier.
+    /// If `call_node` is `<recv>.<destructor_name>(...)` where
+    /// `recv` is a local with `from_container` set (a for-loop
+    /// pointer-capture into a container) AND the callee actually
+    /// calls `allocator.destroy(self)` internally (signaled via
+    /// `@takes ownership(self)` inferred from the body — present
+    /// only for destructors like `MarkedArrayBuffer.destroy()`,
+    /// NOT for destructors that merely free sub-fields like
+    /// `Problem.deinit()`), return the receiver + container pair.
+    ///
+    /// The takes-self gate is essential: zbc's own
+    /// `Problem.deinit` and other "iter-and-deinit-sub-fields"
+    /// patterns would otherwise FP loudly.
+    const InteriorPtrDestructor = struct { receiver: LocalId, container: LocalId };
+    fn interiorPointerDestructor(self: *Builder, call_node: Ast.Node.Index) ?InteriorPtrDestructor {
+        const tree = self.tree;
+        var buf: [1]Ast.Node.Index = undefined;
+        const call_full = tree.fullCall(&buf, call_node) orelse return null;
+        const callee = call_full.ast.fn_expr;
+        if (tree.nodeTag(callee) != .field_access) return null;
+        const fa = tree.nodeData(callee).node_and_token;
+        const recv = fa[0];
+        if (tree.nodeTag(recv) != .identifier) return null;
+        const recv_name = tree.tokenSlice(tree.nodeMainToken(recv));
+        const recv_local = self.name_to_local.get(recv_name) orelse return null;
+        const container = self.locals.items[@intFromEnum(recv_local)].from_container orelse return null;
+
+        // Receiver IS interior — check the method actually frees
+        // `self` via takesOwnershipFreedLocal (which consults
+        // db.lookupTyped's @takes annotation, including inferred
+        // ones).  Returns the receiver only when the callee
+        // promises to free arg 0.
+        const freed = self.takesOwnershipFreedLocal(call_node) orelse return null;
+        if (freed != recv_local) return null;
+        return .{ .receiver = recv_local, .container = container };
+    }
+
     /// For a call like `<recv>.alloc(...)`, `<recv>.free(...)`,
     /// `<recv>.destroy(...)`, return the LocalId of `<recv>` when
     /// it's a bare identifier resolving to a known local.  Walks
