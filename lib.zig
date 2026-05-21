@@ -29,6 +29,7 @@ const arraylist_items_slice_mod = @import("arraylist_items_slice.zig");
 const fd_write_after_close_mod = @import("fd_write_after_close.zig");
 const slice_of_arena_into_heap_mod = @import("slice_of_arena_into_heap.zig");
 const free_without_null_then_check_mod = @import("free_without_null_then_check.zig");
+const tagged_union_retag_with_old_payload_read_mod = @import("tagged_union_retag_with_old_payload_read.zig");
 const rule_catalog_mod = @import("rule_catalog.zig");
 
 pub const Config = config_mod.Config;
@@ -198,6 +199,12 @@ pub fn analyzeEscape(
     // in a non-destructor fn without `<r>.<f> = null;` reset →
     // slot dangles, later `if (<r>.<f>) |h| use(h);` UAFs.
     try free_without_null_then_check_mod.check(gpa, &tree, config, &problems);
+
+    // Tagged-union retag-with-old-payload-read — `<path> = .{ .NewTag
+    // = .{ ... <path>.OldTag... ... } };`.  Reading the old tag's
+    // payload while flipping the active tag is undefined on Zig's
+    // x86_64 self-hosted backend.
+    try tagged_union_retag_with_old_payload_read_mod.check(gpa, &tree, config, &problems);
 
     return problems.toOwnedSlice(gpa);
 }
@@ -662,5 +669,6 @@ test {
     _ = fd_write_after_close_mod;
     _ = slice_of_arena_into_heap_mod;
     _ = free_without_null_then_check_mod;
+    _ = tagged_union_retag_with_old_payload_read_mod;
     std.testing.refAllDecls(@This());
 }

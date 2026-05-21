@@ -262,9 +262,18 @@ pub const Invariant = enum {
     /// dangling slot.  Catches oven-sh/bun#30148 / #30176 / #29983 /
     /// #29988 class.
     free_without_null_then_check,
+    /// `<path> = .{ .<NewTag> = .{ ... <path>.<OldTag>... ... } };`
+    /// — reading the old tag's payload while assigning a new tag to
+    /// the same union.  Under Zig's x86_64 self-hosted backend
+    /// the active-tag flip happens BEFORE the RHS evaluates, so the
+    /// old payload read may see undefined / garbage.  LLVM hides
+    /// this on aarch64.  Catches tigerbeetle/tigerbeetle#3317 +
+    /// #2200 class (same file `src/lsm/scan_tree.zig`, same shape,
+    /// 14 months apart).
+    tagged_union_retag_with_old_payload_read,
 };
 
-pub const all_invariants: [27]Invariant = .{
+pub const all_invariants: [28]Invariant = .{
     .arena_escape,
     .stack_escape,
     .use_undefined,
@@ -292,6 +301,7 @@ pub const all_invariants: [27]Invariant = .{
     .fd_write_after_close,
     .slice_of_arena_into_heap,
     .free_without_null_then_check,
+    .tagged_union_retag_with_old_payload_read,
 };
 
 pub const Default: Config = .{};

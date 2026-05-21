@@ -164,6 +164,11 @@ pub const all = [_]Rule{
         .title = "freed `<recv>.<field>` without reset — slot now dangles; later `if (<recv>.<field>) |h| use(h);` UAFs",
         .body = @embedFile("rules/free-without-null-then-check.md"),
     },
+    .{
+        .id = "tagged-union-retag-with-old-payload-read",
+        .title = "reading `<path>.<OldTag>` while assigning `.{ .<NewTag> = ... }` to `<path>` — x86_64 backend may evaluate read after tag flip",
+        .body = @embedFile("rules/tagged-union-retag-with-old-payload-read.md"),
+    },
 };
 
 /// Look up a rule by id.  Returns null on unknown id so callers can
