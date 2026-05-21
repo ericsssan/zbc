@@ -137,9 +137,19 @@ pub const Invariant = enum {
     /// `old_path` was leaked when `new_path = try PathLike.fromJS(...)`
     /// errored.
     missing_errdefer_between_tries,
+    /// `<allocator>.free(X); X = try <allocator>.alloc(...);` —
+    /// after the free, X points at freed memory.  If the `try`'s
+    /// alloc fails, the function returns the error and `X` is
+    /// still that dangling pointer — a later `deinit` (which
+    /// expects an owned slice) frees it again, double-freeing /
+    /// using freed memory.  Fix is to set `X = &.{};` (or
+    /// `undefined`) between the free and the fallible realloc.
+    /// Catches PR #29968 class: MySQLConnection.handleResultSet
+    /// reallocating `statement.columns` without clearing first.
+    free_then_try_realloc,
 };
 
-pub const all_invariants: [15]Invariant = .{
+pub const all_invariants: [16]Invariant = .{
     .arena_escape,
     .stack_escape,
     .use_undefined,
@@ -155,6 +165,7 @@ pub const all_invariants: [15]Invariant = .{
     .realloc_byte_count,
     .asymmetric_field_free,
     .missing_errdefer_between_tries,
+    .free_then_try_realloc,
 };
 
 pub const Default: Config = .{};

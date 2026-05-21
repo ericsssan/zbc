@@ -17,6 +17,7 @@ const clobbered_by_struct_reset_mod = @import("clobbered_by_struct_reset.zig");
 const realloc_byte_count_mod = @import("realloc_byte_count.zig");
 const asymmetric_field_free_mod = @import("asymmetric_field_free.zig");
 const missing_errdefer_between_tries_mod = @import("missing_errdefer_between_tries.zig");
+const free_then_try_realloc_mod = @import("free_then_try_realloc.zig");
 const rule_catalog_mod = @import("rule_catalog.zig");
 
 pub const Config = config_mod.Config;
@@ -124,6 +125,11 @@ pub fn analyzeEscape(
     // try Type.method(…);` then a later `try` with no errdefer for
     // X registered between.
     try missing_errdefer_between_tries_mod.check(gpa, &tree, &db, config, &problems);
+
+    // Free-then-try-realloc (PR #29968) — `<x>.free(X); X = try
+    // alloc(…);` leaves X dangling on alloc failure.  Whole-file
+    // token scan.
+    try free_then_try_realloc_mod.check(gpa, &tree, config, &problems);
 
     return problems.toOwnedSlice(gpa);
 }

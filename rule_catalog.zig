@@ -104,6 +104,11 @@ pub const all = [_]Rule{
         .title = "`const X = try Type.method(…);` then another `try` with no `errdefer X.deinit();` — X leaks on the second error",
         .body = @embedFile("rules/missing-errdefer-between-tries.md"),
     },
+    .{
+        .id = "free-then-try-realloc",
+        .title = "`free(X); X = try alloc(…);` without clearing X first — X dangles on alloc failure → double-free in `deinit`",
+        .body = @embedFile("rules/free-then-try-realloc.md"),
+    },
 };
 
 /// Look up a rule by id.  Returns null on unknown id so callers can
