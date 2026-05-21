@@ -99,6 +99,11 @@ pub const all = [_]Rule{
         .title = "destructor handles some same-typed fields but omits others — the omitted ones leak",
         .body = @embedFile("rules/asymmetric-field-free.md"),
     },
+    .{
+        .id = "missing-errdefer-between-tries",
+        .title = "`const X = try Type.method(…);` then another `try` with no `errdefer X.deinit();` — X leaks on the second error",
+        .body = @embedFile("rules/missing-errdefer-between-tries.md"),
+    },
 };
 
 /// Look up a rule by id.  Returns null on unknown id so callers can

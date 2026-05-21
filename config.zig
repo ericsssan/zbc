@@ -129,9 +129,17 @@ pub const Invariant = enum {
     /// first but forgets the second.  Catches PR #29853 class:
     /// `MatchedRoute.deinit` forgot to free `param_map`.
     asymmetric_field_free,
+    /// `const X = try <Type>.<method>(...);` where `<Type>` has a
+    /// `deinit` method, then a subsequent `try` in the same scope
+    /// with NO `errdefer X.deinit();` between.  If the second
+    /// `try` throws, X leaks (its deinit isn't reached).  Catches
+    /// PR #30169 class: `node_fs` Symlink/Link/Rename.fromJS where
+    /// `old_path` was leaked when `new_path = try PathLike.fromJS(...)`
+    /// errored.
+    missing_errdefer_between_tries,
 };
 
-pub const all_invariants: [14]Invariant = .{
+pub const all_invariants: [15]Invariant = .{
     .arena_escape,
     .stack_escape,
     .use_undefined,
@@ -146,6 +154,7 @@ pub const all_invariants: [14]Invariant = .{
     .clobbered_by_struct_reset,
     .realloc_byte_count,
     .asymmetric_field_free,
+    .missing_errdefer_between_tries,
 };
 
 pub const Default: Config = .{};

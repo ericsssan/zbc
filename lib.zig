@@ -16,6 +16,7 @@ const aliased_heap_dupe_mod = @import("aliased_heap_dupe.zig");
 const clobbered_by_struct_reset_mod = @import("clobbered_by_struct_reset.zig");
 const realloc_byte_count_mod = @import("realloc_byte_count.zig");
 const asymmetric_field_free_mod = @import("asymmetric_field_free.zig");
+const missing_errdefer_between_tries_mod = @import("missing_errdefer_between_tries.zig");
 const rule_catalog_mod = @import("rule_catalog.zig");
 
 pub const Config = config_mod.Config;
@@ -118,6 +119,11 @@ pub fn analyzeEscape(
     // Asymmetric-field-free (PR #29853) — destructor handles some
     // same-typed sibling fields but omits others.
     try asymmetric_field_free_mod.check(gpa, &tree, &db, config, &problems);
+
+    // Missing-errdefer-between-tries (PR #30169) — `const X =
+    // try Type.method(…);` then a later `try` with no errdefer for
+    // X registered between.
+    try missing_errdefer_between_tries_mod.check(gpa, &tree, &db, config, &problems);
 
     return problems.toOwnedSlice(gpa);
 }
