@@ -114,6 +114,11 @@ pub const all = [_]Rule{
         .title = "destructor loops `<h>.deinit();` over pointer-list items without `<allocator>.destroy(<h>);` — heap descriptors leak",
         .body = @embedFile("rules/destroy-after-deinit-in-loop.md"),
     },
+    .{
+        .id = "dead-errdefer-in-result-fn",
+        .title = "`errdefer` in a fn returning a `Result(T)` tagged union (not `!T`) — never fires, cleanup silently leaks",
+        .body = @embedFile("rules/dead-errdefer-in-result-fn.md"),
+    },
 };
 
 /// Look up a rule by id.  Returns null on unknown id so callers can

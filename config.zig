@@ -158,9 +158,19 @@ pub const Invariant = enum {
     /// class: `LOLHTMLContext.deinit` looped handlers and called
     /// `handler.deinit()` but never `allocator.destroy(handler)`.
     destroy_after_deinit_in_loop,
+    /// A fn whose return type is a parameterized tagged union
+    /// (`Result(T)`, `Maybe(T)`, …) — NOT a Zig error union
+    /// (`!T`) — contains an `errdefer` in its body.  Zig's
+    /// `errdefer` only runs on Zig error returns (`return
+    /// error.X`); a `return .{ .err = e }` is a normal return,
+    /// so the errdefer never fires.  Any cleanup it was meant
+    /// to do silently leaks.  Catches PR #27706 class: CSS
+    /// parsers with `Result(T)` return type and dead errdefer
+    /// blocks.
+    dead_errdefer_in_result_fn,
 };
 
-pub const all_invariants: [17]Invariant = .{
+pub const all_invariants: [18]Invariant = .{
     .arena_escape,
     .stack_escape,
     .use_undefined,
@@ -178,6 +188,7 @@ pub const all_invariants: [17]Invariant = .{
     .missing_errdefer_between_tries,
     .free_then_try_realloc,
     .destroy_after_deinit_in_loop,
+    .dead_errdefer_in_result_fn,
 };
 
 pub const Default: Config = .{};
