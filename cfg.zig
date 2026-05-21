@@ -1667,6 +1667,15 @@ const Builder = struct {
         if (init_opt) |init| if (!init_was_labeled_block) {
             try self.unpackStructInitFields(cur.*, local, null, init,
                 self.posOf(decl_node), self.endPosOf(decl_node));
+            // Constructor-call result with heap fields: when init is
+            // `T.constructor(...)` and that fn's body returned
+            // `.{ .X = <heap_alloc> }`, emit a synthetic
+            // `field_assign(local, X, .heap_alloc(fresh))` so
+            // downstream field-use machinery sees the right state
+            // (e.g. `var u = toUtf8(a); use(u.bytes);` tracks
+            // u.bytes's heap allocation).
+            try self.emitConstructorResultHeapFields(cur.*, local, init,
+                self.posOf(decl_node), self.endPosOf(decl_node));
         };
 
         // Init-position try/catch: now that the decl has emitted, model
@@ -2231,6 +2240,74 @@ const Builder = struct {
     /// Returns true if anything was emitted; caller may use this to
     /// decide whether to additionally emit a use/gap.  Does NOT
     /// terminate the block for noreturn — callers handle that.
+    /// If `init_expr` resolves to a call whose callee FnEntry has
+    /// `result_heap_fields` (per annotations.zig's
+    /// inferConstructorFieldHeaps), emit one
+    /// `field_assign(local, field_name, .heap_alloc(fresh))` per
+    /// recorded field.  Handles `try` / `catch` wrappers.
+    fn emitConstructorResultHeapFields(
+        self: *Builder,
+        cur: BlockId,
+        local: LocalId,
+        init_expr: Ast.Node.Index,
+        pos: SrcPos,
+        end_pos: SrcPos,
+    ) std.mem.Allocator.Error!void {
+        const tree = self.tree;
+        var node = init_expr;
+        while (true) switch (tree.nodeTag(node)) {
+            .@"try" => node = tree.nodeData(node).node,
+            .@"catch" => node = tree.nodeData(node).node_and_node[0],
+            else => break,
+        };
+        switch (tree.nodeTag(node)) {
+            .call, .call_one, .call_comma, .call_one_comma => {},
+            else => return,
+        }
+        var buf: [1]Ast.Node.Index = undefined;
+        const call_full = tree.fullCall(&buf, node) orelse return;
+        const callee = call_full.ast.fn_expr;
+        const method_tok = switch (tree.nodeTag(callee)) {
+            .identifier => tree.nodeMainToken(callee),
+            .field_access => tree.nodeData(callee).node_and_token[1],
+            else => return,
+        };
+        const callee_name = tree.tokenSlice(method_tok);
+
+        const db = self.db orelse return;
+        // Resolve type-aware first when the receiver is a known
+        // namespace (e.g. `Utf8.init(...)`), then bare-name.
+        const heap_fields: []const []const u8 = blk: {
+            if (tree.nodeTag(callee) == .field_access) {
+                const recv = tree.nodeData(callee).node_and_token[0];
+                if (tree.nodeTag(recv) == .identifier) {
+                    const recv_name = tree.tokenSlice(tree.nodeMainToken(recv));
+                    if (db.lookupTyped(recv_name, callee_name)) |entry| {
+                        if (entry.result_heap_fields.len > 0) break :blk entry.result_heap_fields;
+                    }
+                }
+            }
+            if (db.lookup(callee_name)) |entry| {
+                break :blk entry.result_heap_fields;
+            }
+            break :blk &[_][]const u8{};
+        };
+        if (heap_fields.len == 0) return;
+        for (heap_fields) |fname| {
+            const hid: abstract_state.HeapId = @enumFromInt(self.next_heap);
+            self.next_heap += 1;
+            try self.appendStmt(cur, .{
+                .kind = .{ .field_assign = .{
+                    .parent = local,
+                    .name = fname,
+                    .rhs_kind = .{ .heap_alloc = hid },
+                } },
+                .pos = pos,
+                .end_pos = end_pos,
+            });
+        }
+    }
+
     fn applyTopLevelCallEffects(self: *Builder, expr_node: Ast.Node.Index, cur: *BlockId) (std.mem.Allocator.Error)!void {
         const tree = self.tree;
         // Walk through `try` / `catch` wrappers — they don't change
@@ -2383,14 +2460,18 @@ const Builder = struct {
         // `@takes ownership(p)` — annotated free-wrapper.  Look up
         // the callee in the same-file DB; if it carries the
         // annotation, treat this call as a heap_free for the matched
-        // arg before falling through to the untracked-call path.
+        // arg.  Doesn't return: a single call can both take
+        // ownership of `self` AND have `may_free_fields` describing
+        // additional field frees (e.g.
+        // `Utf8.deinit(self, alloc) { alloc.free(self.bytes); }`).
+        var fired_any = false;
         if (self.takesOwnershipFreedLocal(call_node)) |freed| {
             try self.appendStmt(cur.*, .{
                 .kind = .{ .heap_free = .{ .freed_local = freed, .fallback_hid = blk_h: { const h: abstract_state.HeapId = @enumFromInt(self.next_heap); self.next_heap += 1; break :blk_h h; } } },
                 .pos = self.posOf(call_node),
                 .end_pos = self.endPosOf(call_node),
             });
-            return;
+            fired_any = true;
         }
         // Same but for `<local>.<field>.method(...)` where method has
         // @takes ownership(0) (R9 inference: callee frees its receiver).
@@ -2404,7 +2485,7 @@ const Builder = struct {
                 .pos = self.posOf(call_node),
                 .end_pos = self.endPosOf(call_node),
             });
-            return;
+            fired_any = true;
         }
         // Callee's `may_free_fields` (R10 field-chain inference) —
         // each entry says "the call frees param[N]'s field F".
@@ -2424,9 +2505,10 @@ const Builder = struct {
                         .end_pos = self.endPosOf(call_node),
                     });
                 }
-                return;
+                fired_any = true;
             }
         }
+        if (fired_any) return;
 
         // Untracked call at stmt position — emit uses for everything
         // it references so UAF on call args still fires before the

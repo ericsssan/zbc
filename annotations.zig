@@ -102,6 +102,19 @@ pub const FnEntry = struct {
     /// chain matched.  Supports multiple frees per body and frees
     /// on non-receiver params alike.
     may_free_fields: []const FieldFree = &.{},
+    /// Field names that the constructor heap-allocates and stores
+    /// in the returned struct.  E.g.
+    ///
+    ///     pub fn init(alloc: Allocator) Utf8 {
+    ///         return .{ .bytes = alloc.alloc(u8, N) catch ... };
+    ///     }
+    ///
+    /// records "bytes".  At call sites, the receiving local gets
+    /// a synthetic `field_assign(local, name, .heap_alloc)` per
+    /// entry so subsequent `local.<name>` reads can track the
+    /// field's UAF state.  Slices borrow from source; outer slice
+    /// is owned by Db.deinit.
+    result_heap_fields: []const []const u8 = &.{},
 };
 
 pub const Db = struct {
@@ -155,6 +168,7 @@ pub const Db = struct {
         while (it.next()) |list| {
             for (list.items) |e| {
                 if (e.may_free_fields.len > 0) gpa.free(e.may_free_fields);
+                if (e.result_heap_fields.len > 0) gpa.free(e.result_heap_fields);
             }
             list.deinit(gpa);
         }
@@ -282,7 +296,8 @@ pub const Db = struct {
     /// these when counting overloads.
     fn entryIsEmpty(e: FnEntry) bool {
         return e.annotation == null and e.takes == null and !e.is_noreturn and
-            e.may_free_fields.len == 0 and !e.may_free_self;
+            e.may_free_fields.len == 0 and !e.may_free_self and
+            e.result_heap_fields.len == 0;
     }
 
     /// Look up a method by (containing_type, name).  When `ty` is
@@ -616,7 +631,110 @@ pub fn buildFull(
     // `discoverContainingTypes`.
     try inferBorrowedFields(gpa, tree, &db, alloc_patterns);
 
+    // Field-heap-owner inference — when a fn returns `.{ .X =
+    // <heap_alloc> }`, record "X" on the FnEntry so call sites can
+    // emit a synthetic `field_assign(local, X, .heap_alloc(...))`
+    // and downstream field-tracking sees the right state.
+    try inferConstructorFieldHeaps(gpa, tree, &db, alloc_patterns);
+
     return db;
+}
+
+/// Walk each fn_decl; if its body is a single
+/// `return <struct_literal>;`, inspect each field initializer.
+/// For any field whose RHS text matches an alloc pattern (the
+/// same ones classifyExpr would tag as `.heap_alloc`), record
+/// the field name on the FnEntry's `result_heap_fields`.
+///
+/// Runs after R6/R7/R8/R10 so it doesn't fight the rest of the
+/// annotation pipeline.  The recorded list is consumed in
+/// `cfg.zig:lowerVarDecl` to emit field_assigns at call sites.
+fn inferConstructorFieldHeaps(
+    gpa: std.mem.Allocator,
+    tree: *const Ast,
+    db: *Db,
+    alloc_patterns: []const []const u8,
+) !void {
+    var node_idx: u32 = 1;
+    while (node_idx < tree.nodes.len) : (node_idx += 1) {
+        const node: Ast.Node.Index = @enumFromInt(node_idx);
+        if (tree.nodeTag(node) != .fn_decl) continue;
+        var fnp_buf: [1]Ast.Node.Index = undefined;
+        const fn_proto = fullFnProto(tree, &fnp_buf, node) orelse continue;
+        const name_tok = fn_proto.name_token orelse continue;
+        const fn_name = tree.tokenSlice(name_tok);
+
+        const body = tree.nodeData(node).node_and_node[1];
+        const return_expr = singleReturnExpr(tree, body) orelse continue;
+        var si_buf: [2]Ast.Node.Index = undefined;
+        const si = tree.fullStructInit(&si_buf, return_expr) orelse continue;
+
+        var heap_fields: std.ArrayListUnmanaged([]const u8) = .empty;
+        errdefer heap_fields.deinit(gpa);
+        const starts = tree.tokens.items(.start);
+        for (si.ast.fields) |field_value| {
+            const fname = scannedFieldInitName(tree, field_value) orelse continue;
+            const fl_first = tree.firstToken(field_value);
+            const fl_last = tree.lastToken(field_value);
+            const rhs_start = starts[fl_first];
+            const rhs_end = starts[fl_last] + tree.tokenSlice(fl_last).len;
+            const rhs_text = tree.source[rhs_start..rhs_end];
+            // Same text-match as the cfg classifier — any of
+            // `.alloc(`, `.create(`, `.dupe(`, etc.  Conservative
+            // skip on anything else.
+            var matched = false;
+            for (alloc_patterns) |pat| {
+                if (std.mem.indexOf(u8, rhs_text, pat) != null) {
+                    matched = true;
+                    break;
+                }
+            }
+            if (!matched) continue;
+            try heap_fields.append(gpa, fname);
+        }
+        if (heap_fields.items.len == 0) {
+            heap_fields.deinit(gpa);
+            continue;
+        }
+
+        const ct = db.containing_types.get(node);
+        const owned = try heap_fields.toOwnedSlice(gpa);
+        errdefer gpa.free(owned);
+        // Update the matching entry's result_heap_fields.  If the
+        // entry doesn't exist yet (no signal at all up to this
+        // point), insert a fresh one.
+        if (db.fns.getPtr(fn_name)) |list| {
+            for (list.items) |*e| {
+                if (eqlOptStr(e.containing_type, ct)) {
+                    if (e.result_heap_fields.len > 0) gpa.free(e.result_heap_fields);
+                    e.result_heap_fields = owned;
+                    break;
+                }
+            } else {
+                try list.append(gpa, .{
+                    .name = fn_name,
+                    .containing_type = ct,
+                    .annotation = null,
+                    .result_heap_fields = owned,
+                });
+            }
+        } else {
+            var list: std.ArrayListUnmanaged(FnEntry) = .empty;
+            try list.append(gpa, .{
+                .name = fn_name,
+                .containing_type = ct,
+                .annotation = null,
+                .result_heap_fields = owned,
+            });
+            try db.fns.put(gpa, fn_name, list);
+        }
+    }
+}
+
+fn eqlOptStr(a: ?[]const u8, b: ?[]const u8) bool {
+    if (a == null and b == null) return true;
+    if (a == null or b == null) return false;
+    return std.mem.eql(u8, a.?, b.?);
 }
 
 /// R8a: body is `{ return EXPR; }` or `{ var x = EXPR; return x; }`
@@ -782,10 +900,109 @@ fn inferTakesViaReceiverCall(
         }
     }
 
+    // Inverse-shape inference: `<allocator>.free(<param>.<field>)`
+    // / `<allocator>.destroy(<param>.<field>)`.  Body explicitly
+    // frees a param's field (typical destructor pattern:
+    // `pub fn deinit(self: *T, alloc: Allocator) void {
+    //   alloc.free(self.bytes); }`).  Records the same
+    // {param, field} shape as the chain-style inference above so
+    // call sites emit `field_heap_free` on the matching arg.
+    try inferFreesArgField(gpa, tree, fn_proto, body_node, &fields);
+
     if (fields.items.len > 0) {
         result.may_free_fields = try fields.toOwnedSlice(gpa);
     }
     return result;
+}
+
+/// Walk tokens for `.free(` / `.destroy(` calls; for each, if any
+/// arg is `<param>.<field_path>` (where `<param>` is a fn param
+/// and `<field_path>` is one or more `.<ident>` segments), record
+/// `{ param, field_path }` in `fields`.  Dedupes against entries
+/// already present.
+///
+/// **Gated on destructor-shape fn names** (`deinit` / `destroy` /
+/// `die` / `release` / `free`).  Restricts to the canonical
+/// destructor pattern (`pub fn deinit(self: *T, alloc: Allocator)
+/// void { alloc.free(self.bytes); }`) and avoids FPs on general-
+/// purpose fns that conditionally free a field in an error
+/// branch — e.g. `hybridSetup` allocates and conditionally frees
+/// on alloc failure; the caller's view shouldn't treat it as an
+/// unconditional free.
+fn inferFreesArgField(
+    gpa: std.mem.Allocator,
+    tree: *const Ast,
+    fn_proto: Ast.full.FnProto,
+    body_node: Ast.Node.Index,
+    fields: *std.ArrayListUnmanaged(FieldFree),
+) !void {
+    const fn_name_tok = fn_proto.name_token orelse return;
+    const fn_name = tree.tokenSlice(fn_name_tok);
+    const is_destructor = std.mem.eql(u8, fn_name, "deinit") or
+        std.mem.eql(u8, fn_name, "destroy") or
+        std.mem.eql(u8, fn_name, "die") or
+        std.mem.eql(u8, fn_name, "release") or
+        std.mem.eql(u8, fn_name, "free") or
+        std.mem.eql(u8, fn_name, "close") or
+        std.mem.eql(u8, fn_name, "dispose");
+    if (!is_destructor) return;
+
+    const first = tree.firstToken(body_node);
+    const last = tree.lastToken(body_node);
+    const tags = tree.tokens.items(.tag);
+    const starts = tree.tokens.items(.start);
+
+    var t: Ast.TokenIndex = first;
+    while (t + 3 <= last) : (t += 1) {
+        if (tags[t] != .period) continue;
+        if (tags[t + 1] != .identifier) continue;
+        if (tags[t + 2] != .l_paren) continue;
+        const method = tree.tokenSlice(t + 1);
+        if (!std.mem.eql(u8, method, "free") and !std.mem.eql(u8, method, "destroy")) continue;
+
+        // Walk args at depth 1.  For each identifier that's a fn
+        // param and is followed by `. <ident>` (a dotted chain),
+        // record the FieldFree with the dotted-path.
+        var depth: u32 = 1;
+        var k: Ast.TokenIndex = t + 3;
+        while (k <= last and depth > 0) : (k += 1) {
+            switch (tags[k]) {
+                .l_paren => depth += 1,
+                .r_paren => depth -= 1,
+                .identifier => {
+                    if (k > 0 and tags[k - 1] == .period) continue;
+                    const name = tree.tokenSlice(k);
+                    const param_idx = resolveParamIndex(tree, fn_proto, name) orelse continue;
+                    // Need at least `.<field>` after the param.
+                    if (k + 2 > last) continue;
+                    if (tags[k + 1] != .period or tags[k + 2] != .identifier) continue;
+                    var end = k + 2;
+                    while (end + 2 <= last and tags[end + 1] == .period and tags[end + 2] == .identifier) {
+                        end += 2;
+                    }
+                    const path_start = starts[k + 2];
+                    const path_end = starts[end] + tree.tokenSlice(end).len;
+                    const path = tree.source[path_start..path_end];
+
+                    // Dedupe against any existing entry with the
+                    // same (param, field).
+                    var already = false;
+                    for (fields.items) |ff| {
+                        if (ff.param == param_idx and std.mem.eql(u8, ff.field, path)) {
+                            already = true;
+                            break;
+                        }
+                    }
+                    if (!already) try fields.append(gpa, .{
+                        .param = param_idx,
+                        .field = path,
+                    });
+                    k = end;
+                },
+                else => {},
+            }
+        }
+    }
 }
 
 /// Resolve a method by (containing_type, name) — local DB first,
