@@ -23,6 +23,7 @@ const dead_errdefer_in_result_fn_mod = @import("dead_errdefer_in_result_fn.zig")
 const duplicate_errdefer_mod = @import("duplicate_errdefer.zig");
 const overwrite_without_deinit_mod = @import("overwrite_without_deinit.zig");
 const stack_fallback_escape_mod = @import("stack_fallback_escape.zig");
+const unreleased_refs_on_error_mod = @import("unreleased_refs_on_error.zig");
 const rule_catalog_mod = @import("rule_catalog.zig");
 
 pub const Config = config_mod.Config;
@@ -160,6 +161,12 @@ pub fn analyzeEscape(
     // built on `std.heap.stackFallback(N, …).get()` escapes the
     // fn → dangles into caller's stack frame.
     try stack_fallback_escape_mod.check(gpa, &tree, config, &problems);
+
+    // Unreleased-refs-on-error (hexops/mach
+    // sysgpu/vulkan.zig:1887) — loop body acquires refcounted refs
+    // via `<obj>.<addref>()` and a later `try` runs with no
+    // `errdefer <obj>.<release>()` registered.
+    try unreleased_refs_on_error_mod.check(gpa, &tree, config, &problems);
 
     return problems.toOwnedSlice(gpa);
 }
@@ -618,5 +625,6 @@ test {
     _ = duplicate_errdefer_mod;
     _ = overwrite_without_deinit_mod;
     _ = stack_fallback_escape_mod;
+    _ = unreleased_refs_on_error_mod;
     std.testing.refAllDecls(@This());
 }

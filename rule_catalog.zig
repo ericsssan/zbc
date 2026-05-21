@@ -134,6 +134,11 @@ pub const all = [_]Rule{
         .title = "value built on a `stackFallback(N, …)` allocator escapes the fn — points at caller's stack buffer",
         .body = @embedFile("rules/stack-fallback-escape.md"),
     },
+    .{
+        .id = "unreleased-refs-on-error",
+        .title = "loop calls `<obj>.<addref>()` then a later `try` runs with no `errdefer` releasing — refs leak on error",
+        .body = @embedFile("rules/unreleased-refs-on-error.md"),
+    },
 };
 
 /// Look up a rule by id.  Returns null on unknown id so callers can

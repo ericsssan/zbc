@@ -197,9 +197,20 @@ pub const Invariant = enum {
     /// ghostty-org/ghostty#9885 class; same shape as
     /// ziglang/zig#16344.
     stack_fallback_escape,
+    /// A loop body contains `<obj>.<addref>()` calls (where addref ∈
+    /// {`reference`, `retain`, `addRef`, `addref`}) acquiring
+    /// refcounted references, and the enclosing fn has a later `try`
+    /// with no `errdefer` containing a release-class method call
+    /// (`release` / `deref` / `unref` / `removeRef`).  On the try's
+    /// error path the references taken in the loop leak.  Catches
+    /// the `hexops/mach` sysgpu/vulkan.zig PipelineLayout.init class:
+    /// `for (...) |bgl| bgl.manager.reference();` then `try
+    /// vkd.createPipelineLayout(...);` — no errdefer releases the
+    /// references on vulkan-create failure.
+    unreleased_refs_on_error,
 };
 
-pub const all_invariants: [21]Invariant = .{
+pub const all_invariants: [22]Invariant = .{
     .arena_escape,
     .stack_escape,
     .use_undefined,
@@ -221,6 +232,7 @@ pub const all_invariants: [21]Invariant = .{
     .duplicate_errdefer,
     .overwrite_without_deinit,
     .stack_fallback_escape,
+    .unreleased_refs_on_error,
 };
 
 pub const Default: Config = .{};
