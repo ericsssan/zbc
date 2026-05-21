@@ -14,6 +14,7 @@ const problem_mod = @import("problem.zig");
 const require_borrowed_from = @import("rules/require_borrowed_from.zig");
 const aliased_heap_dupe_mod = @import("aliased_heap_dupe.zig");
 const clobbered_by_struct_reset_mod = @import("clobbered_by_struct_reset.zig");
+const realloc_byte_count_mod = @import("realloc_byte_count.zig");
 const rule_catalog_mod = @import("rule_catalog.zig");
 
 pub const Config = config_mod.Config;
@@ -107,6 +108,11 @@ pub fn analyzeEscape(
     // per-fn check.  `<obj>.<X> = …;` followed by `<obj>.* = T{…}`
     // that omits `.<X>` silently drops the prior write.
     try clobbered_by_struct_reset_mod.check(gpa, &tree, &db, config, &problems);
+
+    // Realloc-byte-count (PR #29452) — `<x>.realloc(slice, n *
+    // @sizeOf(T))` over-allocates by `@sizeOf(T)×`.  Whole-file
+    // token scan, no Db dependency.
+    try realloc_byte_count_mod.check(gpa, &tree, config, &problems);
 
     return problems.toOwnedSlice(gpa);
 }

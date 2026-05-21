@@ -115,9 +115,16 @@ pub const Invariant = enum {
     /// (which checks the now-default value).  Catches PR #29854
     /// class: `PathWatcher.init` clobbered `this.resolved_path`.
     clobbered_by_struct_reset,
+    /// A call to `<allocator>.realloc(slice, <expr> * @sizeOf(T))`
+    /// — the new-length argument multiplies by `@sizeOf(T)` as if
+    /// it were a byte count, but Zig's `Allocator.realloc` takes
+    /// an ELEMENT count.  The allocation grows by `@sizeOf(T)×`
+    /// the intended size on every call.  Catches PR #29452 class:
+    /// `SmallList.tryGrow` over-allocated.
+    realloc_byte_count,
 };
 
-pub const all_invariants: [12]Invariant = .{
+pub const all_invariants: [13]Invariant = .{
     .arena_escape,
     .stack_escape,
     .use_undefined,
@@ -130,6 +137,7 @@ pub const all_invariants: [12]Invariant = .{
     .partial_union_write,
     .aliased_heap_dupe,
     .clobbered_by_struct_reset,
+    .realloc_byte_count,
 };
 
 pub const Default: Config = .{};

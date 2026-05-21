@@ -89,6 +89,11 @@ pub const all = [_]Rule{
         .title = "`this.<X> = …;` then `this.* = StructLit{…}` without `.<X>` — heap pointer dropped to default",
         .body = @embedFile("rules/clobbered-by-struct-reset.md"),
     },
+    .{
+        .id = "realloc-byte-count",
+        .title = "`allocator.realloc(slice, n * @sizeOf(T))` — Zig's realloc takes ELEMENT count, not bytes",
+        .body = @embedFile("rules/realloc-byte-count.md"),
+    },
 };
 
 /// Look up a rule by id.  Returns null on unknown id so callers can
