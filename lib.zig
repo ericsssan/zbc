@@ -13,6 +13,7 @@ const problem_mod = @import("problem.zig");
 
 const require_borrowed_from = @import("rules/require_borrowed_from.zig");
 const aliased_heap_dupe_mod = @import("aliased_heap_dupe.zig");
+const clobbered_by_struct_reset_mod = @import("clobbered_by_struct_reset.zig");
 const rule_catalog_mod = @import("rule_catalog.zig");
 
 pub const Config = config_mod.Config;
@@ -101,6 +102,11 @@ pub fn analyzeEscape(
     // over the parsed tree.  Runs after the per-fn cfg loop so we
     // have a fully-populated Db (flag_owned_fields etc.).
     try aliased_heap_dupe_mod.check(gpa, &tree, &db, config, &problems);
+
+    // Clobbered-by-struct-reset (PR #29854) — purely syntactic
+    // per-fn check.  `<obj>.<X> = …;` followed by `<obj>.* = T{…}`
+    // that omits `.<X>` silently drops the prior write.
+    try clobbered_by_struct_reset_mod.check(gpa, &tree, &db, config, &problems);
 
     return problems.toOwnedSlice(gpa);
 }

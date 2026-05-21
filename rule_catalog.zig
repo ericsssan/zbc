@@ -84,6 +84,11 @@ pub const all = [_]Rule{
         .title = "dupe returns `T` by value with `var dup = this.*;` — heap-owning fields alias the source",
         .body = @embedFile("rules/aliased-heap-dupe.md"),
     },
+    .{
+        .id = "clobbered-by-struct-reset",
+        .title = "`this.<X> = …;` then `this.* = StructLit{…}` without `.<X>` — heap pointer dropped to default",
+        .body = @embedFile("rules/clobbered-by-struct-reset.md"),
+    },
 };
 
 /// Look up a rule by id.  Returns null on unknown id so callers can

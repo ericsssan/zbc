@@ -107,9 +107,17 @@ pub const Invariant = enum {
     /// later frees from each side collide (UAF, then double-free).
     /// Catches PR #29910 class: `Blob.dupeWithContentType`.
     aliased_heap_dupe,
+    /// A heap-owning field is assigned (`this.<X> = <expr>;`) and
+    /// then `this.*` is overwritten with a struct literal that
+    /// does NOT include `.<X>`, so `<X>` silently falls back to
+    /// its declared default (usually `null` / `&.{}`).  The prior
+    /// heap pointer is unreachable and never freed by `deinit()`
+    /// (which checks the now-default value).  Catches PR #29854
+    /// class: `PathWatcher.init` clobbered `this.resolved_path`.
+    clobbered_by_struct_reset,
 };
 
-pub const all_invariants: [11]Invariant = .{
+pub const all_invariants: [12]Invariant = .{
     .arena_escape,
     .stack_escape,
     .use_undefined,
@@ -121,6 +129,7 @@ pub const all_invariants: [11]Invariant = .{
     .heap_leak,
     .partial_union_write,
     .aliased_heap_dupe,
+    .clobbered_by_struct_reset,
 };
 
 pub const Default: Config = .{};
