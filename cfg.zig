@@ -175,6 +175,15 @@ pub const StmtKind = union(enum) {
     /// `type_name` is the bare ident of T (source slice); used
     /// in the diagnostic.
     leak_warning: struct { type_name: []const u8 },
+    /// `<long-lived-lhs> = .{ .tag = <expr> }` where `<expr>`
+    /// contains an early-exit (`try` or `catch ... return /
+    /// unreachable`).  Zig writes the union tag to the result
+    /// location before evaluating the payload, so the early-exit
+    /// path leaves the LHS with the new tag and stale payload
+    /// bytes.  PR #29422 class.  `tag_name` is the source slice
+    /// of the union variant being written (`.zlib`, `.namedPipe`,
+    /// `.Locked`, `.err`, …).
+    partial_union_write: struct { tag_name: []const u8 },
     /// Re-bind a local to .plain.  Emitted at loop body entry for
     /// `while (it) |n|` / `for (xs) |x|` captures so back-edges
     /// don't carry one iteration's `free(n)` state into the next —
@@ -1973,6 +1982,15 @@ const Builder = struct {
             // `(install, "ca.str")`.  PR #25563 shape.
             try self.unpackStructInitFields(cur.*, fref.parent, fref.name, rhs,
                 self.posOf(assign_node), self.endPosOf(assign_node));
+            // PR #29422: `obj.field = .{ .tag = try ... }` leaves
+            // the union with the new tag and garbage payload on the
+            // error path.  Fire only on field assignments through a
+            // pointer-typed parent — pure-local field writes don't
+            // outlive the frame and aren't observable.
+            if (self.locals.items[@intFromEnum(fref.parent)].is_pointer) {
+                try self.maybePartialUnionWrite(cur.*, rhs,
+                    self.posOf(assign_node), self.endPosOf(assign_node));
+            }
             // Escape-via-out-param: `out.field = X` where `out` is a
             // pointer-typed parameter writes through to caller
             // storage.  If X's origin is a function-local arena /
@@ -2011,6 +2029,22 @@ const Builder = struct {
                 .pos = self.posOf(assign_node),
                 .end_pos = self.endPosOf(assign_node),
             });
+            // PR #29422: `this.* = .{ .tag = try ... }` — same
+            // partial-write hazard as the field case above, but
+            // ONLY when the deref target is itself a tagged union
+            // (not a plain 1-field struct masquerading with `.{ .x
+            // = ... }` syntax — `ErrorResponse.zig` / `NoticeResponse.zig`
+            // FP).  We approximate "tagged union" with a substring
+            // scan of the file for `<type_name> = union(` — cheap,
+            // accurate for canonical Zig idiom, and only used to
+            // suppress FPs on the deref case (the field-of-pointer
+            // case above has no symmetric FP class because most
+            // observed field LHSs ARE unions).
+            const tn = self.locals.items[@intFromEnum(out_local)].type_name;
+            if (tn != null and self.typeIsTaggedUnion(tn.?)) {
+                try self.maybePartialUnionWrite(cur.*, rhs,
+                    self.posOf(assign_node), self.endPosOf(assign_node));
+            }
         } else if (tree.nodeTag(lhs) == .identifier and
             std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(lhs)), "_"))
         {
@@ -4178,6 +4212,95 @@ const Builder = struct {
         if (tags[first - 2] != .identifier) return null;
         if (tags[first - 3] != .period) return null;
         return tree.tokenSlice(first - 2);
+    }
+
+    /// Heuristic: scan the file source for `<type_name> = union(`
+    /// to detect that the named type is declared as a tagged union
+    /// (`union(enum)` or `union(SomeEnum)`).  Used by
+    /// `maybePartialUnionWrite` to suppress FPs on 1-field plain
+    /// structs (`const NoticeResponse = struct { messages: ... };`
+    /// — `this.* = .{ .messages = try ... }` looks identical to a
+    /// union literal but is just a struct init, no tag-write
+    /// hazard).  Substring match is accurate for canonical Zig
+    /// idiom; misses cross-file decls and unusual forms like
+    /// `const T: type = union(enum) { ... }` — false negatives,
+    /// not positives, which is the safer side.
+    fn typeIsTaggedUnion(self: *const Builder, type_name: []const u8) bool {
+        const src = self.tree.source;
+        var buf: [256]u8 = undefined;
+        const suffix = " = union(";
+        if (type_name.len + suffix.len > buf.len) return true;
+        @memcpy(buf[0..type_name.len], type_name);
+        @memcpy(buf[type_name.len..][0..suffix.len], suffix);
+        return std.mem.indexOf(u8, src, buf[0 .. type_name.len + suffix.len]) != null;
+    }
+
+    /// True iff the token range of `node` contains a control-flow
+    /// early-exit that would skip past a surrounding tagged-union
+    /// literal's payload evaluation AND let the partial-write be
+    /// observed — i.e. `try` (which exits via the enclosing fn's
+    /// error path and runs errdefers between tag-write and return),
+    /// or `catch` whose arm body contains a `return` (same: any
+    /// errdefer / side-effect-in-catch-body observes the partial
+    /// state).  `catch unreachable` is excluded — it aborts the
+    /// process immediately, so the partial state is never read.
+    /// Pure token scan; matches conservatively across nested
+    /// expressions, which is fine because anonymous struct-literal
+    /// payloads almost never contain unrelated `return`s.
+    fn fieldValueHasEarlyExit(self: *Builder, node: Ast.Node.Index) bool {
+        const tree = self.tree;
+        const first = tree.firstToken(node);
+        const last = tree.lastToken(node);
+        const tags = tree.tokens.items(.tag);
+        var catch_seen: bool = false;
+        var t: Ast.TokenIndex = first;
+        while (t <= last) : (t += 1) {
+            switch (tags[t]) {
+                .keyword_try => return true,
+                .keyword_catch => catch_seen = true,
+                .keyword_return => {
+                    if (catch_seen) return true;
+                },
+                else => {},
+            }
+        }
+        return false;
+    }
+
+    /// PR #29422: scan a struct-literal RHS for top-level fields
+    /// whose payload contains an early-exit, and emit
+    /// `partial_union_write` for each.  Only called from
+    /// `lowerAssign` for LHS shapes that reach long-lived storage
+    /// (`x.*` or `obj.field`) — pure-local writes don't have the
+    /// same observable-on-error problem because the local dies
+    /// with the frame.
+    fn maybePartialUnionWrite(
+        self: *Builder,
+        cur: BlockId,
+        rhs: Ast.Node.Index,
+        pos: SrcPos,
+        end_pos: SrcPos,
+    ) !void {
+        const tree = self.tree;
+        var buf: [2]Ast.Node.Index = undefined;
+        const init = tree.fullStructInit(&buf, rhs) orelse return;
+        // Tagged-union literals always have EXACTLY ONE field — a
+        // union has one active variant per value, so the syntactic
+        // shape `.{ .tag = expr }` always has a single initializer.
+        // Multi-field anonymous literals are regular struct inits,
+        // not unions; the tag-then-payload write-order hazard does
+        // not apply to them.  This single-field gate is what
+        // separates real catches from FPs like `header.* = .{ .a =
+        // x, .b = y, ... };`.
+        if (init.ast.fields.len != 1) return;
+        const field_value = init.ast.fields[0];
+        const tag_name = self.fieldInitName(field_value) orelse return;
+        if (!self.fieldValueHasEarlyExit(field_value)) return;
+        try self.appendStmt(cur, .{
+            .kind = .{ .partial_union_write = .{ .tag_name = tag_name } },
+            .pos = pos,
+            .end_pos = end_pos,
+        });
     }
 
     /// Build a dotted path `prefix.leaf` and stash the allocated bytes

@@ -74,6 +74,11 @@ pub const all = [_]Rule{
         .title = "destructor of a heap-allocated type never frees `self`",
         .body = @embedFile("rules/heap-leak.md"),
     },
+    .{
+        .id = "partial-union-write",
+        .title = "tagged-union literal with `try`/`catch return` in payload — tag is written before payload",
+        .body = @embedFile("rules/partial-union-write.md"),
+    },
 };
 
 /// Look up a rule by id.  Returns null on unknown id so callers can

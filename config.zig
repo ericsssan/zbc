@@ -88,9 +88,19 @@ pub const Invariant = enum {
     /// self via `allocator.create(...)` but `finalize()` never
     /// calls `allocator.destroy(this)`.
     heap_leak,
+    /// An assignment to long-lived storage (`x.* = ...` or
+    /// `obj.field = ...`) whose RHS is an anonymous struct literal
+    /// `.{ .tag = <expr> }` where `<expr>` contains an early-exit
+    /// (`try ...` or `catch return ...` / `catch |...| { ... return; ... }`).
+    /// Zig writes the union tag to the result location BEFORE
+    /// evaluating the payload, so on the error path the LHS is
+    /// left with the new tag and the old/garbage payload bytes — a
+    /// later read (often via an `errdefer this.deinit()`) sees a
+    /// wild pointer.  Catches PR #29422 class.
+    partial_union_write,
 };
 
-pub const all_invariants: [9]Invariant = .{
+pub const all_invariants: [10]Invariant = .{
     .arena_escape,
     .stack_escape,
     .use_undefined,
@@ -100,6 +110,7 @@ pub const all_invariants: [9]Invariant = .{
     .allocator_mismatch,
     .interior_pointer_destroy,
     .heap_leak,
+    .partial_union_write,
 };
 
 pub const Default: Config = .{};

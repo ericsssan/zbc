@@ -76,6 +76,7 @@ pub fn transfer(ctx: Ctx, state: *AbstractState, stmt: Stmt) !void {
         .out_param_write => |w| try transferOutParamWrite(ctx, state, w, stmt.pos, stmt.end_pos),
         .interior_pointer_destroy => |i| try transferInteriorPointerDestroy(ctx, state, i, stmt.pos, stmt.end_pos),
         .leak_warning => |l| try transferLeakWarning(ctx, l, stmt.pos, stmt.end_pos),
+        .partial_union_write => |p| try transferPartialUnionWrite(ctx, p, stmt.pos, stmt.end_pos),
         .lowering_gap => |g| try transferGap(ctx, state, g, stmt.pos),
     }
 }
@@ -90,6 +91,18 @@ fn transferLeakWarning(
     try report(ctx, "heap-leak", pos, end_pos, .@"error",
         "destructor for `{s}` does not free `self` — instances allocated by the type's heap-creator leak (no `allocator.destroy(self)` reachable from this destructor)",
         .{l.type_name});
+}
+
+fn transferPartialUnionWrite(
+    ctx: Ctx,
+    p: @TypeOf(@as(StmtKind, undefined).partial_union_write),
+    pos: cfg.SrcPos,
+    end_pos: cfg.SrcPos,
+) !void {
+    if (!config_mod.isEnabled(ctx.config, .partial_union_write)) return;
+    try report(ctx, "partial-union-write", pos, end_pos, .@"error",
+        "tagged-union literal writes the `.{s}` tag before evaluating its payload; an early-exit (`try` / `catch return`) in the payload leaves the LHS with the new tag and stale/garbage payload bytes — hoist the fallible expression into a local first",
+        .{p.tag_name});
 }
 
 fn transferInteriorPointerDestroy(
