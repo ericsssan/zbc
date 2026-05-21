@@ -18,6 +18,7 @@ const realloc_byte_count_mod = @import("realloc_byte_count.zig");
 const asymmetric_field_free_mod = @import("asymmetric_field_free.zig");
 const missing_errdefer_between_tries_mod = @import("missing_errdefer_between_tries.zig");
 const free_then_try_realloc_mod = @import("free_then_try_realloc.zig");
+const destroy_after_deinit_in_loop_mod = @import("destroy_after_deinit_in_loop.zig");
 const rule_catalog_mod = @import("rule_catalog.zig");
 
 pub const Config = config_mod.Config;
@@ -130,6 +131,11 @@ pub fn analyzeEscape(
     // alloc(…);` leaves X dangling on alloc failure.  Whole-file
     // token scan.
     try free_then_try_realloc_mod.check(gpa, &tree, config, &problems);
+
+    // Destroy-after-deinit-in-loop (PR #29879) — destructor loops
+    // `<h>.deinit();` over pointer-list items without per-item
+    // `destroy`.  Whole-file token scan, destructor-fns only.
+    try destroy_after_deinit_in_loop_mod.check(gpa, &tree, config, &problems);
 
     return problems.toOwnedSlice(gpa);
 }

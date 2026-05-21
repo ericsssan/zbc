@@ -147,9 +147,20 @@ pub const Invariant = enum {
     /// Catches PR #29968 class: MySQLConnection.handleResultSet
     /// reallocating `statement.columns` without clearing first.
     free_then_try_realloc,
+    /// A destructor (`deinit` / `finalize` / `destroy`) loops over
+    /// `<list>.items` calling `<h>.deinit()` per item but never
+    /// `<allocator>.destroy(<h>)` (or `.free(<h>)`).  When the
+    /// list's element type is a heap-allocated pointer (e.g.
+    /// `std.ArrayList...(*Handler)` with items minted via
+    /// `allocator.create(Handler)`), the per-item destructor
+    /// reclaims the item's fields but not its heap descriptor —
+    /// every list item leaks its allocation.  Catches PR #29879
+    /// class: `LOLHTMLContext.deinit` looped handlers and called
+    /// `handler.deinit()` but never `allocator.destroy(handler)`.
+    destroy_after_deinit_in_loop,
 };
 
-pub const all_invariants: [16]Invariant = .{
+pub const all_invariants: [17]Invariant = .{
     .arena_escape,
     .stack_escape,
     .use_undefined,
@@ -166,6 +177,7 @@ pub const all_invariants: [16]Invariant = .{
     .asymmetric_field_free,
     .missing_errdefer_between_tries,
     .free_then_try_realloc,
+    .destroy_after_deinit_in_loop,
 };
 
 pub const Default: Config = .{};

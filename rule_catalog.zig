@@ -109,6 +109,11 @@ pub const all = [_]Rule{
         .title = "`free(X); X = try alloc(…);` without clearing X first — X dangles on alloc failure → double-free in `deinit`",
         .body = @embedFile("rules/free-then-try-realloc.md"),
     },
+    .{
+        .id = "destroy-after-deinit-in-loop",
+        .title = "destructor loops `<h>.deinit();` over pointer-list items without `<allocator>.destroy(<h>);` — heap descriptors leak",
+        .body = @embedFile("rules/destroy-after-deinit-in-loop.md"),
+    },
 };
 
 /// Look up a rule by id.  Returns null on unknown id so callers can
