@@ -174,6 +174,11 @@ pub const all = [_]Rule{
         .title = "switch arm deinit'd payload but didn't retag the union — idempotent reset/clear/end fn will double-free on next call",
         .body = @embedFile("rules/union-deinit-without-inert-reset.md"),
     },
+    .{
+        .id = "self-undefined-after-destroy",
+        .title = "`<X>.* = ...` / `<X>.<field> = ...` after `<alloc>.destroy(<X>);` — write hits freed memory (TigerStyle order inverted)",
+        .body = @embedFile("rules/self-undefined-after-destroy.md"),
+    },
 };
 
 /// Look up a rule by id.  Returns null on unknown id so callers can

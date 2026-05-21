@@ -280,9 +280,16 @@ pub const Invariant = enum {
     /// next call fires the same arm and double-frees.  Catches
     /// ghostty-org/ghostty#2257 + #8307 class.
     union_deinit_without_inert_reset,
+    /// `<alloc>.destroy(<X>);` immediately followed by `<X>.* = ...`
+    /// or `<X>.<field> = ...` — the write hits freed memory.  The
+    /// canonical TigerStyle invariant is overwrite-THEN-free:
+    /// `<X>.* = undefined; <alloc>.destroy(<X>);` — this rule
+    /// catches the inversion.  Catches tigerbeetle/tigerbeetle#2687
+    /// class.
+    self_undefined_after_destroy,
 };
 
-pub const all_invariants: [29]Invariant = .{
+pub const all_invariants: [30]Invariant = .{
     .arena_escape,
     .stack_escape,
     .use_undefined,
@@ -312,6 +319,7 @@ pub const all_invariants: [29]Invariant = .{
     .free_without_null_then_check,
     .tagged_union_retag_with_old_payload_read,
     .union_deinit_without_inert_reset,
+    .self_undefined_after_destroy,
 };
 
 pub const Default: Config = .{};

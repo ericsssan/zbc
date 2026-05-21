@@ -38,6 +38,7 @@ Bun's.
 | `free_without_null_then_check.zig` | `free-without-null-then-check` | [oven-sh/bun#30148](https://github.com/oven-sh/bun/pull/30148), [oven-sh/bun#30176](https://github.com/oven-sh/bun/pull/30176), [oven-sh/bun#29983](https://github.com/oven-sh/bun/pull/29983), [oven-sh/bun#29988](https://github.com/oven-sh/bun/pull/29988) |
 | `tagged_union_retag_with_old_payload_read.zig` | `tagged-union-retag-with-old-payload-read` | [tigerbeetle/tigerbeetle#3317](https://github.com/tigerbeetle/tigerbeetle/pull/3317), [tigerbeetle/tigerbeetle#2200](https://github.com/tigerbeetle/tigerbeetle/pull/2200) |
 | `union_deinit_without_inert_reset.zig` | `union-deinit-without-inert-reset` | [ghostty-org/ghostty#2257](https://github.com/ghostty-org/ghostty/pull/2257), [ghostty-org/ghostty#8307](https://github.com/ghostty-org/ghostty/pull/8307) |
+| `self_undefined_after_destroy.zig` | `self-undefined-after-destroy` | [tigerbeetle/tigerbeetle#2687](https://github.com/tigerbeetle/tigerbeetle/pull/2687) |
 
 ## Re-fetching the actual pre-merge buggy files
 

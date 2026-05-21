@@ -31,6 +31,7 @@ const slice_of_arena_into_heap_mod = @import("slice_of_arena_into_heap.zig");
 const free_without_null_then_check_mod = @import("free_without_null_then_check.zig");
 const tagged_union_retag_with_old_payload_read_mod = @import("tagged_union_retag_with_old_payload_read.zig");
 const union_deinit_without_inert_reset_mod = @import("union_deinit_without_inert_reset.zig");
+const self_undefined_after_destroy_mod = @import("self_undefined_after_destroy.zig");
 const rule_catalog_mod = @import("rule_catalog.zig");
 
 pub const Config = config_mod.Config;
@@ -212,6 +213,12 @@ pub fn analyzeEscape(
     // reset/clear/end fn the next call fires the same arm and
     // double-frees the already-freed payload.
     try union_deinit_without_inert_reset_mod.check(gpa, &tree, config, &problems);
+
+    // Self-undefined-after-destroy — `<alloc>.destroy(<X>);` then
+    // `<X>.* = ...;` or `<X>.<field> = ...;` writes through freed
+    // memory (TigerStyle order inverted; canonical order is
+    // overwrite-then-free).
+    try self_undefined_after_destroy_mod.check(gpa, &tree, config, &problems);
 
     return problems.toOwnedSlice(gpa);
 }
@@ -678,5 +685,6 @@ test {
     _ = free_without_null_then_check_mod;
     _ = tagged_union_retag_with_old_payload_read_mod;
     _ = union_deinit_without_inert_reset_mod;
+    _ = self_undefined_after_destroy_mod;
     std.testing.refAllDecls(@This());
 }
