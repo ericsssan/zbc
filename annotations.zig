@@ -1133,10 +1133,55 @@ fn tryInferFromReturnExpr(
     db: *const Db,
     remote: ?RemoteCtx,
 ) ?ReturnsAnnotation {
+    // Extends-storage form: `return .{ .field = <param> }` or
+    // `return T{ .field = <param> }` — the returned value carries
+    // a param's storage in one of its fields.  R7's call-style
+    // walks below don't see this (the return expression isn't a
+    // call), so try it first.
+    if (inferReturnStructLiteralBorrowsParam(tree, fn_proto, return_expr)) |a| return a;
+
     var buf: [1]Ast.Node.Index = undefined;
     const call_full = tree.fullCall(&buf, return_expr) orelse return null;
     if (inferMethodStyle(tree, fn_proto, return_expr, db, remote)) |a| return a;
     return inferNamespaceStyle(tree, fn_proto, call_full, db, remote);
+}
+
+/// Inference for the canonical wrapper-constructor shape:
+///
+///     pub fn init(slice: []const u8) ZigString {
+///         return .{ .data = slice };
+///     }
+///
+/// When the return expression is a struct literal and any field
+/// initializer is exactly a fn-param identifier, infer
+/// `@returns borrowed_from(<that param>)`.  Picks the first such
+/// param when multiple fields match different params — acceptable
+/// approximation; callers chase the lifetime root, and any of the
+/// borrows would do.
+///
+/// Skipped when:
+/// - The return expr isn't a struct literal.
+/// - No field's value resolves to a known param.
+/// - A field value contains a CALL (constructor likely allocates,
+///   so the result owns its storage rather than borrowing from
+///   the param).
+fn inferReturnStructLiteralBorrowsParam(
+    tree: *const Ast,
+    fn_proto: Ast.full.FnProto,
+    return_expr: Ast.Node.Index,
+) ?ReturnsAnnotation {
+    var buf: [2]Ast.Node.Index = undefined;
+    const si = tree.fullStructInit(&buf, return_expr) orelse return null;
+    for (si.ast.fields) |field_value| {
+        // Field value must be a bare param identifier — reject
+        // calls / paren-exprs / anything more elaborate to keep
+        // the inference conservative.
+        if (tree.nodeTag(field_value) != .identifier) continue;
+        const name = tree.tokenSlice(tree.nodeMainToken(field_value));
+        const idx = resolveParamIndex(tree, fn_proto, name) orelse continue;
+        return .{ .borrowed_from = idx };
+    }
+    return null;
 }
 
 /// Walk every `.@"return"` node whose token range lies within

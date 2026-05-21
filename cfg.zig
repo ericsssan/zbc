@@ -3663,11 +3663,26 @@ const Builder = struct {
                 const method_tok = fa_data.node_and_token[1];
                 const method_name = tree.tokenSlice(method_tok);
 
+                // Distinguish method-style (`obj.f(args)` where
+                // `obj` is a local — receiver IS arg 0) from
+                // same-file namespace-style (`Type.f(args)` where
+                // `Type` is the containing struct's name —
+                // receiver IS the namespace, not a logical arg).
+                // Without this, an inferred
+                // `@returns borrowed_from(0)` on `Type.init(slice)`
+                // would resolve param 0 to `Type` itself, missing
+                // the actual borrow source.
+                const recv_is_local = blk: {
+                    if (tree.nodeTag(recv_node) != .identifier) break :blk false;
+                    const recv_name = tree.tokenSlice(tree.nodeMainToken(recv_node));
+                    break :blk self.name_to_local.contains(recv_name);
+                };
+
                 // 1. Same-file DB hit on method name.
                 if (self.db) |db| {
                     if (db.lookup(method_name)) |entry| {
                         if (entry.annotation) |a| {
-                            return self.applyAnnotationToCall(a, recv_node, args, true);
+                            return self.applyAnnotationToCall(a, recv_node, args, recv_is_local);
                         }
                     }
                 }
