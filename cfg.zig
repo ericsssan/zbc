@@ -3059,12 +3059,24 @@ const Builder = struct {
             // where nested-literal inference marks dotted paths
             // borrowed but the single-level classifier above only
             // catches `<local>.<field>`.
+            //
+            // Two-tier lookup: first try the literal dotted-path
+            // (set by nested-literal inference) for a direct match,
+            // then fall through to a per-step walk via
+            // `isBorrowedDeepChain` which threads through
+            // `db.field_types`, stops at any pointer-typed
+            // intermediate field, and reports any `@borrowed`
+            // step along the way.  The per-step path catches the
+            // explicit-leaf-annotation case
+            // (`Inner.buf @borrowed`, read via `o.outer.buf`).
             if (self.db) |db| {
                 if (self.fieldLhsFor(expr_node)) |fref| {
                     const info = self.locals.items[@intFromEnum(fref.parent)];
-                    if (info.type_name) |ty| if (db.isBorrowedField(ty, fref.name)) {
-                        if (!info.is_pointer) return .{ .stack_ref = fref.parent };
-                    };
+                    if (info.type_name) |ty| {
+                        const borrowed = db.isBorrowedField(ty, fref.name) or
+                            db.isBorrowedDeepChain(ty, fref.name);
+                        if (borrowed and !info.is_pointer) return .{ .stack_ref = fref.parent };
+                    }
                 }
             }
         }

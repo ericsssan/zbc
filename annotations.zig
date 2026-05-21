@@ -123,6 +123,13 @@ pub const Db = struct {
     /// lookup to the FIELD's type rather than the local's type or
     /// the bare name.
     field_types: std.HashMapUnmanaged(FieldKey, []const u8, FieldKey.Context, std.hash_map.default_max_load_percentage) = .empty,
+    /// Subset of `field_types` keys whose original declared type
+    /// began with `*` (after `?` / `const` stripping).  Used by
+    /// the per-step deep-chain `@borrowed` walker — when an
+    /// intermediate field is pointer-typed, the chain "breaks"
+    /// (the pointee lives elsewhere, not in the root's storage),
+    /// so we stop traversing.
+    field_is_pointer: std.HashMapUnmanaged(FieldKey, void, FieldKey.Context, std.hash_map.default_max_load_percentage) = .empty,
     /// (containing-struct, field-name) ∈ set when the field is
     /// annotated `/// @borrowed` — meaning its storage is owned by
     /// the containing struct.  Reading or copying the field gives
@@ -154,6 +161,7 @@ pub const Db = struct {
         self.fns.deinit(gpa);
         self.containing_types.deinit(gpa);
         self.field_types.deinit(gpa);
+        self.field_is_pointer.deinit(gpa);
         self.borrowed_fields.deinit(gpa);
         for (self.owned_paths.items) |p| gpa.free(p);
         self.owned_paths.deinit(gpa);
@@ -174,6 +182,40 @@ pub const Db = struct {
             .containing_type = struct_name,
             .name = field_name,
         }, .{});
+    }
+
+    /// True iff `<struct_name>.<field_name>` is borrowed when
+    /// reached through a chain of value-typed fields — walks the
+    /// dotted path `dotted_path` from `root_type` step by step
+    /// via `field_types`, stopping at any pointer-typed
+    /// intermediate (chain breaks there).  At the final segment
+    /// checks `isBorrowedField` on the resolved containing type.
+    ///
+    /// Returns true if any step in the chain is itself borrowed
+    /// (`Owner.outer` annotated `@borrowed`), since reading
+    /// anything beneath the borrowed step is still tied to the
+    /// root's lifetime.
+    pub fn isBorrowedDeepChain(self: *const Db, root_type: []const u8, dotted_path: []const u8) bool {
+        var current_type = root_type;
+        var rest = dotted_path;
+        while (true) {
+            const dot = std.mem.indexOfScalar(u8, rest, '.');
+            const segment = if (dot) |d| rest[0..d] else rest;
+            if (segment.len == 0) return false;
+            if (self.isBorrowedField(current_type, segment)) return true;
+            if (dot == null) return false;
+            // Pointer-typed intermediate field → chain breaks here;
+            // anything past the pointer is not tied to the root.
+            if (self.field_is_pointer.containsContext(.{
+                .containing_type = current_type,
+                .name = segment,
+            }, .{})) return false;
+            current_type = self.field_types.get(.{
+                .containing_type = current_type,
+                .name = segment,
+            }) orelse return false;
+            rest = rest[dot.? + 1 ..];
+        }
     }
 
     pub const FieldKey = struct {
@@ -354,7 +396,7 @@ pub fn buildFull(
     // enum type; for each field declaration, record its declared
     // type.  Together these let `<recv>.<field>.<method>()` calls
     // disambiguate by both the local's type and the field's type.
-    try discoverContainingTypes(gpa, tree, &db.containing_types, &db.field_types, &db.borrowed_fields);
+    try discoverContainingTypes(gpa, tree, &db.containing_types, &db.field_types, &db.borrowed_fields, &db.field_is_pointer);
     const fn_to_type = &db.containing_types;
 
     // Pass 1 — explicit annotations + R6 (slice + body allocs → owned).
@@ -1494,9 +1536,10 @@ fn discoverContainingTypes(
     fn_out: *std.AutoHashMapUnmanaged(Ast.Node.Index, []const u8),
     field_out: *std.HashMapUnmanaged(Db.FieldKey, []const u8, Db.FieldKey.Context, std.hash_map.default_max_load_percentage),
     borrowed_out: *std.HashMapUnmanaged(Db.FieldKey, void, Db.FieldKey.Context, std.hash_map.default_max_load_percentage),
+    ptr_out: *std.HashMapUnmanaged(Db.FieldKey, void, Db.FieldKey.Context, std.hash_map.default_max_load_percentage),
 ) !void {
     const root = tree.containerDeclRoot();
-    try walkContainerMembers(gpa, tree, root.ast.members, null, fn_out, field_out, borrowed_out);
+    try walkContainerMembers(gpa, tree, root.ast.members, null, fn_out, field_out, borrowed_out, ptr_out);
 }
 
 fn walkContainerMembers(
@@ -1507,6 +1550,7 @@ fn walkContainerMembers(
     fn_out: *std.AutoHashMapUnmanaged(Ast.Node.Index, []const u8),
     field_out: *std.HashMapUnmanaged(Db.FieldKey, []const u8, Db.FieldKey.Context, std.hash_map.default_max_load_percentage),
     borrowed_out: *std.HashMapUnmanaged(Db.FieldKey, void, Db.FieldKey.Context, std.hash_map.default_max_load_percentage),
+    ptr_out: *std.HashMapUnmanaged(Db.FieldKey, void, Db.FieldKey.Context, std.hash_map.default_max_load_percentage),
 ) (std.mem.Allocator.Error)!void {
     for (members) |member| {
         switch (tree.nodeTag(member)) {
@@ -1525,7 +1569,7 @@ fn walkContainerMembers(
                 const name_tok = vd.ast.mut_token + 1;
                 if (tree.tokens.items(.tag)[name_tok] != .identifier) continue;
                 const ty_name = tree.tokenSlice(name_tok);
-                try descendContainer(gpa, tree, init_node, ty_name, fn_out, field_out, borrowed_out);
+                try descendContainer(gpa, tree, init_node, ty_name, fn_out, field_out, borrowed_out, ptr_out);
             },
             // Struct/union field declarations — `name: T [= default],`.
             .container_field_init,
@@ -1543,6 +1587,12 @@ fn walkContainerMembers(
                             .containing_type = ct,
                             .name = field_name,
                         }, field_ty, .{});
+                    }
+                    if (fieldTypeIsPointer(tree, type_expr)) {
+                        try ptr_out.putContext(gpa, .{
+                            .containing_type = ct,
+                            .name = field_name,
+                        }, {}, .{});
                     }
                 }
                 // Annotation scan: `/// @borrowed` (preceding doc
@@ -2130,30 +2180,49 @@ fn descendContainer(
     fn_out: *std.AutoHashMapUnmanaged(Ast.Node.Index, []const u8),
     field_out: *std.HashMapUnmanaged(Db.FieldKey, []const u8, Db.FieldKey.Context, std.hash_map.default_max_load_percentage),
     borrowed_out: *std.HashMapUnmanaged(Db.FieldKey, void, Db.FieldKey.Context, std.hash_map.default_max_load_percentage),
+    ptr_out: *std.HashMapUnmanaged(Db.FieldKey, void, Db.FieldKey.Context, std.hash_map.default_max_load_percentage),
 ) (std.mem.Allocator.Error)!void {
     switch (tree.nodeTag(node)) {
         .container_decl, .container_decl_trailing => {
-            try walkContainerMembers(gpa, tree, tree.containerDecl(node).ast.members, ty_name, fn_out, field_out, borrowed_out);
+            try walkContainerMembers(gpa, tree, tree.containerDecl(node).ast.members, ty_name, fn_out, field_out, borrowed_out, ptr_out);
         },
         .container_decl_two, .container_decl_two_trailing => {
             var buf: [2]Ast.Node.Index = undefined;
-            try walkContainerMembers(gpa, tree, tree.containerDeclTwo(&buf, node).ast.members, ty_name, fn_out, field_out, borrowed_out);
+            try walkContainerMembers(gpa, tree, tree.containerDeclTwo(&buf, node).ast.members, ty_name, fn_out, field_out, borrowed_out, ptr_out);
         },
         .container_decl_arg, .container_decl_arg_trailing => {
-            try walkContainerMembers(gpa, tree, tree.containerDeclArg(node).ast.members, ty_name, fn_out, field_out, borrowed_out);
+            try walkContainerMembers(gpa, tree, tree.containerDeclArg(node).ast.members, ty_name, fn_out, field_out, borrowed_out, ptr_out);
         },
         .tagged_union, .tagged_union_trailing => {
-            try walkContainerMembers(gpa, tree, tree.taggedUnion(node).ast.members, ty_name, fn_out, field_out, borrowed_out);
+            try walkContainerMembers(gpa, tree, tree.taggedUnion(node).ast.members, ty_name, fn_out, field_out, borrowed_out, ptr_out);
         },
         .tagged_union_two, .tagged_union_two_trailing => {
             var buf: [2]Ast.Node.Index = undefined;
-            try walkContainerMembers(gpa, tree, tree.taggedUnionTwo(&buf, node).ast.members, ty_name, fn_out, field_out, borrowed_out);
+            try walkContainerMembers(gpa, tree, tree.taggedUnionTwo(&buf, node).ast.members, ty_name, fn_out, field_out, borrowed_out, ptr_out);
         },
         .tagged_union_enum_tag, .tagged_union_enum_tag_trailing => {
-            try walkContainerMembers(gpa, tree, tree.taggedUnionEnumTag(node).ast.members, ty_name, fn_out, field_out, borrowed_out);
+            try walkContainerMembers(gpa, tree, tree.taggedUnionEnumTag(node).ast.members, ty_name, fn_out, field_out, borrowed_out, ptr_out);
         },
         else => {},
     }
+}
+
+/// True iff `type_expr`'s first non-trivia token (after `?` /
+/// `const`) is `*`.  Used to detect pointer-shaped fields so the
+/// deep-chain walker can stop traversing through them.
+fn fieldTypeIsPointer(tree: *const Ast, type_expr: Ast.Node.Index) bool {
+    const first = tree.firstToken(type_expr);
+    const last = tree.lastToken(type_expr);
+    const tags = tree.tokens.items(.tag);
+    var t: Ast.TokenIndex = first;
+    while (t <= last) : (t += 1) {
+        switch (tags[t]) {
+            .question_mark, .keyword_const => continue,
+            .asterisk => return true,
+            else => return false,
+        }
+    }
+    return false;
 }
 
 fn fullFnProto(tree: *const Ast, buf: *[1]Ast.Node.Index, node: Ast.Node.Index) ?Ast.full.FnProto {
