@@ -168,9 +168,18 @@ pub const Invariant = enum {
     /// parsers with `Result(T)` return type and dead errdefer
     /// blocks.
     dead_errdefer_in_result_fn,
+    /// Two `errdefer <X>.<cleanup>();` statements register the
+    /// same cleanup against the same receiver in one fn body.  On
+    /// the error path both fire — the cleanup runs twice and the
+    /// second call hits its assert / double-frees / corrupts
+    /// state.  Catches tigerbeetle/tigerbeetle#2700 class:
+    /// `Command.init` registered `errdefer command.io.deinit()`
+    /// twice; second `IO.deinit()` hit
+    /// `assert(self.fd >= 0)` in `IoUring.deinit`.
+    duplicate_errdefer,
 };
 
-pub const all_invariants: [18]Invariant = .{
+pub const all_invariants: [19]Invariant = .{
     .arena_escape,
     .stack_escape,
     .use_undefined,
@@ -189,6 +198,7 @@ pub const all_invariants: [18]Invariant = .{
     .free_then_try_realloc,
     .destroy_after_deinit_in_loop,
     .dead_errdefer_in_result_fn,
+    .duplicate_errdefer,
 };
 
 pub const Default: Config = .{};

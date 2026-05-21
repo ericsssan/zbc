@@ -27,6 +27,7 @@ Bun's.
 | `free_then_try_realloc_mysql.zig` | `free-then-try-realloc` (faithful MySQL repro, no `#`-private fields) | [oven-sh/bun#29968](https://github.com/oven-sh/bun/pull/29968) |
 | `destroy_after_deinit_in_loop.zig` | `destroy-after-deinit-in-loop` | [oven-sh/bun#29879](https://github.com/oven-sh/bun/pull/29879) |
 | `dead_errdefer_in_result_fn.zig` | `dead-errdefer-in-result-fn` | [oven-sh/bun#27706](https://github.com/oven-sh/bun/pull/27706) |
+| `duplicate_errdefer.zig` | `duplicate-errdefer` | [tigerbeetle/tigerbeetle#2700](https://github.com/tigerbeetle/tigerbeetle/pull/2700) |
 
 ## Re-fetching the actual pre-merge buggy files
 

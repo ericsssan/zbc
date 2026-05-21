@@ -20,6 +20,7 @@ const missing_errdefer_between_tries_mod = @import("missing_errdefer_between_tri
 const free_then_try_realloc_mod = @import("free_then_try_realloc.zig");
 const destroy_after_deinit_in_loop_mod = @import("destroy_after_deinit_in_loop.zig");
 const dead_errdefer_in_result_fn_mod = @import("dead_errdefer_in_result_fn.zig");
+const duplicate_errdefer_mod = @import("duplicate_errdefer.zig");
 const rule_catalog_mod = @import("rule_catalog.zig");
 
 pub const Config = config_mod.Config;
@@ -142,6 +143,11 @@ pub fn analyzeEscape(
     // fn returning a parameterized tagged-union (`Result(T)`) is
     // dead because `return .{ .err = e }` doesn't fire errdefers.
     try dead_errdefer_in_result_fn_mod.check(gpa, &tree, config, &problems);
+
+    // Duplicate-errdefer (tigerbeetle/tigerbeetle#2700) — two
+    // `errdefer X.deinit();` for the same receiver fire twice on
+    // the error path → double-free / assert.
+    try duplicate_errdefer_mod.check(gpa, &tree, config, &problems);
 
     return problems.toOwnedSlice(gpa);
 }
@@ -597,5 +603,6 @@ test {
     _ = free_then_try_realloc_mod;
     _ = destroy_after_deinit_in_loop_mod;
     _ = dead_errdefer_in_result_fn_mod;
+    _ = duplicate_errdefer_mod;
     std.testing.refAllDecls(@This());
 }

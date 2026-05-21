@@ -119,6 +119,11 @@ pub const all = [_]Rule{
         .title = "`errdefer` in a fn returning a `Result(T)` tagged union (not `!T`) — never fires, cleanup silently leaks",
         .body = @embedFile("rules/dead-errdefer-in-result-fn.md"),
     },
+    .{
+        .id = "duplicate-errdefer",
+        .title = "two `errdefer X.<cleanup>();` for the same receiver — cleanup runs twice on error → double-free / assert",
+        .body = @embedFile("rules/duplicate-errdefer.md"),
+    },
 };
 
 /// Look up a rule by id.  Returns null on unknown id so callers can
