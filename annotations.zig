@@ -1645,6 +1645,13 @@ fn inferBorrowedFields(
 
         if (self_names.count() > 0) {
             try scanBodyForFieldWrites(tree, body, &self_names, ct, alloc_patterns, db, gpa, &stats);
+            // Recurse into nested struct literals written directly
+            // to `<self>.<field>` — `self.outer = .{ .inner = ... }`.
+            // The token-based scanner above classifies the outer
+            // field as `.neutral` (RHS starts with `.{`); this pass
+            // additionally walks the literal's nested fields with
+            // the outer field name as the dotted-path prefix.
+            try scanAssignedStructLiterals(tree, body, &self_names, ct, alloc_patterns, db, gpa, &stats);
         }
 
         // Constructor-shape inference — when this fn's return type
@@ -1917,6 +1924,76 @@ fn fnReturnTypeMatches(tree: *const Ast, fn_decl: Ast.Node.Index, ct: []const u8
         }
         if (t == first) return false;
         t -= 1;
+    }
+}
+
+/// Walk every struct_init node in the file; for each one inside
+/// `body`'s token range AND immediately preceded by
+/// `<self_name>.<field_name> =` (where `self_name` is in
+/// `self_names`), recurse with `<field_name>` as the path prefix.
+/// Companion to `scanReturnStructLiterals` for body writes:
+///
+///     pub fn populate(self: *Owner) !void {
+///         self.outer = .{ .inner = try alloc.alloc(...) };
+///     }
+///
+/// Each nested field contributes to stats[(ct, "outer.inner")].
+/// The outer `<self>.outer = .{...}` write itself is recorded by
+/// `scanBodyForFieldWrites` as `.neutral` (RHS starts with `.{`),
+/// so this pass is purely additive — handles the inner level.
+fn scanAssignedStructLiterals(
+    tree: *const Ast,
+    body: Ast.Node.Index,
+    self_names: *const std.StringHashMapUnmanaged(void),
+    ct: []const u8,
+    alloc_patterns: []const []const u8,
+    db: *Db,
+    gpa: std.mem.Allocator,
+    stats: *std.HashMapUnmanaged(Db.FieldKey, FieldStats, Db.FieldKey.Context, std.hash_map.default_max_load_percentage),
+) !void {
+    const body_first = tree.firstToken(body);
+    const body_last = tree.lastToken(body);
+    const tags = tree.tokens.items(.tag);
+
+    var node_idx: u32 = 1;
+    while (node_idx < tree.nodes.len) : (node_idx += 1) {
+        const node: Ast.Node.Index = @enumFromInt(node_idx);
+        const is_si = switch (tree.nodeTag(node)) {
+            .struct_init,
+            .struct_init_comma,
+            .struct_init_one,
+            .struct_init_one_comma,
+            .struct_init_dot,
+            .struct_init_dot_comma,
+            .struct_init_dot_two,
+            .struct_init_dot_two_comma,
+            => true,
+            else => false,
+        };
+        if (!is_si) continue;
+
+        const t0 = tree.firstToken(node);
+        if (t0 < body_first or t0 > body_last) continue;
+
+        // Preceding tokens must form `<self_name> . <field_name> =`.
+        // Anonymous form (`.{...}`): t0 is `.`.  Typed form
+        // (`T{...}`): t0 is the type identifier.  Either way the
+        // four tokens at t0-1..t0-4 carry the assignment context.
+        if (t0 < 4) continue;
+        const eq_tok = t0 - 1;
+        if (tags[eq_tok] != .equal) continue;
+        if (tags[eq_tok - 1] != .identifier) continue;
+        if (tags[eq_tok - 2] != .period) continue;
+        if (tags[eq_tok - 3] != .identifier) continue;
+        const self_tok = eq_tok - 3;
+        // Reject when the receiver itself is a field of something
+        // (`a.b.<field> =`) — only direct `<self>.<field> =` shapes.
+        if (self_tok > 0 and tags[self_tok - 1] == .period) continue;
+        const self_name = tree.tokenSlice(self_tok);
+        if (!self_names.contains(self_name)) continue;
+        const field_name = tree.tokenSlice(eq_tok - 1);
+
+        try recordStructLiteralFields(tree, node, ct, field_name, alloc_patterns, db, gpa, stats);
     }
 }
 
