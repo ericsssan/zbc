@@ -128,13 +128,19 @@ fn checkStruct(
     // `cache.reset()` / `cache.clearRetainingCapacity()` in reset
     // both qualify as "cleanup on the same receiver".
     //
-    // Cross-fn gate: before firing on a missing-from-reset cleanup,
-    // check whether any non-lifecycle method in the struct calls
-    // `<recv>.<acquire-method>(...)` matching the cleanup receiver.
-    // If yes, the resource is acquired per-cycle and reset MUST
-    // release it (fire).  If no, the resource is pool-lifetime
-    // (acquired once in init, released in deinit, persists across
-    // resets) — suppress.
+    // Suppression layers (semantic signals):
+    //  (1) Receiver-matched cleanup in reset → suppress.
+    //  (2) Reset is a PARTIAL CLEAR — it already does ≥1 cleanup
+    //      but doesn't touch this receiver → suppress.  The author
+    //      has demonstrated cleanup-awareness; receivers they
+    //      didn't touch are intentionally persistent (e.g.,
+    //      IncrementalGraph.reset clears current-chunk state but
+    //      intentionally leaves graph state alone).
+    //  (3) Cross-fn analysis — only run when reset is a MINIMAL
+    //      reset (no cleanups at all).  If a non-lifecycle method
+    //      re-acquires the receiver → per-cycle leak (fire).  If
+    //      not → pool-lifetime (suppress).
+    const reset_has_any_cleanup = reset_cleanups.items.len > 0;
     for (deinit_cleanups.items) |dc| {
         var matched_in_reset = false;
         for (reset_cleanups.items) |rc| {
@@ -144,6 +150,16 @@ fn checkStruct(
             }
         }
         if (matched_in_reset) continue;
+        // Layer 2: partial-clear suppression.  Reset has cleanup
+        // logic but intentionally skipped this receiver — author
+        // was aware of cleanup duties and chose to leave this
+        // resource alone (canonical pattern: state-machine reset
+        // clears current-cycle state, leaves persistent state).
+        if (reset_has_any_cleanup) continue;
+        // Layer 3: cross-fn analysis for minimal resets (no
+        // cleanups at all).  If a non-lifecycle method re-acquires
+        // the receiver → per-cycle leak (fire).  If not →
+        // pool-lifetime (suppress).
         if (!receiverReacquiredElsewhere(tree, other_fns.items, dc.recv)) continue;
         try report(gpa, problems, tree, reset_fn.?.name_tok, dc);
     }
@@ -359,6 +375,47 @@ test "reset-skips: deinit releases pool, reset doesn't, AND per-cycle acquire el
     defer freeProblems(gpa, &problems);
     try std.testing.expect(problems.items.len >= 1);
     try std.testing.expectEqualStrings("reset-skips-pooled-resource-release", problems.items[0].rule_id);
+}
+
+test "reset-skips: partial-clear (reset does some cleanup) suppresses non-touched receivers" {
+    // Real-world IncrementalGraph pattern — reset clears only the
+    // current-chunk state (intentionally) while deinit tears down
+    // the entire graph including persistent fields.  The presence
+    // of ANY cleanup in reset signals the author was aware; the
+    // fields they didn't touch are intentionally persistent.
+    const gpa = std.testing.allocator;
+    var problems = try runOn(gpa,
+        \\const std = @import("std");
+        \\const Pool = struct {
+        \\    pub fn release(_: *Pool, _: anytype) void {}
+        \\    pub fn acquire(_: *Pool) *u8 { return undefined; }
+        \\};
+        \\const G = struct {
+        \\    bundled_files: std.ArrayList(u8),
+        \\    current_chunk: std.ArrayList(u8),
+        \\    nodes: []*u8,
+        \\    node_count: usize,
+        \\    pub fn deinit(g: *G, alloc: std.mem.Allocator, pool: *Pool) void {
+        \\        g.bundled_files.deinit(alloc);
+        \\        g.current_chunk.deinit(alloc);
+        \\        for (g.nodes[0..g.node_count]) |n| pool.release(n);
+        \\    }
+        \\    pub fn reset(g: *G) void {
+        \\        g.current_chunk.clearRetainingCapacity();
+        \\    }
+        \\    pub fn use(g: *G, pool: *Pool) void {
+        \\        g.nodes[g.node_count] = pool.acquire();
+        \\        g.node_count += 1;
+        \\    }
+        \\};
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    // `reset` clears `current_chunk` and intentionally leaves
+    // `bundled_files` and `pool` (graph state) alone.  Even though
+    // `use` re-acquires from `pool` (per-cycle signal), the
+    // partial-clear heuristic suppresses the fire.
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
 }
 
 test "reset-skips: pool-lifetime asymmetry (no non-init acquire) is suppressed" {
