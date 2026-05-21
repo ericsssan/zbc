@@ -221,9 +221,20 @@ pub const Invariant = enum {
     /// / `getOrPut.value_ptr` are valid only until the next
     /// capacity-modifying call.
     hashmap_getptr_rehash,
+    /// `const <X> = <list>.items;` borrows a slice over the list's
+    /// heap-backed storage.  A subsequent `<list>.<mutate>(...)` on
+    /// the SAME receiver (where mutate ∈ {`append`, `appendSlice`,
+    /// `appendNTimes`, `insert`, `insertSlice`, `addOne`,
+    /// `addManyAsSlice`, `addManyAsArray`, `resize`, `clearAndFree`,
+    /// `deinit`}) may reallocate the backing storage and invalidate
+    /// `<X>.ptr` — a later read/write through `<X>` is a UAF
+    /// against list storage.  Sibling of [[hashmap-getptr-rehash]];
+    /// `*AssumeCapacity` variants are deliberately excluded (no
+    /// realloc by contract).
+    arraylist_items_slice,
 };
 
-pub const all_invariants: [23]Invariant = .{
+pub const all_invariants: [24]Invariant = .{
     .arena_escape,
     .stack_escape,
     .use_undefined,
@@ -247,6 +258,7 @@ pub const all_invariants: [23]Invariant = .{
     .stack_fallback_escape,
     .unreleased_refs_on_error,
     .hashmap_getptr_rehash,
+    .arraylist_items_slice,
 };
 
 pub const Default: Config = .{};

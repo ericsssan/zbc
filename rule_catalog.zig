@@ -144,6 +144,11 @@ pub const all = [_]Rule{
         .title = "use of `<X>` after `<map>.put/remove/...(...)` — the borrow from `<map>.getPtr/getOrPut(...)` was invalidated",
         .body = @embedFile("rules/hashmap-getptr-rehash.md"),
     },
+    .{
+        .id = "arraylist-items-slice",
+        .title = "use of `<X>` after `<list>.append/insert/...(...)` — the slice borrowed via `<list>.items` was invalidated by a realloc",
+        .body = @embedFile("rules/arraylist-items-slice.md"),
+    },
 };
 
 /// Look up a rule by id.  Returns null on unknown id so callers can

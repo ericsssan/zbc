@@ -25,6 +25,7 @@ const overwrite_without_deinit_mod = @import("overwrite_without_deinit.zig");
 const stack_fallback_escape_mod = @import("stack_fallback_escape.zig");
 const unreleased_refs_on_error_mod = @import("unreleased_refs_on_error.zig");
 const hashmap_getptr_rehash_mod = @import("hashmap_getptr_rehash.zig");
+const arraylist_items_slice_mod = @import("arraylist_items_slice.zig");
 const rule_catalog_mod = @import("rule_catalog.zig");
 
 pub const Config = config_mod.Config;
@@ -174,6 +175,11 @@ pub fn analyzeEscape(
     // followed by a use of the borrowed pointer → UAF against
     // table storage.
     try hashmap_getptr_rehash_mod.check(gpa, &tree, config, &problems);
+
+    // ArrayList items-slice — `const X = <list>.items;` then
+    // receiver-matched mutating call (`.append` / `.insert` / …)
+    // followed by a use of `X` → UAF if the call reallocated.
+    try arraylist_items_slice_mod.check(gpa, &tree, config, &problems);
 
     return problems.toOwnedSlice(gpa);
 }
@@ -634,5 +640,6 @@ test {
     _ = stack_fallback_escape_mod;
     _ = unreleased_refs_on_error_mod;
     _ = hashmap_getptr_rehash_mod;
+    _ = arraylist_items_slice_mod;
     std.testing.refAllDecls(@This());
 }

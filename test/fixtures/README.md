@@ -32,6 +32,7 @@ Bun's.
 | `stack_fallback_escape.zig` | `stack-fallback-escape` | [ghostty-org/ghostty#9885](https://github.com/ghostty-org/ghostty/pull/9885) |
 | `unreleased_refs_on_error.zig` | `unreleased-refs-on-error` | hexops/mach `sysgpu/vulkan.zig:1887` (mined; no PR) |
 | `hashmap_getptr_rehash.zig` | `hashmap-getptr-rehash` | Zig std `HashMap` pointer-stability footgun (canonical class, no specific PR) |
+| `arraylist_items_slice.zig` | `arraylist-items-slice` | Zig std `ArrayList.items` pointer-stability footgun (canonical class, no specific PR) |
 
 ## Re-fetching the actual pre-merge buggy files
 
