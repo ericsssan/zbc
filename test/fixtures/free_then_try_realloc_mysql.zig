@@ -1,4 +1,4 @@
-// Isolated repro of the PR #29968 bug pattern in standalone form.
+// Isolated repro of the oven-sh/bun#29968 bug pattern in standalone form.
 
 const std = @import("std");
 

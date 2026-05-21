@@ -120,7 +120,7 @@ pub const ArenaState = struct {
     /// e.g. for `var buf = gpa.alloc(...)`, the LocalId of `gpa`.
     /// Compared against the free-site allocator at
     /// `transferHeapFree` to surface allocator-mismatch bugs
-    /// (PR #29840 class: `mimalloc_arena.alloc(...)` then
+    /// (oven-sh/bun#29840 class: `mimalloc_arena.alloc(...)` then
     /// `default.free(...)`).  Null when the alloc receiver
     /// wasn't a known local (dotted chain, stdlib reference,
     /// fallback heap from inter-procedural @takes, etc.) — no

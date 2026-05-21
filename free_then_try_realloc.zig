@@ -1,4 +1,4 @@
-//! PR #29968 detector — `<x>.free(X);` immediately followed by
+//! oven-sh/bun#29968 detector — `<x>.free(X);` immediately followed by
 //! `X = try …;` with no intervening reset of `X` to a sentinel.
 //! If the `try` propagates an error, `X` is left pointing at
 //! freed memory; a subsequent `deinit` then re-frees it.

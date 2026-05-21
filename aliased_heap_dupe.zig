@@ -1,4 +1,4 @@
-//! PR #29910 detector — bitwise-copy "dupe" patterns that alias the
+//! oven-sh/bun#29910 detector — bitwise-copy "dupe" patterns that alias the
 //! source's heap-owned fields.
 //!
 //! A function returning `T` by value via `var dup = <ptr>.*; ... return

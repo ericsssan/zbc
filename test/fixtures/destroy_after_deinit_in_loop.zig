@@ -1,4 +1,4 @@
-// PR #29879 — destructor loops `<h>.deinit()` over pointer-list
+// oven-sh/bun#29879 — destructor loops `<h>.deinit()` over pointer-list
 // items without per-item destroy.
 
 const std = @import("std");

@@ -1,4 +1,4 @@
-// PR #29452 — `<x>.realloc(slice, n * @sizeOf(T))` over-allocates.
+// oven-sh/bun#29452 — `<x>.realloc(slice, n * @sizeOf(T))` over-allocates.
 
 const std = @import("std");
 

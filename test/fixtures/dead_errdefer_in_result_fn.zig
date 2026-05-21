@@ -1,4 +1,4 @@
-// PR #27706 — `errdefer` in a fn returning `Result(T)` (tagged
+// oven-sh/bun#27706 — `errdefer` in a fn returning `Result(T)` (tagged
 // union, NOT error union) is dead code.
 
 const std = @import("std");

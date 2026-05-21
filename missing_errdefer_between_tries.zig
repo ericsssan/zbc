@@ -1,4 +1,4 @@
-//! PR #30169 detector — `const X = try <Type>.<method>(...);`
+//! oven-sh/bun#30169 detector — `const X = try <Type>.<method>(...);`
 //! followed by another `try` in the same function body with NO
 //! `errdefer X.deinit();` registered between.  If the second try
 //! propagates an error, X's allocation leaks.
@@ -218,7 +218,7 @@ fn isOwnershipTransferMethod(name: []const u8) bool {
 /// True iff `Type` has a `deinit` method discoverable in the Db.
 /// Conservative: cross-file / unknown types pass through as true
 /// so we don't miss real bugs whose types are declared in another
-/// file (the canonical PR #30169 case has `PathLike` in a separate
+/// file (the canonical oven-sh/bun#30169 case has `PathLike` in a separate
 /// module).  Returns false only when the type IS in the local file
 /// AND demonstrably has no `deinit`.
 fn typeHasDeinit(db: *const Db, type_name: []const u8) bool {

@@ -1,4 +1,4 @@
-// PR #30169 — heap-owning local bound via `try Type.method(...)`
+// oven-sh/bun#30169 — heap-owning local bound via `try Type.method(...)`
 // without an errdefer registered before the next `try`.
 
 const std = @import("std");

@@ -1,4 +1,4 @@
-// PR #29854 — `this.<X> = heap;` then `this.* = StructLit{…}` that
+// oven-sh/bun#29854 — `this.<X> = heap;` then `this.* = StructLit{…}` that
 // omits `.<X>` — heap pointer silently dropped to default.
 
 const std = @import("std");

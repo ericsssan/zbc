@@ -72,19 +72,19 @@ pub const Invariant = enum {
     /// the special case of leaking the borrow past return).
     arena_use_after_kill,
     /// A heap allocation must be freed with the same allocator
-    /// that produced it.  Catches the PR #29840 class:
+    /// that produced it.  Catches the oven-sh/bun#29840 class:
     /// `mimalloc_arena.alloc(...)` then `default.free(...)` (UB
     /// under any reasonable allocator implementation).
     allocator_mismatch,
     /// Calling a destructor (`destroy` / `deinit` / etc.) on an
     /// interior pointer into a container's storage is UB under
-    /// typical allocators.  Catches the PR #30166 class:
+    /// typical allocators.  Catches the oven-sh/bun#30166 class:
     /// `for (entries.items) |*r| r.destroy();`.
     interior_pointer_destroy,
     /// A type with a heap-creator method (`<x>.create(Self)`) has
     /// a destructor (finalize / deinit / destroy) that doesn't
     /// free `self` — every instance leaks the heap descriptor.
-    /// Catches PR #29840 class: `ResolveMessage.create` allocates
+    /// Catches oven-sh/bun#29840 class: `ResolveMessage.create` allocates
     /// self via `allocator.create(...)` but `finalize()` never
     /// calls `allocator.destroy(this)`.
     heap_leak,
@@ -96,7 +96,7 @@ pub const Invariant = enum {
     /// evaluating the payload, so on the error path the LHS is
     /// left with the new tag and the old/garbage payload bytes — a
     /// later read (often via an `errdefer this.deinit()`) sees a
-    /// wild pointer.  Catches PR #29422 class.
+    /// wild pointer.  Catches oven-sh/bun#29422 class.
     partial_union_write,
     /// A "dupe" function returns `T` by value via a bitwise copy
     /// (`var dup = this.*; return dup;`), and T has a heap-owning
@@ -105,35 +105,35 @@ pub const Invariant = enum {
     /// `<X>` independently.  Both the source and the dupe now hold
     /// the same heap pointer with `<X>_allocated == true`, so the
     /// later frees from each side collide (UAF, then double-free).
-    /// Catches PR #29910 class: `Blob.dupeWithContentType`.
+    /// Catches oven-sh/bun#29910 class: `Blob.dupeWithContentType`.
     aliased_heap_dupe,
     /// A heap-owning field is assigned (`this.<X> = <expr>;`) and
     /// then `this.*` is overwritten with a struct literal that
     /// does NOT include `.<X>`, so `<X>` silently falls back to
     /// its declared default (usually `null` / `&.{}`).  The prior
     /// heap pointer is unreachable and never freed by `deinit()`
-    /// (which checks the now-default value).  Catches PR #29854
+    /// (which checks the now-default value).  Catches oven-sh/bun#29854
     /// class: `PathWatcher.init` clobbered `this.resolved_path`.
     clobbered_by_struct_reset,
     /// A call to `<allocator>.realloc(slice, <expr> * @sizeOf(T))`
     /// — the new-length argument multiplies by `@sizeOf(T)` as if
     /// it were a byte count, but Zig's `Allocator.realloc` takes
     /// an ELEMENT count.  The allocation grows by `@sizeOf(T)×`
-    /// the intended size on every call.  Catches PR #29452 class:
+    /// the intended size on every call.  Catches oven-sh/bun#29452 class:
     /// `SmallList.tryGrow` over-allocated.
     realloc_byte_count,
     /// A type's destructor (`deinit` / `finalize` / `destroy`)
     /// mentions some same-typed sibling fields but omits others.
     /// E.g. fields `query_string_map: ?QueryStringMap` and
     /// `param_map: ?QueryStringMap` — destructor handles the
-    /// first but forgets the second.  Catches PR #29853 class:
+    /// first but forgets the second.  Catches oven-sh/bun#29853 class:
     /// `MatchedRoute.deinit` forgot to free `param_map`.
     asymmetric_field_free,
     /// `const X = try <Type>.<method>(...);` where `<Type>` has a
     /// `deinit` method, then a subsequent `try` in the same scope
     /// with NO `errdefer X.deinit();` between.  If the second
     /// `try` throws, X leaks (its deinit isn't reached).  Catches
-    /// PR #30169 class: `node_fs` Symlink/Link/Rename.fromJS where
+    /// oven-sh/bun#30169 class: `node_fs` Symlink/Link/Rename.fromJS where
     /// `old_path` was leaked when `new_path = try PathLike.fromJS(...)`
     /// errored.
     missing_errdefer_between_tries,
@@ -144,7 +144,7 @@ pub const Invariant = enum {
     /// expects an owned slice) frees it again, double-freeing /
     /// using freed memory.  Fix is to set `X = &.{};` (or
     /// `undefined`) between the free and the fallible realloc.
-    /// Catches PR #29968 class: MySQLConnection.handleResultSet
+    /// Catches oven-sh/bun#29968 class: MySQLConnection.handleResultSet
     /// reallocating `statement.columns` without clearing first.
     free_then_try_realloc,
     /// A destructor (`deinit` / `finalize` / `destroy`) loops over
@@ -154,7 +154,7 @@ pub const Invariant = enum {
     /// `std.ArrayList...(*Handler)` with items minted via
     /// `allocator.create(Handler)`), the per-item destructor
     /// reclaims the item's fields but not its heap descriptor —
-    /// every list item leaks its allocation.  Catches PR #29879
+    /// every list item leaks its allocation.  Catches oven-sh/bun#29879
     /// class: `LOLHTMLContext.deinit` looped handlers and called
     /// `handler.deinit()` but never `allocator.destroy(handler)`.
     destroy_after_deinit_in_loop,
@@ -164,7 +164,7 @@ pub const Invariant = enum {
     /// `errdefer` only runs on Zig error returns (`return
     /// error.X`); a `return .{ .err = e }` is a normal return,
     /// so the errdefer never fires.  Any cleanup it was meant
-    /// to do silently leaks.  Catches PR #27706 class: CSS
+    /// to do silently leaks.  Catches oven-sh/bun#27706 class: CSS
     /// parsers with `Result(T)` return type and dead errdefer
     /// blocks.
     dead_errdefer_in_result_fn,

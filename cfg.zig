@@ -85,7 +85,7 @@ pub const StmtKind = union(enum) {
         fallback_hid: abstract_state.HeapId,
         /// The allocator local that's freeing — `gpa` in
         /// `gpa.free(p)`.  Compared against the original alloc
-        /// site's allocator to detect mismatch (PR #29840 class).
+        /// site's allocator to detect mismatch (oven-sh/bun#29840 class).
         /// Null when the free's receiver isn't a known local
         /// (dotted chain, stdlib reference, etc.).
         allocator_local: ?LocalId = null,
@@ -163,7 +163,7 @@ pub const StmtKind = union(enum) {
     out_param_write: struct { out: LocalId, value_kind: ExprKind },
     /// Calling a destructor on an interior pointer — UB under
     /// typical allocators since the pointer wasn't returned by
-    /// `allocator.create()`.  The canonical PR #30166 pattern:
+    /// `allocator.create()`.  The canonical oven-sh/bun#30166 pattern:
     /// `for (entries.items) |*r| r.destroy();`.  `receiver` is
     /// the interior pointer local; `container` is the source
     /// container it borrows from (recorded at for-loop capture).
@@ -171,7 +171,7 @@ pub const StmtKind = union(enum) {
     /// Type T has a heap creator (`<x>.create(T)`) and a
     /// destructor (finalize / deinit / destroy) but the
     /// destructor doesn't free `self` — every instance of T
-    /// leaks the heap-allocated descriptor.  PR #29840 class.
+    /// leaks the heap-allocated descriptor.  oven-sh/bun#29840 class.
     /// `type_name` is the bare ident of T (source slice); used
     /// in the diagnostic.
     leak_warning: struct { type_name: []const u8 },
@@ -180,7 +180,7 @@ pub const StmtKind = union(enum) {
     /// unreachable`).  Zig writes the union tag to the result
     /// location before evaluating the payload, so the early-exit
     /// path leaves the LHS with the new tag and stale payload
-    /// bytes.  PR #29422 class.  `tag_name` is the source slice
+    /// bytes.  oven-sh/bun#29422 class.  `tag_name` is the source slice
     /// of the union variant being written (`.zlib`, `.namedPipe`,
     /// `.Locked`, `.err`, …).
     partial_union_write: struct { tag_name: []const u8 },
@@ -354,7 +354,7 @@ pub const LocalInfo = struct {
     /// references.  Used by `interior_pointer_destroy` detection
     /// to flag calls like `for (entries.items) |*result|
     /// result.destroy();` — destroying an interior pointer is UB
-    /// under typical allocators (PR #30166).
+    /// under typical allocators (oven-sh/bun#30166).
     from_container: ?LocalId = null,
 };
 
@@ -904,7 +904,7 @@ const Builder = struct {
         // (finalize / deinit / destroy) on type T AND another fn
         // on T heap-allocates an instance (`<x>.create(T)`) AND
         // this fn doesn't have inferred @takes(self), the
-        // destructor LEAKS instances of T.  Catches PR #29840
+        // destructor LEAKS instances of T.  Catches oven-sh/bun#29840
         // class.  Emits a leak_warning stmt at body start;
         // transferLeakWarning fires the diagnostic.
         if (self.leakyDestructorTypeName()) |type_name| {
@@ -1351,7 +1351,7 @@ const Builder = struct {
         // Detect interior-pointer captures: when input N is a
         // `<container>.<field>` access AND capture N is `|*p|`
         // (by-pointer), mark `p` as borrowing from the container.
-        // Used by destructor-call detection to flag the PR #30176
+        // Used by destructor-call detection to flag the oven-sh/bun#30176
         // pattern `for (entries.items) |*r| r.destroy();`.
         self.markInteriorCaptures(for_data, body);
         var body_cur = body;
@@ -1979,10 +1979,10 @@ const Builder = struct {
             });
             // Nested struct-literal unpack for the field LHS, e.g.
             // `install.ca = .{ .str = buf }` → field_assign on
-            // `(install, "ca.str")`.  PR #25563 shape.
+            // `(install, "ca.str")`.  oven-sh/bun#25563 shape.
             try self.unpackStructInitFields(cur.*, fref.parent, fref.name, rhs,
                 self.posOf(assign_node), self.endPosOf(assign_node));
-            // PR #29422: `obj.field = .{ .tag = try ... }` leaves
+            // oven-sh/bun#29422: `obj.field = .{ .tag = try ... }` leaves
             // the union with the new tag and garbage payload on the
             // error path.  Fire only on field assignments through a
             // pointer-typed parent — pure-local field writes don't
@@ -2029,7 +2029,7 @@ const Builder = struct {
                 .pos = self.posOf(assign_node),
                 .end_pos = self.endPosOf(assign_node),
             });
-            // PR #29422: `this.* = .{ .tag = try ... }` — same
+            // oven-sh/bun#29422: `this.* = .{ .tag = try ... }` — same
             // partial-write hazard as the field case above, but
             // ONLY when the deref target is itself a tagged union
             // (not a plain 1-field struct masquerading with `.{ .x
@@ -2683,7 +2683,7 @@ const Builder = struct {
         // Same but for `<local>.<field>.method(...)` where method has
         // @takes ownership(0) (R9 inference: callee frees its receiver).
         // The freed thing is the FIELD of the caller's local.  Without
-        // this, inter-procedural UAF through struct fields (PR #30176
+        // this, inter-procedural UAF through struct fields (oven-sh/bun#30176
         // class) is invisible: takesOwnershipFreedLocal returns null
         // because the receiver is a field_access, not a bare ident.
         if (self.takesOwnershipFreedField(call_node)) |fref| {
@@ -4267,7 +4267,7 @@ const Builder = struct {
         return false;
     }
 
-    /// PR #29422: scan a struct-literal RHS for top-level fields
+    /// oven-sh/bun#29422: scan a struct-literal RHS for top-level fields
     /// whose payload contains an early-exit, and emit
     /// `partial_union_write` for each.  Only called from
     /// `lowerAssign` for LHS shapes that reach long-lived storage

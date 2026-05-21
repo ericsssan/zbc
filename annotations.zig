@@ -120,7 +120,7 @@ pub const FnEntry = struct {
     /// Used by cross-fn leak detection: when type T has a
     /// heap-creator AND a destructor (finalize / deinit / destroy)
     /// AND the destructor doesn't free `self`, flag the
-    /// destructor as leaking instances.  Catches the PR #29840
+    /// destructor as leaking instances.  Catches the oven-sh/bun#29840
     /// `ResolveMessage.create` / `ResolveMessage.finalize`-no-free
     /// pattern.
     heap_allocates_self: bool = false,
@@ -201,7 +201,7 @@ pub const Db = struct {
     /// True iff `<struct_name>.<field_name>` is one half of a
     /// flag-paired ownership pattern (the heap-owning `<X>` whose
     /// sibling `<X>_allocated: bool` gates frees).  Used by the
-    /// PR #29910 aliased-heap-dupe detector.
+    /// oven-sh/bun#29910 aliased-heap-dupe detector.
     pub fn isFlagOwnedField(self: *const Db, struct_name: []const u8, field_name: []const u8) bool {
         return self.flag_owned_fields.containsContext(.{
             .containing_type = struct_name,
@@ -1846,7 +1846,7 @@ fn discoverContainingTypes(
 /// ownership patterns — a `<X>_allocated: bool` field with a
 /// sibling `<X>: <slice-or-pointer>` field on the same type.  The
 /// canonical Zig idiom for "this slice/pointer is conditionally
-/// heap-owned, free it iff the flag is true."  zbc's PR #29910
+/// heap-owned, free it iff the flag is true."  zbc's oven-sh/bun#29910
 /// detector uses the set of `<X>` field keys to flag bitwise-dupe
 /// patterns that alias the source's owned pointer.
 fn discoverFlagOwnedFields(

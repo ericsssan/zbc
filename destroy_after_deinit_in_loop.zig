@@ -1,4 +1,4 @@
-//! PR #29879 detector — `for (list.items) |h| { h.deinit(); }`
+//! oven-sh/bun#29879 detector — `for (list.items) |h| { h.deinit(); }`
 //! inside a destructor where the per-item destroy is missing.
 //! When `list` holds heap-allocated pointers (`(*T)`-typed list
 //! elements minted via `allocator.create(T)`), the per-iteration

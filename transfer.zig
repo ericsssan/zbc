@@ -282,7 +282,7 @@ fn transferRet(
 /// whose recorded HeapId is now dead.  Fires when a value written
 /// through a `*T` parameter is freed (typically via `defer`) before
 /// the function returns — the caller's pointee dangles.  Closes the
-/// PR #30151-shape gap:
+/// oven-sh/bun#30151-shape gap:
 ///
 ///     defer buf.deinit();
 ///     out.* = buf.slice();      // at write time buf is live

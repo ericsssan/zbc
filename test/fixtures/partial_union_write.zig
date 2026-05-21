@@ -1,4 +1,4 @@
-// PR #29422 — partial-union-write across all 4 site shapes.
+// oven-sh/bun#29422 — partial-union-write across all 4 site shapes.
 
 const std = @import("std");
 

@@ -1,4 +1,4 @@
-//! PR #29853 detector — a type's destructor mentions some
+//! oven-sh/bun#29853 detector — a type's destructor mentions some
 //! same-typed sibling fields but omits others.
 //!
 //! Algorithm (purely syntactic, two passes over the tree):

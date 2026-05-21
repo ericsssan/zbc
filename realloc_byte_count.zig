@@ -1,4 +1,4 @@
-//! PR #29452 detector — `<allocator>.realloc(slice, <expr> *
+//! oven-sh/bun#29452 detector — `<allocator>.realloc(slice, <expr> *
 //! @sizeOf(T))`.  Zig's `Allocator.realloc` takes an ELEMENT count,
 //! not bytes, so the `* @sizeOf(T)` over-allocates by `@sizeOf(T)×`.
 //!

@@ -1,4 +1,4 @@
-//! PR #29854 detector — `this.<X> = <heap_thing>;` immediately
+//! oven-sh/bun#29854 detector — `this.<X> = <heap_thing>;` immediately
 //! followed by a `this.* = StructLit{ … }` that omits `.<X>`.  The
 //! struct literal resets `<X>` to its declared default (typically
 //! `null` / `&.{}`), silently dropping the heap pointer; `deinit()`

@@ -1,4 +1,4 @@
-// PR #29968 — `<x>.free(X); X = try alloc(...);` leaves X dangling
+// oven-sh/bun#29968 — `<x>.free(X); X = try alloc(...);` leaves X dangling
 // on alloc failure.
 
 const std = @import("std");

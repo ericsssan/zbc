@@ -1,4 +1,4 @@
-//! PR #27706 detector — `errdefer` inside a fn whose return type
+//! oven-sh/bun#27706 detector — `errdefer` inside a fn whose return type
 //! is a parameterized tagged union (`Result(T)`, `Maybe(T)`, …),
 //! NOT an error union (`!T`).  Zig's `errdefer` only fires on a
 //! Zig error return, but `return .{ .err = e }` is a normal

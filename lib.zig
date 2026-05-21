@@ -104,41 +104,41 @@ pub fn analyzeEscape(
         try analyzer_mod.check(gpa, &cfg, .{ .path = path, .config = config }, &problems);
     }
 
-    // Aliased-heap-dupe (PR #29910) — purely syntactic per-fn check
+    // Aliased-heap-dupe (oven-sh/bun#29910) — purely syntactic per-fn check
     // over the parsed tree.  Runs after the per-fn cfg loop so we
     // have a fully-populated Db (flag_owned_fields etc.).
     try aliased_heap_dupe_mod.check(gpa, &tree, &db, config, &problems);
 
-    // Clobbered-by-struct-reset (PR #29854) — purely syntactic
+    // Clobbered-by-struct-reset (oven-sh/bun#29854) — purely syntactic
     // per-fn check.  `<obj>.<X> = …;` followed by `<obj>.* = T{…}`
     // that omits `.<X>` silently drops the prior write.
     try clobbered_by_struct_reset_mod.check(gpa, &tree, &db, config, &problems);
 
-    // Realloc-byte-count (PR #29452) — `<x>.realloc(slice, n *
+    // Realloc-byte-count (oven-sh/bun#29452) — `<x>.realloc(slice, n *
     // @sizeOf(T))` over-allocates by `@sizeOf(T)×`.  Whole-file
     // token scan, no Db dependency.
     try realloc_byte_count_mod.check(gpa, &tree, config, &problems);
 
-    // Asymmetric-field-free (PR #29853) — destructor handles some
+    // Asymmetric-field-free (oven-sh/bun#29853) — destructor handles some
     // same-typed sibling fields but omits others.
     try asymmetric_field_free_mod.check(gpa, &tree, &db, config, &problems);
 
-    // Missing-errdefer-between-tries (PR #30169) — `const X =
+    // Missing-errdefer-between-tries (oven-sh/bun#30169) — `const X =
     // try Type.method(…);` then a later `try` with no errdefer for
     // X registered between.
     try missing_errdefer_between_tries_mod.check(gpa, &tree, &db, config, &problems);
 
-    // Free-then-try-realloc (PR #29968) — `<x>.free(X); X = try
+    // Free-then-try-realloc (oven-sh/bun#29968) — `<x>.free(X); X = try
     // alloc(…);` leaves X dangling on alloc failure.  Whole-file
     // token scan.
     try free_then_try_realloc_mod.check(gpa, &tree, config, &problems);
 
-    // Destroy-after-deinit-in-loop (PR #29879) — destructor loops
+    // Destroy-after-deinit-in-loop (oven-sh/bun#29879) — destructor loops
     // `<h>.deinit();` over pointer-list items without per-item
     // `destroy`.  Whole-file token scan, destructor-fns only.
     try destroy_after_deinit_in_loop_mod.check(gpa, &tree, config, &problems);
 
-    // Dead-errdefer-in-result-fn (PR #27706) — `errdefer` inside a
+    // Dead-errdefer-in-result-fn (oven-sh/bun#27706) — `errdefer` inside a
     // fn returning a parameterized tagged-union (`Result(T)`) is
     // dead because `return .{ .err = e }` doesn't fire errdefers.
     try dead_errdefer_in_result_fn_mod.check(gpa, &tree, config, &problems);

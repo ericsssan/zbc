@@ -1,4 +1,4 @@
-// PR #29910 — bitwise-copy of a heap-owning struct.
+// oven-sh/bun#29910 — bitwise-copy of a heap-owning struct.
 
 const std = @import("std");
 

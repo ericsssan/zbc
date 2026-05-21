@@ -1,4 +1,4 @@
-// PR #29853 — type has two same-typed optional fields; destructor
+// oven-sh/bun#29853 — type has two same-typed optional fields; destructor
 // frees one but not the other.
 
 const std = @import("std");
