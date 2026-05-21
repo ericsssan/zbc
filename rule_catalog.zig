@@ -159,6 +159,11 @@ pub const all = [_]Rule{
         .title = "arena-allocated slice stored into a non-arena container — dangles when the local arena's deinit fires",
         .body = @embedFile("rules/slice-of-arena-into-heap.md"),
     },
+    .{
+        .id = "free-without-null-then-check",
+        .title = "freed `<recv>.<field>` without reset — slot now dangles; later `if (<recv>.<field>) |h| use(h);` UAFs",
+        .body = @embedFile("rules/free-without-null-then-check.md"),
+    },
 };
 
 /// Look up a rule by id.  Returns null on unknown id so callers can

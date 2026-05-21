@@ -28,6 +28,7 @@ const hashmap_getptr_rehash_mod = @import("hashmap_getptr_rehash.zig");
 const arraylist_items_slice_mod = @import("arraylist_items_slice.zig");
 const fd_write_after_close_mod = @import("fd_write_after_close.zig");
 const slice_of_arena_into_heap_mod = @import("slice_of_arena_into_heap.zig");
+const free_without_null_then_check_mod = @import("free_without_null_then_check.zig");
 const rule_catalog_mod = @import("rule_catalog.zig");
 
 pub const Config = config_mod.Config;
@@ -192,6 +193,11 @@ pub fn analyzeEscape(
     // into a container with a non-arena allocator → dangles when
     // the local arena's defer-deinit fires at scope exit.
     try slice_of_arena_into_heap_mod.check(gpa, &tree, config, &problems);
+
+    // Free-without-null-then-check — `<alloc>.destroy/free(<r>.<f>)`
+    // in a non-destructor fn without `<r>.<f> = null;` reset →
+    // slot dangles, later `if (<r>.<f>) |h| use(h);` UAFs.
+    try free_without_null_then_check_mod.check(gpa, &tree, config, &problems);
 
     return problems.toOwnedSlice(gpa);
 }
@@ -655,5 +661,6 @@ test {
     _ = arraylist_items_slice_mod;
     _ = fd_write_after_close_mod;
     _ = slice_of_arena_into_heap_mod;
+    _ = free_without_null_then_check_mod;
     std.testing.refAllDecls(@This());
 }

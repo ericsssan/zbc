@@ -35,6 +35,7 @@ Bun's.
 | `arraylist_items_slice.zig` | `arraylist-items-slice` | Zig std `ArrayList.items` pointer-stability footgun (canonical class, no specific PR) |
 | `fd_write_after_close.zig` | `fd-write-after-close` | POSIX/Windows file-handle use-after-close (canonical class, no specific PR) |
 | `slice_of_arena_into_heap.zig` | `slice-of-arena-into-heap` | arena-allocated slice stored into a non-arena container (canonical class, no specific PR) |
+| `free_without_null_then_check.zig` | `free-without-null-then-check` | [oven-sh/bun#30148](https://github.com/oven-sh/bun/pull/30148), [oven-sh/bun#30176](https://github.com/oven-sh/bun/pull/30176), [oven-sh/bun#29983](https://github.com/oven-sh/bun/pull/29983), [oven-sh/bun#29988](https://github.com/oven-sh/bun/pull/29988) |
 
 ## Re-fetching the actual pre-merge buggy files
 

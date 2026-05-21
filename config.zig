@@ -253,9 +253,18 @@ pub const Invariant = enum {
     /// third escape path: STORE into a longer-lived container
     /// during the arena's lifetime.
     slice_of_arena_into_heap,
+    /// `<allocator>.destroy(<recv>.<field>);` / `.free(<recv>.<field>);`
+    /// in a NON-destructor fn without a subsequent
+    /// `<recv>.<field> = null;` (or `= &.{}`, `= .empty`, `= ...new`).
+    /// The freed slot now holds a dangling pointer; a later
+    /// `if (<recv>.<field>) |h| use(h);` passes the optional null-
+    /// check and UAFs, or the struct's own `deinit` re-frees the
+    /// dangling slot.  Catches oven-sh/bun#30148 / #30176 / #29983 /
+    /// #29988 class.
+    free_without_null_then_check,
 };
 
-pub const all_invariants: [26]Invariant = .{
+pub const all_invariants: [27]Invariant = .{
     .arena_escape,
     .stack_escape,
     .use_undefined,
@@ -282,6 +291,7 @@ pub const all_invariants: [26]Invariant = .{
     .arraylist_items_slice,
     .fd_write_after_close,
     .slice_of_arena_into_heap,
+    .free_without_null_then_check,
 };
 
 pub const Default: Config = .{};
