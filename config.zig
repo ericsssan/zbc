@@ -208,9 +208,22 @@ pub const Invariant = enum {
     /// vkd.createPipelineLayout(...);` — no errdefer releases the
     /// references on vulkan-create failure.
     unreleased_refs_on_error,
+    /// `const <X> = <map>.getPtr(...);` (or `getOrPut`,
+    /// `getOrPutValue`, `getOrPutAssumeCapacity`,
+    /// `getOrPutAdapted`) borrows a pointer into the map's internal
+    /// storage.  A subsequent `<map>.<mutate>(...)` on the SAME
+    /// receiver — where mutate ∈ {`put`, `putAssumeCapacity`,
+    /// `putNoClobber`, `putNoClobberAssumeCapacity`, `remove`,
+    /// `removeByPtr`, `fetchPut`, `fetchRemove`, `swapRemove`} — may
+    /// rehash the table and invalidate `<X>`.  A later read of
+    /// `<X>` is a UAF against table storage.  Zig std's HashMap
+    /// docs explicitly call out that pointers returned by `getPtr`
+    /// / `getOrPut.value_ptr` are valid only until the next
+    /// capacity-modifying call.
+    hashmap_getptr_rehash,
 };
 
-pub const all_invariants: [22]Invariant = .{
+pub const all_invariants: [23]Invariant = .{
     .arena_escape,
     .stack_escape,
     .use_undefined,
@@ -233,6 +246,7 @@ pub const all_invariants: [22]Invariant = .{
     .overwrite_without_deinit,
     .stack_fallback_escape,
     .unreleased_refs_on_error,
+    .hashmap_getptr_rehash,
 };
 
 pub const Default: Config = .{};

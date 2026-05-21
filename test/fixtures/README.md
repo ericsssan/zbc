@@ -31,6 +31,7 @@ Bun's.
 | `overwrite_without_deinit.zig` | `overwrite-without-deinit` | [oven-sh/bun#28633](https://github.com/oven-sh/bun/pull/28633), [oven-sh/bun#29864](https://github.com/oven-sh/bun/pull/29864) |
 | `stack_fallback_escape.zig` | `stack-fallback-escape` | [ghostty-org/ghostty#9885](https://github.com/ghostty-org/ghostty/pull/9885) |
 | `unreleased_refs_on_error.zig` | `unreleased-refs-on-error` | hexops/mach `sysgpu/vulkan.zig:1887` (mined; no PR) |
+| `hashmap_getptr_rehash.zig` | `hashmap-getptr-rehash` | Zig std `HashMap` pointer-stability footgun (canonical class, no specific PR) |
 
 ## Re-fetching the actual pre-merge buggy files
 

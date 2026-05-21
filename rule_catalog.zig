@@ -139,6 +139,11 @@ pub const all = [_]Rule{
         .title = "loop calls `<obj>.<addref>()` then a later `try` runs with no `errdefer` releasing — refs leak on error",
         .body = @embedFile("rules/unreleased-refs-on-error.md"),
     },
+    .{
+        .id = "hashmap-getptr-rehash",
+        .title = "use of `<X>` after `<map>.put/remove/...(...)` — the borrow from `<map>.getPtr/getOrPut(...)` was invalidated",
+        .body = @embedFile("rules/hashmap-getptr-rehash.md"),
+    },
 };
 
 /// Look up a rule by id.  Returns null on unknown id so callers can

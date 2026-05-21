@@ -24,6 +24,7 @@ const duplicate_errdefer_mod = @import("duplicate_errdefer.zig");
 const overwrite_without_deinit_mod = @import("overwrite_without_deinit.zig");
 const stack_fallback_escape_mod = @import("stack_fallback_escape.zig");
 const unreleased_refs_on_error_mod = @import("unreleased_refs_on_error.zig");
+const hashmap_getptr_rehash_mod = @import("hashmap_getptr_rehash.zig");
 const rule_catalog_mod = @import("rule_catalog.zig");
 
 pub const Config = config_mod.Config;
@@ -167,6 +168,12 @@ pub fn analyzeEscape(
     // via `<obj>.<addref>()` and a later `try` runs with no
     // `errdefer <obj>.<release>()` registered.
     try unreleased_refs_on_error_mod.check(gpa, &tree, config, &problems);
+
+    // HashMap getPtr-rehash — `<map>.getPtr(...)` then receiver-
+    // matched mutating call (`.put` / `.remove` / `.fetchPut` / …)
+    // followed by a use of the borrowed pointer → UAF against
+    // table storage.
+    try hashmap_getptr_rehash_mod.check(gpa, &tree, config, &problems);
 
     return problems.toOwnedSlice(gpa);
 }
@@ -626,5 +633,6 @@ test {
     _ = overwrite_without_deinit_mod;
     _ = stack_fallback_escape_mod;
     _ = unreleased_refs_on_error_mod;
+    _ = hashmap_getptr_rehash_mod;
     std.testing.refAllDecls(@This());
 }
