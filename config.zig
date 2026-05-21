@@ -186,9 +186,20 @@ pub const Invariant = enum {
     /// oven-sh/bun#29864 class: protocol decoders and re-execute
     /// paths overwriting heap-owning fields without cleanup.
     overwrite_without_deinit,
+    /// `var <SF> = std.heap.stackFallback(N, <alloc>);` produces an
+    /// allocator whose small allocations land in the *caller's*
+    /// stack frame.  When a container built on `<SF>.get()` calls
+    /// `.toOwnedSlice()` / `.toOwnedSliceSentinel()` / similar and
+    /// the resulting slice escapes the function (return, out-param
+    /// write, store in a non-local struct), the pointer dangles
+    /// once the frame dies — intermittent UAF whenever the
+    /// allocation stays under the fallback threshold.  Catches
+    /// ghostty-org/ghostty#9885 class; same shape as
+    /// ziglang/zig#16344.
+    stack_fallback_escape,
 };
 
-pub const all_invariants: [20]Invariant = .{
+pub const all_invariants: [21]Invariant = .{
     .arena_escape,
     .stack_escape,
     .use_undefined,
@@ -209,6 +220,7 @@ pub const all_invariants: [20]Invariant = .{
     .dead_errdefer_in_result_fn,
     .duplicate_errdefer,
     .overwrite_without_deinit,
+    .stack_fallback_escape,
 };
 
 pub const Default: Config = .{};

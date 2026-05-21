@@ -22,6 +22,7 @@ const destroy_after_deinit_in_loop_mod = @import("destroy_after_deinit_in_loop.z
 const dead_errdefer_in_result_fn_mod = @import("dead_errdefer_in_result_fn.zig");
 const duplicate_errdefer_mod = @import("duplicate_errdefer.zig");
 const overwrite_without_deinit_mod = @import("overwrite_without_deinit.zig");
+const stack_fallback_escape_mod = @import("stack_fallback_escape.zig");
 const rule_catalog_mod = @import("rule_catalog.zig");
 
 pub const Config = config_mod.Config;
@@ -154,6 +155,11 @@ pub fn analyzeEscape(
     // single-field reassignment to a deinit-able field without
     // prior cleanup leaks the old value.
     try overwrite_without_deinit_mod.check(gpa, &tree, &db, config, &problems);
+
+    // Stack-fallback-escape (ghostty-org/ghostty#9885) — value
+    // built on `std.heap.stackFallback(N, …).get()` escapes the
+    // fn → dangles into caller's stack frame.
+    try stack_fallback_escape_mod.check(gpa, &tree, config, &problems);
 
     return problems.toOwnedSlice(gpa);
 }
@@ -611,5 +617,6 @@ test {
     _ = dead_errdefer_in_result_fn_mod;
     _ = duplicate_errdefer_mod;
     _ = overwrite_without_deinit_mod;
+    _ = stack_fallback_escape_mod;
     std.testing.refAllDecls(@This());
 }

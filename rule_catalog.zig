@@ -129,6 +129,11 @@ pub const all = [_]Rule{
         .title = "`this.field = X;` for a deinit-able field without prior `this.field.deinit();` — old value leaks",
         .body = @embedFile("rules/overwrite-without-deinit.md"),
     },
+    .{
+        .id = "stack-fallback-escape",
+        .title = "value built on a `stackFallback(N, …)` allocator escapes the fn — points at caller's stack buffer",
+        .body = @embedFile("rules/stack-fallback-escape.md"),
+    },
 };
 
 /// Look up a rule by id.  Returns null on unknown id so callers can
