@@ -77,6 +77,10 @@ const Binding = struct {
     /// Token of the statement-terminating semicolon — scan for
     /// subsequent `try` / `errdefer` starts from after this.
     end_token: Ast.TokenIndex,
+    /// True when the binding was an fd-opening call (`createFile`,
+    /// `openFile`, …) — the suggested cleanup in the diagnostic is
+    /// `.close()` rather than `.deinit()`.
+    is_fd_open: bool = false,
 };
 
 fn checkBody(
@@ -125,14 +129,20 @@ fn checkBody(
         // last is the method.
         const try_tok = after_name + 1;
         const parsed = parseTypeMethodAfter(tree, try_tok + 1, last) orelse continue;
-        if (!isOwnershipTransferMethod(parsed.method)) continue;
-        // Type name must start with an uppercase letter — Zig
-        // convention for struct/union/enum types.  Lowercase names
-        // are local variables (`gpa.dupe(...)`, `allocator.alloc(...)`)
-        // where the receiver is an Allocator, not a heap-owning
-        // type with a `deinit` method.
-        if (parsed.type_name.len == 0 or parsed.type_name[0] < 'A' or parsed.type_name[0] > 'Z') continue;
-        if (!typeHasDeinit(db, parsed.type_name)) continue;
+        // Two acceptance paths:
+        //   A. Ownership-transfer methods (e.g. `<Type>.fromJS(...)`)
+        //      where Type is title-cased and has a `deinit`.
+        //   B. File-handle openers (`createFile`, `openFile`,
+        //      `openat`, etc.) where the receiver can be any
+        //      `dir` / `posix` / `std.fs.cwd()` chain — the cleanup
+        //      is `.close()` rather than `.deinit()`.
+        var is_fd_open = false;
+        if (isOwnershipTransferMethod(parsed.method)) {
+            if (parsed.type_name.len == 0 or parsed.type_name[0] < 'A' or parsed.type_name[0] > 'Z') continue;
+            if (!typeHasDeinit(db, parsed.type_name)) continue;
+        } else if (isFileHandleOpenerMethod(parsed.method)) {
+            is_fd_open = true;
+        } else continue;
 
         // Find the binding's terminating semicolon at statement depth.
         const sc = findStmtSemicolon(tags, try_tok + 4, last) orelse continue;
@@ -140,6 +150,7 @@ fn checkBody(
             .x_name = tree.tokenSlice(t + 1),
             .name_token = t + 1,
             .end_token = sc,
+            .is_fd_open = is_fd_open,
         });
         t = sc;
     }
@@ -215,6 +226,25 @@ fn isOwnershipTransferMethod(name: []const u8) bool {
     return std.mem.eql(u8, name, "fromJS");
 }
 
+/// Methods that return an owned OS file/socket handle.  The cleanup
+/// for these is `.close()` rather than `.deinit()`.  Receivers are
+/// usually lowercase locals or `std`/`posix` namespace chains, so the
+/// uppercase-Type filter doesn't apply — the method name itself is
+/// the entire selectivity.
+fn isFileHandleOpenerMethod(name: []const u8) bool {
+    return std.mem.eql(u8, name, "createFile") or
+        std.mem.eql(u8, name, "createFileZ") or
+        std.mem.eql(u8, name, "openFile") or
+        std.mem.eql(u8, name, "openFileZ") or
+        std.mem.eql(u8, name, "openDir") or
+        std.mem.eql(u8, name, "openDirZ") or
+        std.mem.eql(u8, name, "openat") or
+        std.mem.eql(u8, name, "openatZ") or
+        std.mem.eql(u8, name, "open") or
+        std.mem.eql(u8, name, "socket") or
+        std.mem.eql(u8, name, "accept");
+}
+
 /// True iff `Type` has a `deinit` method discoverable in the Db.
 /// Conservative: cross-file / unknown types pass through as true
 /// so we don't miss real bugs whose types are declared in another
@@ -265,15 +295,26 @@ fn findStmtSemicolon(tags: []const std.zig.Token.Tag, start: Ast.TokenIndex, las
 fn cleanupReferencesLocal(tree: *const Ast, kw: Ast.TokenIndex, x_name: []const u8, last: Ast.TokenIndex) bool {
     const tags = tree.tokens.items(.tag);
     if (kw + 1 > last) return false;
-    // Inline form: `<kw> X.<method>(`.
-    if (tags[kw + 1] == .identifier and
-        std.mem.eql(u8, tree.tokenSlice(kw + 1), x_name) and
-        kw + 3 <= last and
-        tags[kw + 2] == .period and
-        tags[kw + 3] == .identifier and
-        isCleanupMethodName(tree.tokenSlice(kw + 3)))
-    {
-        return true;
+    // Inline form (no block): scan to the next `;` at our paren
+    // depth.  If `X` appears anywhere in that range (as a receiver,
+    // an argument to a helper, etc.), accept as cleanup.
+    if (tags[kw + 1] != .l_brace and tags[kw + 1] != .pipe) {
+        var paren: u32 = 0;
+        var t: Ast.TokenIndex = kw + 1;
+        while (t <= last) : (t += 1) {
+            switch (tags[t]) {
+                .l_paren => paren += 1,
+                .r_paren => if (paren > 0) {
+                    paren -= 1;
+                },
+                .semicolon => if (paren == 0) break,
+                .identifier => {
+                    if (std.mem.eql(u8, tree.tokenSlice(t), x_name)) return true;
+                },
+                else => {},
+            }
+        }
+        return false;
     }
     // Optional capture (errdefer only): `errdefer |err| { … }`.
     var scan_start: Ast.TokenIndex = kw + 1;
@@ -294,11 +335,14 @@ fn cleanupReferencesLocal(tree: *const Ast, kw: Ast.TokenIndex, x_name: []const 
                 if (depth == 0) break;
             },
             .identifier => {
-                if (!std.mem.eql(u8, tree.tokenSlice(t), x_name)) continue;
-                if (t + 2 > last) continue;
-                if (tags[t + 1] != .period) continue;
-                if (tags[t + 2] != .identifier) continue;
-                if (isCleanupMethodName(tree.tokenSlice(t + 2))) return true;
+                // Any mention of X inside the defer/errdefer body
+                // counts as cleanup — either as a receiver
+                // (`X.cleanup()`) or as an argument to a helper
+                // (`self.close_socket(X)`, `allocator.free(X)`).
+                // Anything else inside a defer/errdefer with X is
+                // either real cleanup or so unusual that not firing
+                // is the right call.
+                if (std.mem.eql(u8, tree.tokenSlice(t), x_name)) return true;
             },
             else => {},
         }
@@ -327,10 +371,11 @@ fn report(
     tree: *const Ast,
     b: Binding,
 ) !void {
+    const cleanup = if (b.is_fd_open) "close" else "deinit";
     const msg = try std.fmt.allocPrint(
         gpa,
-        "`{s}` is bound via `try …`, but a later `try` in this scope has no `errdefer {s}.deinit();` between them — `{s}` leaks every time the next `try` propagates an error",
-        .{ b.x_name, b.x_name, b.x_name },
+        "`{s}` is bound via `try …`, but a later `try` in this scope has no `errdefer {s}.{s}();` between them — `{s}` leaks every time the next `try` propagates an error",
+        .{ b.x_name, b.x_name, cleanup, b.x_name },
     );
     errdefer gpa.free(msg);
 
@@ -433,6 +478,37 @@ test "missing-errdefer-between-tries: lowercase receiver (gpa.dupe) doesn't fire
         \\    _ = try otherFallible();
         \\}
         \\fn otherFallible() !void {}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
+test "missing-errdefer-between-tries: file-handle open (createFile/openFile) without errdefer fires" {
+    const gpa = std.testing.allocator;
+    var problems = try runOn(gpa,
+        \\const std = @import("std");
+        \\pub fn writeAof(dir: std.fs.Dir, path: []const u8) !void {
+        \\    const file = try dir.createFile(path, .{});
+        \\    try file.sync();
+        \\    file.close();
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 1), problems.items.len);
+    try std.testing.expectEqualStrings("missing-errdefer-between-tries", problems.items[0].rule_id);
+}
+
+test "missing-errdefer-between-tries: file open with `errdefer file.close()` is OK" {
+    const gpa = std.testing.allocator;
+    var problems = try runOn(gpa,
+        \\const std = @import("std");
+        \\pub fn writeAof(dir: std.fs.Dir, path: []const u8) !void {
+        \\    const file = try dir.createFile(path, .{});
+        \\    errdefer file.close();
+        \\    try file.sync();
+        \\}
         \\
     );
     defer freeProblems(gpa, &problems);
