@@ -287,9 +287,19 @@ pub const Invariant = enum {
     /// catches the inversion.  Catches tigerbeetle/tigerbeetle#2687
     /// class.
     self_undefined_after_destroy,
+    /// Multi-step in-place struct-builder:
+    /// `try <out>.<field>.<acquire>(...)` (where `<out>` ∈
+    /// {`result`, `out`, `r`} and `<acquire>` ∈
+    /// {`ensureTotalCapacity`, `init`, `append`, ...}) populates
+    /// `<out>.<field>` but a later `try` runs with no `errdefer
+    /// <out>.<field>.deinit(...)` registered.  Catches
+    /// ghostty-org/ghostty#10401 class — distinct from existing
+    /// `missing-errdefer-between-tries` which covers the binding-
+    /// and-leak `const X = try Type.method()` shape.
+    missing_errdefer_on_out_param,
 };
 
-pub const all_invariants: [30]Invariant = .{
+pub const all_invariants: [31]Invariant = .{
     .arena_escape,
     .stack_escape,
     .use_undefined,
@@ -320,6 +330,7 @@ pub const all_invariants: [30]Invariant = .{
     .tagged_union_retag_with_old_payload_read,
     .union_deinit_without_inert_reset,
     .self_undefined_after_destroy,
+    .missing_errdefer_on_out_param,
 };
 
 pub const Default: Config = .{};

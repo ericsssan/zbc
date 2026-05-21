@@ -32,6 +32,7 @@ const free_without_null_then_check_mod = @import("free_without_null_then_check.z
 const tagged_union_retag_with_old_payload_read_mod = @import("tagged_union_retag_with_old_payload_read.zig");
 const union_deinit_without_inert_reset_mod = @import("union_deinit_without_inert_reset.zig");
 const self_undefined_after_destroy_mod = @import("self_undefined_after_destroy.zig");
+const missing_errdefer_on_out_param_mod = @import("missing_errdefer_on_out_param.zig");
 const rule_catalog_mod = @import("rule_catalog.zig");
 
 pub const Config = config_mod.Config;
@@ -219,6 +220,12 @@ pub fn analyzeEscape(
     // memory (TigerStyle order inverted; canonical order is
     // overwrite-then-free).
     try self_undefined_after_destroy_mod.check(gpa, &tree, config, &problems);
+
+    // Missing-errdefer-on-out-param —
+    // `try <out>.<field>.<acquire>(...)` then later `try` with no
+    // `errdefer <out>.<field>.deinit(...)` registered — out-param
+    // leaks on the later try's error path.
+    try missing_errdefer_on_out_param_mod.check(gpa, &tree, config, &problems);
 
     return problems.toOwnedSlice(gpa);
 }
@@ -686,5 +693,6 @@ test {
     _ = tagged_union_retag_with_old_payload_read_mod;
     _ = union_deinit_without_inert_reset_mod;
     _ = self_undefined_after_destroy_mod;
+    _ = missing_errdefer_on_out_param_mod;
     std.testing.refAllDecls(@This());
 }

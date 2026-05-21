@@ -39,6 +39,7 @@ Bun's.
 | `tagged_union_retag_with_old_payload_read.zig` | `tagged-union-retag-with-old-payload-read` | [tigerbeetle/tigerbeetle#3317](https://github.com/tigerbeetle/tigerbeetle/pull/3317), [tigerbeetle/tigerbeetle#2200](https://github.com/tigerbeetle/tigerbeetle/pull/2200) |
 | `union_deinit_without_inert_reset.zig` | `union-deinit-without-inert-reset` | [ghostty-org/ghostty#2257](https://github.com/ghostty-org/ghostty/pull/2257), [ghostty-org/ghostty#8307](https://github.com/ghostty-org/ghostty/pull/8307) |
 | `self_undefined_after_destroy.zig` | `self-undefined-after-destroy` | [tigerbeetle/tigerbeetle#2687](https://github.com/tigerbeetle/tigerbeetle/pull/2687) |
+| `missing_errdefer_on_out_param.zig` | `missing-errdefer-on-out-param` | [ghostty-org/ghostty#10401](https://github.com/ghostty-org/ghostty/pull/10401) |
 
 ## Re-fetching the actual pre-merge buggy files
 
