@@ -146,6 +146,15 @@ pub const StmtKind = union(enum) {
     /// Only clears .undef → .plain (the underlying storage was
     /// initialized via this write).
     pointer_write: struct { target: LocalId },
+    /// Write through a `*T` parameter (or pointer-typed local) to
+    /// caller-visible storage — `out.* = X;` or `out.field = X;`
+    /// where `out` is pointer-typed.  Mirrors the escape-style
+    /// checks at `return`: a value whose lifetime ends with this
+    /// function (function-local arena, stack reference) being
+    /// reachable from caller-owned storage is an escape.  `out`
+    /// is the pointer-typed local; `value_kind` is the RHS
+    /// classification used to derive the written value's origin.
+    out_param_write: struct { out: LocalId, value_kind: ExprKind },
     /// Re-bind a local to .plain.  Emitted at loop body entry for
     /// `while (it) |n|` / `for (xs) |x|` captures so back-edges
     /// don't carry one iteration's `free(n)` state into the next —
@@ -1784,6 +1793,44 @@ const Builder = struct {
             // `(install, "ca.str")`.  PR #25563 shape.
             try self.unpackStructInitFields(cur.*, fref.parent, fref.name, rhs,
                 self.posOf(assign_node), self.endPosOf(assign_node));
+            // Escape-via-out-param: `out.field = X` where `out` is a
+            // pointer-typed parameter writes through to caller
+            // storage.  If X's origin is a function-local arena /
+            // stack reference, that lifetime now reaches the caller
+            // — fire the same escape diagnostics as a borrowed-shape
+            // return.
+            if (self.locals.items[@intFromEnum(fref.parent)].is_pointer) {
+                try self.appendStmt(cur.*, .{
+                    .kind = .{ .out_param_write = .{
+                        .out = fref.parent,
+                        .value_kind = self.classifyExpr(rhs),
+                    } },
+                    .pos = self.posOf(assign_node),
+                    .end_pos = self.endPosOf(assign_node),
+                });
+            }
+        } else if (self.derefOfPointerLocal(lhs)) |out_local| {
+            // `<local>.* = RHS` — when local is pointer-typed, this
+            // writes through the pointer to caller-visible storage.
+            // Mirror the field-of-pointer case above: emit a
+            // pointer_write to clear .undef on the pointer and an
+            // out_param_write for the escape check.
+            if (!rhs_was_labeled_block) {
+                try self.emitUsesInExpr(rhs, cur.*, null);
+            }
+            try self.appendStmt(cur.*, .{
+                .kind = .{ .pointer_write = .{ .target = out_local } },
+                .pos = self.posOf(assign_node),
+                .end_pos = self.endPosOf(assign_node),
+            });
+            try self.appendStmt(cur.*, .{
+                .kind = .{ .out_param_write = .{
+                    .out = out_local,
+                    .value_kind = self.classifyExpr(rhs),
+                } },
+                .pos = self.posOf(assign_node),
+                .end_pos = self.endPosOf(assign_node),
+            });
         } else if (tree.nodeTag(lhs) == .identifier and
             std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(lhs)), "_"))
         {
@@ -3706,6 +3753,20 @@ const Builder = struct {
         const last_len = tree.tokenSlice(last_tok).len;
         const path = tree.source[first_path_byte..(last_start + last_len)];
         return .{ .parent = parent, .name = path };
+    }
+
+    /// True if `lhs_node` is `<local>.*` where `local` is pointer-
+    /// typed.  Returns the local id when it matches.  Used to
+    /// dispatch deref-writes to `out_param_write` for escape checks.
+    fn derefOfPointerLocal(self: *Builder, lhs_node: Ast.Node.Index) ?LocalId {
+        const tree = self.tree;
+        if (tree.nodeTag(lhs_node) != .deref) return null;
+        const inner = tree.nodeData(lhs_node).node;
+        if (tree.nodeTag(inner) != .identifier) return null;
+        const name = tree.tokenSlice(tree.nodeMainToken(inner));
+        const id = self.name_to_local.get(name) orelse return null;
+        if (!self.locals.items[@intFromEnum(id)].is_pointer) return null;
+        return id;
     }
 
     /// `.field_name = <value>` field initializer in a struct literal:

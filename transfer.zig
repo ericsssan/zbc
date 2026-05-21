@@ -73,6 +73,7 @@ pub fn transfer(ctx: Ctx, state: *AbstractState, stmt: Stmt) !void {
         .field_assign => |a| try transferFieldAssign(ctx, state, a, stmt.pos),
         .field_heap_free => |f| try transferFieldHeapFree(ctx, state, f, stmt.pos, stmt.end_pos),
         .field_use => |u| try transferFieldUse(ctx, state, u, stmt.pos, stmt.end_pos),
+        .out_param_write => |w| try transferOutParamWrite(ctx, state, w, stmt.pos, stmt.end_pos),
         .lowering_gap => |g| try transferGap(ctx, state, g, stmt.pos),
     }
 }
@@ -470,6 +471,56 @@ fn transferCompositeEscape(
     const name = ctx.locals[@intFromEnum(c.local)].name;
     try report(ctx, "stack-escape", pos, end_pos, .@"error",
         "returning a value that holds a pointer to function-local stack variable `{s}` (escapes its frame)", .{name});
+}
+
+/// Write-through-pointer escape check.  `out.* = X` (or
+/// `out.field = X` where `out` is `*T`) makes whatever `X`'s
+/// origin is reachable from caller-owned storage.  If that origin
+/// is a function-local arena / stack reference, the lifetime
+/// ends with this frame — surface the same arena-escape /
+/// stack-escape diagnostics that fire at `return`.
+///
+/// Heap origins are left alone here: heap allocations are
+/// owned-and-transferable, so writing one to caller-storage is
+/// legitimate (the canonical out-param return-allocator pattern).
+/// The case where a heap allocation is freed via `defer` BEFORE
+/// the function returns — and the write therefore leaves a
+/// dangling caller pointer — needs a deferred check at fn exit
+/// that this pass doesn't do yet.
+fn transferOutParamWrite(
+    ctx: Ctx,
+    state: *AbstractState,
+    w: @TypeOf(@as(StmtKind, undefined).out_param_write),
+    pos: cfg.SrcPos,
+    end_pos: cfg.SrcPos,
+) !void {
+    const origin = try originOfInit(ctx, state, w.value_kind, pos);
+    const out_name = ctx.locals[@intFromEnum(w.out)].name;
+    switch (origin) {
+        .stack => |src_local| {
+            // `out.field = &local` / `out.* = &local` — unambiguous
+            // stack-frame escape regardless of out's pointee type.
+            if (!config_mod.isEnabled(ctx.config, .stack_escape)) return;
+            const src_name = ctx.locals[@intFromEnum(src_local)].name;
+            try report(ctx, "stack-escape", pos, end_pos, .@"error",
+                "writing a pointer to function-local stack variable `{s}` through `{s}` (escapes its frame)",
+                .{ src_name, out_name });
+        },
+        // .arena / .arena_borrow are NOT checked here yet — zbc's
+        // classifier mints the same arena id for both stack-allocated
+        // arenas (`var a = ArenaAllocator.init(...)`) and heap-
+        // allocated ones (`var a = gpa.create(ArenaAllocator)`), so
+        // we can't tell at this point whether the arena dies with the
+        // frame.  Adding heap-shape tracking to ArenaState would let
+        // this fire safely; left as next-tier work.
+        //
+        // .heap is intentionally skipped: a fresh heap allocation
+        // written through `out` is an ownership transfer, which is
+        // the canonical out-param-allocator pattern.  Catching
+        // "heap allocation freed via defer THEN written to out" needs
+        // a deferred check at fn exit, also left as next-tier work.
+        else => {},
+    }
 }
 
 fn transferUse(
