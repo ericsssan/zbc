@@ -33,6 +33,7 @@ const tagged_union_retag_with_old_payload_read_mod = @import("tagged_union_retag
 const union_deinit_without_inert_reset_mod = @import("union_deinit_without_inert_reset.zig");
 const self_undefined_after_destroy_mod = @import("self_undefined_after_destroy.zig");
 const missing_errdefer_on_out_param_mod = @import("missing_errdefer_on_out_param.zig");
+const reset_skips_pooled_resource_release_mod = @import("reset_skips_pooled_resource_release.zig");
 const rule_catalog_mod = @import("rule_catalog.zig");
 
 pub const Config = config_mod.Config;
@@ -226,6 +227,11 @@ pub fn analyzeEscape(
     // `errdefer <out>.<field>.deinit(...)` registered — out-param
     // leaks on the later try's error path.
     try missing_errdefer_on_out_param_mod.check(gpa, &tree, config, &problems);
+
+    // Reset-skips-pooled-resource-release — `deinit` releases
+    // pool/handle resources but sibling `reset` doesn't.  Callers
+    // using `reset` leak the pool slots.
+    try reset_skips_pooled_resource_release_mod.check(gpa, &tree, config, &problems);
 
     return problems.toOwnedSlice(gpa);
 }
@@ -694,5 +700,6 @@ test {
     _ = union_deinit_without_inert_reset_mod;
     _ = self_undefined_after_destroy_mod;
     _ = missing_errdefer_on_out_param_mod;
+    _ = reset_skips_pooled_resource_release_mod;
     std.testing.refAllDecls(@This());
 }

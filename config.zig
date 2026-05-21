@@ -297,9 +297,16 @@ pub const Invariant = enum {
     /// `missing-errdefer-between-tries` which covers the binding-
     /// and-leak `const X = try Type.method()` shape.
     missing_errdefer_on_out_param,
+    /// A struct's `deinit` releases owned pool / sub-allocator
+    /// slots (`<obj>.<cleanup>(...)` where cleanup ∈ {`release`,
+    /// `free`, `destroy`, `close`, `deinit`, `unref`, `deref`}),
+    /// but the sibling `reset` method doesn't.  State is logically
+    /// "freed" after `reset` but the slots are still held.
+    /// Catches tigerbeetle/tigerbeetle#3436 + #1734 class.
+    reset_skips_pooled_resource_release,
 };
 
-pub const all_invariants: [31]Invariant = .{
+pub const all_invariants: [32]Invariant = .{
     .arena_escape,
     .stack_escape,
     .use_undefined,
@@ -331,6 +338,7 @@ pub const all_invariants: [31]Invariant = .{
     .union_deinit_without_inert_reset,
     .self_undefined_after_destroy,
     .missing_errdefer_on_out_param,
+    .reset_skips_pooled_resource_release,
 };
 
 pub const Default: Config = .{};

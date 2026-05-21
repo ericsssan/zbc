@@ -184,6 +184,11 @@ pub const all = [_]Rule{
         .title = "`try <out>.<field>.<acquire>(...)` then later `try` with no `errdefer <out>.<field>.deinit(...)` — out-param leaks on error",
         .body = @embedFile("rules/missing-errdefer-on-out-param.md"),
     },
+    .{
+        .id = "reset-skips-pooled-resource-release",
+        .title = "`deinit` releases pool/handle resources but sibling `reset` doesn't — callers using `reset` leak slots",
+        .body = @embedFile("rules/reset-skips-pooled-resource-release.md"),
+    },
 };
 
 /// Look up a rule by id.  Returns null on unknown id so callers can
