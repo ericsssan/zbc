@@ -294,3 +294,101 @@ fn report(
         .message = msg,
     });
 }
+
+// ── Tests ──────────────────────────────────────────────────
+
+fn runOn(gpa: std.mem.Allocator, src: []const u8) !std.ArrayListUnmanaged(Problem) {
+    const src_z = try gpa.dupeSentinel(u8, src, 0);
+    defer gpa.free(src_z);
+    var tree = try Ast.parse(gpa, src_z, .zig);
+    defer tree.deinit(gpa);
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    try check(gpa, &tree, &config_mod.Default, &problems);
+    return problems;
+}
+
+fn freeProblems(gpa: std.mem.Allocator, p: *std.ArrayListUnmanaged(Problem)) void {
+    for (p.items) |*x| x.deinit(gpa);
+    p.deinit(gpa);
+}
+
+test "destroy-after-deinit-in-loop: pointer-list loop without destroy fires" {
+    const gpa = std.testing.allocator;
+    var problems = try runOn(gpa,
+        \\const std = @import("std");
+        \\const Handler = struct { pub fn deinit(_: *Handler) void {} };
+        \\const Ctx = struct {
+        \\    handlers: std.ArrayListUnmanaged(*Handler) = .{},
+        \\    pub fn deinit(this: *Ctx) void {
+        \\        for (this.handlers.items) |h| {
+        \\            h.deinit();
+        \\        }
+        \\        this.handlers.deinit(std.heap.page_allocator);
+        \\    }
+        \\};
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 1), problems.items.len);
+    try std.testing.expectEqualStrings("destroy-after-deinit-in-loop", problems.items[0].rule_id);
+}
+
+test "destroy-after-deinit-in-loop: loop body includes destroy is OK" {
+    const gpa = std.testing.allocator;
+    var problems = try runOn(gpa,
+        \\const std = @import("std");
+        \\const Handler = struct { pub fn deinit(_: *Handler) void {} };
+        \\const Ctx = struct {
+        \\    handlers: std.ArrayListUnmanaged(*Handler) = .{},
+        \\    pub fn deinit(this: *Ctx) void {
+        \\        for (this.handlers.items) |h| {
+        \\            h.deinit();
+        \\            std.heap.page_allocator.destroy(h);
+        \\        }
+        \\        this.handlers.deinit(std.heap.page_allocator);
+        \\    }
+        \\};
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
+test "destroy-after-deinit-in-loop: value-typed list is OK (no `(*` in decl)" {
+    const gpa = std.testing.allocator;
+    var problems = try runOn(gpa,
+        \\const std = @import("std");
+        \\const Handler = struct { pub fn deinit(_: *Handler) void {} };
+        \\const Ctx = struct {
+        \\    handlers: std.ArrayListUnmanaged(Handler) = .{},
+        \\    pub fn deinit(this: *Ctx) void {
+        \\        for (this.handlers.items) |*h| {
+        \\            h.deinit();
+        \\        }
+        \\        this.handlers.deinit(std.heap.page_allocator);
+        \\    }
+        \\};
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
+test "destroy-after-deinit-in-loop: non-destructor fn is OK" {
+    const gpa = std.testing.allocator;
+    var problems = try runOn(gpa,
+        \\const std = @import("std");
+        \\const Handler = struct { pub fn deinit(_: *Handler) void {} };
+        \\const Ctx = struct {
+        \\    handlers: std.ArrayListUnmanaged(*Handler) = .{},
+        \\    pub fn cleanupSome(this: *Ctx) void {
+        \\        for (this.handlers.items) |h| {
+        \\            h.deinit();
+        \\        }
+        \\    }
+        \\};
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}

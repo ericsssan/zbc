@@ -368,3 +368,112 @@ fn report(
         .message = msg,
     });
 }
+
+// ── Tests ──────────────────────────────────────────────────
+
+fn runOn(gpa: std.mem.Allocator, src: []const u8) !std.ArrayListUnmanaged(Problem) {
+    const src_z = try gpa.dupeSentinel(u8, src, 0);
+    defer gpa.free(src_z);
+    var tree = try Ast.parse(gpa, src_z, .zig);
+    defer tree.deinit(gpa);
+    var db = try annotations_mod.buildFull(gpa, &tree, null, null);
+    defer db.deinit(gpa);
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    try check(gpa, &tree, &db, &config_mod.Default, &problems);
+    return problems;
+}
+
+fn freeProblems(gpa: std.mem.Allocator, p: *std.ArrayListUnmanaged(Problem)) void {
+    for (p.items) |*x| x.deinit(gpa);
+    p.deinit(gpa);
+}
+
+test "aliased-heap-dupe: shallow dupe of flag-paired struct fires" {
+    const gpa = std.testing.allocator;
+    var problems = try runOn(gpa,
+        \\const Blob = struct {
+        \\    content_type: []const u8 = "",
+        \\    content_type_allocated: bool = false,
+        \\    pub fn dupe(this: *const Blob) Blob {
+        \\        var d = this.*;
+        \\        return d;
+        \\    }
+        \\};
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 1), problems.items.len);
+    try std.testing.expectEqualStrings("aliased-heap-dupe", problems.items[0].rule_id);
+}
+
+test "aliased-heap-dupe: clearing the flag is OK" {
+    const gpa = std.testing.allocator;
+    var problems = try runOn(gpa,
+        \\const Blob = struct {
+        \\    content_type: []const u8 = "",
+        \\    content_type_allocated: bool = false,
+        \\    pub fn dupe(this: *const Blob) Blob {
+        \\        var d = this.*;
+        \\        d.content_type_allocated = false;
+        \\        return d;
+        \\    }
+        \\};
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
+test "aliased-heap-dupe: re-allocating the field is OK" {
+    const gpa = std.testing.allocator;
+    var problems = try runOn(gpa,
+        \\const std = @import("std");
+        \\const Blob = struct {
+        \\    content_type: []const u8 = "",
+        \\    content_type_allocated: bool = false,
+        \\    pub fn dupe(this: *const Blob, a: std.mem.Allocator) Blob {
+        \\        var d = this.*;
+        \\        d.content_type = a.dupe(u8, this.content_type) catch unreachable;
+        \\        return d;
+        \\    }
+        \\};
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
+test "aliased-heap-dupe: type without flag-pair fields doesn't fire" {
+    const gpa = std.testing.allocator;
+    var problems = try runOn(gpa,
+        \\const Plain = struct {
+        \\    a: u32 = 0,
+        \\    b: u32 = 0,
+        \\    pub fn dupe(this: *const Plain) Plain {
+        \\        var d = this.*;
+        \\        return d;
+        \\    }
+        \\};
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
+test "aliased-heap-dupe: `<src>.* = undefined` ownership transfer is OK" {
+    const gpa = std.testing.allocator;
+    var problems = try runOn(gpa,
+        \\const Blob = struct {
+        \\    content_type: []const u8 = "",
+        \\    content_type_allocated: bool = false,
+        \\    pub fn takeOwnership(self: *Blob) Blob {
+        \\        var result = self.*;
+        \\        self.* = undefined;
+        \\        return result;
+        \\    }
+        \\};
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}

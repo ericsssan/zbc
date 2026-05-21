@@ -231,3 +231,128 @@ fn report(
         .message = msg,
     });
 }
+
+// ── Tests ──────────────────────────────────────────────────
+
+fn runOn(gpa: std.mem.Allocator, src: []const u8) !std.ArrayListUnmanaged(Problem) {
+    const src_z = try gpa.dupeSentinel(u8, src, 0);
+    defer gpa.free(src_z);
+    var tree = try Ast.parse(gpa, src_z, .zig);
+    defer tree.deinit(gpa);
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    try check(gpa, &tree, &config_mod.Default, &problems);
+    return problems;
+}
+
+fn freeProblems(gpa: std.mem.Allocator, p: *std.ArrayListUnmanaged(Problem)) void {
+    for (p.items) |*x| x.deinit(gpa);
+    p.deinit(gpa);
+}
+
+test "dead-errdefer-in-result-fn: errdefer in `Result(T)` fn fires" {
+    const gpa = std.testing.allocator;
+    var problems = try runOn(gpa,
+        \\fn Result(comptime T: type) type {
+        \\    return union(enum) { result: T, err: anyerror };
+        \\}
+        \\const V = struct { pub fn deinit(_: *V) void {} };
+        \\pub fn parse(_: usize) Result(V) {
+        \\    var v: V = .{};
+        \\    errdefer v.deinit();
+        \\    return .{ .err = error.X };
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 1), problems.items.len);
+    try std.testing.expectEqualStrings("dead-errdefer-in-result-fn", problems.items[0].rule_id);
+}
+
+test "dead-errdefer-in-result-fn: errdefer in `!T` fn is OK (live)" {
+    const gpa = std.testing.allocator;
+    var problems = try runOn(gpa,
+        \\const V = struct { pub fn deinit(_: *V) void {} };
+        \\pub fn parse(_: usize) !V {
+        \\    var v: V = .{};
+        \\    errdefer v.deinit();
+        \\    return error.X;
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
+test "dead-errdefer-in-result-fn: errdefer in `E!T` fn is OK" {
+    const gpa = std.testing.allocator;
+    var problems = try runOn(gpa,
+        \\const E = error{X};
+        \\const V = struct { pub fn deinit(_: *V) void {} };
+        \\pub fn parse(_: usize) E!V {
+        \\    var v: V = .{};
+        \\    errdefer v.deinit();
+        \\    return error.X;
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
+test "dead-errdefer-in-result-fn: `?Result(T)` optional wrapper also fires" {
+    const gpa = std.testing.allocator;
+    var problems = try runOn(gpa,
+        \\fn Result(comptime T: type) type {
+        \\    return union(enum) { result: T, err: anyerror };
+        \\}
+        \\const V = struct { pub fn deinit(_: *V) void {} };
+        \\pub fn parse(_: usize) ?Result(V) {
+        \\    var v: V = .{};
+        \\    errdefer v.deinit();
+        \\    return null;
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 1), problems.items.len);
+}
+
+test "dead-errdefer-in-result-fn: bare named return (no parens) doesn't fire" {
+    const gpa = std.testing.allocator;
+    var problems = try runOn(gpa,
+        \\const V = struct { pub fn deinit(_: *V) void {} };
+        \\pub fn parse(_: usize) V {
+        \\    var v: V = .{};
+        \\    errdefer v.deinit();
+        \\    return v;
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
+test "dead-errdefer-in-result-fn: nested fn errdefer attributed to inner fn only" {
+    const gpa = std.testing.allocator;
+    var problems = try runOn(gpa,
+        \\fn Result(comptime T: type) type {
+        \\    return union(enum) { result: T, err: anyerror };
+        \\}
+        \\const V = struct { pub fn deinit(_: *V) void {} };
+        \\pub fn outer() void {
+        \\    const Inner = struct {
+        \\        pub fn parse(_: usize) Result(V) {
+        \\            var v: V = .{};
+        \\            errdefer v.deinit();
+        \\            return .{ .err = error.X };
+        \\        }
+        \\    };
+        \\    _ = Inner;
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    // Inner fn fires once; outer fn returns `void` so its scan skips
+    // past the inner fn's body via skipNestedFn.
+    try std.testing.expectEqual(@as(usize, 1), problems.items.len);
+}

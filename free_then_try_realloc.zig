@@ -161,3 +161,106 @@ fn report(
         .message = msg,
     });
 }
+
+// ── Tests ──────────────────────────────────────────────────
+
+fn runOn(gpa: std.mem.Allocator, src: []const u8) !std.ArrayListUnmanaged(Problem) {
+    const src_z = try gpa.dupeSentinel(u8, src, 0);
+    defer gpa.free(src_z);
+    var tree = try Ast.parse(gpa, src_z, .zig);
+    defer tree.deinit(gpa);
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    try check(gpa, &tree, &config_mod.Default, &problems);
+    return problems;
+}
+
+fn freeProblems(gpa: std.mem.Allocator, p: *std.ArrayListUnmanaged(Problem)) void {
+    for (p.items) |*x| x.deinit(gpa);
+    p.deinit(gpa);
+}
+
+test "free-then-try-realloc: adjacent free + try-alloc fires" {
+    const gpa = std.testing.allocator;
+    var problems = try runOn(gpa,
+        \\const std = @import("std");
+        \\const T = struct { x: u32 };
+        \\const S = struct { columns: []T = &.{} };
+        \\pub fn refill(s: *S, n: usize) !void {
+        \\    std.heap.page_allocator.free(s.columns);
+        \\    s.columns = try std.heap.page_allocator.alloc(T, n);
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 1), problems.items.len);
+    try std.testing.expectEqualStrings("free-then-try-realloc", problems.items[0].rule_id);
+}
+
+test "free-then-try-realloc: clearing between free and try is OK" {
+    const gpa = std.testing.allocator;
+    var problems = try runOn(gpa,
+        \\const std = @import("std");
+        \\const T = struct { x: u32 };
+        \\const S = struct { columns: []T = &.{} };
+        \\pub fn refill(s: *S, n: usize) !void {
+        \\    std.heap.page_allocator.free(s.columns);
+        \\    s.columns = &.{};
+        \\    s.columns = try std.heap.page_allocator.alloc(T, n);
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
+test "free-then-try-realloc: `catch unreachable` instead of `try` is OK" {
+    const gpa = std.testing.allocator;
+    var problems = try runOn(gpa,
+        \\const std = @import("std");
+        \\const T = struct { x: u32 };
+        \\const S = struct { columns: []T = &.{} };
+        \\pub fn refill(s: *S, n: usize) void {
+        \\    std.heap.page_allocator.free(s.columns);
+        \\    s.columns = std.heap.page_allocator.alloc(T, n) catch unreachable;
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
+test "free-then-try-realloc: free in inner `if`, try in outer scope still fires" {
+    const gpa = std.testing.allocator;
+    var problems = try runOn(gpa,
+        \\const std = @import("std");
+        \\const T = struct { x: u32 };
+        \\const S = struct { columns: []T = &.{} };
+        \\pub fn refill(s: *S, n: usize, cond: bool) !void {
+        \\    if (cond) {
+        \\        std.heap.page_allocator.free(s.columns);
+        \\    }
+        \\    s.columns = try std.heap.page_allocator.alloc(T, n);
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 1), problems.items.len);
+}
+
+test "free-then-try-realloc: free followed by unrelated stmt then try doesn't fire" {
+    const gpa = std.testing.allocator;
+    var problems = try runOn(gpa,
+        \\const std = @import("std");
+        \\const T = struct { x: u32 };
+        \\const S = struct { columns: []T = &.{} };
+        \\pub fn refill(s: *S, n: usize) !void {
+        \\    std.heap.page_allocator.free(s.columns);
+        \\    const x: u32 = 0;
+        \\    _ = x;
+        \\    s.columns = try std.heap.page_allocator.alloc(T, n);
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}

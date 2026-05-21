@@ -136,3 +136,93 @@ fn report(
         .message = msg,
     });
 }
+
+// ── Tests ──────────────────────────────────────────────────
+
+fn runOn(gpa: std.mem.Allocator, src: []const u8) !std.ArrayListUnmanaged(Problem) {
+    const src_z = try gpa.dupeSentinel(u8, src, 0);
+    defer gpa.free(src_z);
+    var tree = try Ast.parse(gpa, src_z, .zig);
+    defer tree.deinit(gpa);
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    try check(gpa, &tree, &config_mod.Default, &problems);
+    return problems;
+}
+
+fn freeProblems(gpa: std.mem.Allocator, p: *std.ArrayListUnmanaged(Problem)) void {
+    for (p.items) |*x| x.deinit(gpa);
+    p.deinit(gpa);
+}
+
+test "realloc-byte-count: `n * @sizeOf(T)` fires" {
+    const gpa = std.testing.allocator;
+    var problems = try runOn(gpa,
+        \\const std = @import("std");
+        \\const T = struct { x: u32 };
+        \\pub fn grow(a: std.mem.Allocator, p: [*]T, len: usize, n: usize) []T {
+        \\    return a.realloc(p[0..len], n * @sizeOf(T)) catch unreachable;
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 1), problems.items.len);
+    try std.testing.expectEqualStrings("realloc-byte-count", problems.items[0].rule_id);
+}
+
+test "realloc-byte-count: `@sizeOf(T) * n` (left-side) also fires" {
+    const gpa = std.testing.allocator;
+    var problems = try runOn(gpa,
+        \\const std = @import("std");
+        \\const T = struct { x: u32 };
+        \\pub fn grow(a: std.mem.Allocator, p: [*]T, len: usize, n: usize) []T {
+        \\    return a.realloc(p[0..len], @sizeOf(T) * n) catch unreachable;
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 1), problems.items.len);
+}
+
+test "realloc-byte-count: plain element count is OK" {
+    const gpa = std.testing.allocator;
+    var problems = try runOn(gpa,
+        \\const std = @import("std");
+        \\const T = struct { x: u32 };
+        \\pub fn grow(a: std.mem.Allocator, p: [*]T, cap: usize, n: usize) []T {
+        \\    return a.realloc(p[0..cap], n) catch unreachable;
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
+test "realloc-byte-count: pre-bound byte count via local is OK" {
+    const gpa = std.testing.allocator;
+    var problems = try runOn(gpa,
+        \\const std = @import("std");
+        \\const T = struct { x: u32 };
+        \\pub fn grow(a: std.mem.Allocator, p: [*]u8, cap: usize, n: usize) []u8 {
+        \\    const new_bytes = n * @sizeOf(T);
+        \\    return a.realloc(p[0..cap], new_bytes) catch unreachable;
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
+test "realloc-byte-count: @sizeOf inside a nested call doesn't fire" {
+    const gpa = std.testing.allocator;
+    var problems = try runOn(gpa,
+        \\const std = @import("std");
+        \\const T = struct { x: u32 };
+        \\pub fn grow(a: std.mem.Allocator, p: [*]T, cap: usize) []T {
+        \\    return a.realloc(p[0..cap], doubleOf(2 * @sizeOf(T))) catch unreachable;
+        \\}
+        \\fn doubleOf(x: usize) usize { return x * 2; }
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}

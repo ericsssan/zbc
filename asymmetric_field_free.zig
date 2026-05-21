@@ -482,3 +482,105 @@ fn report(
         .message = msg,
     });
 }
+
+// ── Tests ──────────────────────────────────────────────────
+
+fn runOn(gpa: std.mem.Allocator, src: []const u8) !std.ArrayListUnmanaged(Problem) {
+    const src_z = try gpa.dupeSentinel(u8, src, 0);
+    defer gpa.free(src_z);
+    var tree = try Ast.parse(gpa, src_z, .zig);
+    defer tree.deinit(gpa);
+    var db = try annotations_mod.buildFull(gpa, &tree, null, null);
+    defer db.deinit(gpa);
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    try check(gpa, &tree, &db, &config_mod.Default, &problems);
+    return problems;
+}
+
+fn freeProblems(gpa: std.mem.Allocator, p: *std.ArrayListUnmanaged(Problem)) void {
+    for (p.items) |*x| x.deinit(gpa);
+    p.deinit(gpa);
+}
+
+test "asymmetric-field-free: one of two `?Type` siblings deinit'd, the other not — fires" {
+    const gpa = std.testing.allocator;
+    var problems = try runOn(gpa,
+        \\const Map = struct { pub fn deinit(_: *Map) void {} };
+        \\const Route = struct {
+        \\    a_map: ?Map = null,
+        \\    b_map: ?Map = null,
+        \\    pub fn deinit(this: *Route) void {
+        \\        if (this.a_map) |*m| m.deinit();
+        \\    }
+        \\};
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 1), problems.items.len);
+    try std.testing.expectEqualStrings("asymmetric-field-free", problems.items[0].rule_id);
+}
+
+test "asymmetric-field-free: both siblings deinit'd — OK" {
+    const gpa = std.testing.allocator;
+    var problems = try runOn(gpa,
+        \\const Map = struct { pub fn deinit(_: *Map) void {} };
+        \\const Route = struct {
+        \\    a_map: ?Map = null,
+        \\    b_map: ?Map = null,
+        \\    pub fn deinit(this: *Route) void {
+        \\        if (this.a_map) |*m| m.deinit();
+        \\        if (this.b_map) |*m| m.deinit();
+        \\    }
+        \\};
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
+test "asymmetric-field-free: neither sibling mentioned (symmetric) — OK" {
+    const gpa = std.testing.allocator;
+    var problems = try runOn(gpa,
+        \\const Map = struct { pub fn deinit(_: *Map) void {} };
+        \\const Route = struct {
+        \\    a_map: ?Map = null,
+        \\    b_map: ?Map = null,
+        \\    pub fn deinit(_: *Route) void {}
+        \\};
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
+test "asymmetric-field-free: scalar siblings (bool) — OK" {
+    const gpa = std.testing.allocator;
+    var problems = try runOn(gpa,
+        \\const T = struct {
+        \\    a: bool = false,
+        \\    b: bool = false,
+        \\    pub fn deinit(this: *T) void {
+        \\        _ = this.a;
+        \\    }
+        \\};
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
+test "asymmetric-field-free: bare slice siblings (`[]const u8`) — OK" {
+    const gpa = std.testing.allocator;
+    var problems = try runOn(gpa,
+        \\const T = struct {
+        \\    name: []const u8 = "",
+        \\    message: []const u8 = "",
+        \\    pub fn deinit(this: *T) void {
+        \\        _ = this.message;
+        \\    }
+        \\};
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}

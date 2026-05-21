@@ -342,3 +342,119 @@ fn report(
         .message = msg,
     });
 }
+
+// ── Tests ──────────────────────────────────────────────────
+
+fn runOn(gpa: std.mem.Allocator, src: []const u8) !std.ArrayListUnmanaged(Problem) {
+    const src_z = try gpa.dupeSentinel(u8, src, 0);
+    defer gpa.free(src_z);
+    var tree = try Ast.parse(gpa, src_z, .zig);
+    defer tree.deinit(gpa);
+    var db = try annotations_mod.buildFull(gpa, &tree, null, null);
+    defer db.deinit(gpa);
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    try check(gpa, &tree, &db, &config_mod.Default, &problems);
+    return problems;
+}
+
+fn freeProblems(gpa: std.mem.Allocator, p: *std.ArrayListUnmanaged(Problem)) void {
+    for (p.items) |*x| x.deinit(gpa);
+    p.deinit(gpa);
+}
+
+test "missing-errdefer-between-tries: `fromJS` binding without errdefer fires" {
+    const gpa = std.testing.allocator;
+    var problems = try runOn(gpa,
+        \\const std = @import("std");
+        \\const PathLike = struct {
+        \\    pub fn fromJS(_: usize, _: usize) !?PathLike { return null; }
+        \\    pub fn deinit(_: *PathLike) void {}
+        \\};
+        \\pub fn rename(ctx: usize, a: usize, b: usize) !struct { o: PathLike, n: PathLike } {
+        \\    const old_path = try PathLike.fromJS(ctx, a) orelse return error.Invalid;
+        \\    const new_path = try PathLike.fromJS(ctx, b) orelse return error.Invalid;
+        \\    return .{ .o = old_path, .n = new_path };
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 1), problems.items.len);
+    try std.testing.expectEqualStrings("missing-errdefer-between-tries", problems.items[0].rule_id);
+}
+
+test "missing-errdefer-between-tries: errdefer between tries is OK" {
+    const gpa = std.testing.allocator;
+    var problems = try runOn(gpa,
+        \\const std = @import("std");
+        \\const PathLike = struct {
+        \\    pub fn fromJS(_: usize, _: usize) !?PathLike { return null; }
+        \\    pub fn deinit(_: *PathLike) void {}
+        \\};
+        \\pub fn rename(ctx: usize, a: usize, b: usize) !struct { o: PathLike, n: PathLike } {
+        \\    var old_path = try PathLike.fromJS(ctx, a) orelse return error.Invalid;
+        \\    errdefer old_path.deinit();
+        \\    var new_path = try PathLike.fromJS(ctx, b) orelse return error.Invalid;
+        \\    errdefer new_path.deinit();
+        \\    return .{ .o = old_path, .n = new_path };
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
+test "missing-errdefer-between-tries: `defer X.deref()` is also accepted as protection" {
+    const gpa = std.testing.allocator;
+    var problems = try runOn(gpa,
+        \\const Str = struct {
+        \\    pub fn fromJS(_: usize, _: usize) !?Str { return null; }
+        \\    pub fn deref(_: *const Str) void {}
+        \\    pub fn deinit(_: *Str) void {}
+        \\};
+        \\pub fn parse(ctx: usize, v: usize) !void {
+        \\    const str = try Str.fromJS(ctx, v) orelse return error.Invalid;
+        \\    defer str.deref();
+        \\    _ = try otherFallible();
+        \\}
+        \\fn otherFallible() !void {}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
+test "missing-errdefer-between-tries: lowercase receiver (gpa.dupe) doesn't fire" {
+    const gpa = std.testing.allocator;
+    var problems = try runOn(gpa,
+        \\const std = @import("std");
+        \\pub fn foo(a: std.mem.Allocator) !void {
+        \\    const buf = try a.dupe(u8, "abc");
+        \\    defer a.free(buf);
+        \\    _ = try otherFallible();
+        \\}
+        \\fn otherFallible() !void {}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
+test "missing-errdefer-between-tries: non-`fromJS` method doesn't fire" {
+    const gpa = std.testing.allocator;
+    var problems = try runOn(gpa,
+        \\const T = struct {
+        \\    pub fn create() !T { return .{}; }
+        \\    pub fn deinit(_: *T) void {}
+        \\};
+        \\pub fn foo() !void {
+        \\    const x = try T.create();
+        \\    _ = x;
+        \\    _ = try otherFallible();
+        \\}
+        \\fn otherFallible() !void {}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    // Method is `create`, not `fromJS`; narrow gate skips it.
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}

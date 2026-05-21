@@ -588,5 +588,14 @@ test {
     _ = @import("transfer.zig");
     _ = require_borrowed_from;
     _ = rule_catalog_mod;
+    // Session rules — each module owns its inline tests.
+    _ = aliased_heap_dupe_mod;
+    _ = clobbered_by_struct_reset_mod;
+    _ = realloc_byte_count_mod;
+    _ = asymmetric_field_free_mod;
+    _ = missing_errdefer_between_tries_mod;
+    _ = free_then_try_realloc_mod;
+    _ = destroy_after_deinit_in_loop_mod;
+    _ = dead_errdefer_in_result_fn_mod;
     std.testing.refAllDecls(@This());
 }

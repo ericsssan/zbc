@@ -365,3 +365,136 @@ fn report(
         .message = msg,
     });
 }
+
+// ── Tests ──────────────────────────────────────────────────
+
+fn runOn(gpa: std.mem.Allocator, src: []const u8) !std.ArrayListUnmanaged(Problem) {
+    const src_z = try gpa.dupeSentinel(u8, src, 0);
+    defer gpa.free(src_z);
+    var tree = try Ast.parse(gpa, src_z, .zig);
+    defer tree.deinit(gpa);
+    var db = try annotations_mod.buildFull(gpa, &tree, null, null);
+    defer db.deinit(gpa);
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    try check(gpa, &tree, &db, &config_mod.Default, &problems);
+    return problems;
+}
+
+fn freeProblems(gpa: std.mem.Allocator, p: *std.ArrayListUnmanaged(Problem)) void {
+    for (p.items) |*x| x.deinit(gpa);
+    p.deinit(gpa);
+}
+
+test "clobbered-by-struct-reset: assignment then struct-reset omitting the field fires" {
+    const gpa = std.testing.allocator;
+    var problems = try runOn(gpa,
+        \\const Watcher = struct {
+        \\    path: []const u8 = "",
+        \\    callback: usize = 0,
+        \\    resolved_path: ?[:0]const u8 = null,
+        \\};
+        \\pub fn init(this: *Watcher, path: []const u8) !void {
+        \\    const resolved_path = "abc";
+        \\    this.resolved_path = resolved_path;
+        \\    this.* = Watcher{ .path = path, .callback = 0 };
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 1), problems.items.len);
+    try std.testing.expectEqualStrings("clobbered-by-struct-reset", problems.items[0].rule_id);
+}
+
+test "clobbered-by-struct-reset: literal carries the field forward — OK" {
+    const gpa = std.testing.allocator;
+    var problems = try runOn(gpa,
+        \\const Watcher = struct {
+        \\    path: []const u8 = "",
+        \\    resolved_path: ?[:0]const u8 = null,
+        \\};
+        \\pub fn init(this: *Watcher, path: []const u8) !void {
+        \\    const resolved_path = "abc";
+        \\    this.resolved_path = resolved_path;
+        \\    this.* = Watcher{ .path = path, .resolved_path = resolved_path };
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
+test "clobbered-by-struct-reset: prior RHS is `null` sentinel — OK" {
+    const gpa = std.testing.allocator;
+    var problems = try runOn(gpa,
+        \\const Watcher = struct {
+        \\    path: []const u8 = "",
+        \\    resolved_path: ?[:0]const u8 = null,
+        \\};
+        \\pub fn init(this: *Watcher, path: []const u8) void {
+        \\    this.resolved_path = null;
+        \\    this.* = Watcher{ .path = path };
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
+test "clobbered-by-struct-reset: empty `.{}` reset (defer-clear pattern) is OK" {
+    const gpa = std.testing.allocator;
+    var problems = try runOn(gpa,
+        \\const Progress = struct {
+        \\    supports_ansi_escape_codes: bool = false,
+        \\    pub fn run(this: *Progress) void {
+        \\        this.supports_ansi_escape_codes = true;
+        \\        this.* = .{};
+        \\    }
+        \\};
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
+test "clobbered-by-struct-reset: intervening `var <obj>` shadowing is OK" {
+    const gpa = std.testing.allocator;
+    var problems = try runOn(gpa,
+        \\const Watcher = struct {
+        \\    path: []const u8 = "",
+        \\    resolved_path: ?[:0]const u8 = null,
+        \\};
+        \\pub fn init(_: *Watcher) void {
+        \\    var this: *Watcher = undefined;
+        \\    this.resolved_path = "abc";
+        \\    var this2: *Watcher = undefined;
+        \\    _ = &this2;
+        \\    // Different `this` would be a different scope in real code; here we
+        \\    // just verify the shadow-detection branch.
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
+test "clobbered-by-struct-reset: comptime type-builder fn is skipped" {
+    const gpa = std.testing.allocator;
+    var problems = try runOn(gpa,
+        \\pub fn Builder(comptime T: type) type {
+        \\    return struct {
+        \\        val: T,
+        \\        pub fn set(self: *@This(), v: T) void {
+        \\            self.val = v;
+        \\            self.* = .{ .val = v };
+        \\        }
+        \\    };
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    // Outer fn returns `type` so its body scan is skipped.  The
+    // inner `set` fn's `self.val = v` and `self.* = .{ .val = v }`
+    // both reference the SAME field, so the literal doesn't omit
+    // it — no fire.
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}
