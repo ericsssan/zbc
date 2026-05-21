@@ -165,6 +165,13 @@ pub const Db = struct {
     /// storage lives in `owned_paths` (single-segment keys are
     /// source-slices owned by the tree).
     borrowed_fields: std.HashMapUnmanaged(FieldKey, void, FieldKey.Context, std.hash_map.default_max_load_percentage) = .empty,
+    /// (containing-struct, field-name) ∈ set when the field is the
+    /// "value" side of a flag-paired ownership pattern: a sibling
+    /// `<name>_allocated: bool` field exists on the same struct,
+    /// signalling that `<name>` is conditionally heap-owned.  PR
+    /// #29910 detector (`aliased-heap-dupe`) uses this to identify
+    /// types where a bitwise-copy dupe is unsafe.
+    flag_owned_fields: std.HashMapUnmanaged(FieldKey, void, FieldKey.Context, std.hash_map.default_max_load_percentage) = .empty,
     /// Owned byte slices for any field-name strings in
     /// `borrowed_fields` that aren't a contiguous slice of the
     /// source (currently: dotted paths built by nested-literal
@@ -186,8 +193,20 @@ pub const Db = struct {
         self.field_types.deinit(gpa);
         self.field_is_pointer.deinit(gpa);
         self.borrowed_fields.deinit(gpa);
+        self.flag_owned_fields.deinit(gpa);
         for (self.owned_paths.items) |p| gpa.free(p);
         self.owned_paths.deinit(gpa);
+    }
+
+    /// True iff `<struct_name>.<field_name>` is one half of a
+    /// flag-paired ownership pattern (the heap-owning `<X>` whose
+    /// sibling `<X>_allocated: bool` gates frees).  Used by the
+    /// PR #29910 aliased-heap-dupe detector.
+    pub fn isFlagOwnedField(self: *const Db, struct_name: []const u8, field_name: []const u8) bool {
+        return self.flag_owned_fields.containsContext(.{
+            .containing_type = struct_name,
+            .name = field_name,
+        }, .{});
     }
 
     /// (struct_name, field_name) → declared field type name, or
@@ -421,6 +440,7 @@ pub fn buildFull(
     // type.  Together these let `<recv>.<field>.<method>()` calls
     // disambiguate by both the local's type and the field's type.
     try discoverContainingTypes(gpa, tree, &db.containing_types, &db.field_types, &db.borrowed_fields, &db.field_is_pointer);
+    try discoverFlagOwnedFields(gpa, tree, &db.flag_owned_fields);
     const fn_to_type = &db.containing_types;
 
     // Pass 1 — explicit annotations + R6 (slice + body allocs → owned).
@@ -1820,6 +1840,160 @@ fn discoverContainingTypes(
 ) !void {
     const root = tree.containerDeclRoot();
     try walkContainerMembers(gpa, tree, root.ast.members, null, fn_out, field_out, borrowed_out, ptr_out);
+}
+
+/// Walk every container_decl in the file and identify flag-paired
+/// ownership patterns — a `<X>_allocated: bool` field with a
+/// sibling `<X>: <slice-or-pointer>` field on the same type.  The
+/// canonical Zig idiom for "this slice/pointer is conditionally
+/// heap-owned, free it iff the flag is true."  zbc's PR #29910
+/// detector uses the set of `<X>` field keys to flag bitwise-dupe
+/// patterns that alias the source's owned pointer.
+fn discoverFlagOwnedFields(
+    gpa: std.mem.Allocator,
+    tree: *const Ast,
+    out: *std.HashMapUnmanaged(Db.FieldKey, void, Db.FieldKey.Context, std.hash_map.default_max_load_percentage),
+) !void {
+    const root = tree.containerDeclRoot();
+    // Resolve the root container's name when the file uses the
+    // canonical `const Foo = @This();` pattern.  Without this,
+    // file-level fields (the dominant convention for single-type
+    // Zig modules) are not associated with any containing-type
+    // name and the rule misses them entirely.
+    const root_name = findRootSelfTypeName(tree, root.ast.members);
+    try walkFlagFields(gpa, tree, root.ast.members, root_name, out);
+}
+
+/// Scan top-level var-decls for `const <Name> = @This();` and
+/// return `<Name>`.  This is the Zig convention for naming a
+/// module-as-struct so other code can reference it by name.
+fn findRootSelfTypeName(tree: *const Ast, members: []const Ast.Node.Index) ?[]const u8 {
+    for (members) |member| {
+        switch (tree.nodeTag(member)) {
+            .simple_var_decl,
+            .local_var_decl,
+            .aligned_var_decl,
+            .global_var_decl,
+            => {
+                const vd = tree.fullVarDecl(member) orelse continue;
+                const init_node = vd.ast.init_node.unwrap() orelse continue;
+                // `@This()` is a builtin_call_two with main token
+                // `.builtin` whose slice is "@This".
+                if (tree.nodeTag(init_node) != .builtin_call_two and
+                    tree.nodeTag(init_node) != .builtin_call_two_comma) continue;
+                const main_tok = tree.nodeMainToken(init_node);
+                if (tree.tokens.items(.tag)[main_tok] != .builtin) continue;
+                if (!std.mem.eql(u8, tree.tokenSlice(main_tok), "@This")) continue;
+                const name_tok = vd.ast.mut_token + 1;
+                if (tree.tokens.items(.tag)[name_tok] != .identifier) continue;
+                return tree.tokenSlice(name_tok);
+            },
+            else => {},
+        }
+    }
+    return null;
+}
+
+fn walkFlagFields(
+    gpa: std.mem.Allocator,
+    tree: *const Ast,
+    members: []const Ast.Node.Index,
+    containing_type: ?[]const u8,
+    out: *std.HashMapUnmanaged(Db.FieldKey, void, Db.FieldKey.Context, std.hash_map.default_max_load_percentage),
+) (std.mem.Allocator.Error)!void {
+    // First, gather the names of all fields on THIS container.
+    var names: std.StringHashMapUnmanaged(void) = .empty;
+    defer names.deinit(gpa);
+    for (members) |member| {
+        switch (tree.nodeTag(member)) {
+            .container_field_init,
+            .container_field_align,
+            .container_field,
+            => {
+                const cf = tree.fullContainerField(member) orelse continue;
+                const name_tok = cf.ast.main_token;
+                if (tree.tokens.items(.tag)[name_tok] != .identifier) continue;
+                try names.put(gpa, tree.tokenSlice(name_tok), {});
+            },
+            else => {},
+        }
+    }
+
+    // Second, for each `<X>_allocated: bool` field whose sibling
+    // `<X>` also exists, record `<X>` as flag-owned.
+    if (containing_type) |ct| {
+        for (members) |member| {
+            switch (tree.nodeTag(member)) {
+                .container_field_init,
+                .container_field_align,
+                .container_field,
+                => {
+                    const cf = tree.fullContainerField(member) orelse continue;
+                    const name_tok = cf.ast.main_token;
+                    if (tree.tokens.items(.tag)[name_tok] != .identifier) continue;
+                    const fname = tree.tokenSlice(name_tok);
+                    if (!std.mem.endsWith(u8, fname, "_allocated")) continue;
+                    // Verify the field's declared type is `bool` — the flag
+                    // half of the pair MUST be a bool.  Without this we'd
+                    // false-pair on names like `was_allocated_at_offset: u64`.
+                    const type_expr = cf.ast.type_expr.unwrap() orelse continue;
+                    const first = tree.firstToken(type_expr);
+                    const last = tree.lastToken(type_expr);
+                    if (first != last) continue;
+                    if (!std.mem.eql(u8, tree.tokenSlice(first), "bool")) continue;
+                    const x = fname[0 .. fname.len - "_allocated".len];
+                    if (x.len == 0) continue;
+                    if (!names.contains(x)) continue;
+                    try out.putContext(gpa, .{
+                        .containing_type = ct,
+                        .name = x,
+                    }, {}, .{});
+                },
+                else => {},
+            }
+        }
+    }
+
+    // Third, recurse into nested container types declared inside.
+    for (members) |member| {
+        switch (tree.nodeTag(member)) {
+            .simple_var_decl,
+            .local_var_decl,
+            .aligned_var_decl,
+            .global_var_decl,
+            => {
+                const vd = tree.fullVarDecl(member) orelse continue;
+                const init_node = vd.ast.init_node.unwrap() orelse continue;
+                const name_tok = vd.ast.mut_token + 1;
+                if (tree.tokens.items(.tag)[name_tok] != .identifier) continue;
+                const ty_name = tree.tokenSlice(name_tok);
+                try descendFlagContainer(gpa, tree, init_node, ty_name, out);
+            },
+            else => {},
+        }
+    }
+}
+
+fn descendFlagContainer(
+    gpa: std.mem.Allocator,
+    tree: *const Ast,
+    node: Ast.Node.Index,
+    ty_name: []const u8,
+    out: *std.HashMapUnmanaged(Db.FieldKey, void, Db.FieldKey.Context, std.hash_map.default_max_load_percentage),
+) (std.mem.Allocator.Error)!void {
+    switch (tree.nodeTag(node)) {
+        .container_decl, .container_decl_trailing => {
+            try walkFlagFields(gpa, tree, tree.containerDecl(node).ast.members, ty_name, out);
+        },
+        .container_decl_two, .container_decl_two_trailing => {
+            var buf: [2]Ast.Node.Index = undefined;
+            try walkFlagFields(gpa, tree, tree.containerDeclTwo(&buf, node).ast.members, ty_name, out);
+        },
+        .container_decl_arg, .container_decl_arg_trailing => {
+            try walkFlagFields(gpa, tree, tree.containerDeclArg(node).ast.members, ty_name, out);
+        },
+        else => {},
+    }
 }
 
 fn walkContainerMembers(

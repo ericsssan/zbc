@@ -98,9 +98,18 @@ pub const Invariant = enum {
     /// later read (often via an `errdefer this.deinit()`) sees a
     /// wild pointer.  Catches PR #29422 class.
     partial_union_write,
+    /// A "dupe" function returns `T` by value via a bitwise copy
+    /// (`var dup = this.*; return dup;`), and T has a heap-owning
+    /// field signalled by an `<X>_allocated: bool` sibling — but
+    /// the dupe doesn't either clear `<X>_allocated` or re-allocate
+    /// `<X>` independently.  Both the source and the dupe now hold
+    /// the same heap pointer with `<X>_allocated == true`, so the
+    /// later frees from each side collide (UAF, then double-free).
+    /// Catches PR #29910 class: `Blob.dupeWithContentType`.
+    aliased_heap_dupe,
 };
 
-pub const all_invariants: [10]Invariant = .{
+pub const all_invariants: [11]Invariant = .{
     .arena_escape,
     .stack_escape,
     .use_undefined,
@@ -111,6 +120,7 @@ pub const all_invariants: [10]Invariant = .{
     .interior_pointer_destroy,
     .heap_leak,
     .partial_union_write,
+    .aliased_heap_dupe,
 };
 
 pub const Default: Config = .{};

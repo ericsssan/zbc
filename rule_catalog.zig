@@ -79,6 +79,11 @@ pub const all = [_]Rule{
         .title = "tagged-union literal with `try`/`catch return` in payload — tag is written before payload",
         .body = @embedFile("rules/partial-union-write.md"),
     },
+    .{
+        .id = "aliased-heap-dupe",
+        .title = "dupe returns `T` by value with `var dup = this.*;` — heap-owning fields alias the source",
+        .body = @embedFile("rules/aliased-heap-dupe.md"),
+    },
 };
 
 /// Look up a rule by id.  Returns null on unknown id so callers can

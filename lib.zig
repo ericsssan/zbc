@@ -12,6 +12,7 @@ const config_mod = @import("config.zig");
 const problem_mod = @import("problem.zig");
 
 const require_borrowed_from = @import("rules/require_borrowed_from.zig");
+const aliased_heap_dupe_mod = @import("aliased_heap_dupe.zig");
 const rule_catalog_mod = @import("rule_catalog.zig");
 
 pub const Config = config_mod.Config;
@@ -95,6 +96,11 @@ pub fn analyzeEscape(
         defer cfg.deinit(gpa);
         try analyzer_mod.check(gpa, &cfg, .{ .path = path, .config = config }, &problems);
     }
+
+    // Aliased-heap-dupe (PR #29910) — purely syntactic per-fn check
+    // over the parsed tree.  Runs after the per-fn cfg loop so we
+    // have a fully-populated Db (flag_owned_fields etc.).
+    try aliased_heap_dupe_mod.check(gpa, &tree, &db, config, &problems);
 
     return problems.toOwnedSlice(gpa);
 }
