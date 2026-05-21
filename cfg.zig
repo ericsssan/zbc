@@ -2319,7 +2319,15 @@ const Builder = struct {
                 .pos = self.posOf(call_node),
                 .end_pos = self.endPosOf(call_node),
             });
-            return;
+            // For value-typed receivers with their own `deinit`
+            // (e.g. `Utf8.deinit` annotated `@takes ownership(self)`),
+            // fall through so the @takes / R10 checks below get a
+            // chance.  The arena_kill emitted above is a no-op at
+            // transfer time when the receiver's origin isn't .arena.
+            const hint = self.locals.items[@intFromEnum(recv_local)].init_hint;
+            if (hint == .arena_local or hint == .arena_allocator) {
+                return;
+            }
         }
 
         if (anyPatternMatches(text, self.config.heap_free_patterns)) {
@@ -2964,29 +2972,43 @@ const Builder = struct {
         // arena_kill propagation works.  Detected by combining
         // heap_alloc pattern match with "ArenaAllocator" in the call
         // text (the type passed to `.create`).
-        if (anyPatternMatches(text, self.config.heap_alloc_patterns) and
-            std.mem.indexOf(u8, text, "ArenaAllocator") != null and
-            std.mem.indexOf(u8, text, ".create(") != null)
-        {
-            const aid: abstract_state.ArenaId = @enumFromInt(self.next_arena);
-            self.next_arena += 1;
-            return .{ .arena_init = .{ .id = aid, .is_heap_allocated = true } };
-        }
-        if (anyPatternMatches(text, self.config.heap_alloc_patterns)) {
-            // Allocator-provenance check: if the call's immediate
-            // receiver is a local known to be an arena_allocator (or
-            // the arena itself, for direct `arena.allocator().alloc()`
-            // is handled via .allocator() classification below), the
-            // result is arena-bound memory, NOT a fresh heap
-            // allocation.  Catches the canonical pattern
-            //   const a = arena.allocator(); buf = a.alloc(...);
-            //   arena.deinit(); use(buf);  // UAK
-            if (self.arenaBoundReceiverOfCall(expr_node)) |arena_src| {
-                return .{ .copy_of = arena_src };
+        // Heap-alloc / arena-via-create patterns: only fire when the
+        // expression itself is a call.  Without this gate, a struct
+        // literal whose field initializer is `alloc.alloc(...)` would
+        // text-match the heap pattern, accidentally tagging the whole
+        // literal as a fresh heap allocation and binding the parent
+        // local's origin to the matched cell — breaking subsequent
+        // @takes-ownership / field-use checks on the local.
+        const is_call_node = switch (tree.nodeTag(expr_node)) {
+            .call, .call_one, .call_comma, .call_one_comma => true,
+            else => false,
+        };
+        if (is_call_node) {
+            if (anyPatternMatches(text, self.config.heap_alloc_patterns) and
+                std.mem.indexOf(u8, text, "ArenaAllocator") != null and
+                std.mem.indexOf(u8, text, ".create(") != null)
+            {
+                const aid: abstract_state.ArenaId = @enumFromInt(self.next_arena);
+                self.next_arena += 1;
+                return .{ .arena_init = .{ .id = aid, .is_heap_allocated = true } };
             }
-            const hid: abstract_state.HeapId = @enumFromInt(self.next_heap);
-            self.next_heap += 1;
-            return .{ .heap_alloc = hid };
+            if (anyPatternMatches(text, self.config.heap_alloc_patterns)) {
+                // Allocator-provenance check: if the call's immediate
+                // receiver is a local known to be an arena_allocator
+                // (or the arena itself, for direct
+                // `arena.allocator().alloc()` is handled via
+                // .allocator() classification below), the result is
+                // arena-bound memory, NOT a fresh heap allocation.
+                // Catches the canonical pattern
+                //   const a = arena.allocator(); buf = a.alloc(...);
+                //   arena.deinit(); use(buf);  // UAK
+                if (self.arenaBoundReceiverOfCall(expr_node)) |arena_src| {
+                    return .{ .copy_of = arena_src };
+                }
+                const hid: abstract_state.HeapId = @enumFromInt(self.next_heap);
+                self.next_heap += 1;
+                return .{ .heap_alloc = hid };
+            }
         }
 
         // `<arena_local>.allocator()` — return an Allocator value
