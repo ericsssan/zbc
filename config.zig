@@ -271,9 +271,18 @@ pub const Invariant = enum {
     /// #2200 class (same file `src/lsm/scan_tree.zig`, same shape,
     /// 14 months apart).
     tagged_union_retag_with_old_payload_read,
+    /// A `switch (<recv>.<field>)` arm `.<Tag> => |*v| <body>`
+    /// where `<body>` calls a cleanup method on the payload
+    /// (`v.deinit()` / `v.<sub>.deinit()` / `.free()` / `.release()`
+    /// / `.deref()` / `.destroy()` / `.close()`) but does NOT
+    /// retag `<recv>.<field>` to an inert variant.  In a fn named
+    /// `reset` / `clear` / `end` (idempotent by convention) the
+    /// next call fires the same arm and double-frees.  Catches
+    /// ghostty-org/ghostty#2257 + #8307 class.
+    union_deinit_without_inert_reset,
 };
 
-pub const all_invariants: [28]Invariant = .{
+pub const all_invariants: [29]Invariant = .{
     .arena_escape,
     .stack_escape,
     .use_undefined,
@@ -302,6 +311,7 @@ pub const all_invariants: [28]Invariant = .{
     .slice_of_arena_into_heap,
     .free_without_null_then_check,
     .tagged_union_retag_with_old_payload_read,
+    .union_deinit_without_inert_reset,
 };
 
 pub const Default: Config = .{};

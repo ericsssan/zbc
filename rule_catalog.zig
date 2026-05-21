@@ -169,6 +169,11 @@ pub const all = [_]Rule{
         .title = "reading `<path>.<OldTag>` while assigning `.{ .<NewTag> = ... }` to `<path>` — x86_64 backend may evaluate read after tag flip",
         .body = @embedFile("rules/tagged-union-retag-with-old-payload-read.md"),
     },
+    .{
+        .id = "union-deinit-without-inert-reset",
+        .title = "switch arm deinit'd payload but didn't retag the union — idempotent reset/clear/end fn will double-free on next call",
+        .body = @embedFile("rules/union-deinit-without-inert-reset.md"),
+    },
 };
 
 /// Look up a rule by id.  Returns null on unknown id so callers can
