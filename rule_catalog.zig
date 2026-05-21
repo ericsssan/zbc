@@ -154,6 +154,11 @@ pub const all = [_]Rule{
         .title = "use of file handle `<X>` after `<X>.close()` — the fd is invalid; reads/writes go through a dangling fd",
         .body = @embedFile("rules/fd-write-after-close.md"),
     },
+    .{
+        .id = "slice-of-arena-into-heap",
+        .title = "arena-allocated slice stored into a non-arena container — dangles when the local arena's deinit fires",
+        .body = @embedFile("rules/slice-of-arena-into-heap.md"),
+    },
 };
 
 /// Look up a rule by id.  Returns null on unknown id so callers can

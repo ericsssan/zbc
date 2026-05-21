@@ -27,6 +27,7 @@ const unreleased_refs_on_error_mod = @import("unreleased_refs_on_error.zig");
 const hashmap_getptr_rehash_mod = @import("hashmap_getptr_rehash.zig");
 const arraylist_items_slice_mod = @import("arraylist_items_slice.zig");
 const fd_write_after_close_mod = @import("fd_write_after_close.zig");
+const slice_of_arena_into_heap_mod = @import("slice_of_arena_into_heap.zig");
 const rule_catalog_mod = @import("rule_catalog.zig");
 
 pub const Config = config_mod.Config;
@@ -186,6 +187,11 @@ pub fn analyzeEscape(
     // then `X.close();` then any further use of `X` → operations
     // through a dangling file handle.
     try fd_write_after_close_mod.check(gpa, &tree, config, &problems);
+
+    // Slice-of-arena-into-heap — arena-allocated slice stored
+    // into a container with a non-arena allocator → dangles when
+    // the local arena's defer-deinit fires at scope exit.
+    try slice_of_arena_into_heap_mod.check(gpa, &tree, config, &problems);
 
     return problems.toOwnedSlice(gpa);
 }
@@ -648,5 +654,6 @@ test {
     _ = hashmap_getptr_rehash_mod;
     _ = arraylist_items_slice_mod;
     _ = fd_write_after_close_mod;
+    _ = slice_of_arena_into_heap_mod;
     std.testing.refAllDecls(@This());
 }

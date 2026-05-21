@@ -243,9 +243,19 @@ pub const Invariant = enum {
     /// after every other use) and close inside diverging branches
     /// (catch/if bodies).
     fd_write_after_close,
+    /// A slice allocated through a function-local
+    /// `std.heap.ArenaAllocator` is passed as data to a container
+    /// method (`append` / `appendSlice` / `put` / etc.) whose
+    /// allocator argument is NOT the arena's allocator — when the
+    /// arena dies at fn exit, the container holds a dangling
+    /// slice.  Complements `arena_escape` (escape via return) and
+    /// `arena_use_after_kill` (read after deinit) by catching the
+    /// third escape path: STORE into a longer-lived container
+    /// during the arena's lifetime.
+    slice_of_arena_into_heap,
 };
 
-pub const all_invariants: [25]Invariant = .{
+pub const all_invariants: [26]Invariant = .{
     .arena_escape,
     .stack_escape,
     .use_undefined,
@@ -271,6 +281,7 @@ pub const all_invariants: [25]Invariant = .{
     .hashmap_getptr_rehash,
     .arraylist_items_slice,
     .fd_write_after_close,
+    .slice_of_arena_into_heap,
 };
 
 pub const Default: Config = .{};
