@@ -184,12 +184,28 @@ pub fn main(init: std.process.Init) !void {
         };
     }
 
-    var group: std.Io.Group = .init;
-    for (tasks) |*t| {
-        group.concurrent(io, runOne, .{t}) catch
-            group.async(io, runOne, .{t});
+    // Work-stealing thread pool — N workers pop tasks off a shared
+    // atomic counter.  `Io.Group.concurrent` grows its thread pool
+    // lazily (only when ALL existing threads are busy), which on a
+    // fast-per-file workload like ours saturates at ~2 threads
+    // even on an 8-core machine.  Raw `std.Thread.spawn` lets us
+    // pre-allocate one worker per CPU and consume the task list
+    // in parallel.  Measured: 6:49 → ~1:00 on full Bun sweep.
+    const cpu_count = std.Thread.getCpuCount() catch 4;
+    const worker_count = @max(1, @min(cpu_count, tasks.len));
+    const workers = try gpa.alloc(std.Thread, worker_count);
+    defer gpa.free(workers);
+    var next_task: std.atomic.Value(usize) = .init(0);
+    const ctx: WorkerCtx = .{ .tasks = tasks, .next = &next_task };
+    for (workers) |*w| {
+        w.* = std.Thread.spawn(.{}, workerLoop, .{ctx}) catch
+            // If a worker fails to spawn, fall back to serial in
+            // the main thread for remaining tasks.
+            break;
     }
-    group.await(io) catch {};
+    // Main thread also helps drain the queue.
+    workerLoop(ctx);
+    for (workers) |w| w.join();
 
     var all_problems: std.ArrayListUnmanaged(IndexedProblem) = .empty;
     defer all_problems.deinit(gpa);
@@ -381,6 +397,19 @@ fn indexedProblemLess(_: void, a: IndexedProblem, b: IndexedProblem) bool {
     if (a.problem.start.line != b.problem.start.line)
         return a.problem.start.line < b.problem.start.line;
     return a.problem.start.column < b.problem.start.column;
+}
+
+const WorkerCtx = struct {
+    tasks: []Task,
+    next: *std.atomic.Value(usize),
+};
+
+fn workerLoop(ctx: WorkerCtx) void {
+    while (true) {
+        const i = ctx.next.fetchAdd(1, .monotonic);
+        if (i >= ctx.tasks.len) return;
+        runOne(&ctx.tasks[i]) catch {};
+    }
 }
 
 fn runOne(t: *Task) std.Io.Cancelable!void {
