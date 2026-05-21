@@ -232,9 +232,20 @@ pub const Invariant = enum {
     /// `*AssumeCapacity` variants are deliberately excluded (no
     /// realloc by contract).
     arraylist_items_slice,
+    /// `const|var <X> = try <dir>.<opener>(...);` binds an OS file
+    /// handle; `<X>.close();` invalidates it; any subsequent use of
+    /// `<X>` (method call or field access) reads/writes through a
+    /// dangling fd.  On POSIX the closed fd may be reassigned by
+    /// the kernel before the stale use lands, silently routing the
+    /// write to an unrelated file.  Openers: createFile / openFile
+    /// / openDir / open / openat / accept / socket (and their `Z`
+    /// variants).  Skips defer/errdefer close (fires at scope exit,
+    /// after every other use) and close inside diverging branches
+    /// (catch/if bodies).
+    fd_write_after_close,
 };
 
-pub const all_invariants: [24]Invariant = .{
+pub const all_invariants: [25]Invariant = .{
     .arena_escape,
     .stack_escape,
     .use_undefined,
@@ -259,6 +270,7 @@ pub const all_invariants: [24]Invariant = .{
     .unreleased_refs_on_error,
     .hashmap_getptr_rehash,
     .arraylist_items_slice,
+    .fd_write_after_close,
 };
 
 pub const Default: Config = .{};

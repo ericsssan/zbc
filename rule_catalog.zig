@@ -149,6 +149,11 @@ pub const all = [_]Rule{
         .title = "use of `<X>` after `<list>.append/insert/...(...)` — the slice borrowed via `<list>.items` was invalidated by a realloc",
         .body = @embedFile("rules/arraylist-items-slice.md"),
     },
+    .{
+        .id = "fd-write-after-close",
+        .title = "use of file handle `<X>` after `<X>.close()` — the fd is invalid; reads/writes go through a dangling fd",
+        .body = @embedFile("rules/fd-write-after-close.md"),
+    },
 };
 
 /// Look up a rule by id.  Returns null on unknown id so callers can

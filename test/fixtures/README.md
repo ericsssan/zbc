@@ -33,6 +33,7 @@ Bun's.
 | `unreleased_refs_on_error.zig` | `unreleased-refs-on-error` | hexops/mach `sysgpu/vulkan.zig:1887` (mined; no PR) |
 | `hashmap_getptr_rehash.zig` | `hashmap-getptr-rehash` | Zig std `HashMap` pointer-stability footgun (canonical class, no specific PR) |
 | `arraylist_items_slice.zig` | `arraylist-items-slice` | Zig std `ArrayList.items` pointer-stability footgun (canonical class, no specific PR) |
+| `fd_write_after_close.zig` | `fd-write-after-close` | POSIX/Windows file-handle use-after-close (canonical class, no specific PR) |
 
 ## Re-fetching the actual pre-merge buggy files
 

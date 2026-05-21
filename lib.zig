@@ -26,6 +26,7 @@ const stack_fallback_escape_mod = @import("stack_fallback_escape.zig");
 const unreleased_refs_on_error_mod = @import("unreleased_refs_on_error.zig");
 const hashmap_getptr_rehash_mod = @import("hashmap_getptr_rehash.zig");
 const arraylist_items_slice_mod = @import("arraylist_items_slice.zig");
+const fd_write_after_close_mod = @import("fd_write_after_close.zig");
 const rule_catalog_mod = @import("rule_catalog.zig");
 
 pub const Config = config_mod.Config;
@@ -180,6 +181,11 @@ pub fn analyzeEscape(
     // receiver-matched mutating call (`.append` / `.insert` / …)
     // followed by a use of `X` → UAF if the call reallocated.
     try arraylist_items_slice_mod.check(gpa, &tree, config, &problems);
+
+    // FD write-after-close — `const X = try dir.createFile(...);`
+    // then `X.close();` then any further use of `X` → operations
+    // through a dangling file handle.
+    try fd_write_after_close_mod.check(gpa, &tree, config, &problems);
 
     return problems.toOwnedSlice(gpa);
 }
@@ -641,5 +647,6 @@ test {
     _ = unreleased_refs_on_error_mod;
     _ = hashmap_getptr_rehash_mod;
     _ = arraylist_items_slice_mod;
+    _ = fd_write_after_close_mod;
     std.testing.refAllDecls(@This());
 }
