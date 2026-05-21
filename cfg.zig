@@ -209,7 +209,12 @@ pub const ExprKind = union(enum) {
     /// ArenaId is minted at lowering time so worklist re-visits of
     /// the same call site reuse the SAME id; otherwise loops would
     /// blow `state.arenas` up unboundedly.
-    arena_init: abstract_state.ArenaId,
+    /// Fresh arena.  `is_heap_allocated` distinguishes stack-
+    /// allocated (`var a = ArenaAllocator.init(...)`) from heap-
+    /// allocated (`var a = gpa.create(ArenaAllocator)`) — both
+    /// mint an ArenaId for UAK tracking, but out-param escape
+    /// gates on this.
+    arena_init: struct { id: abstract_state.ArenaId, is_heap_allocated: bool = false },
     /// Heap allocation call (gpa.alloc / gpa.create / dupe / ...).
     /// HeapId is minted at lowering time, same reasoning as arena_init.
     heap_alloc: abstract_state.HeapId,
@@ -2949,7 +2954,7 @@ const Builder = struct {
         if (anyPatternMatches(callee_text, self.config.arena_init_patterns)) {
             const aid: abstract_state.ArenaId = @enumFromInt(self.next_arena);
             self.next_arena += 1;
-            return .{ .arena_init = aid };
+            return .{ .arena_init = .{ .id = aid } };
         }
         // Heap-allocated arena: `gpa.create(ArenaAllocator)` returns a
         // pointer to a fresh arena.  The pointer itself is heap, but
@@ -2965,7 +2970,7 @@ const Builder = struct {
         {
             const aid: abstract_state.ArenaId = @enumFromInt(self.next_arena);
             self.next_arena += 1;
-            return .{ .arena_init = aid };
+            return .{ .arena_init = .{ .id = aid, .is_heap_allocated = true } };
         }
         if (anyPatternMatches(text, self.config.heap_alloc_patterns)) {
             // Allocator-provenance check: if the call's immediate

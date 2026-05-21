@@ -107,6 +107,15 @@ pub const ArenaState = struct {
     /// (the field's own tracking handles that, and back-edge state
     /// in loops would otherwise cascade FPs).
     is_inter_procedural: bool = false,
+    /// True iff the arena descriptor itself sits on the heap
+    /// (`var a = gpa.create(ArenaAllocator)`).  Stack-allocated
+    /// arenas (`var a = ArenaAllocator.init(...)`) leave this
+    /// false.  Both still mint an `ArenaId` for UAK tracking, but
+    /// out-param escape needs to distinguish them: a heap-
+    /// allocated arena's descriptor outlives the function, so
+    /// writing its pointer through `*T` is ownership transfer,
+    /// not escape.
+    is_heap_allocated: bool = false,
 };
 
 // ── AbstractState ──────────────────────────────────────────

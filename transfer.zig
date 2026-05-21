@@ -555,13 +555,20 @@ fn transferOutParamWrite(
             // Last-write-wins per out-param.
             try state.out_param_writes.put(ctx.gpa, w.out, hid);
         },
-        // .arena / .arena_borrow are NOT checked here yet — zbc's
-        // classifier mints the same arena id for both stack-allocated
-        // arenas (`var a = ArenaAllocator.init(...)`) and heap-
-        // allocated ones (`var a = gpa.create(ArenaAllocator)`), so
-        // we can't tell at this point whether the arena dies with the
-        // frame.  Adding heap-shape tracking to ArenaState would let
-        // this fire safely; left as next-tier work.
+        .arena, .arena_borrow => |aid| {
+            // Arena-shaped value written to caller storage.  Only a
+            // stack-allocated arena (`var a = ArenaAllocator.init(...)`)
+            // dies with the frame — heap-allocated arenas
+            // (`var a = gpa.create(ArenaAllocator)`) carry their
+            // descriptor on the heap and survive the function.
+            // Tracked via `ArenaState.is_heap_allocated`.
+            if (!config_mod.isEnabled(ctx.config, .arena_escape)) return;
+            const st = state.arenas.get(aid) orelse return;
+            if (st.is_heap_allocated) return;
+            try report(ctx, "arena-escape", pos, end_pos, .@"error",
+                "writing a value borrowed from a function-local arena through `{s}` (escapes its lifetime)",
+                .{out_name});
+        },
         else => {},
     }
 }
@@ -625,7 +632,7 @@ fn originOfInit(
     return switch (kind) {
         .plain => .plain,
         .owned => .plain,
-        .arena_init => |aid| blk: {
+        .arena_init => |info| blk: {
             // OVERWRITE to .live on every visit — the decl represents
             // a fresh resource at this call site.  Inside a loop,
             // back-edges propagate dead state from a prior iteration's
@@ -633,8 +640,11 @@ fn originOfInit(
             // fresh allocation would inherit that stale dead state and
             // spurious UAF would fire on later uses.
             const mut_state: *AbstractState = @constCast(state);
-            try mut_state.arenas.put(ctx.gpa, aid, .{ .state = .live });
-            break :blk .{ .arena = aid };
+            try mut_state.arenas.put(ctx.gpa, info.id, .{
+                .state = .live,
+                .is_heap_allocated = info.is_heap_allocated,
+            });
+            break :blk .{ .arena = info.id };
         },
         .stack_ref => |src_local| .{ .stack = src_local },
         .composite_borrow => |src_local| state.locals.get(src_local) orelse .plain,
