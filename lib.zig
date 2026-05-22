@@ -13,6 +13,7 @@ const problem_mod = @import("problem.zig");
 const rule_registry = @import("rule_registry.zig");
 const rule_catalog_mod = @import("rule_catalog.zig");
 const file_cache_mod = @import("file_cache.zig");
+const suppressions_mod = @import("suppressions.zig");
 
 const require_borrowed_from = @import("rules/require_borrowed_from.zig");
 
@@ -110,7 +111,35 @@ pub fn analyzeEscape(
     defer rule_cache.deinit();
     try rule_registry.runEscape(gpa, &tree, &db, &rule_cache, config, &problems);
 
-    return problems.toOwnedSlice(gpa);
+    // Apply per-line suppressions parsed from `// zbc-disable-line` /
+    // `// zbc-disable-next-line` source comments.  Filter happens at
+    // the boundary so individual rules don't need to know about it.
+    var supp = try suppressions_mod.parse(gpa, src);
+    defer supp.deinit();
+    return try filterSuppressed(gpa, &problems, &supp);
+}
+
+/// Drop any Problems whose start.line matches an active suppression.
+/// Frees dropped problems immediately; the caller still owns the
+/// returned slice and the surviving problems' message storage.
+fn filterSuppressed(
+    gpa: std.mem.Allocator,
+    problems: *std.ArrayListUnmanaged(Problem),
+    supp: *const suppressions_mod.Suppressions,
+) ![]Problem {
+    if (supp.entries.len == 0) return problems.toOwnedSlice(gpa);
+    var kept: std.ArrayListUnmanaged(Problem) = .empty;
+    errdefer freeProblemsArrayList(gpa, &kept);
+    for (problems.items) |p| {
+        if (supp.isSuppressed(p.rule_id, p.start.line)) {
+            var dead = p;
+            dead.deinit(gpa);
+            continue;
+        }
+        try kept.append(gpa, p);
+    }
+    problems.deinit(gpa);
+    return kept.toOwnedSlice(gpa);
 }
 
 pub fn analyzeHygiene(
@@ -559,6 +588,7 @@ test {
     // refAllDecls'es every rule module so inline tests run.
     _ = rule_registry;
     _ = file_cache_mod;
+    _ = suppressions_mod;
     _ = @import("lexer.zig");
     _ = @import("scope.zig");
     _ = @import("receiver.zig");
