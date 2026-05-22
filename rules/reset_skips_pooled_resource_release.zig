@@ -27,6 +27,9 @@ const Ast = std.zig.Ast;
 const problem_mod = @import("../problem.zig");
 const config_mod = @import("../config.zig");
 
+const lexer = @import("../lexer.zig");
+const matchBrace = lexer.matchBrace;
+
 const Problem = problem_mod.Problem;
 const Pos = problem_mod.Pos;
 
@@ -285,26 +288,6 @@ fn isCleanupMethodName(name: []const u8) bool {
         std.mem.eql(u8, name, "clearAndFree") or
         std.mem.eql(u8, name, "shrinkRetainingCapacity") or
         std.mem.eql(u8, name, "shrinkAndFree");
-}
-
-fn matchBrace(
-    tags: []const std.zig.Token.Tag,
-    lb: Ast.TokenIndex,
-    last: Ast.TokenIndex,
-) ?Ast.TokenIndex {
-    var depth: u32 = 1;
-    var t: Ast.TokenIndex = lb + 1;
-    while (t <= last) : (t += 1) {
-        switch (tags[t]) {
-            .l_brace => depth += 1,
-            .r_brace => {
-                depth -= 1;
-                if (depth == 0) return t;
-            },
-            else => {},
-        }
-    }
-    return null;
 }
 
 fn report(

@@ -18,6 +18,12 @@ const annotations_mod = @import("../annotations.zig");
 const problem_mod = @import("../problem.zig");
 const config_mod = @import("../config.zig");
 
+const lexer = @import("../lexer.zig");
+const findStmtSemicolon = lexer.findStmtSemicolon;
+const returnsType = lexer.returnsType;
+const fnProto = lexer.fnProto;
+const bodyOf = lexer.bodyOf;
+
 const Db = annotations_mod.Db;
 const Problem = problem_mod.Problem;
 const Pos = problem_mod.Pos;
@@ -43,30 +49,6 @@ pub fn check(
         const body = bodyOf(tree, node) orelse continue;
         try checkBody(gpa, tree, db, body, problems);
     }
-}
-
-fn returnsType(tree: *const Ast, fn_decl: Ast.Node.Index) bool {
-    var buf: [1]Ast.Node.Index = undefined;
-    const fp = fnProto(tree, &buf, fn_decl) orelse return false;
-    const rt = fp.ast.return_type.unwrap() orelse return false;
-    const first = tree.firstToken(rt);
-    const last = tree.lastToken(rt);
-    if (first != last) return false;
-    return tree.tokens.items(.tag)[first] == .identifier and
-        std.mem.eql(u8, tree.tokenSlice(first), "type");
-}
-
-fn fnProto(tree: *const Ast, buf: *[1]Ast.Node.Index, node: Ast.Node.Index) ?Ast.full.FnProto {
-    return switch (tree.nodeTag(node)) {
-        .fn_decl => switch (tree.nodeTag(tree.nodeData(node).node_and_node[0])) {
-            .fn_proto => tree.fnProto(tree.nodeData(node).node_and_node[0]),
-            .fn_proto_multi => tree.fnProtoMulti(tree.nodeData(node).node_and_node[0]),
-            .fn_proto_one => tree.fnProtoOne(buf, tree.nodeData(node).node_and_node[0]),
-            .fn_proto_simple => tree.fnProtoSimple(buf, tree.nodeData(node).node_and_node[0]),
-            else => null,
-        },
-        else => null,
-    };
 }
 
 const Binding = struct {
@@ -262,32 +244,6 @@ fn typeHasDeinit(db: *const Db, type_name: []const u8) bool {
 /// brace / bracket all zero) until we find the first `;`.  Returns
 /// its index, or null if the stmt's terminating semicolon isn't in
 /// `[start, last]`.
-fn findStmtSemicolon(tags: []const std.zig.Token.Tag, start: Ast.TokenIndex, last: Ast.TokenIndex) ?Ast.TokenIndex {
-    var paren: u32 = 0;
-    var brace: u32 = 0;
-    var bracket: u32 = 0;
-    var t: Ast.TokenIndex = start;
-    while (t <= last) : (t += 1) {
-        switch (tags[t]) {
-            .l_paren => paren += 1,
-            .r_paren => if (paren > 0) {
-                paren -= 1;
-            },
-            .l_brace => brace += 1,
-            .r_brace => if (brace > 0) {
-                brace -= 1;
-            },
-            .l_bracket => bracket += 1,
-            .r_bracket => if (bracket > 0) {
-                bracket -= 1;
-            },
-            .semicolon => if (paren == 0 and brace == 0 and bracket == 0) return t,
-            else => {},
-        }
-    }
-    return null;
-}
-
 /// True iff the `defer` / `errdefer` at `kw` references some
 /// cleanup call on `X` — `X.<deinit/deref/destroy/close/free>(...)`.
 /// Accepts the inline form and the block form `{ … X.cleanup() … }`,
@@ -358,11 +314,6 @@ fn isCleanupMethodName(name: []const u8) bool {
         std.mem.eql(u8, name, "free") or
         std.mem.eql(u8, name, "release") or
         std.mem.eql(u8, name, "finalize");
-}
-
-fn bodyOf(tree: *const Ast, node: Ast.Node.Index) ?Ast.Node.Index {
-    if (tree.nodeTag(node) != .fn_decl) return null;
-    return tree.nodeData(node).node_and_node[1];
 }
 
 fn report(

@@ -17,6 +17,11 @@ const annotations_mod = @import("../annotations.zig");
 const problem_mod = @import("../problem.zig");
 const config_mod = @import("../config.zig");
 
+const lexer = @import("../lexer.zig");
+const returnsType = lexer.returnsType;
+const fnProto = lexer.fnProto;
+const bodyOf = lexer.bodyOf;
+
 const Db = annotations_mod.Db;
 const Problem = problem_mod.Problem;
 const Pos = problem_mod.Pos;
@@ -45,30 +50,6 @@ pub fn check(
         const self_type = db.containingType(node);
         try checkBody(gpa, tree, db, self_type, body, problems);
     }
-}
-
-fn returnsType(tree: *const Ast, fn_decl: Ast.Node.Index) bool {
-    var buf: [1]Ast.Node.Index = undefined;
-    const fp = fnProto(tree, &buf, fn_decl) orelse return false;
-    const rt = fp.ast.return_type.unwrap() orelse return false;
-    const first = tree.firstToken(rt);
-    const last = tree.lastToken(rt);
-    if (first != last) return false;
-    return tree.tokens.items(.tag)[first] == .identifier and
-        std.mem.eql(u8, tree.tokenSlice(first), "type");
-}
-
-fn fnProto(tree: *const Ast, buf: *[1]Ast.Node.Index, node: Ast.Node.Index) ?Ast.full.FnProto {
-    return switch (tree.nodeTag(node)) {
-        .fn_decl => switch (tree.nodeTag(tree.nodeData(node).node_and_node[0])) {
-            .fn_proto => tree.fnProto(tree.nodeData(node).node_and_node[0]),
-            .fn_proto_multi => tree.fnProtoMulti(tree.nodeData(node).node_and_node[0]),
-            .fn_proto_one => tree.fnProtoOne(buf, tree.nodeData(node).node_and_node[0]),
-            .fn_proto_simple => tree.fnProtoSimple(buf, tree.nodeData(node).node_and_node[0]),
-            else => null,
-        },
-        else => null,
-    };
 }
 
 const Assign = struct {
@@ -336,11 +317,6 @@ fn literalSetsField(
         if (std.mem.eql(u8, tree.tokenSlice(t + 1), field)) return true;
     }
     return false;
-}
-
-fn bodyOf(tree: *const Ast, node: Ast.Node.Index) ?Ast.Node.Index {
-    if (tree.nodeTag(node) != .fn_decl) return null;
-    return tree.nodeData(node).node_and_node[1];
 }
 
 fn report(

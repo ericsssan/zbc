@@ -24,6 +24,10 @@ const annotations_mod = @import("../annotations.zig");
 const problem_mod = @import("../problem.zig");
 const config_mod = @import("../config.zig");
 
+const lexer = @import("../lexer.zig");
+const fnProto = lexer.fnProto;
+const bodyOf = lexer.bodyOf;
+
 const Db = annotations_mod.Db;
 const Problem = problem_mod.Problem;
 const Severity = problem_mod.Severity;
@@ -262,24 +266,6 @@ const Dup = struct {
     src_name: ?[]const u8,
     decl_token: Ast.TokenIndex,
 };
-
-fn fnProto(tree: *const Ast, buf: *[1]Ast.Node.Index, node: Ast.Node.Index) ?Ast.full.FnProto {
-    return switch (tree.nodeTag(node)) {
-        .fn_decl => switch (tree.nodeTag(tree.nodeData(node).node_and_node[0])) {
-            .fn_proto => tree.fnProto(tree.nodeData(node).node_and_node[0]),
-            .fn_proto_multi => tree.fnProtoMulti(tree.nodeData(node).node_and_node[0]),
-            .fn_proto_one => tree.fnProtoOne(buf, tree.nodeData(node).node_and_node[0]),
-            .fn_proto_simple => tree.fnProtoSimple(buf, tree.nodeData(node).node_and_node[0]),
-            else => null,
-        },
-        else => null,
-    };
-}
-
-fn bodyOf(tree: *const Ast, node: Ast.Node.Index) ?Ast.Node.Index {
-    if (tree.nodeTag(node) != .fn_decl) return null;
-    return tree.nodeData(node).node_and_node[1];
-}
 
 /// Return the base type name of a function's return type, peeling
 /// `?`, `const`, and an error-union prefix (`SomeErrSet!T` → `T`).

@@ -28,6 +28,10 @@ const Ast = std.zig.Ast;
 const problem_mod = @import("../problem.zig");
 const config_mod = @import("../config.zig");
 
+const lexer = @import("../lexer.zig");
+const findStmtSemicolon = lexer.findStmtSemicolon;
+const bodyOf = lexer.bodyOf;
+
 const Problem = problem_mod.Problem;
 const Pos = problem_mod.Pos;
 
@@ -248,37 +252,6 @@ fn findEqualAtStmt(tags: []const std.zig.Token.Tag, start: Ast.TokenIndex, last:
         }
     }
     return null;
-}
-
-fn findStmtSemicolon(tags: []const std.zig.Token.Tag, start: Ast.TokenIndex, last: Ast.TokenIndex) ?Ast.TokenIndex {
-    var paren: u32 = 0;
-    var brace: u32 = 0;
-    var bracket: u32 = 0;
-    var t: Ast.TokenIndex = start;
-    while (t <= last) : (t += 1) {
-        switch (tags[t]) {
-            .l_paren => paren += 1,
-            .r_paren => if (paren > 0) {
-                paren -= 1;
-            },
-            .l_brace => brace += 1,
-            .r_brace => if (brace > 0) {
-                brace -= 1;
-            },
-            .l_bracket => bracket += 1,
-            .r_bracket => if (bracket > 0) {
-                bracket -= 1;
-            },
-            .semicolon => if (paren == 0 and brace == 0 and bracket == 0) return t,
-            else => {},
-        }
-    }
-    return null;
-}
-
-fn bodyOf(tree: *const Ast, node: Ast.Node.Index) ?Ast.Node.Index {
-    if (tree.nodeTag(node) != .fn_decl) return null;
-    return tree.nodeData(node).node_and_node[1];
 }
 
 fn report(

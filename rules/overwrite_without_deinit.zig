@@ -30,6 +30,11 @@ const annotations_mod = @import("../annotations.zig");
 const problem_mod = @import("../problem.zig");
 const config_mod = @import("../config.zig");
 
+const lexer = @import("../lexer.zig");
+const findStmtSemicolon = lexer.findStmtSemicolon;
+const fnProto = lexer.fnProto;
+const bodyOf = lexer.bodyOf;
+
 const Db = annotations_mod.Db;
 const Problem = problem_mod.Problem;
 const Pos = problem_mod.Pos;
@@ -274,32 +279,6 @@ fn isConstructorName(name: []const u8) bool {
     return false;
 }
 
-fn findStmtSemicolon(tags: []const std.zig.Token.Tag, start: Ast.TokenIndex, last: Ast.TokenIndex) ?Ast.TokenIndex {
-    var paren: u32 = 0;
-    var brace: u32 = 0;
-    var bracket: u32 = 0;
-    var t: Ast.TokenIndex = start;
-    while (t <= last) : (t += 1) {
-        switch (tags[t]) {
-            .l_paren => paren += 1,
-            .r_paren => if (paren > 0) {
-                paren -= 1;
-            },
-            .l_brace => brace += 1,
-            .r_brace => if (brace > 0) {
-                brace -= 1;
-            },
-            .l_bracket => bracket += 1,
-            .r_bracket => if (bracket > 0) {
-                bracket -= 1;
-            },
-            .semicolon => if (paren == 0 and brace == 0 and bracket == 0) return t,
-            else => {},
-        }
-    }
-    return null;
-}
-
 fn returnsType(tree: *const Ast, fp: Ast.full.FnProto) bool {
     const rt = fp.ast.return_type.unwrap() orelse return false;
     const first = tree.firstToken(rt);
@@ -314,24 +293,6 @@ fn firstParamName(tree: *const Ast, fp: Ast.full.FnProto) ?[]const u8 {
     const first = it.next() orelse return null;
     const tok = first.name_token orelse return null;
     return tree.tokenSlice(tok);
-}
-
-fn fnProto(tree: *const Ast, buf: *[1]Ast.Node.Index, node: Ast.Node.Index) ?Ast.full.FnProto {
-    return switch (tree.nodeTag(node)) {
-        .fn_decl => switch (tree.nodeTag(tree.nodeData(node).node_and_node[0])) {
-            .fn_proto => tree.fnProto(tree.nodeData(node).node_and_node[0]),
-            .fn_proto_multi => tree.fnProtoMulti(tree.nodeData(node).node_and_node[0]),
-            .fn_proto_one => tree.fnProtoOne(buf, tree.nodeData(node).node_and_node[0]),
-            .fn_proto_simple => tree.fnProtoSimple(buf, tree.nodeData(node).node_and_node[0]),
-            else => null,
-        },
-        else => null,
-    };
-}
-
-fn bodyOf(tree: *const Ast, node: Ast.Node.Index) ?Ast.Node.Index {
-    if (tree.nodeTag(node) != .fn_decl) return null;
-    return tree.nodeData(node).node_and_node[1];
 }
 
 fn skipNestedFn(tags: []const std.zig.Token.Tag, kw_fn: Ast.TokenIndex, last: Ast.TokenIndex) Ast.TokenIndex {

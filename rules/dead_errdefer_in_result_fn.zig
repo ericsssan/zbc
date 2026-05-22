@@ -18,6 +18,10 @@ const Ast = std.zig.Ast;
 const problem_mod = @import("../problem.zig");
 const config_mod = @import("../config.zig");
 
+const lexer = @import("../lexer.zig");
+const fnProto = lexer.fnProto;
+const bodyOf = lexer.bodyOf;
+
 const Problem = problem_mod.Problem;
 const Pos = problem_mod.Pos;
 
@@ -190,24 +194,6 @@ fn skipNestedFn(tags: []const std.zig.Token.Tag, kw_fn: Ast.TokenIndex, last: As
         }
     }
     return @min(t -| 1, last);
-}
-
-fn fnProto(tree: *const Ast, buf: *[1]Ast.Node.Index, node: Ast.Node.Index) ?Ast.full.FnProto {
-    return switch (tree.nodeTag(node)) {
-        .fn_decl => switch (tree.nodeTag(tree.nodeData(node).node_and_node[0])) {
-            .fn_proto => tree.fnProto(tree.nodeData(node).node_and_node[0]),
-            .fn_proto_multi => tree.fnProtoMulti(tree.nodeData(node).node_and_node[0]),
-            .fn_proto_one => tree.fnProtoOne(buf, tree.nodeData(node).node_and_node[0]),
-            .fn_proto_simple => tree.fnProtoSimple(buf, tree.nodeData(node).node_and_node[0]),
-            else => null,
-        },
-        else => null,
-    };
-}
-
-fn bodyOf(tree: *const Ast, node: Ast.Node.Index) ?Ast.Node.Index {
-    if (tree.nodeTag(node) != .fn_decl) return null;
-    return tree.nodeData(node).node_and_node[1];
 }
 
 fn report(
