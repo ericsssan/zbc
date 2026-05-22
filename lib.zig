@@ -800,5 +800,6 @@ test {
     _ = @import("trace.zig");
     _ = @import("local.zig");
     _ = @import("query.zig");
+    _ = @import("model_query.zig");
     std.testing.refAllDecls(@This());
 }

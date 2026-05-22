@@ -12,21 +12,19 @@
 //! ziglang/zig#20192 (intermediate `Dir` leaked) and
 //! ziglang/zig#18651 (Thread.Pool init cleanup gap).
 //!
-//! Pointer / slice fields are excluded — the "owned pointer" vs
-//! "borrowed pointer" distinction is invisible at the type level,
-//! and treating all pointer fields as owned produces many FPs.
-//! Value-typed (incl. `?T` optional value) fields are the cleanest
-//! "I own this" signal.
+//! Rewritten via the AST-level model_query DSL.
 
 const std = @import("std");
 const Ast = std.zig.Ast;
 
 const fmodel = @import("../model.zig");
+const mq = @import("../model_query.zig");
+const query = @import("../query.zig");
 const problem = @import("../problem.zig");
 const testing = @import("../testing.zig");
 const config_mod = @import("../config.zig");
 
-const TokenIndex = std.zig.Ast.TokenIndex;
+const R = "missing-deinit-on-composed-owner";
 
 pub fn check(
     gpa: std.mem.Allocator,
@@ -39,57 +37,42 @@ pub fn check(
     var model = try fmodel.build(gpa, tree);
     defer model.deinit();
 
-    const tags = tree.tokens.items(.tag);
+    // Find all structs that have a `deinit` method.
+    const outers = try mq.findTypes(gpa, &model, .{
+        .kind = .struct_,
+        .has_method = .{ .name_eq = "deinit" },
+    });
+    defer gpa.free(outers);
 
-    for (model.types) |outer| {
-        if (outer.kind != .struct_) continue;
-        const deinit = outer.findMethod("deinit") orelse continue;
+    for (outers) |outer| {
+        const deinit = outer.findMethod("deinit").?;
 
-        for (outer.fields) |field| {
-            // Peel one optional `?` prefix; reject pointer / slice
-            // (borrow-y) types.
-            var ty: TokenIndex = field.type_first;
-            if (tags[ty] == .question_mark) ty += 1;
-            if (ty > field.type_last) continue;
-            if (tags[ty] != .identifier) continue; // *T / []T / etc.
-            const type_name = tree.tokenSlice(ty);
+        // Find this struct's value-typed fields whose declared type
+        // is a struct in this file that exposes a cleanup method.
+        const fields = try mq.findFields(gpa, &model, tree, outer, .{
+            .value_typed = true,
+            .type_matches = .{ .has_method = .{ .name_pred = isCleanupName } },
+        });
+        defer gpa.free(fields);
 
-            const inner = model.findType(type_name) orelse continue;
-            if (!inner.hasCleanupMethod()) continue;
+        for (fields) |field| {
+            // Build the body pattern: `<X>.<field>.<cleanup>(`.
+            // X is wildcarded (typically self/this).  The body pattern
+            // is built per-field since `.text` needs the field's name.
+            const cleanup_call = &[_]query.Atom{
+                .{ .tok = .identifier },
+                .{ .tok = .period },
+                .{ .text = field.name },
+                .{ .tok = .period },
+                .{ .pred = isCleanupName },
+                .paren_args,
+            };
+            if (mq.methodBodyContains(tree, deinit, cleanup_call)) continue;
 
-            // Check the outer deinit's body for any
-            // `<X>.<field>.<cleanup>(` call (X wildcarded).
-            const b_first = deinit.body_first + 1; // inside the `{`
-            const b_last = if (deinit.body_last > 0) deinit.body_last - 1 else deinit.body_last;
-            if (deinitCallsCleanupOnField(tree, b_first, b_last, field.name)) continue;
-
-            try report(gpa, problems, tree, field.name_token, field.name, type_name);
+            const ti = mq.resolveFieldType(tree, &model, field).?;
+            try report(gpa, problems, tree, field.name_token, field.name, ti.name);
         }
     }
-}
-
-/// True iff `[start, end]` contains a call of shape
-/// `<X>.<field>.<cleanup-method>(`.
-fn deinitCallsCleanupOnField(
-    tree: *const Ast,
-    start: TokenIndex,
-    end: TokenIndex,
-    field: []const u8,
-) bool {
-    const tags = tree.tokens.items(.tag);
-    if (start > end) return false;
-    var t: TokenIndex = start;
-    while (t + 5 <= end) : (t += 1) {
-        if (tags[t] != .identifier) continue;
-        if (tags[t + 1] != .period) continue;
-        if (tags[t + 2] != .identifier) continue;
-        if (!std.mem.eql(u8, tree.tokenSlice(t + 2), field)) continue;
-        if (tags[t + 3] != .period) continue;
-        if (tags[t + 4] != .identifier) continue;
-        if (tags[t + 5] != .l_paren) continue;
-        if (isCleanupName(tree.tokenSlice(t + 4))) return true;
-    }
-    return false;
 }
 
 fn isCleanupName(name: []const u8) bool {
@@ -106,7 +89,7 @@ fn report(
     gpa: std.mem.Allocator,
     problems: *std.ArrayListUnmanaged(problem.Problem),
     tree: *const Ast,
-    field_tok: TokenIndex,
+    field_tok: Ast.TokenIndex,
     field_name: []const u8,
     type_name: []const u8,
 ) !void {
@@ -118,7 +101,7 @@ fn report(
     errdefer gpa.free(msg);
 
     try problems.append(gpa, .{
-        .rule_id = "missing-deinit-on-composed-owner",
+        .rule_id = R,
         .severity = .@"error",
         .start = problem.Pos.fromTokenStart(tree, field_tok),
         .end = problem.Pos.fromTokenEnd(tree, field_tok),
@@ -127,8 +110,6 @@ fn report(
 }
 
 // ── Tests ──────────────────────────────────────────────────
-
-const R = "missing-deinit-on-composed-owner";
 
 test "outer deinit forgets inner field deinit fires" {
     try testing.expectFires(check, R,

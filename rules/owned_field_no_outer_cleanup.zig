@@ -7,29 +7,22 @@
 //! ref, mmap) when the outer goes out of scope.
 //!
 //! Complement to `missing-deinit-on-composed-owner`: that rule
-//! fires when `Outer.deinit` exists but FORGETS to call
+//! fires when `Outer.deinit` EXISTS but FORGETS to call
 //! `<self>.<field>.deinit(...)`; this rule fires when `Outer.deinit`
-//! is missing ENTIRELY.  Same family of bugs (resource leak via
-//! composition), different signal in the source.
+//! is missing ENTIRELY.
 //!
-//! Pointer / slice fields are excluded — the "owned pointer" vs
-//! "borrowed pointer" distinction is invisible at the type level.
-//! Value-typed (incl. `?T`) fields are the cleanest "I own this"
-//! signal.
-//!
-//! Only fires ONCE per outer struct — the first qualifying field
-//! is enough to indicate the design gap.
+//! Rewritten via the AST-level model_query DSL.
 
 const std = @import("std");
 const Ast = std.zig.Ast;
 
 const fmodel = @import("../model.zig");
+const mq = @import("../model_query.zig");
 const problem = @import("../problem.zig");
 const testing = @import("../testing.zig");
 const trace = @import("../trace.zig");
 const config_mod = @import("../config.zig");
 
-const TokenIndex = std.zig.Ast.TokenIndex;
 const R = "owned-field-no-outer-cleanup";
 
 pub fn check(
@@ -43,32 +36,41 @@ pub fn check(
     var model = try fmodel.build(gpa, tree);
     defer model.deinit();
 
-    const tags = tree.tokens.items(.tag);
+    // Find all structs that lack ANY cleanup method.  The
+    // missing-deinit-on-composed-owner rule covers the case where
+    // a cleanup method DOES exist but forgets the field.
+    const outers = try mq.findTypes(gpa, &model, .{
+        .kind = .struct_,
+        .no_method = .{ .name_pred = isCleanupName },
+    });
+    defer gpa.free(outers);
 
-    for (model.types) |outer| {
-        if (outer.kind != .struct_) continue;
-        // Skip if outer already has any cleanup method — that's
-        // covered by missing-deinit-on-composed-owner.
-        if (outer.hasCleanupMethod()) {
-            trace.skip(R, tree, outer.name_token, "outer has cleanup method (covered by composed-owner rule)");
-            continue;
-        }
+    for (outers) |outer| {
+        // Find the first value-typed field whose type has a cleanup
+        // method.  Only one fire per outer (the design gap is the
+        // missing method, not the field count).
+        const fields = try mq.findFields(gpa, &model, tree, outer, .{
+            .value_typed = true,
+            .type_matches = .{ .has_method = .{ .name_pred = isCleanupName } },
+        });
+        defer gpa.free(fields);
 
-        for (outer.fields) |field| {
-            var ty: TokenIndex = field.type_first;
-            if (tags[ty] == .question_mark) ty += 1;
-            if (ty > field.type_last) continue;
-            if (tags[ty] != .identifier) continue;
-            const type_name = tree.tokenSlice(ty);
-
-            const inner = model.findType(type_name) orelse continue;
-            if (!inner.hasCleanupMethod()) continue;
-
-            trace.match(R, tree, field.name_token, "owned field with no outer cleanup");
-            try report(gpa, problems, tree, outer.name, field.name_token, field.name, type_name);
-            break; // one fire per outer is enough
-        }
+        if (fields.len == 0) continue;
+        const field = fields[0];
+        const inner = mq.resolveFieldType(tree, &model, field).?;
+        trace.match(R, tree, field.name_token, "owned field with no outer cleanup");
+        try report(gpa, problems, tree, outer.name, field.name_token, field.name, inner.name);
     }
+}
+
+fn isCleanupName(name: []const u8) bool {
+    return std.mem.eql(u8, name, "deinit") or
+        std.mem.eql(u8, name, "close") or
+        std.mem.eql(u8, name, "destroy") or
+        std.mem.eql(u8, name, "free") or
+        std.mem.eql(u8, name, "stop") or
+        std.mem.eql(u8, name, "finalize") or
+        std.mem.eql(u8, name, "dispose");
 }
 
 fn report(
@@ -76,7 +78,7 @@ fn report(
     problems: *std.ArrayListUnmanaged(problem.Problem),
     tree: *const Ast,
     outer_name: []const u8,
-    field_tok: TokenIndex,
+    field_tok: Ast.TokenIndex,
     field_name: []const u8,
     type_name: []const u8,
 ) !void {
