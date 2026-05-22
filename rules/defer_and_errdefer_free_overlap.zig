@@ -30,6 +30,7 @@ const Ast = std.zig.Ast;
 const lexer = @import("../lexer.zig");
 const problem_mod = @import("../problem.zig");
 const config_mod = @import("../config.zig");
+const testing = @import("../testing.zig");
 
 const Problem = problem_mod.Problem;
 const Pos = problem_mod.Pos;
@@ -203,19 +204,10 @@ fn report(
 // ── Tests ──────────────────────────────────────────────────
 
 fn runOn(gpa: std.mem.Allocator, src: []const u8) !std.ArrayListUnmanaged(Problem) {
-    const src_z = try gpa.dupeSentinel(u8, src, 0);
-    defer gpa.free(src_z);
-    var tree = try Ast.parse(gpa, src_z, .zig);
-    defer tree.deinit(gpa);
-    var problems: std.ArrayListUnmanaged(Problem) = .empty;
-    try check(gpa, &tree, &config_mod.Default, &problems);
-    return problems;
+    return testing.runRule(gpa, check, src);
 }
 
-fn freeProblems(gpa: std.mem.Allocator, p: *std.ArrayListUnmanaged(Problem)) void {
-    for (p.items) |*x| x.deinit(gpa);
-    p.deinit(gpa);
-}
+const freeProblems = testing.freeProblems;
 
 test "defer-and-errdefer-free-overlap: Atlas.grow pattern fires" {
     const gpa = std.testing.allocator;

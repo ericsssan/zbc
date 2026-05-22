@@ -22,6 +22,7 @@ const lexer = @import("../lexer.zig");
 const annotations_mod = @import("../annotations.zig");
 const problem_mod = @import("../problem.zig");
 const config_mod = @import("../config.zig");
+const testing = @import("../testing.zig");
 
 const Db = annotations_mod.Db;
 const Problem = problem_mod.Problem;
@@ -293,10 +294,7 @@ fn runOn(gpa: std.mem.Allocator, src: []const u8) !std.ArrayListUnmanaged(Proble
     return problems;
 }
 
-fn freeProblems(gpa: std.mem.Allocator, p: *std.ArrayListUnmanaged(Problem)) void {
-    for (p.items) |*x| x.deinit(gpa);
-    p.deinit(gpa);
-}
+const freeProblems = testing.freeProblems;
 
 test "destroy-after-deinit-in-loop: pointer-list loop without destroy fires" {
     const gpa = std.testing.allocator;

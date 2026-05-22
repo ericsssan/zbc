@@ -31,6 +31,7 @@ const problem_mod = @import("../problem.zig");
 const config_mod = @import("../config.zig");
 
 const lexer = @import("../lexer.zig");
+const testing = @import("../testing.zig");
 const findStmtSemicolon = lexer.findStmtSemicolon;
 const fnProto = lexer.fnProto;
 const bodyOf = lexer.bodyOf;
@@ -363,10 +364,7 @@ fn runOn(gpa: std.mem.Allocator, src: []const u8) !std.ArrayListUnmanaged(Proble
     return problems;
 }
 
-fn freeProblems(gpa: std.mem.Allocator, p: *std.ArrayListUnmanaged(Problem)) void {
-    for (p.items) |*x| x.deinit(gpa);
-    p.deinit(gpa);
-}
+const freeProblems = testing.freeProblems;
 
 test "overwrite-without-deinit: reassign deinit-able field without prior cleanup fires" {
     const gpa = std.testing.allocator;

@@ -26,6 +26,7 @@ const problem_mod = @import("../problem.zig");
 const config_mod = @import("../config.zig");
 
 const lexer = @import("../lexer.zig");
+const testing = @import("../testing.zig");
 const fnProto = lexer.fnProto;
 const bodyOf = lexer.bodyOf;
 
@@ -483,10 +484,7 @@ fn runOn(gpa: std.mem.Allocator, src: []const u8) !std.ArrayListUnmanaged(Proble
     return problems;
 }
 
-fn freeProblems(gpa: std.mem.Allocator, p: *std.ArrayListUnmanaged(Problem)) void {
-    for (p.items) |*x| x.deinit(gpa);
-    p.deinit(gpa);
-}
+const freeProblems = testing.freeProblems;
 
 test "asymmetric-field-free: one of two `?Type` siblings deinit'd, the other not — fires" {
     const gpa = std.testing.allocator;
