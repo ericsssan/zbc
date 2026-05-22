@@ -3,17 +3,51 @@
 //! TigerStyle invariant: correct order is overwrite-THEN-free.
 //!
 //! Real-world: tigerbeetle/tigerbeetle#2687.
+//!
+//! Rewritten via the query DSL: declarative bind-then-write-via-X
+//! pattern, scoped to skip defer/errdefer.
 
 const std = @import("std");
 const Ast = std.zig.Ast;
 
 const lexer = @import("../lexer.zig");
-const scope = @import("../scope.zig");
+const query = @import("../query.zig");
 const problem = @import("../problem.zig");
 const testing = @import("../testing.zig");
 const config_mod = @import("../config.zig");
 
-const TokenIndex = lexer.TokenIndex;
+const Atom = query.Atom;
+const R = "self-undefined-after-destroy";
+
+// Pattern: `.destroy($X)` or `.free($X)` — preceded by `.` so we
+// require the receiver-method shape, slot 0 captures X.
+const destroy_or_free = &[_]Atom{
+    .{ .tok = .period },
+    .{ .pred = isDestroyOrFree },
+    .{ .tok = .l_paren },
+    .{ .capture = 0 },
+    .{ .tok = .r_paren },
+};
+
+// Pattern: write through X — `$X.* = ...` or `$X.<field> = ...`.
+// Two alternatives expressed as two patterns (DSL has no "or" yet).
+const write_deref = &[_]Atom{
+    .{ .ref = 0 },
+    .{ .tok = .period_asterisk },
+    .{ .tok = .equal },
+};
+const write_field = &[_]Atom{
+    .{ .ref = 0 },
+    .{ .tok = .period },
+    .{ .tok = .identifier },
+    .{ .tok = .equal },
+};
+
+// Pattern: rebinding of X — stops the scan.  `$X = ...` (no leading `.`).
+const rebind_x = &[_]Atom{
+    .{ .ref = 0 },
+    .{ .tok = .equal },
+};
 
 pub fn check(
     gpa: std.mem.Allocator,
@@ -36,93 +70,55 @@ fn checkBody(
     body: Ast.Node.Index,
     problems: *std.ArrayListUnmanaged(problem.Problem),
 ) !void {
-    const tags = tree.tokens.items(.tag);
     const first = tree.firstToken(body);
     const last = tree.lastToken(body);
 
-    var walk = scope.BodyWalk.init(tags, first, last);
-    while (walk.t + 4 <= last) : (walk.t += 1) {
-        if (walk.atNestedFn()) {
-            walk.skipNestedFn();
-            continue;
+    const destroys = try query.findAllInBodySkippingDefer(gpa, tree, destroy_or_free, first, last);
+    defer gpa.free(destroys);
+
+    for (destroys) |d| {
+        // Defensive: skip `<X>.destroy(<X>)` nonsense — receiver
+        // identifier just before the `.` equals the capture.
+        if (d.start >= 1) {
+            const before = d.start - 1;
+            const tags = tree.tokens.items(.tag);
+            if (tags[before] == .identifier and
+                std.mem.eql(u8, tree.tokenSlice(before), tree.tokenSlice(d.captures[0].?)))
+                continue;
         }
-        if (walk.atDeferKeyword()) {
-            walk.skipDeferStmt();
-            continue;
-        }
-        // Pattern: `.destroy(<X>)` or `.free(<X>)` preceded by `.`.
-        const t = walk.t;
-        if (tags[t] != .identifier) continue;
-        if (t == 0 or tags[t - 1] != .period) continue;
-        const method = tree.tokenSlice(t);
-        if (!std.mem.eql(u8, method, "destroy") and !std.mem.eql(u8, method, "free")) continue;
-        if (tags[t + 1] != .l_paren) continue;
-        if (tags[t + 2] != .identifier) continue;
-        if (tags[t + 3] != .r_paren) continue;
-        const x_name = tree.tokenSlice(t + 2);
-        // Defensive: skip `<name>.destroy(<name>)` (nonsense).
-        if (t >= 2 and tags[t - 2] == .identifier and
-            std.mem.eql(u8, tree.tokenSlice(t - 2), x_name)) continue;
-        const sc = lexer.findStmtSemicolon(tags, t + 4, last) orelse continue;
-        const write_tok = findWriteThroughX(tree, sc + 1, last, x_name) orelse {
-            walk.t = sc;
-            continue;
-        };
-        try report(gpa, problems, tree, write_tok, x_name, method);
-        walk.t = sc;
+        // Look for `.* = ...` first, then `.<field> = ...`, OR
+        // a rebinding `<X> = ...` that ends the scan.
+        const after = d.end + 1;
+        const reb = query.findInSameScope(tree, rebind_x, after, last, &d);
+        const w_deref = query.findInSameScope(tree, write_deref, after, last, &d);
+        const w_field = query.findInSameScope(tree, write_field, after, last, &d);
+        const write = pickFirst(w_deref, w_field) orelse continue;
+        // If the rebind is BEFORE the write, treat as rebinding → no fire.
+        if (reb) |r| if (r.start < write.start) continue;
+        try report(gpa, problems, tree, write.start, d.captures[0].?, d.start + 1);
     }
 }
 
-/// Scan `[start, last]` for the first write through `<X>` —
-/// `<X>.* = ...` or `<X>.<field> = ...`.  Bounded by enclosing
-/// scope; skips nested blocks / defer / errdefer; stops at
-/// reassignment of `<X>`.
-fn findWriteThroughX(
-    tree: *const Ast,
-    start: TokenIndex,
-    last: TokenIndex,
-    x_name: []const u8,
-) ?TokenIndex {
-    const tags = tree.tokens.items(.tag);
-    if (start > last) return null;
-    var t: TokenIndex = start;
-    while (t + 2 <= last) : (t += 1) {
-        if (tags[t] == .l_brace) {
-            t = lexer.matchBrace(tags, t, last) orelse return null;
-            continue;
-        }
-        if (tags[t] == .r_brace) return null;
-        if (tags[t] == .keyword_defer or tags[t] == .keyword_errdefer) {
-            t = lexer.skipDeferStmt(tags, t, last) orelse return null;
-            continue;
-        }
-        if (tags[t] != .identifier) continue;
-        if (!std.mem.eql(u8, tree.tokenSlice(t), x_name)) continue;
-        // `<X> = ...` — rebinding, stop.
-        if (tags[t + 1] == .equal) return null;
-        // `<X>.* = ...` — deref-write.
-        if (tags[t + 1] == .period_asterisk) {
-            if (t + 2 <= last and tags[t + 2] == .equal) return t;
-            continue;
-        }
-        if (tags[t + 1] != .period) continue;
-        if (t + 2 > last) continue;
-        // `<X>.<field> = ...`.
-        if (tags[t + 2] != .identifier) continue;
-        if (t + 3 > last) continue;
-        if (tags[t + 3] == .equal) return t;
-    }
-    return null;
+fn pickFirst(a: ?query.Match, b: ?query.Match) ?query.Match {
+    if (a == null) return b;
+    if (b == null) return a;
+    return if (a.?.start <= b.?.start) a else b;
+}
+
+fn isDestroyOrFree(name: []const u8) bool {
+    return std.mem.eql(u8, name, "destroy") or std.mem.eql(u8, name, "free");
 }
 
 fn report(
     gpa: std.mem.Allocator,
     problems: *std.ArrayListUnmanaged(problem.Problem),
     tree: *const Ast,
-    write_tok: TokenIndex,
-    x_name: []const u8,
-    method: []const u8,
+    write_tok: query.TokenIndex,
+    x_tok: query.TokenIndex,
+    method_tok: query.TokenIndex,
 ) !void {
+    const x_name = tree.tokenSlice(x_tok);
+    const method = tree.tokenSlice(method_tok);
     const msg = try std.fmt.allocPrint(
         gpa,
         "write through `{s}` after `<alloc>.{s}({s})` — the write hits freed memory.  The TigerStyle invariant is overwrite-THEN-free: `{s}.* = undefined; <alloc>.{s}({s});` (not the other order)",
@@ -131,7 +127,7 @@ fn report(
     errdefer gpa.free(msg);
 
     try problems.append(gpa, .{
-        .rule_id = "self-undefined-after-destroy",
+        .rule_id = R,
         .severity = .@"error",
         .start = problem.Pos.fromTokenStart(tree, write_tok),
         .end = problem.Pos.fromTokenEnd(tree, write_tok),
@@ -140,8 +136,6 @@ fn report(
 }
 
 // ── Tests ──────────────────────────────────────────────────
-
-const R = "self-undefined-after-destroy";
 
 test "TigerBeetle inspect.zig pattern fires" {
     try testing.expectFires(check, R,

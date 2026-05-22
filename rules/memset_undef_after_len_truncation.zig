@@ -8,17 +8,41 @@
 //! Real-world: ziglang/zig#25810 + #25832 fix this in both
 //! `ArrayListAligned` and `ArrayListAlignedManaged`'s
 //! `shrinkRetainingCapacity` / `clearRetainingCapacity`.
+//!
+//! Rewritten via the query DSL: two patterns + same-scope find.
 
 const std = @import("std");
 const Ast = std.zig.Ast;
 
 const lexer = @import("../lexer.zig");
-const scope = @import("../scope.zig");
+const query = @import("../query.zig");
 const problem = @import("../problem.zig");
 const testing = @import("../testing.zig");
 const config_mod = @import("../config.zig");
 
-const TokenIndex = lexer.TokenIndex;
+const Atom = query.Atom;
+const R = "memset-undef-after-len-truncation";
+
+// Pattern: `$X.$F.len = ...;`
+//   slot 0 — receiver name (X)
+//   slot 1 — field name (F)
+const len_truncation = &[_]Atom{
+    .{ .capture = 0 },
+    .{ .tok = .period },
+    .{ .capture = 1 },
+    .{ .tok = .period },
+    .{ .text = "len" },
+    .{ .tok = .equal },
+};
+
+// Pattern: `@memset($X.$F...)` — the first arg starts with `$X.$F`.
+const memset_on_slice = &[_]Atom{
+    .{ .builtin = "@memset" },
+    .{ .tok = .l_paren },
+    .{ .ref = 0 },
+    .{ .tok = .period },
+    .{ .ref = 1 },
+};
 
 pub fn check(
     gpa: std.mem.Allocator,
@@ -41,72 +65,28 @@ fn checkBody(
     body: Ast.Node.Index,
     problems: *std.ArrayListUnmanaged(problem.Problem),
 ) !void {
-    const tags = tree.tokens.items(.tag);
     const first = tree.firstToken(body);
     const last = tree.lastToken(body);
 
-    var walk = scope.BodyWalk.init(tags, first, last);
-    while (walk.t + 5 <= last) : (walk.t += 1) {
-        if (walk.atNestedFn()) {
-            walk.skipNestedFn();
-            continue;
-        }
-        // Pattern: `<X>.<field>.len = ...`
-        const t = walk.t;
-        if (tags[t] != .identifier) continue;
-        if (tags[t + 1] != .period) continue;
-        if (tags[t + 2] != .identifier) continue;
-        if (tags[t + 3] != .period) continue;
-        if (tags[t + 4] != .identifier) continue;
-        if (!std.mem.eql(u8, tree.tokenSlice(t + 4), "len")) continue;
-        if (t + 5 > last or tags[t + 5] != .equal) continue;
-        const x_name = tree.tokenSlice(t);
-        const field_name = tree.tokenSlice(t + 2);
-        const sc = lexer.findStmtSemicolon(tags, t + 6, last) orelse continue;
-        const memset_tok = findMemsetOnSlice(tree, sc + 1, last, x_name, field_name) orelse {
-            walk.t = sc;
-            continue;
-        };
-        try report(gpa, problems, tree, memset_tok, x_name, field_name);
-        walk.t = sc;
-    }
-}
+    const truncations = try query.findAllInBody(gpa, tree, len_truncation, first, last);
+    defer gpa.free(truncations);
 
-/// `@memset(<X>.<field>...)` where the first arg starts with the
-/// target slice.
-fn findMemsetOnSlice(
-    tree: *const Ast,
-    start: TokenIndex,
-    last: TokenIndex,
-    x_name: []const u8,
-    field_name: []const u8,
-) ?TokenIndex {
-    const tags = tree.tokens.items(.tag);
-    if (start > last) return null;
-    var t: TokenIndex = start;
-    while (t + 4 <= last) : (t += 1) {
-        if (tags[t] == .r_brace) return null;
-        if (tags[t] != .builtin) continue;
-        if (!std.mem.eql(u8, tree.tokenSlice(t), "@memset")) continue;
-        if (tags[t + 1] != .l_paren) continue;
-        if (tags[t + 2] != .identifier) continue;
-        if (!std.mem.eql(u8, tree.tokenSlice(t + 2), x_name)) continue;
-        if (tags[t + 3] != .period) continue;
-        if (tags[t + 4] != .identifier) continue;
-        if (!std.mem.eql(u8, tree.tokenSlice(t + 4), field_name)) continue;
-        return t;
+    for (truncations) |t| {
+        const ms = query.findInSameScope(tree, memset_on_slice, t.end + 1, last, &t) orelse continue;
+        try report(gpa, problems, tree, ms.start, t.captures[0].?, t.captures[1].?);
     }
-    return null;
 }
 
 fn report(
     gpa: std.mem.Allocator,
     problems: *std.ArrayListUnmanaged(problem.Problem),
     tree: *const Ast,
-    memset_tok: TokenIndex,
-    x_name: []const u8,
-    field_name: []const u8,
+    memset_tok: query.TokenIndex,
+    x_tok: query.TokenIndex,
+    field_tok: query.TokenIndex,
 ) !void {
+    const x_name = tree.tokenSlice(x_tok);
+    const field_name = tree.tokenSlice(field_tok);
     const msg = try std.fmt.allocPrint(
         gpa,
         "`@memset({s}.{s}[...]...)` follows `{s}.{s}.len = ...;` — the memset slices the ALREADY-TRUNCATED items so the range is empty and the memset is a no-op.  The freed-but-retained capacity keeps its old bytes, defeating Zig's `undefined` use-after-shrink safety.  Swap the order: `@memset(...)` BEFORE the `.len = ...` truncation",
@@ -115,7 +95,7 @@ fn report(
     errdefer gpa.free(msg);
 
     try problems.append(gpa, .{
-        .rule_id = "memset-undef-after-len-truncation",
+        .rule_id = R,
         .severity = .@"error",
         .start = problem.Pos.fromTokenStart(tree, memset_tok),
         .end = problem.Pos.fromTokenEnd(tree, memset_tok),
@@ -124,8 +104,6 @@ fn report(
 }
 
 // ── Tests ──────────────────────────────────────────────────
-
-const R = "memset-undef-after-len-truncation";
 
 test "shrink-then-memset (canonical bug) fires" {
     try testing.expectFires(check, R,
@@ -165,6 +143,7 @@ test "memset BEFORE truncation (correct order) doesn't fire" {
 
 test "memset on a different field doesn't fire" {
     try testing.expectNoFire(check,
+        \\const std = @import("std");
         \\const T = struct {
         \\    items: []u8,
         \\    other: []u8,

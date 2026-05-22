@@ -2,19 +2,48 @@
 //! <dir>.<open-method>(...);` binds an OS file handle; `<X>.close();`
 //! invalidates it; any subsequent `<X>.<io-method>(...)` /
 //! `<X>.<field-access>` reads or writes through a dangling handle.
+//!
+//! Rewritten via the query DSL: the rule is now a declarative
+//! description of three patterns + scope constraints, NOT a
+//! hand-rolled token walker.
 
 const std = @import("std");
 const Ast = std.zig.Ast;
 
 const lexer = @import("../lexer.zig");
-const scope = @import("../scope.zig");
+const query = @import("../query.zig");
 const problem = @import("../problem.zig");
 const testing = @import("../testing.zig");
 const trace = @import("../trace.zig");
 const config_mod = @import("../config.zig");
 
-const TokenIndex = lexer.TokenIndex;
+const Atom = query.Atom;
 const R = "fd-write-after-close";
+
+// Pattern: `const $X = [try] <ident>.<openMethod>(...);`
+//   slot 0 — bound name X
+const open_call = &[_]Atom{
+    .{ .tok = .keyword_const },
+    .{ .capture = 0 },
+    .{ .tok = .equal },
+    .{ .opt = &[_]Atom{.{ .tok = .keyword_try }} },
+    .{ .tok = .identifier }, // receiver (dir / sock / etc.)
+    .{ .tok = .period },
+    .{ .pred = isOpenerMethod },
+    .paren_args,
+};
+
+// Pattern: `$X.close()` — inline close, same scope.
+const close_call = &[_]Atom{
+    .{ .ref = 0 },
+    .{ .tok = .period },
+    .{ .text = "close" },
+    .paren_args,
+};
+
+// Pattern: any reference to $X — used to detect "use after close"
+// inside the enclosing scope.
+const use_of_x = &[_]Atom{.{ .ref = 0 }};
 
 pub fn check(
     gpa: std.mem.Allocator,
@@ -31,87 +60,34 @@ pub fn check(
     }
 }
 
-const Binding = struct {
-    x_name: []const u8,
-    name_token: TokenIndex,
-    end_token: TokenIndex,
-};
-
 fn checkBody(
     gpa: std.mem.Allocator,
     tree: *const Ast,
     body: Ast.Node.Index,
     problems: *std.ArrayListUnmanaged(problem.Problem),
 ) !void {
-    const tags = tree.tokens.items(.tag);
     const first = tree.firstToken(body);
     const last = tree.lastToken(body);
 
-    var bindings: std.ArrayListUnmanaged(Binding) = .empty;
-    defer bindings.deinit(gpa);
+    const binds = try query.findAllInBody(gpa, tree, open_call, first, last);
+    defer gpa.free(binds);
 
-    var walk = scope.BodyWalk.init(tags, first, last);
-    while (walk.t + 5 <= last) : (walk.t += 1) {
-        if (walk.atNestedFn()) {
-            walk.skipNestedFn();
-            continue;
-        }
-        const t = walk.t;
-        if (tags[t] != .keyword_const and tags[t] != .keyword_var) continue;
-        if (tags[t + 1] != .identifier) continue;
-
-        // Skip optional type annotation.
-        var after_name: TokenIndex = t + 2;
-        if (after_name <= last and tags[after_name] == .colon) {
-            var d: u32 = 0;
-            while (after_name <= last) : (after_name += 1) {
-                switch (tags[after_name]) {
-                    .l_paren, .l_brace, .l_bracket => d += 1,
-                    .r_paren, .r_brace, .r_bracket => if (d > 0) {
-                        d -= 1;
-                    },
-                    .equal => if (d == 0) break,
-                    else => {},
-                }
-            }
-        }
-        if (after_name > last or tags[after_name] != .equal) continue;
-
-        var rhs_start: TokenIndex = after_name + 1;
-        if (rhs_start <= last and tags[rhs_start] == .keyword_try) rhs_start += 1;
-        if (rhs_start + 3 > last) continue;
-        if (tags[rhs_start] != .identifier) continue;
-        if (tags[rhs_start + 1] != .period) continue;
-        if (tags[rhs_start + 2] != .identifier) continue;
-        if (tags[rhs_start + 3] != .l_paren) continue;
-        if (!isOpenerMethodName(tree.tokenSlice(rhs_start + 2))) continue;
-
-        const sc = lexer.findStmtSemicolon(tags, rhs_start + 4, last) orelse continue;
-        trace.note(R, tree, t + 1, "bound file handle via opener");
-        try bindings.append(gpa, .{
-            .x_name = tree.tokenSlice(t + 1),
-            .name_token = t + 1,
-            .end_token = sc,
-        });
-        walk.t = sc;
-    }
-
-    for (bindings.items) |b| {
-        const close_tok = scope.findReceiverCallSameDepth(tree, b.end_token + 1, last, b.x_name, isCloseMethodName) orelse {
-            trace.skip(R, tree, b.name_token, "no inline .close() at same depth (defer/errdefer is fine)");
+    for (binds) |b| {
+        trace.note(R, tree, b.captures[0].?, "bound file handle via opener");
+        const close = query.findInSameScope(tree, close_call, b.end + 1, last, &b) orelse {
+            trace.skip(R, tree, b.captures[0].?, "no inline .close() at same depth (defer/errdefer is fine)");
             continue;
         };
-        const after_close = lexer.findStmtSemicolon(tree.tokens.items(.tag), close_tok, last) orelse continue;
-        const use_tok = scope.findIdentUseInEnclosingScope(tree, after_close + 1, last, b.x_name) orelse {
-            trace.skip(R, tree, close_tok, "close found but no later use of binding in enclosing scope");
+        const use = query.findInEnclosingScope(tree, use_of_x, close.end + 1, last, &b) orelse {
+            trace.skip(R, tree, close.start, "close found but no later use of binding in enclosing scope");
             continue;
         };
-        trace.match(R, tree, use_tok, "use after close");
-        try report(gpa, problems, tree, b, close_tok, use_tok);
+        trace.match(R, tree, use.start, "use after close");
+        try report(gpa, problems, tree, b.captures[0].?, use.start);
     }
 }
 
-fn isOpenerMethodName(name: []const u8) bool {
+fn isOpenerMethod(name: []const u8) bool {
     return std.mem.eql(u8, name, "createFile") or
         std.mem.eql(u8, name, "createFileZ") or
         std.mem.eql(u8, name, "openFile") or
@@ -126,23 +102,18 @@ fn isOpenerMethodName(name: []const u8) bool {
         std.mem.eql(u8, name, "socket");
 }
 
-fn isCloseMethodName(name: []const u8) bool {
-    return std.mem.eql(u8, name, "close");
-}
-
 fn report(
     gpa: std.mem.Allocator,
     problems: *std.ArrayListUnmanaged(problem.Problem),
     tree: *const Ast,
-    b: Binding,
-    close_tok: TokenIndex,
-    use_tok: TokenIndex,
+    bind_tok: query.TokenIndex,
+    use_tok: query.TokenIndex,
 ) !void {
-    _ = close_tok;
+    const x_name = tree.tokenSlice(bind_tok);
     const msg = try std.fmt.allocPrint(
         gpa,
         "use of `{s}` after `{s}.close()` — the file handle is invalid; subsequent operations through `{s}` read/write through a dangling fd (fd-reuse on POSIX) or a closed handle (Windows)",
-        .{ b.x_name, b.x_name, b.x_name },
+        .{ x_name, x_name, x_name },
     );
     errdefer gpa.free(msg);
 
@@ -152,13 +123,13 @@ fn report(
     var notes = try gpa.alloc(problem.Note, 1);
     errdefer gpa.free(notes);
     notes[0] = .{
-        .start = problem.Pos.fromTokenStart(tree, b.name_token),
-        .end = problem.Pos.fromTokenEnd(tree, b.name_token),
+        .start = problem.Pos.fromTokenStart(tree, bind_tok),
+        .end = problem.Pos.fromTokenEnd(tree, bind_tok),
         .label = note_label,
     };
 
     try problems.append(gpa, .{
-        .rule_id = "fd-write-after-close",
+        .rule_id = R,
         .severity = .@"error",
         .start = problem.Pos.fromTokenStart(tree, use_tok),
         .end = problem.Pos.fromTokenEnd(tree, use_tok),

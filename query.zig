@@ -214,6 +214,8 @@ pub fn findAll(
 /// Find ALL non-overlapping matches of `atoms` in `[start, last]`,
 /// SKIPPING nested fn declarations entirely.  Use this when scanning
 /// inside a fn body so that inner fn contents aren't double-matched.
+/// Does NOT skip defer/errdefer statements — use
+/// findAllInBodySkippingDefer if you want both.
 pub fn findAllInBody(
     gpa: std.mem.Allocator,
     tree: *const Ast,
@@ -228,6 +230,45 @@ pub fn findAllInBody(
         if (tags[t] == .keyword_fn) {
             t = lexer.skipNestedFn(tags, t, last);
             t = if (t < last) t + 1 else last + 1;
+            continue;
+        }
+        if (matchAt(tree, atoms, t, last, null)) |m| {
+            try out.append(gpa, m);
+            t = m.end + 1;
+            continue;
+        }
+        t += 1;
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+/// Find ALL non-overlapping matches of `atoms` in `[start, last]`,
+/// SKIPPING both nested fn declarations AND defer/errdefer
+/// statements.  Use when matches inside deferred code shouldn't
+/// count toward the rule (because they fire at a different point
+/// in the fn's lifetime).
+pub fn findAllInBodySkippingDefer(
+    gpa: std.mem.Allocator,
+    tree: *const Ast,
+    atoms: []const Atom,
+    start: TokenIndex,
+    last: TokenIndex,
+) ![]Match {
+    var out: std.ArrayListUnmanaged(Match) = .empty;
+    const tags = tree.tokens.items(.tag);
+    var t: TokenIndex = start;
+    while (t <= last) {
+        if (tags[t] == .keyword_fn) {
+            t = lexer.skipNestedFn(tags, t, last);
+            t = if (t < last) t + 1 else last + 1;
+            continue;
+        }
+        if (tags[t] == .keyword_defer or tags[t] == .keyword_errdefer) {
+            const end = lexer.skipDeferStmt(tags, t, last) orelse {
+                t = last + 1;
+                continue;
+            };
+            t = end + 1;
             continue;
         }
         if (matchAt(tree, atoms, t, last, null)) |m| {
