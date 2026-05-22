@@ -68,12 +68,7 @@ pub fn check(
     problems: *std.ArrayListUnmanaged(Problem),
 ) !void {
     if (!config_mod.isEnabled(config, .slice_of_arena_into_heap)) return;
-
-    var proto_buf: [1]Ast.Node.Index = undefined;
-    var fns = lexer.iterFnDecls(tree);
-    while (fns.next(&proto_buf)) |fn_entry| {
-        try checkFn(gpa, tree, fn_entry.proto, fn_entry.body, problems);
-    }
+    try lexer.forEachFn(gpa, tree, problems, checkFn);
 }
 
 const ArenaVar = struct {

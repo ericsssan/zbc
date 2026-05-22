@@ -37,12 +37,13 @@ const Pos = problem_mod.Pos;
 const Atom = query.Atom;
 
 // `.free(<X>.ptr (.?)? [<lo>..<X>.len])` — the sentinel-strip shape.
-// $0 captures X (the slice's binding name) so the trailing `<X>.len`
-// is matched as the SAME identifier via ref.  The `<lo>` expression
-// between `[` and `..` is captured via range slot 0 (skipped).
+// Capture slots:
+//   $0 = X (slice binding name); trailing `<X>.len` ref-matches it
+//   $1 = `free` method token (used as the report site)
+// Range slot 0 captures the `<lo>` expression between `[` and `..`.
 const sentinel_strip = &[_]Atom{
     .{ .tok = .period },
-    .{ .text = "free" },
+    .{ .text_at = .{ .slot = 1, .text = "free" } },
     .{ .tok = .l_paren },
     .{ .capture = 0 },
     .{ .tok = .period },
@@ -65,12 +66,7 @@ pub fn check(
     problems: *std.ArrayListUnmanaged(Problem),
 ) !void {
     if (!config_mod.isEnabled(config, .sentinel_strip_free_size_mismatch)) return;
-
-    var proto_buf: [1]Ast.Node.Index = undefined;
-    var fns = lexer.iterFnDecls(tree);
-    while (fns.next(&proto_buf)) |fn_entry| {
-        try checkBody(gpa, tree, fn_entry.body, problems);
-    }
+    try lexer.forEachFnBody(gpa, tree, problems, checkBody);
 }
 
 fn checkBody(
@@ -84,9 +80,7 @@ fn checkBody(
     const matches = try query.findAllInBody(gpa, tree, sentinel_strip, first, last);
     defer gpa.free(matches);
     for (matches) |m| {
-        // Report at the `.free` method token (m.start is the leading `.`;
-        // m.start + 1 is `free`).
-        try report(gpa, problems, tree, m.start + 1);
+        try report(gpa, problems, tree, m.captures[1].?);
     }
 }
 

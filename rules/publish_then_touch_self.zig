@@ -33,6 +33,8 @@ const config_mod = @import("../config.zig");
 
 const lexer = @import("../lexer.zig");
 const query = @import("../query.zig");
+const scope = @import("../scope.zig");
+const receiver = @import("../receiver.zig");
 const testing = @import("../testing.zig");
 const findStmtSemicolon = lexer.findStmtSemicolon;
 
@@ -41,12 +43,12 @@ const Pos = problem_mod.Pos;
 const Atom = query.Atom;
 
 // `.<method>(<this|self>)` — preceded by `.` so it's a method call
-// on a chain.  Layout: m.start=`.`, +1=method, +2=`(`, +3=arg, +4=`)`.
+// on a chain.  Capture slots: $0 = method, $1 = arg (this|self).
 const publish_call = &[_]Atom{
     .{ .tok = .period },
-    .{ .tok = .identifier },
+    .{ .capture = 0 },
     .{ .tok = .l_paren },
-    .{ .pred = isThisOrSelf },
+    .{ .pred_at = .{ .slot = 1, .pred = receiver.isSelfReceiverName } },
     .{ .tok = .r_paren },
 };
 
@@ -57,12 +59,7 @@ pub fn check(
     problems: *std.ArrayListUnmanaged(Problem),
 ) !void {
     if (!config_mod.isEnabled(config, .publish_then_touch_self)) return;
-
-    var proto_buf: [1]Ast.Node.Index = undefined;
-    var fns = lexer.iterFnDecls(tree);
-    while (fns.next(&proto_buf)) |fn_entry| {
-        try checkBody(gpa, tree, fn_entry.body, problems);
-    }
+    try lexer.forEachFnBody(gpa, tree, problems, checkBody);
 }
 
 fn checkBody(
@@ -78,23 +75,18 @@ fn checkBody(
     const calls = try query.findAllInBody(gpa, tree, publish_call, first, last);
     defer gpa.free(calls);
     for (calls) |m| {
-        const method_tok = m.start + 1;
-        const arg_tok = m.start + 3;
+        const method_tok = m.captures[0].?;
         const method = tree.tokenSlice(method_tok);
-        const arg = tree.tokenSlice(arg_tok);
+        const arg = m.captureText(tree, 1).?;
         // Concurrency check: method name OR chain receiver suggests
         // concurrent dispatch.
         const chain_start = walkBackChain(tags, method_tok);
         if (!isConcurrentDispatch(tree, method, chain_start, method_tok)) continue;
         // Find next use of `arg` (this/self) in the same scope.
         const sc = findStmtSemicolon(tags, m.end + 1, last) orelse continue;
-        const use_tok = findIdentUseSameScope(tree, sc + 1, last, arg) orelse continue;
-        try report(gpa, problems, tree, method_tok, use_tok, method, arg);
+        const use_tok = scope.findIdentUseInEnclosingScope(tree, sc + 1, last, arg) orelse continue;
+        try report(gpa, problems, tree, use_tok, method, arg);
     }
-}
-
-fn isThisOrSelf(name: []const u8) bool {
-    return std.mem.eql(u8, name, "this") or std.mem.eql(u8, name, "self");
 }
 
 /// Walk backward from the `.method` to find the chain's start token.
@@ -200,40 +192,14 @@ fn isConcurrencyChainToken(name: []const u8) bool {
         std.mem.eql(u8, name, "threadPool");
 }
 
-/// Find the next bare identifier matching `name` in the same scope.
-fn findIdentUseSameScope(
-    tree: *const Ast,
-    start: Ast.TokenIndex,
-    last: Ast.TokenIndex,
-    name: []const u8,
-) ?Ast.TokenIndex {
-    const tags = tree.tokens.items(.tag);
-    if (start > last) return null;
-    var depth: u32 = 0;
-    var t: Ast.TokenIndex = start;
-    while (t <= last) : (t += 1) {
-        switch (tags[t]) {
-            .l_brace => depth += 1,
-            .r_brace => if (depth == 0) return null else {
-                depth -= 1;
-            },
-            .identifier => if (std.mem.eql(u8, tree.tokenSlice(t), name)) return t,
-            else => {},
-        }
-    }
-    return null;
-}
-
 fn report(
     gpa: std.mem.Allocator,
     problems: *std.ArrayListUnmanaged(Problem),
     tree: *const Ast,
-    publish_tok: Ast.TokenIndex,
     use_tok: Ast.TokenIndex,
     method: []const u8,
     arg: []const u8,
 ) !void {
-    _ = publish_tok;
     const msg = try std.fmt.allocPrint(
         gpa,
         "use of `{s}` after `.{s}({s})` published it to a concurrent queue / thread pool — the consumer may have freed `{s}` before this access lands.  Hoist any post-publish reads into locals BEFORE the publish call",

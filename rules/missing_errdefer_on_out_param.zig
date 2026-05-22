@@ -59,12 +59,7 @@ pub fn check(
     problems: *std.ArrayListUnmanaged(Problem),
 ) !void {
     if (!config_mod.isEnabled(config, .missing_errdefer_on_out_param)) return;
-
-    var proto_buf: [1]Ast.Node.Index = undefined;
-    var fns = lexer.iterFnDecls(tree);
-    while (fns.next(&proto_buf)) |fn_entry| {
-        try checkFn(gpa, tree, fn_entry.proto, fn_entry.body, problems);
-    }
+    try lexer.forEachFn(gpa, tree, problems, checkFn);
 }
 
 const Acquire = struct {

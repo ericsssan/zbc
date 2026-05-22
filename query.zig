@@ -68,6 +68,15 @@ pub const Atom = union(enum) {
     text: []const u8,
     /// Consume one identifier whose text passes this predicate.
     pred: *const fn ([]const u8) bool,
+    /// Consume one identifier whose text equals this AND record its
+    /// position in captures[slot].  Use over `.text` when the matched
+    /// token's position is needed at report time — avoids fragile
+    /// `m.start + N` offsets.
+    text_at: struct { slot: u8, text: []const u8 },
+    /// Consume one identifier whose text passes this predicate AND
+    /// record its position in captures[slot].  Use over `.pred` when
+    /// the matched token's position is needed at report time.
+    pred_at: struct { slot: u8, pred: *const fn ([]const u8) bool },
     /// Consume one identifier; record its position in captures[slot].
     capture: u8,
     /// Consume one identifier whose text equals tokenSlice(captures[slot]).
@@ -185,6 +194,20 @@ fn matchSlice(
             .pred => |p| {
                 if (t.* > last or tags[t.*] != .identifier) return false;
                 if (!p(tree.tokenSlice(t.*))) return false;
+                t.* += 1;
+            },
+            .text_at => |ta| {
+                if (ta.slot >= MAX_CAPTURES) return false;
+                if (t.* > last or tags[t.*] != .identifier) return false;
+                if (!std.mem.eql(u8, tree.tokenSlice(t.*), ta.text)) return false;
+                captures[ta.slot] = t.*;
+                t.* += 1;
+            },
+            .pred_at => |pa| {
+                if (pa.slot >= MAX_CAPTURES) return false;
+                if (t.* > last or tags[t.*] != .identifier) return false;
+                if (!pa.pred(tree.tokenSlice(t.*))) return false;
+                captures[pa.slot] = t.*;
                 t.* += 1;
             },
             .capture => |slot| {
@@ -330,6 +353,7 @@ pub fn findAll(
         }
         t += 1;
     }
+    if (out.items.len == 0) return &.{};
     return out.toOwnedSlice(gpa);
 }
 
@@ -361,6 +385,7 @@ pub fn findAllInBody(
         }
         t += 1;
     }
+    if (out.items.len == 0) return &.{};
     return out.toOwnedSlice(gpa);
 }
 
@@ -400,6 +425,7 @@ pub fn findAllInBodySkippingDefer(
         }
         t += 1;
     }
+    if (out.items.len == 0) return &.{};
     return out.toOwnedSlice(gpa);
 }
 
@@ -580,6 +606,41 @@ test "matchAt: capture and ref" {
     const use = &[_]Atom{.{ .ref = 0 }};
     const use_m = findInEnclosingScope(&tree, use, b.end + 1, last, &b).?;
     try testing.expectEqualStrings("x", tree.tokenSlice(use_m.start));
+}
+
+test "matchAt: text_at captures the matched token" {
+    var tree = try parseTokens("fn f() void { a.free(x); }");
+    defer tree.deinit(testing.allocator);
+    const last: TokenIndex = @intCast(tree.tokens.len - 1);
+    const atoms = &[_]Atom{
+        .{ .tok = .identifier },
+        .{ .tok = .period },
+        .{ .text_at = .{ .slot = 0, .text = "free" } },
+        .paren_args,
+    };
+    const a_pos = findIdent(&tree, "a");
+    const m = matchAt(&tree, atoms, a_pos, last, null).?;
+    try testing.expectEqualStrings("free", m.captureText(&tree, 0).?);
+}
+
+test "matchAt: pred_at captures the matched token" {
+    var tree = try parseTokens("fn f() void { a.openFile(); }");
+    defer tree.deinit(testing.allocator);
+    const last: TokenIndex = @intCast(tree.tokens.len - 1);
+    const isOpener = struct {
+        fn p(name: []const u8) bool {
+            return std.mem.eql(u8, name, "openFile");
+        }
+    }.p;
+    const atoms = &[_]Atom{
+        .{ .tok = .identifier },
+        .{ .tok = .period },
+        .{ .pred_at = .{ .slot = 0, .pred = isOpener } },
+        .paren_args,
+    };
+    const a_pos = findIdent(&tree, "a");
+    const m = matchAt(&tree, atoms, a_pos, last, null).?;
+    try testing.expectEqualStrings("openFile", m.captureText(&tree, 0).?);
 }
 
 test "matchAt: predicate" {

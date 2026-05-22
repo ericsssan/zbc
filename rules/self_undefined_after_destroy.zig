@@ -52,12 +52,7 @@ pub fn check(
     problems: *std.ArrayListUnmanaged(problem.Problem),
 ) !void {
     if (!config_mod.isEnabled(config, .self_undefined_after_destroy)) return;
-
-    var proto_buf: [1]Ast.Node.Index = undefined;
-    var fns = lexer.iterFnDecls(tree);
-    while (fns.next(&proto_buf)) |fn_entry| {
-        try checkBody(gpa, tree, fn_entry.body, problems);
-    }
+    try lexer.forEachFnBody(gpa, tree, problems, checkBody);
 }
 
 fn checkBody(

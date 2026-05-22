@@ -38,7 +38,6 @@ const Pos = problem_mod.Pos;
 const hasTokenInRange = lexer.hasTokenInRange;
 const matchBrace = lexer.matchBrace;
 const skipNestedFn = lexer.skipNestedFn;
-const bodyOf = lexer.bodyOf;
 
 const query = @import("../query.zig");
 const Atom = query.Atom;
@@ -67,12 +66,7 @@ pub fn check(
     problems: *std.ArrayListUnmanaged(Problem),
 ) !void {
     if (!config_mod.isEnabled(config, .defer_and_errdefer_free_overlap)) return;
-
-    var proto_buf: [1]Ast.Node.Index = undefined;
-    var fns = lexer.iterFnDecls(tree);
-    while (fns.next(&proto_buf)) |fn_entry| {
-        try checkBody(gpa, tree, fn_entry.body, problems);
-    }
+    try lexer.forEachFnBody(gpa, tree, problems, checkBody);
 }
 
 fn checkBody(
@@ -85,13 +79,11 @@ fn checkBody(
     const first = tree.firstToken(body);
     const last = tree.lastToken(body);
 
-    // Collect `defer <alloc>.free(<X>);` deferred names.
-    var deferred_frees: std.ArrayListUnmanaged([]const u8) = .empty;
-    defer deferred_frees.deinit(gpa);
+    // Collect `defer <alloc>.free(<X>);` matches — names referenced
+    // directly from the match captures (no intermediate copy).
     const defer_matches = try query.findAllInBody(gpa, tree, defer_free_pattern, first, last);
     defer gpa.free(defer_matches);
-    for (defer_matches) |m| try deferred_frees.append(gpa, m.captureText(tree, 0).?);
-    if (deferred_frees.items.len == 0) return;
+    if (defer_matches.len == 0) return;
 
     // Walk for `errdefer { ... }` blocks that contain an
     // assignment `<lhs> = <deferred-name>;` AND a free call
@@ -118,7 +110,7 @@ fn checkBody(
             continue;
         }
         const body_end = matchBrace(tags, body_start, last) orelse continue;
-        const restored = errdeferRestoresDeferredName(tree, body_start + 1, body_end - 1, deferred_frees.items) orelse {
+        const restored = errdeferRestoresDeferredName(tree, body_start + 1, body_end - 1, defer_matches) orelse {
             t = body_end;
             continue;
         };
@@ -143,7 +135,7 @@ fn errdeferRestoresDeferredName(
     tree: *const Ast,
     start: Ast.TokenIndex,
     end: Ast.TokenIndex,
-    deferred: []const []const u8,
+    deferred: []const query.Match,
 ) ?[]const u8 {
     const tags = tree.tokens.items(.tag);
     if (start > end) return null;
@@ -152,7 +144,8 @@ fn errdeferRestoresDeferredName(
         if (tags[t] != .equal) continue;
         if (t + 1 > end or tags[t + 1] != .identifier) continue;
         const name = tree.tokenSlice(t + 1);
-        for (deferred) |d| {
+        for (deferred) |m| {
+            const d = m.captureText(tree, 0).?;
             if (std.mem.eql(u8, d, name)) return d;
         }
     }

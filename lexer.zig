@@ -316,6 +316,40 @@ pub fn iterFnDecls(tree: *const Ast) FnDeclIter {
     return .{ .tree = tree, .skip_type_builders = true };
 }
 
+/// For each non-type-builder fn in `tree`, invoke `callback(gpa, tree,
+/// fn_body, problems)`.  Eliminates the `proto_buf` / `iterFnDecls` /
+/// `while next` boilerplate that every body-only rule reproduces.
+/// `problems` is `anytype` so the helper doesn't need to import the
+/// `Problem` type; `callback` is also `anytype` for the same reason
+/// (Zig duck-types both at the call site).
+pub fn forEachFnBody(
+    gpa: std.mem.Allocator,
+    tree: *const Ast,
+    problems: anytype,
+    comptime callback: anytype,
+) !void {
+    var proto_buf: [1]Ast.Node.Index = undefined;
+    var fns = iterFnDecls(tree);
+    while (fns.next(&proto_buf)) |fn_entry| {
+        try callback(gpa, tree, fn_entry.body, problems);
+    }
+}
+
+/// As `forEachFnBody` but also passes the fn's `FnProto` to the
+/// callback — for rules that inspect parameter lists / return type.
+pub fn forEachFn(
+    gpa: std.mem.Allocator,
+    tree: *const Ast,
+    problems: anytype,
+    comptime callback: anytype,
+) !void {
+    var proto_buf: [1]Ast.Node.Index = undefined;
+    var fns = iterFnDecls(tree);
+    while (fns.next(&proto_buf)) |fn_entry| {
+        try callback(gpa, tree, fn_entry.proto, fn_entry.body, problems);
+    }
+}
+
 // ── Tests ──────────────────────────────────────────────────
 
 test "matchBrace pairs simple braces" {

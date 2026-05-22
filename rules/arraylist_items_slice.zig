@@ -66,12 +66,7 @@ pub fn check(
     problems: *std.ArrayListUnmanaged(Problem),
 ) !void {
     if (!config_mod.isEnabled(config, .arraylist_items_slice)) return;
-
-    var proto_buf: [1]Ast.Node.Index = undefined;
-    var fns = lexer.iterFnDecls(tree);
-    while (fns.next(&proto_buf)) |fn_entry| {
-        try checkFn(gpa, tree, fn_entry.proto, fn_entry.body, problems);
-    }
+    try lexer.forEachFn(gpa, tree, problems, checkFn);
 }
 
 const Borrow = struct {

@@ -36,28 +36,25 @@ const config_mod = @import("../config.zig");
 
 const lexer = @import("../lexer.zig");
 const query = @import("../query.zig");
+const receiver = @import("../receiver.zig");
 const testing = @import("../testing.zig");
 const matchBrace = lexer.matchBrace;
-const matchParen = lexer.matchParen;
 const findStmtSemicolon = lexer.findStmtSemicolon;
-const skipNestedFn = lexer.skipNestedFn;
 const hasTokenInRange = lexer.hasTokenInRange;
-const returnsType = lexer.returnsType;
-const fnProto = lexer.fnProto;
-const bodyOf = lexer.bodyOf;
 const Atom = query.Atom;
 
 // `.<addrefMethod>(` — preceded by `.` so it's a method call.
+// Capture slot $0 = the addref method token (report site).
 const addref_call_pattern = &[_]Atom{
     .{ .tok = .period },
-    .{ .pred = isAddrefMethodName },
+    .{ .pred_at = .{ .slot = 0, .pred = isAddrefMethodName } },
     .{ .tok = .l_paren },
 };
 
 // `.<releaseMethod>(` — used inside defer/errdefer body scans.
 const release_call_pattern = &[_]Atom{
     .{ .tok = .period },
-    .{ .pred = isReleaseMethodName },
+    .{ .pred = receiver.isReleaseMethodName },
     .{ .tok = .l_paren },
 };
 
@@ -71,15 +68,7 @@ pub fn check(
     problems: *std.ArrayListUnmanaged(Problem),
 ) !void {
     if (!config_mod.isEnabled(config, .unreleased_refs_on_error)) return;
-
-    var node_idx: u32 = 1;
-    while (node_idx < tree.nodes.len) : (node_idx += 1) {
-        const node: Ast.Node.Index = @enumFromInt(node_idx);
-        if (tree.nodeTag(node) != .fn_decl) continue;
-        if (returnsType(tree, node)) continue;
-        const body = bodyOf(tree, node) orelse continue;
-        try checkBody(gpa, tree, body, problems);
-    }
+    try lexer.forEachFnBody(gpa, tree, problems, checkBody);
 }
 
 fn checkBody(
@@ -110,9 +99,8 @@ fn checkBody(
     const addrefs = try query.findAllInBody(gpa, tree, addref_call_pattern, first, last);
     defer gpa.free(addrefs);
     for (addrefs) |m| {
-        // Match layout: m.start = `.`, +1 = method, +2 = `(`.
-        const method_tok = m.start + 1;
-        const sc = findStmtSemicolon(tags, m.start + 2, last) orelse continue;
+        const method_tok = m.captures[0].?;
+        const sc = findStmtSemicolon(tags, m.end, last) orelse continue;
         if (!hasTokenInRange(tags, sc + 1, last, .keyword_try)) continue;
         try report(gpa, problems, tree, method_tok);
     }
@@ -129,34 +117,6 @@ fn isAddrefMethodName(name: []const u8) bool {
         std.mem.eql(u8, name, "addRef") or
         std.mem.eql(u8, name, "addref") or
         std.mem.eql(u8, name, "pendingActivityRef");
-}
-
-/// Names of methods that release a refcounted reference.  Broader
-/// than addref's list — an errdefer with any of these counts as
-/// "author thought about the leak."  Used only to suppress the
-/// report, so over-inclusion = under-fire (preferred for precision).
-fn isReleaseMethodName(name: []const u8) bool {
-    return std.mem.eql(u8, name, "release") or
-        std.mem.eql(u8, name, "deref") or
-        std.mem.eql(u8, name, "unref") or
-        std.mem.eql(u8, name, "removeRef") or
-        std.mem.eql(u8, name, "pendingActivityUnref");
-}
-
-/// Scan `[start, end]` for a `<chain>.<method>(` call where `method`
-/// is an addref name.  Returns the token index of the method name on
-/// hit, or null on miss.
-fn findAddrefCallIn(tree: *const Ast, start: Ast.TokenIndex, end: Ast.TokenIndex) ?Ast.TokenIndex {
-    const tags = tree.tokens.items(.tag);
-    if (end < start or end > tree.tokens.len) return null;
-    var t: Ast.TokenIndex = start;
-    while (t + 2 <= end) : (t += 1) {
-        if (tags[t] != .period) continue;
-        if (tags[t + 1] != .identifier) continue;
-        if (tags[t + 2] != .l_paren) continue;
-        if (isAddrefMethodName(tree.tokenSlice(t + 1))) return t + 1;
-    }
-    return null;
 }
 
 /// True iff some `defer` or `errdefer` in `[start, end]` contains
