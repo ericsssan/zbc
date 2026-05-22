@@ -229,6 +229,11 @@ pub const all = [_]Rule{
         .title = "`defer alloc.free(X)` + `errdefer { ...; <lhs> = X; }` — both fire on error, leaving field dangling",
         .body = @embedFile("rules/defer-and-errdefer-free-overlap.md"),
     },
+    .{
+        .id = "sentinel-strip-free-size-mismatch",
+        .title = "`alloc.free(X.ptr[0..X.len])` — strips sentinel; allocator's free-size check fails on `[:0]` slices",
+        .body = @embedFile("rules/sentinel-strip-free-size-mismatch.md"),
+    },
 };
 
 /// Look up a rule by id.  Returns null on unknown id so callers can

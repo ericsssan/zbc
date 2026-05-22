@@ -42,6 +42,7 @@ const assert_on_untrusted_input_mod = @import("assert_on_untrusted_input.zig");
 const missing_deinit_on_composed_owner_mod = @import("missing_deinit_on_composed_owner.zig");
 const borrowed_slice_into_out_param_mod = @import("borrowed_slice_into_out_param.zig");
 const defer_and_errdefer_free_overlap_mod = @import("defer_and_errdefer_free_overlap.zig");
+const sentinel_strip_free_size_mismatch_mod = @import("sentinel_strip_free_size_mismatch.zig");
 const rule_catalog_mod = @import("rule_catalog.zig");
 
 pub const Config = config_mod.Config;
@@ -279,6 +280,11 @@ pub fn analyzeEscape(
     // error, errdefer fires (frees NEW, restores OLD into the
     // field), then defer frees OLD → field dangles.
     try defer_and_errdefer_free_overlap_mod.check(gpa, &tree, config, &problems);
+
+    // Sentinel-strip-free-size-mismatch —
+    // `alloc.free(X.ptr[0..X.len])` strips sentinel; on `[:0]`
+    // slices the allocator's free-size check fails.
+    try sentinel_strip_free_size_mismatch_mod.check(gpa, &tree, config, &problems);
 
     return problems.toOwnedSlice(gpa);
 }
@@ -756,5 +762,6 @@ test {
     _ = missing_deinit_on_composed_owner_mod;
     _ = borrowed_slice_into_out_param_mod;
     _ = defer_and_errdefer_free_overlap_mod;
+    _ = sentinel_strip_free_size_mismatch_mod;
     std.testing.refAllDecls(@This());
 }

@@ -362,9 +362,17 @@ pub const Invariant = enum {
     /// dangling pointer.  Catches ghostty-org/ghostty#8249
     /// (`Atlas.grow`).
     defer_and_errdefer_free_overlap,
+    /// `<alloc>.free(<X>.ptr[0..<X>.len])` (or `.ptr.?[0..len]`)
+    /// hand-rolls a non-sentinel slice from a many-item-pointer.
+    /// If `<X>` is `[:0]const u8` or another sentinel-terminated
+    /// slice, the underlying allocation is len+1 bytes — the
+    /// allocator's free-size check trips ("Allocation size N+1
+    /// does not match free size N").  Catches
+    /// ghostty-org/ghostty#8886.
+    sentinel_strip_free_size_mismatch,
 };
 
-pub const all_invariants: [40]Invariant = .{
+pub const all_invariants: [41]Invariant = .{
     .arena_escape,
     .stack_escape,
     .use_undefined,
@@ -405,6 +413,7 @@ pub const all_invariants: [40]Invariant = .{
     .missing_deinit_on_composed_owner,
     .borrowed_slice_into_out_param,
     .defer_and_errdefer_free_overlap,
+    .sentinel_strip_free_size_mismatch,
 };
 
 pub const Default: Config = .{};

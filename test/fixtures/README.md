@@ -49,6 +49,7 @@ Bun's.
 | `missing_deinit_on_composed_owner.zig` | `missing-deinit-on-composed-owner` | [ziglang/zig#22683](https://github.com/ziglang/zig/pull/22683), [ziglang/zig#20192](https://github.com/ziglang/zig/pull/20192), [ziglang/zig#18651](https://github.com/ziglang/zig/pull/18651) |
 | `borrowed_slice_into_out_param.zig` | `borrowed-slice-into-out-param` | [oven-sh/bun#30151](https://github.com/oven-sh/bun/pull/30151), [oven-sh/bun#30223](https://github.com/oven-sh/bun/pull/30223), [oven-sh/bun#25563](https://github.com/oven-sh/bun/pull/25563) |
 | `defer_and_errdefer_free_overlap.zig` | `defer-and-errdefer-free-overlap` | [ghostty-org/ghostty#8249](https://github.com/ghostty-org/ghostty/pull/8249) |
+| `sentinel_strip_free_size_mismatch.zig` | `sentinel-strip-free-size-mismatch` | [ghostty-org/ghostty#8886](https://github.com/ghostty-org/ghostty/pull/8886) |
 
 ## Re-fetching the actual pre-merge buggy files
 
