@@ -13,34 +13,60 @@
 //! .str = str }` borrowing parser-arena memory freed by
 //! `defer parser.deinit()`).
 //!
-//! Detection (purely syntactic, per-fn token walk):
-//!   1. Skip comptime type-builder fns.
-//!   2. Pre-pass: collect names of fn parameters whose declared
-//!      type is a pointer (`*T`, `?*T`).  These are the
-//!      out-param candidates.
-//!   3. Pre-pass: collect `defer <X>.deinit()` and
-//!      `defer <alloc>.free(<X>)` cleanup targets.
-//!   4. Walk the body for writes `<out>.* = <RHS>` or
-//!      `<out>.<field> = <RHS>` where `<out>` is in the param set.
-//!   5. If the RHS mentions any deferred name, fire.
+//! Rewritten via local.zig + query.zig.  Pointer-param detection
+//! is now iteration over Binding.origin == .param + a tiny
+//! isPointerType check on the binding's stored type range.
 
 const std = @import("std");
 const Ast = std.zig.Ast;
 
-const problem_mod = @import("../problem.zig");
-const config_mod = @import("../config.zig");
-
 const lexer = @import("../lexer.zig");
-const matchBrace = lexer.matchBrace;
-const matchParen = lexer.matchParen;
-const findStmtSemicolon = lexer.findStmtSemicolon;
-const skipNestedFn = lexer.skipNestedFn;
-const returnsType = lexer.returnsType;
-const fnProto = lexer.fnProto;
-const bodyOf = lexer.bodyOf;
+const local = @import("../local.zig");
+const query = @import("../query.zig");
+const problem_mod = @import("../problem.zig");
+const testing = @import("../testing.zig");
+const config_mod = @import("../config.zig");
 
 const Problem = problem_mod.Problem;
 const Pos = problem_mod.Pos;
+const Atom = query.Atom;
+const R = "borrowed-slice-into-out-param";
+
+// `defer <X>.<deinit|close>(...)` — $0 = X (the cleanup receiver,
+// which is what becomes invalid after the defer fires).
+const defer_cleanup = &[_]Atom{
+    .{ .tok = .keyword_defer },
+    .{ .capture = 0 },
+    .{ .tok = .period },
+    .{ .pred = isDeinitOrClose },
+    .{ .tok = .l_paren },
+};
+
+// `defer <_>.free(<X>...)` — the freed thing is the FIRST ARG,
+// not the receiver.  $0 = the freed name.
+const defer_free = &[_]Atom{
+    .{ .tok = .keyword_defer },
+    .{ .tok = .identifier },
+    .{ .tok = .period },
+    .{ .text = "free" },
+    .{ .tok = .l_paren },
+    .{ .capture = 0 },
+};
+
+// `<out>.* = ...` — $0 = out.
+const write_deref = &[_]Atom{
+    .{ .capture = 0 },
+    .{ .tok = .period_asterisk },
+    .{ .tok = .equal },
+};
+
+// `<out>.<field> = ...` — $0 = out, field name not captured.
+const write_field = &[_]Atom{
+    .{ .capture = 0 },
+    .{ .tok = .period },
+    .{ .tok = .identifier },
+    .{ .tok = .equal },
+};
 
 pub fn check(
     gpa: std.mem.Allocator,
@@ -50,146 +76,101 @@ pub fn check(
 ) !void {
     if (!config_mod.isEnabled(config, .borrowed_slice_into_out_param)) return;
 
-    var node_idx: u32 = 1;
-    while (node_idx < tree.nodes.len) : (node_idx += 1) {
-        const node: Ast.Node.Index = @enumFromInt(node_idx);
-        if (tree.nodeTag(node) != .fn_decl) continue;
-        if (returnsType(tree, node)) continue;
-        var buf: [1]Ast.Node.Index = undefined;
-        const fp = fnProto(tree, &buf, node) orelse continue;
-        const name_tok = fp.name_token orelse continue;
-        const body = bodyOf(tree, node) orelse continue;
-        try checkFn(gpa, tree, name_tok, body, problems);
+    var proto_buf: [1]Ast.Node.Index = undefined;
+    var fns = lexer.iterFnDecls(tree);
+    while (fns.next(&proto_buf)) |fn_entry| {
+        try checkFn(gpa, tree, fn_entry.proto, fn_entry.body, problems);
     }
 }
 
 fn checkFn(
     gpa: std.mem.Allocator,
     tree: *const Ast,
-    name_tok: Ast.TokenIndex,
+    proto: Ast.full.FnProto,
     body: Ast.Node.Index,
     problems: *std.ArrayListUnmanaged(Problem),
 ) !void {
-    const tags = tree.tokens.items(.tag);
-    const first = tree.firstToken(body);
-    const last = tree.lastToken(body);
+    var bindings = try local.build(gpa, tree, proto, body);
+    defer bindings.deinit();
 
+    // Pointer params — bindings with .param origin whose declared
+    // type starts with `*` or `?*`.
     var pointer_params: std.ArrayListUnmanaged([]const u8) = .empty;
     defer pointer_params.deinit(gpa);
-    try collectPointerParams(gpa, tree, name_tok, &pointer_params);
+    for (bindings.items) |b| {
+        if (b.origin != .param) continue;
+        if (!isPointerType(tree, b.rhs_first, b.rhs_last)) continue;
+        try pointer_params.append(gpa, b.name);
+    }
     if (pointer_params.items.len == 0) return;
 
+    // Deferred names registered for cleanup.
+    const first = tree.firstToken(body);
+    const last = tree.lastToken(body);
     var deferred: std.ArrayListUnmanaged([]const u8) = .empty;
     defer deferred.deinit(gpa);
-    try collectDeferredNames(gpa, tree, first, last, &deferred);
+
+    const cleanup_matches = try query.findAllInBody(gpa, tree, defer_cleanup, first, last);
+    defer gpa.free(cleanup_matches);
+    for (cleanup_matches) |m| {
+        try deferred.append(gpa, m.captureText(tree, 0).?);
+    }
+    const free_matches = try query.findAllInBody(gpa, tree, defer_free, first, last);
+    defer gpa.free(free_matches);
+    for (free_matches) |m| {
+        try deferred.append(gpa, m.captureText(tree, 0).?);
+    }
     if (deferred.items.len == 0) return;
 
-    // Walk body for `<out>.* = <RHS>` and `<out>.<field> = <RHS>`
-    // writes where <out> is in pointer_params.
-    var t: Ast.TokenIndex = first;
-    while (t + 3 <= last) : (t += 1) {
-        if (tags[t] == .keyword_fn) {
-            t = skipNestedFn(tags, t, last);
-            continue;
-        }
-        if (tags[t] != .identifier) continue;
-        const name = tree.tokenSlice(t);
-        if (!isPointerParam(name, pointer_params.items)) continue;
-        // `<out>.* = ...` — `.*` is `period_asterisk` (single token).
-        var rhs_start: ?Ast.TokenIndex = null;
-        if (tags[t + 1] == .period_asterisk) {
-            if (t + 2 <= last and tags[t + 2] == .equal) rhs_start = t + 3;
-        } else if (tags[t + 1] == .period and t + 3 <= last and
-            tags[t + 2] == .identifier and tags[t + 3] == .equal)
-        {
-            // `<out>.<field> = ...`
-            rhs_start = t + 4;
-        }
-        const rs = rhs_start orelse continue;
-        const sc = findStmtSemicolon(tags, rs, last) orelse continue;
-        // Does RHS mention any deferred name?
-        if (rhsMentionsDeferred(tree, rs, sc - 1, deferred.items)) |dn| {
-            try report(gpa, problems, tree, t, name, dn);
-        }
-        t = sc;
+    // Find writes through pointer params; check RHS for any deferred name.
+    try scanWrites(gpa, tree, write_deref, first, last, pointer_params.items, deferred.items, problems);
+    try scanWrites(gpa, tree, write_field, first, last, pointer_params.items, deferred.items, problems);
+}
+
+fn scanWrites(
+    gpa: std.mem.Allocator,
+    tree: *const Ast,
+    atoms: []const Atom,
+    first: Ast.TokenIndex,
+    last: Ast.TokenIndex,
+    pointer_params: []const []const u8,
+    deferred: []const []const u8,
+    problems: *std.ArrayListUnmanaged(Problem),
+) !void {
+    const tags = tree.tokens.items(.tag);
+    const writes = try query.findAllInBody(gpa, tree, atoms, first, last);
+    defer gpa.free(writes);
+    for (writes) |w| {
+        const out_name = w.captureText(tree, 0).?;
+        if (!isPointerParam(out_name, pointer_params)) continue;
+        // RHS spans from token after `=` to the next statement `;`.
+        const sc = lexer.findStmtSemicolon(tags, w.end + 1, last) orelse continue;
+        if (sc <= w.end + 1) continue;
+        const dn = rhsMentionsDeferred(tree, w.end + 1, sc - 1, deferred) orelse continue;
+        try report(gpa, problems, tree, w.start, out_name, dn);
     }
 }
 
-fn collectPointerParams(
-    gpa: std.mem.Allocator,
-    tree: *const Ast,
-    name_tok: Ast.TokenIndex,
-    out: *std.ArrayListUnmanaged([]const u8),
-) !void {
+/// True iff the type expression at `[first, last]` starts with `*`
+/// or `?*` — the conservative "this looks like an out-pointer param" check.
+fn isPointerType(tree: *const Ast, first: Ast.TokenIndex, last: Ast.TokenIndex) bool {
     const tags = tree.tokens.items(.tag);
-    const tok_count: u32 = @intCast(tree.tokens.len);
-    if (name_tok + 1 >= tok_count) return;
-    if (tags[name_tok + 1] != .l_paren) return;
-    const last: Ast.TokenIndex = tok_count - 1;
-    const cp = matchParen(tags, name_tok + 1, last) orelse return;
-    var t: Ast.TokenIndex = name_tok + 2;
-    var paren: u32 = 0;
-    while (t < cp) : (t += 1) {
-        switch (tags[t]) {
-            .l_paren => paren += 1,
-            .r_paren => if (paren > 0) {
-                paren -= 1;
-            },
-            .identifier => if (paren == 0) {
-                if (t + 1 < cp and tags[t + 1] == .colon) {
-                    // Look for `*` or `?*` in the type prefix.
-                    var ty: Ast.TokenIndex = t + 2;
-                    if (ty < cp and tags[ty] == .question_mark) ty += 1;
-                    if (ty < cp and tags[ty] == .asterisk) {
-                        try out.append(gpa, tree.tokenSlice(t));
-                    }
-                }
-            },
-            else => {},
-        }
+    if (first > last) return false;
+    var t: Ast.TokenIndex = first;
+    if (tags[t] == .question_mark) {
+        if (t + 1 > last) return false;
+        t += 1;
     }
+    return tags[t] == .asterisk;
 }
 
 fn isPointerParam(name: []const u8, params: []const []const u8) bool {
-    for (params) |p| {
-        if (std.mem.eql(u8, p, name)) return true;
-    }
+    for (params) |p| if (std.mem.eql(u8, p, name)) return true;
     return false;
 }
 
-/// Collect names registered for cleanup via `defer <X>.deinit()`,
-/// `defer <X>.deinit(...)`, or `defer <alloc>.free(<X>)`.
-fn collectDeferredNames(
-    gpa: std.mem.Allocator,
-    tree: *const Ast,
-    first: Ast.TokenIndex,
-    last: Ast.TokenIndex,
-    out: *std.ArrayListUnmanaged([]const u8),
-) !void {
-    const tags = tree.tokens.items(.tag);
-    var t: Ast.TokenIndex = first;
-    while (t + 3 <= last) : (t += 1) {
-        if (tags[t] != .keyword_defer) continue;
-        if (tags[t + 1] != .identifier) continue;
-        // `defer <X>.deinit(...)` shape.
-        if (tags[t + 2] == .period and t + 4 <= last and
-            tags[t + 3] == .identifier and tags[t + 4] == .l_paren)
-        {
-            const m = tree.tokenSlice(t + 3);
-            if (std.mem.eql(u8, m, "deinit") or std.mem.eql(u8, m, "close")) {
-                try out.append(gpa, tree.tokenSlice(t + 1));
-                continue;
-            }
-            // `defer <alloc>.free(<X>)` — the freed thing is the
-            // arg, not the receiver.
-            if (std.mem.eql(u8, m, "free")) {
-                if (t + 5 <= last and tags[t + 5] == .identifier) {
-                    try out.append(gpa, tree.tokenSlice(t + 5));
-                }
-                continue;
-            }
-        }
-    }
+fn isDeinitOrClose(name: []const u8) bool {
+    return std.mem.eql(u8, name, "deinit") or std.mem.eql(u8, name, "close");
 }
 
 /// True iff `[start, end]` mentions one of the deferred names.
@@ -206,9 +187,7 @@ fn rhsMentionsDeferred(
     while (t <= end) : (t += 1) {
         if (tags[t] != .identifier) continue;
         const name = tree.tokenSlice(t);
-        for (deferred) |d| {
-            if (std.mem.eql(u8, d, name)) return d;
-        }
+        for (deferred) |d| if (std.mem.eql(u8, d, name)) return d;
     }
     return null;
 }
@@ -229,7 +208,7 @@ fn report(
     errdefer gpa.free(msg);
 
     try problems.append(gpa, .{
-        .rule_id = "borrowed-slice-into-out-param",
+        .rule_id = R,
         .severity = .@"error",
         .start = Pos.fromTokenStart(tree, write_tok),
         .end = Pos.fromTokenEnd(tree, write_tok),
@@ -239,24 +218,8 @@ fn report(
 
 // ── Tests ──────────────────────────────────────────────────
 
-fn runOn(gpa: std.mem.Allocator, src: []const u8) !std.ArrayListUnmanaged(Problem) {
-    const src_z = try gpa.dupeSentinel(u8, src, 0);
-    defer gpa.free(src_z);
-    var tree = try Ast.parse(gpa, src_z, .zig);
-    defer tree.deinit(gpa);
-    var problems: std.ArrayListUnmanaged(Problem) = .empty;
-    try check(gpa, &tree, &config_mod.Default, &problems);
-    return problems;
-}
-
-fn freeProblems(gpa: std.mem.Allocator, p: *std.ArrayListUnmanaged(Problem)) void {
-    for (p.items) |*x| x.deinit(gpa);
-    p.deinit(gpa);
-}
-
-test "borrowed-slice-into-out-param: defer arena.deinit + out-param write using arena fires" {
-    const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+test "defer arena.deinit + out-param write using arena fires" {
+    try testing.expectFires(check, R,
         \\const std = @import("std");
         \\const ZigString = struct {
         \\    pub fn init(_: anytype) ZigString { return .{}; }
@@ -266,16 +229,11 @@ test "borrowed-slice-into-out-param: defer arena.deinit + out-param write using 
         \\    defer arena.deinit();
         \\    out.* = ZigString.init(arena);
         \\}
-        \\
     );
-    defer freeProblems(gpa, &problems);
-    try std.testing.expect(problems.items.len >= 1);
-    try std.testing.expectEqualStrings("borrowed-slice-into-out-param", problems.items[0].rule_id);
 }
 
-test "borrowed-slice-into-out-param: defer alloc.free(X) + out-param write using X fires" {
-    const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+test "defer alloc.free(X) + out-param write using X fires" {
+    try testing.expectFires(check, R,
         \\const std = @import("std");
         \\const Str = struct { ptr: usize };
         \\pub fn parse(install: *Str, alloc: std.mem.Allocator) !void {
@@ -283,35 +241,24 @@ test "borrowed-slice-into-out-param: defer alloc.free(X) + out-param write using
         \\    defer alloc.free(str);
         \\    install.* = .{ .ptr = @intFromPtr(str.ptr) };
         \\}
-        \\
     );
-    defer freeProblems(gpa, &problems);
-    try std.testing.expect(problems.items.len >= 1);
 }
 
-test "borrowed-slice-into-out-param: out-param not pointer doesn't fire" {
-    const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+test "out-param not pointer doesn't fire" {
+    try testing.expectNoFire(check,
         \\const std = @import("std");
         \\pub fn parse(name: []const u8) !void {
         \\    var buf = name;
         \\    defer _ = buf;
         \\}
-        \\
     );
-    defer freeProblems(gpa, &problems);
-    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
 }
 
-test "borrowed-slice-into-out-param: no defer doesn't fire" {
-    const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+test "no defer doesn't fire" {
+    try testing.expectNoFire(check,
         \\const std = @import("std");
         \\pub fn parse(out: *[]const u8, src: []const u8) !void {
         \\    out.* = src;
         \\}
-        \\
     );
-    defer freeProblems(gpa, &problems);
-    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
 }
