@@ -32,16 +32,23 @@ const problem_mod = @import("../problem.zig");
 const config_mod = @import("../config.zig");
 
 const lexer = @import("../lexer.zig");
+const query = @import("../query.zig");
 const testing = @import("../testing.zig");
-const matchBrace = lexer.matchBrace;
 const findStmtSemicolon = lexer.findStmtSemicolon;
-const skipNestedFn = lexer.skipNestedFn;
-const returnsType = lexer.returnsType;
-const fnProto = lexer.fnProto;
-const bodyOf = lexer.bodyOf;
 
 const Problem = problem_mod.Problem;
 const Pos = problem_mod.Pos;
+const Atom = query.Atom;
+
+// `.<method>(<this|self>)` — preceded by `.` so it's a method call
+// on a chain.  Layout: m.start=`.`, +1=method, +2=`(`, +3=arg, +4=`)`.
+const publish_call = &[_]Atom{
+    .{ .tok = .period },
+    .{ .tok = .identifier },
+    .{ .tok = .l_paren },
+    .{ .pred = isThisOrSelf },
+    .{ .tok = .r_paren },
+};
 
 pub fn check(
     gpa: std.mem.Allocator,
@@ -51,13 +58,10 @@ pub fn check(
 ) !void {
     if (!config_mod.isEnabled(config, .publish_then_touch_self)) return;
 
-    var node_idx: u32 = 1;
-    while (node_idx < tree.nodes.len) : (node_idx += 1) {
-        const node: Ast.Node.Index = @enumFromInt(node_idx);
-        if (tree.nodeTag(node) != .fn_decl) continue;
-        if (returnsType(tree, node)) continue;
-        const body = bodyOf(tree, node) orelse continue;
-        try checkBody(gpa, tree, body, problems);
+    var proto_buf: [1]Ast.Node.Index = undefined;
+    var fns = lexer.iterFnDecls(tree);
+    while (fns.next(&proto_buf)) |fn_entry| {
+        try checkBody(gpa, tree, fn_entry.body, problems);
     }
 }
 
@@ -71,36 +75,26 @@ fn checkBody(
     const first = tree.firstToken(body);
     const last = tree.lastToken(body);
 
-    var t: Ast.TokenIndex = first;
-    while (t + 4 <= last) : (t += 1) {
-        if (tags[t] == .keyword_fn) {
-            t = skipNestedFn(tags, t, last);
-            continue;
-        }
-        // Pattern: `.<method>(this)` or `.<method>(self)` — method
-        // is preceded by `.` (chained call).
-        if (tags[t] != .identifier) continue;
-        if (t == 0 or tags[t - 1] != .period) continue;
-        const method = tree.tokenSlice(t);
-        if (tags[t + 1] != .l_paren) continue;
-        // First arg must be bare `this` or `self`, then `)`.
-        if (tags[t + 2] != .identifier) continue;
-        const arg = tree.tokenSlice(t + 2);
-        if (!std.mem.eql(u8, arg, "this") and !std.mem.eql(u8, arg, "self")) continue;
-        if (tags[t + 3] != .r_paren) continue;
+    const calls = try query.findAllInBody(gpa, tree, publish_call, first, last);
+    defer gpa.free(calls);
+    for (calls) |m| {
+        const method_tok = m.start + 1;
+        const arg_tok = m.start + 3;
+        const method = tree.tokenSlice(method_tok);
+        const arg = tree.tokenSlice(arg_tok);
         // Concurrency check: method name OR chain receiver suggests
         // concurrent dispatch.
-        const chain_start = walkBackChain(tags, t);
-        if (!isConcurrentDispatch(tree, method, chain_start, t)) continue;
+        const chain_start = walkBackChain(tags, method_tok);
+        if (!isConcurrentDispatch(tree, method, chain_start, method_tok)) continue;
         // Find next use of `arg` (this/self) in the same scope.
-        const sc = findStmtSemicolon(tags, t + 4, last) orelse continue;
-        const use_tok = findIdentUseSameScope(tree, sc + 1, last, arg) orelse {
-            t = sc;
-            continue;
-        };
-        try report(gpa, problems, tree, t, use_tok, method, arg);
-        t = sc;
+        const sc = findStmtSemicolon(tags, m.end + 1, last) orelse continue;
+        const use_tok = findIdentUseSameScope(tree, sc + 1, last, arg) orelse continue;
+        try report(gpa, problems, tree, method_tok, use_tok, method, arg);
     }
+}
+
+fn isThisOrSelf(name: []const u8) bool {
+    return std.mem.eql(u8, name, "this") or std.mem.eql(u8, name, "self");
 }
 
 /// Walk backward from the `.method` to find the chain's start token.
