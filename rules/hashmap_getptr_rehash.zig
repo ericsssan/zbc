@@ -42,6 +42,7 @@ const problem_mod = @import("../problem.zig");
 const config_mod = @import("../config.zig");
 
 const lexer = @import("../lexer.zig");
+const local = @import("../local.zig");
 const testing = @import("../testing.zig");
 const matchBrace = lexer.matchBrace;
 const findStmtSemicolon = lexer.findStmtSemicolon;
@@ -62,100 +63,73 @@ pub fn check(
 ) !void {
     if (!config_mod.isEnabled(config, .hashmap_getptr_rehash)) return;
 
-    var node_idx: u32 = 1;
-    while (node_idx < tree.nodes.len) : (node_idx += 1) {
-        const node: Ast.Node.Index = @enumFromInt(node_idx);
-        if (tree.nodeTag(node) != .fn_decl) continue;
-        if (returnsType(tree, node)) continue;
-        const body = bodyOf(tree, node) orelse continue;
-        try checkBody(gpa, tree, body, problems);
+    var proto_buf: [1]Ast.Node.Index = undefined;
+    var fns = lexer.iterFnDecls(tree);
+    while (fns.next(&proto_buf)) |fn_entry| {
+        try checkFn(gpa, tree, fn_entry.proto, fn_entry.body, problems);
     }
 }
 
-const Binding = struct {
+const Borrow = struct {
     /// Identifier text of the borrowed local (`<X>`).
     x_name: []const u8,
-    /// Identifier text of the leading receiver (`<recv>`).
+    /// Identifier text of the receiver (`<recv>`) — first segment of
+    /// the call chain (must be a single ident for this rule's
+    /// detection — map-of-map borrows are out of scope).
     recv_name: []const u8,
     /// Token index of the bound name — anchor for "borrow site" note.
     name_token: Ast.TokenIndex,
-    /// Token of the binding's terminating semicolon — scan starts
-    /// immediately after.
+    /// Token of the binding's terminating `;` — scan for the mutate
+    /// call starts immediately after.
     end_token: Ast.TokenIndex,
 };
 
-fn checkBody(
+fn checkFn(
     gpa: std.mem.Allocator,
     tree: *const Ast,
+    proto: Ast.full.FnProto,
     body: Ast.Node.Index,
     problems: *std.ArrayListUnmanaged(Problem),
 ) !void {
-    const tags = tree.tokens.items(.tag);
-    const first = tree.firstToken(body);
     const last = tree.lastToken(body);
 
-    var bindings: std.ArrayListUnmanaged(Binding) = .empty;
-    defer bindings.deinit(gpa);
+    var bindings = try local.build(gpa, tree, proto, body);
+    defer bindings.deinit();
 
-    var t: Ast.TokenIndex = first;
-    while (t + 5 <= last) : (t += 1) {
-        // Skip past nested fns so inner bindings aren't double-scoped
-        // through the outer fn.
-        if (tags[t] == .keyword_fn) {
-            t = skipNestedFn(tags, t, last);
-            continue;
-        }
-        if (tags[t] != .keyword_const) continue;
-        if (tags[t + 1] != .identifier) continue;
+    var borrows: std.ArrayListUnmanaged(Borrow) = .empty;
+    defer borrows.deinit(gpa);
 
-        // Skip optional `: T` type annotation.
-        var after_name: Ast.TokenIndex = t + 2;
-        if (after_name <= last and tags[after_name] == .colon) {
-            var d: u32 = 0;
-            while (after_name <= last) : (after_name += 1) {
-                switch (tags[after_name]) {
-                    .l_paren, .l_brace, .l_bracket => d += 1,
-                    .r_paren, .r_brace, .r_bracket => if (d > 0) {
-                        d -= 1;
-                    },
-                    .equal => if (d == 0) break,
-                    else => {},
-                }
-            }
-        }
-        if (after_name > last or tags[after_name] != .equal) continue;
-
-        // Optional `try`.
-        var rhs_start: Ast.TokenIndex = after_name + 1;
-        if (rhs_start <= last and tags[rhs_start] == .keyword_try) rhs_start += 1;
-        if (rhs_start + 3 > last) continue;
-        // Need `<recv> . <method> (`.  `<recv>` is a single identifier
-        // (a local map handle) — that's the common case and keeps the
-        // detector tight.  Map-of-map (`outer.inner.getPtr(...)`)
-        // borrows are rare and out of scope.
-        if (tags[rhs_start] != .identifier) continue;
-        if (tags[rhs_start + 1] != .period) continue;
-        if (tags[rhs_start + 2] != .identifier) continue;
-        if (tags[rhs_start + 3] != .l_paren) continue;
-        if (!isBorrowMethodName(tree.tokenSlice(rhs_start + 2))) continue;
-
-        const sc = findStmtSemicolon(tags, rhs_start + 4, last) orelse continue;
-        try bindings.append(gpa, .{
-            .x_name = tree.tokenSlice(t + 1),
-            .recv_name = tree.tokenSlice(rhs_start),
-            .name_token = t + 1,
-            .end_token = sc,
+    // Find `const X = [try] <recv>.<borrowMethod>(...)` bindings.
+    // Limit to single-ident receivers — chained / namespaced
+    // receivers (e.g. `self.inner_map.getPtr(...)`) introduce
+    // ambiguity about who owns the storage; out of scope.
+    for (bindings.items) |b| {
+        if (!b.is_const) continue;
+        if (b.origin == .param) continue;
+        const c = b.asCall() orelse continue;
+        if (c.isChained()) continue;
+        const method = c.method orelse continue;
+        if (!isBorrowMethodName(method)) continue;
+        // Receiver must be a single ident (not a multi-segment chain).
+        const tags = tree.tokens.items(.tag);
+        if (c.receiver_token + 2 != c.method_token.?) continue;
+        if (tags[c.receiver_token + 1] != .period) continue;
+        try borrows.append(gpa, .{
+            .x_name = b.name,
+            .recv_name = c.receiver,
+            .name_token = b.name_token,
+            .end_token = b.rhs_last + 1, // the `;`
         });
-        t = sc;
     }
 
-    for (bindings.items) |b| {
+    for (borrows.items) |b| {
         // Find the first receiver-matched mutate call after the
-        // binding's `;`.
+        // binding's `;` at the SAME lexical block depth.
         const mutate_tok = findReceiverMutate(tree, b.end_token + 1, last, b.recv_name) orelse continue;
-        // After the mutate call's closing `)`, find any token use of
-        // `<X>` — that's the UAF site.
-        const after_mutate = stmtEndAfter(tags, mutate_tok, last) orelse continue;
+        // After the mutate call's `;`, find any token use of `<X>`
+        // in the binding's enclosing scope — that's the UAF site.
+        const tags = tree.tokens.items(.tag);
+        const after_mutate = findStmtSemicolon(tags, mutate_tok, last) orelse continue;
         const use_tok = findIdentUse(tree, after_mutate + 1, last, b.x_name) orelse continue;
         try report(gpa, problems, tree, b, mutate_tok, use_tok);
     }
@@ -270,7 +244,7 @@ fn report(
     gpa: std.mem.Allocator,
     problems: *std.ArrayListUnmanaged(Problem),
     tree: *const Ast,
-    b: Binding,
+    b: Borrow,
     mutate_tok: Ast.TokenIndex,
     use_tok: Ast.TokenIndex,
 ) !void {
