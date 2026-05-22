@@ -44,6 +44,7 @@ const borrowed_slice_into_out_param_mod = @import("borrowed_slice_into_out_param
 const defer_and_errdefer_free_overlap_mod = @import("defer_and_errdefer_free_overlap.zig");
 const sentinel_strip_free_size_mismatch_mod = @import("sentinel_strip_free_size_mismatch.zig");
 const move_out_without_restore_mod = @import("move_out_without_restore.zig");
+const deinit_order_violates_construction_dep_mod = @import("deinit_order_violates_construction_dep.zig");
 const rule_catalog_mod = @import("rule_catalog.zig");
 
 pub const Config = config_mod.Config;
@@ -291,6 +292,11 @@ pub fn analyzeEscape(
     // fallible op on X without `defer obj.setArrayList(X)` →
     // partial allocation leaks on error.
     try move_out_without_restore_mod.check(gpa, &tree, config, &problems);
+
+    // Deinit-order-violates-construction-dep — `B.deinit()`
+    // before `A.deinit()` where `A` was init'd via
+    // `.init(&B, ...)` → A's deinit may UAF B.
+    try deinit_order_violates_construction_dep_mod.check(gpa, &tree, config, &problems);
 
     return problems.toOwnedSlice(gpa);
 }
@@ -770,5 +776,6 @@ test {
     _ = defer_and_errdefer_free_overlap_mod;
     _ = sentinel_strip_free_size_mismatch_mod;
     _ = move_out_without_restore_mod;
+    _ = deinit_order_violates_construction_dep_mod;
     std.testing.refAllDecls(@This());
 }

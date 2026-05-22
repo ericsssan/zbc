@@ -239,6 +239,11 @@ pub const all = [_]Rule{
         .title = "`var X = obj.toArrayList()` + fallible op on X with no `defer obj.setArrayList(X)` — leak on error",
         .body = @embedFile("rules/move-out-without-restore.md"),
     },
+    .{
+        .id = "deinit-order-violates-construction-dep",
+        .title = "`B.deinit()` before `A.deinit()` where `A` was init'd via `.init(&B, ...)` — LIFO violation; A's deinit may UAF",
+        .body = @embedFile("rules/deinit-order-violates-construction-dep.md"),
+    },
 };
 
 /// Look up a rule by id.  Returns null on unknown id so callers can

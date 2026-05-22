@@ -377,9 +377,15 @@ pub const Invariant = enum {
     /// holding cleared/stale state.  Catches ziglang/zig#24452
     /// class (`Io.Writer.Allocating.toOwnedSlice*`).
     move_out_without_restore,
+    /// In a fn body, `<A> = <T>.init(&<B>, ...)` creates a dep
+    /// edge B→A.  Later `<B>.deinit()` runs BEFORE `<A>.deinit()`
+    /// — A's deinit may dereference its borrowed pointer to B,
+    /// which is already torn down.  Catches
+    /// tigerbeetle/tigerbeetle#3732 (manifest_log_fuzz).
+    deinit_order_violates_construction_dep,
 };
 
-pub const all_invariants: [42]Invariant = .{
+pub const all_invariants: [43]Invariant = .{
     .arena_escape,
     .stack_escape,
     .use_undefined,
@@ -422,6 +428,7 @@ pub const all_invariants: [42]Invariant = .{
     .defer_and_errdefer_free_overlap,
     .sentinel_strip_free_size_mismatch,
     .move_out_without_restore,
+    .deinit_order_violates_construction_dep,
 };
 
 pub const Default: Config = .{};
