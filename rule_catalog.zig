@@ -209,6 +209,11 @@ pub const all = [_]Rule{
         .title = "use of `this`/`self` after publishing it to a concurrent queue — consumer thread may have freed it",
         .body = @embedFile("rules/publish-then-touch-self.md"),
     },
+    .{
+        .id = "assert-on-untrusted-input",
+        .title = "`assert(...)` in a parser/decoder against untrusted-input parameter — crafted bytes panic the process",
+        .body = @embedFile("rules/assert-on-untrusted-input.md"),
+    },
 };
 
 /// Look up a rule by id.  Returns null on unknown id so callers can

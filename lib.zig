@@ -38,6 +38,7 @@ const return_borrowed_payload_mod = @import("return_borrowed_payload.zig");
 const unreleased_factory_handle_mod = @import("unreleased_factory_handle.zig");
 const memset_undef_after_len_truncation_mod = @import("memset_undef_after_len_truncation.zig");
 const publish_then_touch_self_mod = @import("publish_then_touch_self.zig");
+const assert_on_untrusted_input_mod = @import("assert_on_untrusted_input.zig");
 const rule_catalog_mod = @import("rule_catalog.zig");
 
 pub const Config = config_mod.Config;
@@ -255,6 +256,10 @@ pub fn analyzeEscape(
     // Publish-then-touch-self — `queue.push(this);` then `this.field`
     // — consumer thread may have freed `this` before access.
     try publish_then_touch_self_mod.check(gpa, &tree, config, &problems);
+
+    // Assert-on-untrusted-input — `assert(<param>.<field>)` in a
+    // parser/decoder fn → crafted input panics the process.
+    try assert_on_untrusted_input_mod.check(gpa, &tree, config, &problems);
 
     return problems.toOwnedSlice(gpa);
 }
@@ -728,5 +733,6 @@ test {
     _ = unreleased_factory_handle_mod;
     _ = memset_undef_after_len_truncation_mod;
     _ = publish_then_touch_self_mod;
+    _ = assert_on_untrusted_input_mod;
     std.testing.refAllDecls(@This());
 }

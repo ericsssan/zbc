@@ -335,9 +335,16 @@ pub const Invariant = enum {
     /// before the access lands → cross-thread UAF.  Catches
     /// oven-sh/bun#29128 + #31177 + #30185 class.
     publish_then_touch_self,
+    /// `assert(<expr>)` in a parser/decoder fn where `<expr>`
+    /// references untrusted-input parameters (`buffer`, `bytes`,
+    /// `data`, `message`, `block`, ...).  Crafted input panics the
+    /// process.  TigerStyle: asserts are for INTERNAL invariants;
+    /// external input requires `if (!<cond>) return error.Invalid;`.
+    /// Catches tigerbeetle/tigerbeetle#3709 + #3726 + #2980 class.
+    assert_on_untrusted_input,
 };
 
-pub const all_invariants: [36]Invariant = .{
+pub const all_invariants: [37]Invariant = .{
     .arena_escape,
     .stack_escape,
     .use_undefined,
@@ -374,6 +381,7 @@ pub const all_invariants: [36]Invariant = .{
     .unreleased_factory_handle,
     .memset_undef_after_len_truncation,
     .publish_then_touch_self,
+    .assert_on_untrusted_input,
 };
 
 pub const Default: Config = .{};
