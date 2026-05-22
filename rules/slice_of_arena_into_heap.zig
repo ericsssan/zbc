@@ -44,6 +44,15 @@ const arena_init_pattern = &[_]Atom{
     .paren_args,
 };
 
+// `<arena>.allocator()` — exact match (no chain after).  $0 = arena name.
+const allocator_call_exact = &[_]Atom{
+    .{ .capture = 0 },
+    .{ .tok = .period },
+    .{ .text = "allocator" },
+    .{ .tok = .l_paren },
+    .{ .tok = .r_paren },
+};
+
 // `<arena>.allocator().<allocMethod>(...)` — inline form.
 // $0 = arena name.
 const inline_arena_alloc = &[_]Atom{
@@ -109,7 +118,7 @@ fn checkFn(
     // Cheap pre-scan: skip fns that don't even mention ArenaAllocator.
     // Avoids the per-fn local.build cost on the long tail of fns
     // that have no arena.
-    if (!bodyMentionsIdent(tree, body_first, body_last, "ArenaAllocator")) return;
+    if (!lexer.hasIdentInRange(tree, body_first, body_last, "ArenaAllocator")) return;
 
     var bindings = try local.build(gpa, tree, proto, body);
     defer bindings.deinit();
@@ -122,28 +131,31 @@ fn checkFn(
     var slices: std.ArrayListUnmanaged(ArenaSlice) = .empty;
     defer slices.deinit(gpa);
 
+    // Classification precedence (mutually exclusive by early-continue):
+    //   Arena    — RHS contains `ArenaAllocator.init(`
+    //   Handle   — RHS is exactly `<arena>.allocator()`
+    //   Slice-A  — `[try] <handle>.<allocMethod>(...)`
+    //   Slice-B  — `[try] <arena>.allocator().<allocMethod>(...)` inline
     for (bindings.items) |b| {
         if (b.origin == .param) continue;
+        const rhs_start = b.rhsFirstAfterTry(tags);
 
-        // Arena: RHS contains ArenaAllocator.init(...).
         if (query.anyMatchAnywhere(tree, arena_init_pattern, b.rhs_first, b.rhs_last, null)) {
             try arenas.append(gpa, .{ .name = b.name });
             continue;
         }
 
-        // Handle: binding is a method_call to `allocator` on an arena,
-        // with no trailing chain (exactly `<arena>.allocator()`).
-        if (b.asCall()) |c| {
-            if (c.method != null and std.mem.eql(u8, c.method.?, "allocator") and
-                c.paren_token + 1 <= b.rhs_last and tags[c.paren_token + 1] == .r_paren and
-                b.rhs_last == c.paren_token + 1)
-            {
-                if (findArena(arenas.items, c.receiver) != null) {
-                    try handles.append(gpa, .{ .name = b.name, .arena_name = c.receiver });
-                    continue;
-                }
+        if (query.matchExact(tree, allocator_call_exact, rhs_start, b.rhs_last, null)) |m| {
+            const arena_name = m.captureText(tree, 0).?;
+            if (findArena(arenas.items, arena_name) != null) {
+                try handles.append(gpa, .{ .name = b.name, .arena_name = arena_name });
+                continue;
             }
-            // Slice — shape A: <handle>.<allocMethod>(...).
+        }
+
+        // Slice — shape A: <handle>.<allocMethod>(...).  Uses asCall()
+        // to short-circuit non-call bindings.
+        if (b.asCall()) |c| {
             if (c.method != null and receiver.isAllocMethodName(c.method.?)) {
                 if (findHandle(handles.items, c.receiver)) |h| {
                     try slices.append(gpa, .{
@@ -157,10 +169,9 @@ fn checkFn(
         }
 
         // Slice — shape B: <arena>.allocator().<allocMethod>(...) inline.
-        // The classified call (asCall) above only captures the outermost
-        // `<arena>.allocator(` of the chain, so we fall back to a
-        // prefix match for the full inline shape.
-        const rhs_start = if (tags[b.rhs_first] == .keyword_try) b.rhs_first + 1 else b.rhs_first;
+        // asCall above only captures the outermost `<arena>.allocator(`
+        // of the chain, so we fall back to a prefix match for the full
+        // inline shape.
         if (query.matchAt(tree, inline_arena_alloc, rhs_start, b.rhs_last, null)) |m| {
             const arena_name = m.captureText(tree, 0).?;
             if (findArena(arenas.items, arena_name)) |a| {
@@ -210,19 +221,6 @@ fn checkFn(
     }
 }
 
-/// True iff any `.identifier` token in `[start, end]` has slice
-/// equal to `name`.  Cheap pre-scan used to gate per-fn analysis.
-fn bodyMentionsIdent(tree: *const Ast, start: Ast.TokenIndex, end: Ast.TokenIndex, name: []const u8) bool {
-    const tags = tree.tokens.items(.tag);
-    if (start > end) return false;
-    var t: Ast.TokenIndex = start;
-    while (t <= end) : (t += 1) {
-        if (tags[t] != .identifier) continue;
-        if (std.mem.eql(u8, tree.tokenSlice(t), name)) return true;
-    }
-    return false;
-}
-
 fn findArena(arenas: []const ArenaVar, name: []const u8) ?ArenaVar {
     for (arenas) |a| if (std.mem.eql(u8, a.name, name)) return a;
     return null;
@@ -247,17 +245,12 @@ fn firstArgIsArenaAllocator(
 ) bool {
     const tags = tree.tokens.items(.tag);
     if (start > end) return false;
-    if (tags[start] != .identifier) return false;
-    const name = tree.tokenSlice(start);
-    if (start == end and findHandle(handles, name) != null) return true;
-    if (end >= start + 4 and
-        tags[start + 1] == .period and
-        tags[start + 2] == .identifier and
-        std.mem.eql(u8, tree.tokenSlice(start + 2), "allocator") and
-        tags[start + 3] == .l_paren and
-        tags[start + 4] == .r_paren)
-    {
-        if (findArena(arenas, name) != null) return true;
+    // Bare handle name — `<H>` alone.
+    if (start == end and tags[start] == .identifier and
+        findHandle(handles, tree.tokenSlice(start)) != null) return true;
+    // Inline form — `<A>.allocator()`.
+    if (query.matchExact(tree, allocator_call_exact, start, end, null)) |m| {
+        return findArena(arenas, m.captureText(tree, 0).?) != null;
     }
     return false;
 }

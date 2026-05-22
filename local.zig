@@ -127,6 +127,16 @@ pub const Binding = struct {
             else => null,
         };
     }
+
+    /// First RHS token after peeling a leading `try`, if present.
+    /// Useful when matching token patterns against the RHS without
+    /// having to special-case the `try` wrapper at every call site.
+    pub fn rhsFirstAfterTry(self: Binding, tags: []const TokenTag) TokenIndex {
+        if (self.rhs_first <= self.rhs_last and tags[self.rhs_first] == .keyword_try) {
+            return self.rhs_first + 1;
+        }
+        return self.rhs_first;
+    }
 };
 
 pub const LocalBindings = struct {

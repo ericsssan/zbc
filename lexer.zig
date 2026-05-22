@@ -158,6 +158,26 @@ pub fn hasTokenInRange(tags: []const TokenTag, start: TokenIndex, end: TokenInde
     return false;
 }
 
+/// True iff any `.identifier` token in `[start, end]` has source text
+/// equal to `name`.  Cheap pre-scan helper for rules that want to
+/// skip expensive per-fn analysis when a sentinel type/method name
+/// isn't even mentioned.
+pub fn hasIdentInRange(
+    tree: *const Ast,
+    start: TokenIndex,
+    end: TokenIndex,
+    name: []const u8,
+) bool {
+    const tags = tree.tokens.items(.tag);
+    if (start > end) return false;
+    var t: TokenIndex = start;
+    while (t <= end) : (t += 1) {
+        if (tags[t] != .identifier) continue;
+        if (std.mem.eql(u8, tree.tokenSlice(t), name)) return true;
+    }
+    return false;
+}
+
 /// One argument's token span — inclusive on both ends.
 pub const ArgRange = struct { start: TokenIndex, end: TokenIndex };
 
@@ -166,6 +186,9 @@ pub const ArgRange = struct { start: TokenIndex, end: TokenIndex };
 /// both — use `matchParen` first).  Caller is responsible for clearing
 /// `out` between calls if reuse is desired (clearRetainingCapacity
 /// avoids per-call allocation on the hot path).
+///
+/// On allocation error `out` is left partially populated — caller
+/// must clear before reuse or treat the result as invalid.
 pub fn splitCallArgs(
     gpa: std.mem.Allocator,
     tags: []const TokenTag,

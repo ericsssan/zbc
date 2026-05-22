@@ -109,19 +109,33 @@ fn checkFn(
     if (pointer_params.items.len == 0) return;
 
     // Deferred names registered for cleanup.  Single pass over
-    // `defer` keywords; classify each.
+    // `defer` keywords; classify each.  Skips nested fn bodies so
+    // a `defer` inside `const f = struct { fn g() void { defer ... } }`
+    // doesn't pollute the outer fn's deferred-name set.
     var deferred: std.ArrayListUnmanaged([]const u8) = .empty;
     defer deferred.deinit(gpa);
     var t: Ast.TokenIndex = first;
-    while (t <= last) : (t += 1) {
-        if (tags[t] != .keyword_defer) continue;
+    while (t <= last) {
+        if (tags[t] == .keyword_fn) {
+            t = lexer.skipNestedFn(tags, t, last);
+            t = if (t < last) t + 1 else last + 1;
+            continue;
+        }
+        if (tags[t] != .keyword_defer) {
+            t += 1;
+            continue;
+        }
         if (query.matchAt(tree, defer_cleanup, t, last, null)) |m| {
             try deferred.append(gpa, m.captureText(tree, 0).?);
+            t = m.end + 1;
             continue;
         }
         if (query.matchAt(tree, defer_free, t, last, null)) |m| {
             try deferred.append(gpa, m.captureText(tree, 0).?);
+            t = m.end + 1;
+            continue;
         }
+        t += 1;
     }
     if (deferred.items.len == 0) return;
 
