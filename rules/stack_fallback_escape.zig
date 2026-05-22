@@ -6,34 +6,44 @@
 //! the slice points into the dead stack buffer once the fn frame
 //! exits — UAF whenever the allocation stays under N.
 //!
-//! Detection per fn (purely syntactic):
-//!
-//!   1. Find `var <SF> = …stackFallback(<N>, <alloc>);` bindings.
-//!      Record `<SF>` ident.  (Inner-alloc name not needed for v1.)
-//!   2. Track SF-tainted locals: any `var <X> = <expr>` whose RHS
-//!      contains `<SF>.get()` (the allocator the fallback hands
-//!      out).  This captures `T.init(<SF>.get())`,
-//!      `ArrayList(...).init(<SF>.get())`, etc.
-//!   3. Walk the rest of the body for `return <expr>` where
-//!      `<expr>` contains a `.toOwnedSlice` / `.toOwnedSliceSentinel`
-//!      / `.allocPrint` / etc. call on an SF-tainted local —
-//!      directly or via a single intermediate binding.
-//!   4. Fire at the `return` site.  v1 doesn't try to detect
-//!      sanitization through `<alloc>.dupe*` etc.; the canonical
-//!      bug shape returns the toOwnedSlice result directly.
+//! Three phases per fn:
+//!   1. Find `var/const <SF> = …stackFallback(…)…` bindings.
+//!   2. Track SF-tainted locals: bindings whose RHS contains
+//!      `<SF>.get()` (direct taint) or mentions an already-tainted
+//!      ident (transitive taint, declaration-order).
+//!   3. Walk returns; fire if the value contains a
+//!      `<tainted>.<sinkMethod>(...)` call AND has no sanitizing
+//!      `.dupe*`/`.alloc*`/`.create*` call (the canonical fix).
 
 const std = @import("std");
 const Ast = std.zig.Ast;
 
-const problem_mod = @import("../problem.zig");
-const config_mod = @import("../config.zig");
-
 const lexer = @import("../lexer.zig");
-const findStmtSemicolon = lexer.findStmtSemicolon;
-const bodyOf = lexer.bodyOf;
+const local = @import("../local.zig");
+const query = @import("../query.zig");
+const problem_mod = @import("../problem.zig");
+const testing = @import("../testing.zig");
+const config_mod = @import("../config.zig");
 
 const Problem = problem_mod.Problem;
 const Pos = problem_mod.Pos;
+const Atom = query.Atom;
+const R = "stack-fallback-escape";
+
+// `stackFallback(...)` anywhere in RHS — sentinel for SF bindings.
+const stack_fallback_pattern = &[_]Atom{
+    .{ .text = "stackFallback" },
+    .{ .tok = .l_paren },
+};
+
+// `.<sanitizer>(` — `dupe`/`dupeZ`/`alloc`/`allocSentinel`/`create`.
+// Presence in a return value flags it as the canonical fix
+// (copy through a real allocator); the rule must NOT fire.
+const sanitizer_call_pattern = &[_]Atom{
+    .{ .tok = .period },
+    .{ .pred = isSanitizingMethod },
+    .{ .tok = .l_paren },
+};
 
 pub fn check(
     gpa: std.mem.Allocator,
@@ -43,18 +53,17 @@ pub fn check(
 ) !void {
     if (!config_mod.isEnabled(config, .stack_fallback_escape)) return;
 
-    var node_idx: u32 = 1;
-    while (node_idx < tree.nodes.len) : (node_idx += 1) {
-        const node: Ast.Node.Index = @enumFromInt(node_idx);
-        if (tree.nodeTag(node) != .fn_decl) continue;
-        const body = bodyOf(tree, node) orelse continue;
-        try checkBody(gpa, tree, body, problems);
+    var proto_buf: [1]Ast.Node.Index = undefined;
+    var fns = lexer.iterFnDecls(tree);
+    while (fns.next(&proto_buf)) |fn_entry| {
+        try checkFn(gpa, tree, fn_entry.proto, fn_entry.body, problems);
     }
 }
 
-fn checkBody(
+fn checkFn(
     gpa: std.mem.Allocator,
     tree: *const Ast,
+    proto: Ast.full.FnProto,
     body: Ast.Node.Index,
     problems: *std.ArrayListUnmanaged(Problem),
 ) !void {
@@ -62,96 +71,78 @@ fn checkBody(
     const first = tree.firstToken(body);
     const last = tree.lastToken(body);
 
-    // Phase 1: find stackFallback bindings.  Record SF ident names.
+    // Cheap pre-scan: skip fns that don't even mention stackFallback.
+    if (!lexer.hasIdentInRange(tree, first, last, "stackFallback")) return;
+
+    var bindings = try local.build(gpa, tree, proto, body);
+    defer bindings.deinit();
+
+    // Phase 1: SF bindings.
     var sf_names: std.ArrayListUnmanaged([]const u8) = .empty;
     defer sf_names.deinit(gpa);
-    var t: Ast.TokenIndex = first;
-    while (t + 4 < last) : (t += 1) {
-        if (tags[t] != .keyword_var and tags[t] != .keyword_const) continue;
-        if (tags[t + 1] != .identifier) continue;
-        // Find the `=` that ends this var/const's LHS, then look
-        // for `stackFallback(` somewhere in the RHS token range up
-        // to the statement-end semicolon.
-        const eq = findEqualAtStmt(tags, t + 2, last) orelse continue;
-        const sc = findStmtSemicolon(tags, eq + 1, last) orelse continue;
-        if (!tokenRangeContainsCall(tree, eq + 1, sc, "stackFallback")) continue;
-        try sf_names.append(gpa, tree.tokenSlice(t + 1));
+    for (bindings.items) |b| {
+        if (b.origin == .param) continue;
+        if (query.anyMatchAnywhere(tree, stack_fallback_pattern, b.rhs_first, b.rhs_last, null)) {
+            try sf_names.append(gpa, b.name);
+        }
     }
     if (sf_names.items.len == 0) return;
 
-    // Phase 2: find SF-tainted locals.  Any `var/const <X> = <RHS>`
-    // where the RHS token range contains `<SF>.get()` (call site)
-    // makes X tainted.  Also propagate one step: if `<X>` is
-    // tainted and `var <Y> = <RHS-mentioning-X>`, Y is tainted.
+    // Phase 2: tainted locals.  Bindings are iterated in declaration
+    // order (local.build appends in body-token order), so the
+    // transitive "RHS mentions a tainted ident" check works as a
+    // single forward pass.
     var tainted: std.StringHashMapUnmanaged(void) = .empty;
     defer tainted.deinit(gpa);
-    t = first;
-    while (t + 4 < last) : (t += 1) {
-        if (tags[t] != .keyword_var and tags[t] != .keyword_const) continue;
-        if (tags[t + 1] != .identifier) continue;
-        const eq = findEqualAtStmt(tags, t + 2, last) orelse continue;
-        const sc = findStmtSemicolon(tags, eq + 1, last) orelse continue;
-        const name = tree.tokenSlice(t + 1);
-        if (std.mem.eql(u8, name, "_")) continue;
-        var is_tainted = false;
-        // Direct taint: RHS contains `<SF>.get`.
-        for (sf_names.items) |sf| {
-            if (rhsHasSfGet(tree, eq + 1, sc, sf)) {
-                is_tainted = true;
-                break;
-            }
+    for (bindings.items) |b| {
+        if (b.origin == .param) continue;
+        if (std.mem.eql(u8, b.name, "_")) continue;
+        if (rhsIsTainted(tree, b, sf_names.items, &tainted)) {
+            try tainted.put(gpa, b.name, {});
         }
-        // Transitive taint: RHS mentions an existing tainted ident.
-        if (!is_tainted) {
-            var u: Ast.TokenIndex = eq + 1;
-            while (u < sc) : (u += 1) {
-                if (tags[u] != .identifier) continue;
-                const id = tree.tokenSlice(u);
-                if (tainted.contains(id)) {
-                    is_tainted = true;
-                    break;
-                }
-            }
-        }
-        if (is_tainted) try tainted.put(gpa, name, {});
     }
 
-    // Phase 3: scan returns.  Fire if a return's value expression
-    // contains `<tainted>.toOwnedSlice(` / `.toOwnedSliceSentinel(`
-    // / `.allocPrint(` / `.allocPrintZ(` — these methods produce a
-    // slice into the tainted allocator's backing storage.  Skip
-    // when the return value also contains a `.dupe*(...)` /
-    // `.alloc*(...)` call — those wrap-and-copy the tainted slice
-    // through the inner allocator, which is the canonical fix
-    // (e.g. `try alloc.dupeZ(u8, try cmd.toOwnedSlice())`).
-    t = first;
-    while (t < last) : (t += 1) {
+    // Phase 3: scan returns for `<tainted>.<sink>(...)` not preceded
+    // by sanitizing `.dupe*`/`.alloc*`/`.create*` in the return value.
+    var t: Ast.TokenIndex = first;
+    while (t <= last) : (t += 1) {
         if (tags[t] != .keyword_return) continue;
-        const sc = findStmtSemicolon(tags, t + 1, last) orelse continue;
-        if (returnHasSanitizingCopy(tree, t + 1, sc)) continue;
-        if (findTaintedToOwned(tree, t + 1, sc, &tainted)) |hit| {
+        const sc = lexer.findStmtSemicolon(tags, t + 1, last) orelse continue;
+        if (sc <= t + 1) continue;
+        const value_last = sc - 1;
+        if (query.anyMatchAnywhere(tree, sanitizer_call_pattern, t + 1, value_last, null)) continue;
+        if (findTaintedSinkCall(tree, t + 1, value_last, &tainted)) |hit| {
             try report(gpa, problems, tree, t, hit.local, hit.method);
         }
     }
 }
 
-/// True iff the return value's token range contains a
-/// `.dupe(` / `.dupeZ(` / `.alloc(` / `.allocSentinel(` /
-/// `.create(` etc. call — the canonical "copy through a real
-/// allocator" sanitization that fixes the bug.
-fn returnHasSanitizingCopy(tree: *const Ast, start: Ast.TokenIndex, end: Ast.TokenIndex) bool {
+/// True iff the binding's RHS is SF-tainted: either contains
+/// `<sf>.get(` for some sf in `sf_names`, or mentions an
+/// identifier already in `tainted`.
+fn rhsIsTainted(
+    tree: *const Ast,
+    b: local.Binding,
+    sf_names: []const []const u8,
+    tainted: *const std.StringHashMapUnmanaged(void),
+) bool {
+    // Direct: `<sf>.get(` for some known sf.  Build the pattern at
+    // runtime since .text takes any []const u8 slice.
+    for (sf_names) |sf| {
+        const sf_get = [_]Atom{
+            .{ .text = sf },
+            .{ .tok = .period },
+            .{ .text = "get" },
+            .{ .tok = .l_paren },
+        };
+        if (query.anyMatchAnywhere(tree, &sf_get, b.rhs_first, b.rhs_last, null)) return true;
+    }
+    // Transitive: any identifier in RHS is already tainted.
     const tags = tree.tokens.items(.tag);
-    var t: Ast.TokenIndex = start;
-    while (t + 2 < end) : (t += 1) {
-        if (tags[t] != .period) continue;
-        if (tags[t + 1] != .identifier) continue;
-        if (tags[t + 2] != .l_paren) continue;
-        const m = tree.tokenSlice(t + 1);
-        if (std.mem.eql(u8, m, "dupe") or
-            std.mem.eql(u8, m, "dupeZ") or
-            std.mem.eql(u8, m, "alloc") or
-            std.mem.eql(u8, m, "allocSentinel") or
-            std.mem.eql(u8, m, "create")) return true;
+    var u: Ast.TokenIndex = b.rhs_first;
+    while (u <= b.rhs_last) : (u += 1) {
+        if (tags[u] != .identifier) continue;
+        if (tainted.contains(tree.tokenSlice(u))) return true;
     }
     return false;
 }
@@ -161,28 +152,36 @@ const Hit = struct {
     method: []const u8,
 };
 
-/// Find any `<tainted_ident>.<sink_method>(` occurrence in the
-/// range `[start, end)` and return the matched local + method.
-fn findTaintedToOwned(
+/// Find `<tainted_ident>.<sinkMethod>(` in `[start, end]`.
+fn findTaintedSinkCall(
     tree: *const Ast,
     start: Ast.TokenIndex,
     end: Ast.TokenIndex,
     tainted: *const std.StringHashMapUnmanaged(void),
 ) ?Hit {
     const tags = tree.tokens.items(.tag);
+    if (start > end) return null;
     var t: Ast.TokenIndex = start;
-    while (t + 3 < end) : (t += 1) {
+    while (t + 3 <= end) : (t += 1) {
         if (tags[t] != .identifier) continue;
-        const local = tree.tokenSlice(t);
-        if (!tainted.contains(local)) continue;
+        const local_name = tree.tokenSlice(t);
+        if (!tainted.contains(local_name)) continue;
         if (tags[t + 1] != .period) continue;
         if (tags[t + 2] != .identifier) continue;
         if (tags[t + 3] != .l_paren) continue;
         const method = tree.tokenSlice(t + 2);
         if (!isSinkMethodName(method)) continue;
-        return .{ .local = local, .method = method };
+        return .{ .local = local_name, .method = method };
     }
     return null;
+}
+
+fn isSanitizingMethod(name: []const u8) bool {
+    return std.mem.eql(u8, name, "dupe") or
+        std.mem.eql(u8, name, "dupeZ") or
+        std.mem.eql(u8, name, "alloc") or
+        std.mem.eql(u8, name, "allocSentinel") or
+        std.mem.eql(u8, name, "create");
 }
 
 fn isSinkMethodName(name: []const u8) bool {
@@ -196,81 +195,23 @@ fn isSinkMethodName(name: []const u8) bool {
         std.mem.eql(u8, name, "joinZ");
 }
 
-/// True iff `[start, end)` contains `<sf>.get(` at any nesting depth.
-fn rhsHasSfGet(tree: *const Ast, start: Ast.TokenIndex, end: Ast.TokenIndex, sf: []const u8) bool {
-    const tags = tree.tokens.items(.tag);
-    var t: Ast.TokenIndex = start;
-    while (t + 3 < end) : (t += 1) {
-        if (tags[t] != .identifier) continue;
-        if (!std.mem.eql(u8, tree.tokenSlice(t), sf)) continue;
-        if (tags[t + 1] != .period) continue;
-        if (tags[t + 2] != .identifier) continue;
-        if (!std.mem.eql(u8, tree.tokenSlice(t + 2), "get")) continue;
-        if (tags[t + 3] != .l_paren) continue;
-        return true;
-    }
-    return false;
-}
-
-/// True iff `[start, end)` contains a `<name>(` call at any depth.
-fn tokenRangeContainsCall(tree: *const Ast, start: Ast.TokenIndex, end: Ast.TokenIndex, name: []const u8) bool {
-    const tags = tree.tokens.items(.tag);
-    var t: Ast.TokenIndex = start;
-    while (t + 1 < end) : (t += 1) {
-        if (tags[t] != .identifier) continue;
-        if (!std.mem.eql(u8, tree.tokenSlice(t), name)) continue;
-        if (tags[t + 1] != .l_paren) continue;
-        return true;
-    }
-    return false;
-}
-
-/// Walk forward from `start` to find the first `=` at statement depth
-/// (paren/brace/bracket all zero).  Skips past optional type annotation.
-fn findEqualAtStmt(tags: []const std.zig.Token.Tag, start: Ast.TokenIndex, last: Ast.TokenIndex) ?Ast.TokenIndex {
-    var paren: u32 = 0;
-    var brace: u32 = 0;
-    var bracket: u32 = 0;
-    var t: Ast.TokenIndex = start;
-    while (t <= last) : (t += 1) {
-        switch (tags[t]) {
-            .l_paren => paren += 1,
-            .r_paren => if (paren > 0) {
-                paren -= 1;
-            },
-            .l_brace => brace += 1,
-            .r_brace => if (brace > 0) {
-                brace -= 1;
-            },
-            .l_bracket => bracket += 1,
-            .r_bracket => if (bracket > 0) {
-                bracket -= 1;
-            },
-            .equal => if (paren == 0 and brace == 0 and bracket == 0) return t,
-            .semicolon => if (paren == 0 and brace == 0 and bracket == 0) return null,
-            else => {},
-        }
-    }
-    return null;
-}
-
 fn report(
     gpa: std.mem.Allocator,
     problems: *std.ArrayListUnmanaged(Problem),
     tree: *const Ast,
     return_tok: Ast.TokenIndex,
-    local: []const u8,
+    local_name: []const u8,
     method: []const u8,
 ) !void {
     const msg = try std.fmt.allocPrint(
         gpa,
         "`{s}.{s}()` returns a slice into the `stackFallback(...)` buffer in the caller's stack frame — escaping it via `return` dangles the pointer once this fn exits.  Bind the result locally and `try <inner_alloc>.dupe*(...)` it before returning",
-        .{ local, method },
+        .{ local_name, method },
     );
     errdefer gpa.free(msg);
 
     try problems.append(gpa, .{
-        .rule_id = "stack-fallback-escape",
+        .rule_id = R,
         .severity = .@"error",
         .start = Pos.fromTokenStart(tree, return_tok),
         .end = Pos.fromTokenEnd(tree, return_tok),
@@ -280,24 +221,8 @@ fn report(
 
 // ── Tests ──────────────────────────────────────────────────
 
-fn runOn(gpa: std.mem.Allocator, src: []const u8) !std.ArrayListUnmanaged(Problem) {
-    const src_z = try gpa.dupeSentinel(u8, src, 0);
-    defer gpa.free(src_z);
-    var tree = try Ast.parse(gpa, src_z, .zig);
-    defer tree.deinit(gpa);
-    var problems: std.ArrayListUnmanaged(Problem) = .empty;
-    try check(gpa, &tree, &config_mod.Default, &problems);
-    return problems;
-}
-
-fn freeProblems(gpa: std.mem.Allocator, p: *std.ArrayListUnmanaged(Problem)) void {
-    for (p.items) |*x| x.deinit(gpa);
-    p.deinit(gpa);
-}
-
-test "stack-fallback-escape: `return cmd.toOwnedSlice()` from SF-tainted local fires" {
-    const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+test "`return cmd.toOwnedSlice()` from SF-tainted local fires" {
+    try testing.expectFires(check, R,
         \\const std = @import("std");
         \\const Builder = struct {
         \\    pub fn init(_: std.mem.Allocator) Builder { return .{}; }
@@ -309,16 +234,11 @@ test "stack-fallback-escape: `return cmd.toOwnedSlice()` from SF-tainted local f
         \\    var cmd = Builder.init(sf.get());
         \\    return .{ .shell = try cmd.toOwnedSlice() };
         \\}
-        \\
     );
-    defer freeProblems(gpa, &problems);
-    try std.testing.expectEqual(@as(usize, 1), problems.items.len);
-    try std.testing.expectEqualStrings("stack-fallback-escape", problems.items[0].rule_id);
 }
 
-test "stack-fallback-escape: dupe through inner allocator is OK" {
-    const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+test "dupe through inner allocator is OK" {
+    try testing.expectNoFire(check,
         \\const std = @import("std");
         \\const Builder = struct {
         \\    pub fn init(_: std.mem.Allocator) Builder { return .{}; }
@@ -331,21 +251,11 @@ test "stack-fallback-escape: dupe through inner allocator is OK" {
         \\    const tmp = try cmd.toOwnedSlice();
         \\    return .{ .shell = try alloc.dupe(u8, tmp) };
         \\}
-        \\
     );
-    defer freeProblems(gpa, &problems);
-    // The toOwnedSlice result is bound to `tmp` and then `tmp` is
-    // copied through `alloc.dupe`.  My detector currently only
-    // flags DIRECT `<tainted>.toOwnedSlice(...)` in a return; this
-    // case has the toOwnedSlice in a binding, then the return uses
-    // `alloc.dupe(u8, tmp)` (no tainted-local method-call in
-    // return).  So no fire.
-    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
 }
 
-test "stack-fallback-escape: no stackFallback present is silent" {
-    const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+test "no stackFallback present is silent" {
+    try testing.expectNoFire(check,
         \\const std = @import("std");
         \\const Builder = struct {
         \\    pub fn init(_: std.mem.Allocator) Builder { return .{}; }
@@ -355,15 +265,11 @@ test "stack-fallback-escape: no stackFallback present is silent" {
         \\    var cmd = Builder.init(alloc);
         \\    return try cmd.toOwnedSlice();
         \\}
-        \\
     );
-    defer freeProblems(gpa, &problems);
-    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
 }
 
-test "stack-fallback-escape: SF-tainted local consumed only locally is OK" {
-    const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+test "SF-tainted local consumed only locally is OK" {
+    try testing.expectNoFire(check,
         \\const std = @import("std");
         \\const Builder = struct {
         \\    pub fn init(_: std.mem.Allocator) Builder { return .{}; }
@@ -377,17 +283,11 @@ test "stack-fallback-escape: SF-tainted local consumed only locally is OK" {
         \\    const slice = try cmd.toOwnedSlice();
         \\    _ = slice;
         \\}
-        \\
     );
-    defer freeProblems(gpa, &problems);
-    // Tainted slice is bound locally and discarded — no return
-    // mentions it, so no escape.
-    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
 }
 
-test "stack-fallback-escape: transitive taint via inner var fires when returned" {
-    const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+test "transitive taint via inner var fires when returned" {
+    try testing.expectFires(check, R,
         \\const std = @import("std");
         \\const Inner = struct {
         \\    pub fn init(_: std.mem.Allocator) Inner { return .{}; }
@@ -402,8 +302,5 @@ test "stack-fallback-escape: transitive taint via inner var fires when returned"
         \\    var outer = Outer.init(inner);
         \\    return try outer.toOwnedSlice();
         \\}
-        \\
     );
-    defer freeProblems(gpa, &problems);
-    try std.testing.expectEqual(@as(usize, 1), problems.items.len);
 }
