@@ -29,17 +29,34 @@ const problem_mod = @import("../problem.zig");
 const config_mod = @import("../config.zig");
 
 const lexer = @import("../lexer.zig");
+const query = @import("../query.zig");
 const testing = @import("../testing.zig");
-const matchBrace = lexer.matchBrace;
-const matchParen = lexer.matchParen;
-const matchBracket = lexer.matchBracket;
-const skipNestedFn = lexer.skipNestedFn;
-const returnsType = lexer.returnsType;
-const fnProto = lexer.fnProto;
-const bodyOf = lexer.bodyOf;
 
 const Problem = problem_mod.Problem;
 const Pos = problem_mod.Pos;
+const Atom = query.Atom;
+
+// `.free(<X>.ptr (.?)? [<lo>..<X>.len])` — the sentinel-strip shape.
+// $0 captures X (the slice's binding name) so the trailing `<X>.len`
+// is matched as the SAME identifier via ref.  The `<lo>` expression
+// between `[` and `..` is captured via range slot 0 (skipped).
+const sentinel_strip = &[_]Atom{
+    .{ .tok = .period },
+    .{ .text = "free" },
+    .{ .tok = .l_paren },
+    .{ .capture = 0 },
+    .{ .tok = .period },
+    .{ .text = "ptr" },
+    .{ .opt = &[_]Atom{ .{ .tok = .period }, .{ .tok = .question_mark } } },
+    .{ .tok = .l_bracket },
+    .{ .capture_until = .{ .slot = 0, .stops = &.{.ellipsis2} } },
+    .{ .tok = .ellipsis2 },
+    .{ .ref = 0 },
+    .{ .tok = .period },
+    .{ .text = "len" },
+    .{ .tok = .r_bracket },
+    .{ .tok = .r_paren },
+};
 
 pub fn check(
     gpa: std.mem.Allocator,
@@ -49,13 +66,10 @@ pub fn check(
 ) !void {
     if (!config_mod.isEnabled(config, .sentinel_strip_free_size_mismatch)) return;
 
-    var node_idx: u32 = 1;
-    while (node_idx < tree.nodes.len) : (node_idx += 1) {
-        const node: Ast.Node.Index = @enumFromInt(node_idx);
-        if (tree.nodeTag(node) != .fn_decl) continue;
-        if (returnsType(tree, node)) continue;
-        const body = bodyOf(tree, node) orelse continue;
-        try checkBody(gpa, tree, body, problems);
+    var proto_buf: [1]Ast.Node.Index = undefined;
+    var fns = lexer.iterFnDecls(tree);
+    while (fns.next(&proto_buf)) |fn_entry| {
+        try checkBody(gpa, tree, fn_entry.body, problems);
     }
 }
 
@@ -65,64 +79,15 @@ fn checkBody(
     body: Ast.Node.Index,
     problems: *std.ArrayListUnmanaged(Problem),
 ) !void {
-    const tags = tree.tokens.items(.tag);
     const first = tree.firstToken(body);
     const last = tree.lastToken(body);
-
-    var t: Ast.TokenIndex = first;
-    while (t + 4 <= last) : (t += 1) {
-        if (tags[t] == .keyword_fn) {
-            t = skipNestedFn(tags, t, last);
-            continue;
-        }
-        // `.free(` preceded by `.` — allocator method call.
-        if (tags[t] != .identifier) continue;
-        if (t == 0 or tags[t - 1] != .period) continue;
-        if (!std.mem.eql(u8, tree.tokenSlice(t), "free")) continue;
-        if (tags[t + 1] != .l_paren) continue;
-        const cp = matchParen(tags, t + 1, last) orelse continue;
-        // Match arg: `<X> . ptr (.?)? [ <expr> . . <X> . len ]`
-        if (matchSentinelStrip(tree, t + 2, cp - 1)) {
-            try report(gpa, problems, tree, t);
-        }
-        t = cp;
+    const matches = try query.findAllInBody(gpa, tree, sentinel_strip, first, last);
+    defer gpa.free(matches);
+    for (matches) |m| {
+        // Report at the `.free` method token (m.start is the leading `.`;
+        // m.start + 1 is `free`).
+        try report(gpa, problems, tree, m.start + 1);
     }
-}
-
-/// True iff `[start, end]` looks like `<X>.ptr[<lo>..<X>.len]`
-/// or `<X>.ptr.?[<lo>..<X>.len]`.
-fn matchSentinelStrip(
-    tree: *const Ast,
-    start: Ast.TokenIndex,
-    end: Ast.TokenIndex,
-) bool {
-    const tags = tree.tokens.items(.tag);
-    if (end < start + 6) return false;
-    if (tags[start] != .identifier) return false;
-    const x_name = tree.tokenSlice(start);
-    if (tags[start + 1] != .period) return false;
-    if (tags[start + 2] != .identifier) return false;
-    if (!std.mem.eql(u8, tree.tokenSlice(start + 2), "ptr")) return false;
-    // Optional `.?` — TWO tokens: `period` + `question_mark`.
-    var t: Ast.TokenIndex = start + 3;
-    if (t + 1 <= end and tags[t] == .period and tags[t + 1] == .question_mark) {
-        t += 2;
-    }
-    if (t > end or tags[t] != .l_bracket) return false;
-    // Find matching `]`.
-    const rb = matchBracket(tags, t, end) orelse return false;
-    // Inside `[...]`, look for `.. <X> . len`.
-    var u: Ast.TokenIndex = t + 1;
-    while (u + 4 <= rb) : (u += 1) {
-        if (tags[u] != .ellipsis2) continue;
-        if (tags[u + 1] != .identifier) continue;
-        if (!std.mem.eql(u8, tree.tokenSlice(u + 1), x_name)) continue;
-        if (tags[u + 2] != .period) continue;
-        if (tags[u + 3] != .identifier) continue;
-        if (!std.mem.eql(u8, tree.tokenSlice(u + 3), "len")) continue;
-        return true;
-    }
-    return false;
 }
 
 fn report(
