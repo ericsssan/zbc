@@ -16,12 +16,6 @@
 //! return) and `arena_use_after_kill` (caught via post-deinit
 //! read).  This rule catches the third escape path: STORE into a
 //! longer-lived container during the arena's lifetime.
-//!
-//! Rewritten via local.zig (binding-origin tracker) + query.zig
-//! (token-pattern matcher).  The three binding-collection passes
-//! (arena vars, alloc handles, arena-allocated slices) are now
-//! one-shot iterations over `local.build`'s output, with RHS
-//! patterns expressed declaratively.
 
 const std = @import("std");
 const Ast = std.zig.Ast;
@@ -29,6 +23,7 @@ const Ast = std.zig.Ast;
 const lexer = @import("../lexer.zig");
 const local = @import("../local.zig");
 const query = @import("../query.zig");
+const receiver = @import("../receiver.zig");
 const problem_mod = @import("../problem.zig");
 const testing = @import("../testing.zig");
 const config_mod = @import("../config.zig");
@@ -49,15 +44,6 @@ const arena_init_pattern = &[_]Atom{
     .paren_args,
 };
 
-// `<recv>.allocator()` — exact match (no chain after).  $0 = receiver.
-const allocator_call_exact = &[_]Atom{
-    .{ .capture = 0 },
-    .{ .tok = .period },
-    .{ .text = "allocator" },
-    .{ .tok = .l_paren },
-    .{ .tok = .r_paren },
-};
-
 // `<arena>.allocator().<allocMethod>(...)` — inline form.
 // $0 = arena name.
 const inline_arena_alloc = &[_]Atom{
@@ -67,7 +53,7 @@ const inline_arena_alloc = &[_]Atom{
     .{ .tok = .l_paren },
     .{ .tok = .r_paren },
     .{ .tok = .period },
-    .{ .pred = isAllocMethodName },
+    .{ .pred = receiver.isAllocMethodName },
     .paren_args,
 };
 
@@ -90,13 +76,12 @@ pub fn check(
     var proto_buf: [1]Ast.Node.Index = undefined;
     var fns = lexer.iterFnDecls(tree);
     while (fns.next(&proto_buf)) |fn_entry| {
-        try checkBody(gpa, tree, fn_entry.proto, fn_entry.body, problems);
+        try checkFn(gpa, tree, fn_entry.proto, fn_entry.body, problems);
     }
 }
 
 const ArenaVar = struct {
     name: []const u8,
-    init_token: Ast.TokenIndex,
 };
 
 const AllocHandle = struct {
@@ -110,63 +95,73 @@ const ArenaSlice = struct {
     name_token: Ast.TokenIndex,
 };
 
-fn checkBody(
+fn checkFn(
     gpa: std.mem.Allocator,
     tree: *const Ast,
     proto: Ast.full.FnProto,
     body: Ast.Node.Index,
     problems: *std.ArrayListUnmanaged(Problem),
 ) !void {
+    const tags = tree.tokens.items(.tag);
+    const body_first = tree.firstToken(body);
+    const body_last = tree.lastToken(body);
+
+    // Cheap pre-scan: skip fns that don't even mention ArenaAllocator.
+    // Avoids the per-fn local.build cost on the long tail of fns
+    // that have no arena.
+    if (!bodyMentionsIdent(tree, body_first, body_last, "ArenaAllocator")) return;
+
     var bindings = try local.build(gpa, tree, proto, body);
     defer bindings.deinit();
 
-    // ── Pass 1: arena vars ─────────────────────────────────
-    // Binding whose RHS contains `ArenaAllocator.init(`.
+    // Fused pass: classify each binding as arena / handle / slice.
     var arenas: std.ArrayListUnmanaged(ArenaVar) = .empty;
     defer arenas.deinit(gpa);
-    for (bindings.items) |b| {
-        if (b.origin == .param) continue;
-        if (!query.anyMatchAnywhere(tree, arena_init_pattern, b.rhs_first, b.rhs_last, null)) continue;
-        try arenas.append(gpa, .{ .name = b.name, .init_token = b.name_token });
-    }
-    if (arenas.items.len == 0) return;
-
-    // ── Pass 2: alloc handles ──────────────────────────────
-    // Binding whose RHS is EXACTLY `<arena>.allocator()` (no chain).
     var handles: std.ArrayListUnmanaged(AllocHandle) = .empty;
     defer handles.deinit(gpa);
-    for (bindings.items) |b| {
-        if (b.origin == .param) continue;
-        // Peel a leading `try` if present (matchExact starts at rhs_first).
-        const start = peelTry(tree, b);
-        const m = query.matchExact(tree, allocator_call_exact, start, b.rhs_last, null) orelse continue;
-        const arena_name = m.captureText(tree, 0).?;
-        if (findArena(arenas.items, arena_name) == null) continue;
-        try handles.append(gpa, .{ .name = b.name, .arena_name = arena_name });
-    }
-
-    // ── Pass 3: arena-allocated slices ─────────────────────
-    // Binding whose RHS is `[try] <H>.<allocMethod>(...)` OR
-    // `[try] <arena>.allocator().<allocMethod>(...)`.
     var slices: std.ArrayListUnmanaged(ArenaSlice) = .empty;
     defer slices.deinit(gpa);
+
     for (bindings.items) |b| {
         if (b.origin == .param) continue;
-        const start = peelTry(tree, b);
-        // Shape A: <handle>.<allocMethod>(...)
-        const call = b.asCall();
-        if (call != null and call.?.method != null and isAllocMethodName(call.?.method.?)) {
-            if (findHandle(handles.items, call.?.receiver)) |h| {
-                try slices.append(gpa, .{
-                    .name = b.name,
-                    .arena_name = h.arena_name,
-                    .name_token = b.name_token,
-                });
-                continue;
+
+        // Arena: RHS contains ArenaAllocator.init(...).
+        if (query.anyMatchAnywhere(tree, arena_init_pattern, b.rhs_first, b.rhs_last, null)) {
+            try arenas.append(gpa, .{ .name = b.name });
+            continue;
+        }
+
+        // Handle: binding is a method_call to `allocator` on an arena,
+        // with no trailing chain (exactly `<arena>.allocator()`).
+        if (b.asCall()) |c| {
+            if (c.method != null and std.mem.eql(u8, c.method.?, "allocator") and
+                c.paren_token + 1 <= b.rhs_last and tags[c.paren_token + 1] == .r_paren and
+                b.rhs_last == c.paren_token + 1)
+            {
+                if (findArena(arenas.items, c.receiver) != null) {
+                    try handles.append(gpa, .{ .name = b.name, .arena_name = c.receiver });
+                    continue;
+                }
+            }
+            // Slice — shape A: <handle>.<allocMethod>(...).
+            if (c.method != null and receiver.isAllocMethodName(c.method.?)) {
+                if (findHandle(handles.items, c.receiver)) |h| {
+                    try slices.append(gpa, .{
+                        .name = b.name,
+                        .arena_name = h.arena_name,
+                        .name_token = b.name_token,
+                    });
+                    continue;
+                }
             }
         }
-        // Shape B: <arena>.allocator().<allocMethod>(...)
-        if (query.matchPrefix(tree, inline_arena_alloc, start, b.rhs_last, null)) |m| {
+
+        // Slice — shape B: <arena>.allocator().<allocMethod>(...) inline.
+        // The classified call (asCall) above only captures the outermost
+        // `<arena>.allocator(` of the chain, so we fall back to a
+        // prefix match for the full inline shape.
+        const rhs_start = if (tags[b.rhs_first] == .keyword_try) b.rhs_first + 1 else b.rhs_first;
+        if (query.matchAt(tree, inline_arena_alloc, rhs_start, b.rhs_last, null)) |m| {
             const arena_name = m.captureText(tree, 0).?;
             if (findArena(arenas.items, arena_name)) |a| {
                 try slices.append(gpa, .{
@@ -177,38 +172,33 @@ fn checkBody(
             }
         }
     }
+
     if (slices.items.len == 0) return;
 
-    // ── Pass 4: store calls ────────────────────────────────
-    // For each `<recv>.<storeMethod>(...)` in the body, where recv
-    // is NOT an arena/handle, scan the args (after the first) for
-    // any identifier matching a known slice.
-    const first = tree.firstToken(body);
-    const last = tree.lastToken(body);
-    const calls = try query.findAllInBody(gpa, tree, store_call, first, last);
+    // Store calls: scan body for `<recv>.<storeMethod>(...)` whose
+    // receiver isn't an arena/handle, and whose later args reference
+    // an arena slice.
+    const calls = try query.findAllInBody(gpa, tree, store_call, body_first, body_last);
     defer gpa.free(calls);
-    const tags = tree.tokens.items(.tag);
+
+    var args_buf: std.ArrayListUnmanaged(lexer.ArgRange) = .empty;
+    defer args_buf.deinit(gpa);
 
     for (calls) |c| {
         const method_tok = c.captures[1].?;
-        if (!isStoreMethodName(tree.tokenSlice(method_tok))) continue;
+        if (!receiver.isContainerStoreMethodName(tree.tokenSlice(method_tok))) continue;
         const recv_name = c.captureText(tree, 0).?;
         if (findArena(arenas.items, recv_name) != null) continue;
         if (findHandle(handles.items, recv_name) != null) continue;
-        // Find the call's matching `)` to bound the args.
-        const lp = method_tok + 1; // l_paren is right after method
-        const rp = lexer.matchParen(tags, lp, last) orelse continue;
-        // Split args at top-level commas.
-        var args: std.ArrayListUnmanaged(Arg) = .empty;
-        defer args.deinit(gpa);
-        collectTopLevelArgs(gpa, tags, lp + 1, rp, &args) catch continue;
-        if (args.items.len < 2) continue;
-        // First arg must not be the arena's allocator.
-        if (firstArgIsArenaAllocator(tree, args.items[0].start, args.items[0].end, arenas.items, handles.items)) continue;
-        // Scan later args for a slice name.
+        const lp = method_tok + 1; // l_paren is right after method_tok
+        const rp = lexer.matchParen(tags, lp, body_last) orelse continue;
+        args_buf.clearRetainingCapacity();
+        lexer.splitCallArgs(gpa, tags, lp, rp, &args_buf) catch continue;
+        if (args_buf.items.len < 2) continue;
+        if (firstArgIsArenaAllocator(tree, args_buf.items[0].start, args_buf.items[0].end, arenas.items, handles.items)) continue;
         var i: usize = 1;
-        while (i < args.items.len) : (i += 1) {
-            const arg = args.items[i];
+        while (i < args_buf.items.len) : (i += 1) {
+            const arg = args_buf.items[i];
             var u: Ast.TokenIndex = arg.start;
             while (u <= arg.end) : (u += 1) {
                 if (tags[u] != .identifier) continue;
@@ -220,36 +210,17 @@ fn checkBody(
     }
 }
 
-fn peelTry(tree: *const Ast, b: local.Binding) Ast.TokenIndex {
+/// True iff any `.identifier` token in `[start, end]` has slice
+/// equal to `name`.  Cheap pre-scan used to gate per-fn analysis.
+fn bodyMentionsIdent(tree: *const Ast, start: Ast.TokenIndex, end: Ast.TokenIndex, name: []const u8) bool {
     const tags = tree.tokens.items(.tag);
-    if (b.rhs_first <= b.rhs_last and tags[b.rhs_first] == .keyword_try) {
-        return b.rhs_first + 1;
+    if (start > end) return false;
+    var t: Ast.TokenIndex = start;
+    while (t <= end) : (t += 1) {
+        if (tags[t] != .identifier) continue;
+        if (std.mem.eql(u8, tree.tokenSlice(t), name)) return true;
     }
-    return b.rhs_first;
-}
-
-fn isAllocMethodName(name: []const u8) bool {
-    return std.mem.eql(u8, name, "alloc") or
-        std.mem.eql(u8, name, "allocSentinel") or
-        std.mem.eql(u8, name, "dupe") or
-        std.mem.eql(u8, name, "dupeZ") or
-        std.mem.eql(u8, name, "create") or
-        std.mem.eql(u8, name, "allocPrint") or
-        std.mem.eql(u8, name, "allocPrintZ") or
-        std.mem.eql(u8, name, "allocPrintSentinel");
-}
-
-fn isStoreMethodName(name: []const u8) bool {
-    return std.mem.eql(u8, name, "append") or
-        std.mem.eql(u8, name, "appendSlice") or
-        std.mem.eql(u8, name, "appendNTimes") or
-        std.mem.eql(u8, name, "insert") or
-        std.mem.eql(u8, name, "insertSlice") or
-        std.mem.eql(u8, name, "put") or
-        std.mem.eql(u8, name, "putAssumeCapacity") or
-        std.mem.eql(u8, name, "putNoClobber") or
-        std.mem.eql(u8, name, "addOne") or
-        std.mem.eql(u8, name, "addManyAsSlice");
+    return false;
 }
 
 fn findArena(arenas: []const ArenaVar, name: []const u8) ?ArenaVar {
@@ -265,50 +236,6 @@ fn findHandle(handles: []const AllocHandle, name: []const u8) ?AllocHandle {
 fn findSlice(slices: []const ArenaSlice, name: []const u8) ?ArenaSlice {
     for (slices) |s| if (std.mem.eql(u8, s.name, name)) return s;
     return null;
-}
-
-const Arg = struct { start: Ast.TokenIndex, end: Ast.TokenIndex };
-
-/// Split a call's args at top-level commas — used to inspect each
-/// arg of a store call independently.  `[start, end)` is the range
-/// between the `(` and `)` (exclusive of both).
-fn collectTopLevelArgs(
-    gpa: std.mem.Allocator,
-    tags: []const std.zig.Token.Tag,
-    start: Ast.TokenIndex,
-    end: Ast.TokenIndex,
-    out: *std.ArrayListUnmanaged(Arg),
-) !void {
-    if (start >= end) return;
-    var paren: u32 = 0;
-    var brace: u32 = 0;
-    var bracket: u32 = 0;
-    var arg_start: Ast.TokenIndex = start;
-    var t: Ast.TokenIndex = start;
-    while (t < end) : (t += 1) {
-        switch (tags[t]) {
-            .l_paren => paren += 1,
-            .r_paren => if (paren > 0) {
-                paren -= 1;
-            },
-            .l_brace => brace += 1,
-            .r_brace => if (brace > 0) {
-                brace -= 1;
-            },
-            .l_bracket => bracket += 1,
-            .r_bracket => if (bracket > 0) {
-                bracket -= 1;
-            },
-            .comma => if (paren == 0 and brace == 0 and bracket == 0) {
-                try out.append(gpa, .{ .start = arg_start, .end = t - 1 });
-                arg_start = t + 1;
-            },
-            else => {},
-        }
-    }
-    if (end > 0 and arg_start <= end - 1) {
-        try out.append(gpa, .{ .start = arg_start, .end = end - 1 });
-    }
 }
 
 fn firstArgIsArenaAllocator(

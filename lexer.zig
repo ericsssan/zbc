@@ -158,6 +158,51 @@ pub fn hasTokenInRange(tags: []const TokenTag, start: TokenIndex, end: TokenInde
     return false;
 }
 
+/// One argument's token span — inclusive on both ends.
+pub const ArgRange = struct { start: TokenIndex, end: TokenIndex };
+
+/// Split a call's arg list at top-level commas, APPENDING into `out`.
+/// `lp` is the call's `(` and `rp` is its matching `)` (caller supplies
+/// both — use `matchParen` first).  Caller is responsible for clearing
+/// `out` between calls if reuse is desired (clearRetainingCapacity
+/// avoids per-call allocation on the hot path).
+pub fn splitCallArgs(
+    gpa: std.mem.Allocator,
+    tags: []const TokenTag,
+    lp: TokenIndex,
+    rp: TokenIndex,
+    out: *std.ArrayListUnmanaged(ArgRange),
+) !void {
+    if (rp <= lp + 1) return;
+    var paren: u32 = 0;
+    var brace: u32 = 0;
+    var bracket: u32 = 0;
+    var arg_start: TokenIndex = lp + 1;
+    var t: TokenIndex = lp + 1;
+    while (t < rp) : (t += 1) {
+        switch (tags[t]) {
+            .l_paren => paren += 1,
+            .r_paren => if (paren > 0) {
+                paren -= 1;
+            },
+            .l_brace => brace += 1,
+            .r_brace => if (brace > 0) {
+                brace -= 1;
+            },
+            .l_bracket => bracket += 1,
+            .r_bracket => if (bracket > 0) {
+                bracket -= 1;
+            },
+            .comma => if (paren == 0 and brace == 0 and bracket == 0) {
+                try out.append(gpa, .{ .start = arg_start, .end = t - 1 });
+                arg_start = t + 1;
+            },
+            else => {},
+        }
+    }
+    if (arg_start < rp) try out.append(gpa, .{ .start = arg_start, .end = rp - 1 });
+}
+
 /// True iff fn `fn_decl` returns the literal `type` — used to skip
 /// comptime type-builder fns (`fn Wrap(T: type) type { return
 /// struct { ... }; }`) so their inner-fn contents don't get

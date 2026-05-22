@@ -362,21 +362,10 @@ pub fn matchExact(
     last: TokenIndex,
     bound: ?*const Match,
 ) ?Match {
+    if (start > last) return null;
     const m = matchAt(tree, atoms, start, last, bound) orelse return null;
     if (m.end != last) return null;
     return m;
-}
-
-/// True iff `atoms` matches at position `start` (don't care if the
-/// match consumes the whole range — there can be trailing tokens).
-pub fn matchPrefix(
-    tree: *const Ast,
-    atoms: []const Atom,
-    start: TokenIndex,
-    last: TokenIndex,
-    bound: ?*const Match,
-) ?Match {
-    return matchAt(tree, atoms, start, last, bound);
 }
 
 /// True iff `atoms` matches ANYWHERE in `[start, last]` at SAME

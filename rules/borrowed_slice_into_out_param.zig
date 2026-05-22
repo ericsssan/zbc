@@ -12,10 +12,6 @@
 //! #30223 (same fn, sibling out-param), #25563 (`install.ca = .{
 //! .str = str }` borrowing parser-arena memory freed by
 //! `defer parser.deinit()`).
-//!
-//! Rewritten via local.zig + query.zig.  Pointer-param detection
-//! is now iteration over Binding.origin == .param + a tiny
-//! isPointerType check on the binding's stored type range.
 
 const std = @import("std");
 const Ast = std.zig.Ast;
@@ -90,6 +86,14 @@ fn checkFn(
     body: Ast.Node.Index,
     problems: *std.ArrayListUnmanaged(Problem),
 ) !void {
+    const tags = tree.tokens.items(.tag);
+    const first = tree.firstToken(body);
+    const last = tree.lastToken(body);
+
+    // Cheap pre-scan: any `defer` keyword at all?  Without one the
+    // rule can never fire, so skip the binding-walk cost.
+    if (!lexer.hasTokenInRange(tags, first, last, .keyword_defer)) return;
+
     var bindings = try local.build(gpa, tree, proto, body);
     defer bindings.deinit();
 
@@ -99,26 +103,25 @@ fn checkFn(
     defer pointer_params.deinit(gpa);
     for (bindings.items) |b| {
         if (b.origin != .param) continue;
-        if (!isPointerType(tree, b.rhs_first, b.rhs_last)) continue;
+        if (!isPointerType(tags, b.rhs_first, b.rhs_last)) continue;
         try pointer_params.append(gpa, b.name);
     }
     if (pointer_params.items.len == 0) return;
 
-    // Deferred names registered for cleanup.
-    const first = tree.firstToken(body);
-    const last = tree.lastToken(body);
+    // Deferred names registered for cleanup.  Single pass over
+    // `defer` keywords; classify each.
     var deferred: std.ArrayListUnmanaged([]const u8) = .empty;
     defer deferred.deinit(gpa);
-
-    const cleanup_matches = try query.findAllInBody(gpa, tree, defer_cleanup, first, last);
-    defer gpa.free(cleanup_matches);
-    for (cleanup_matches) |m| {
-        try deferred.append(gpa, m.captureText(tree, 0).?);
-    }
-    const free_matches = try query.findAllInBody(gpa, tree, defer_free, first, last);
-    defer gpa.free(free_matches);
-    for (free_matches) |m| {
-        try deferred.append(gpa, m.captureText(tree, 0).?);
+    var t: Ast.TokenIndex = first;
+    while (t <= last) : (t += 1) {
+        if (tags[t] != .keyword_defer) continue;
+        if (query.matchAt(tree, defer_cleanup, t, last, null)) |m| {
+            try deferred.append(gpa, m.captureText(tree, 0).?);
+            continue;
+        }
+        if (query.matchAt(tree, defer_free, t, last, null)) |m| {
+            try deferred.append(gpa, m.captureText(tree, 0).?);
+        }
     }
     if (deferred.items.len == 0) return;
 
@@ -143,7 +146,6 @@ fn scanWrites(
     for (writes) |w| {
         const out_name = w.captureText(tree, 0).?;
         if (!isPointerParam(out_name, pointer_params)) continue;
-        // RHS spans from token after `=` to the next statement `;`.
         const sc = lexer.findStmtSemicolon(tags, w.end + 1, last) orelse continue;
         if (sc <= w.end + 1) continue;
         const dn = rhsMentionsDeferred(tree, w.end + 1, sc - 1, deferred) orelse continue;
@@ -153,8 +155,7 @@ fn scanWrites(
 
 /// True iff the type expression at `[first, last]` starts with `*`
 /// or `?*` — the conservative "this looks like an out-pointer param" check.
-fn isPointerType(tree: *const Ast, first: Ast.TokenIndex, last: Ast.TokenIndex) bool {
-    const tags = tree.tokens.items(.tag);
+fn isPointerType(tags: []const std.zig.Token.Tag, first: Ast.TokenIndex, last: Ast.TokenIndex) bool {
     if (first > last) return false;
     var t: Ast.TokenIndex = first;
     if (tags[t] == .question_mark) {

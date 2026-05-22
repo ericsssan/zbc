@@ -99,6 +99,23 @@ pub fn isAllocMethodName(name: []const u8) bool {
         std.mem.eql(u8, name, "allocPrintSentinel");
 }
 
+/// Container-mutation methods that STORE the caller's data into the
+/// container's backing storage.  When the data is borrowed (e.g.
+/// from an arena that's about to die), storing it through one of
+/// these into a longer-lived container leaves a dangling slice.
+pub fn isContainerStoreMethodName(name: []const u8) bool {
+    return std.mem.eql(u8, name, "append") or
+        std.mem.eql(u8, name, "appendSlice") or
+        std.mem.eql(u8, name, "appendNTimes") or
+        std.mem.eql(u8, name, "insert") or
+        std.mem.eql(u8, name, "insertSlice") or
+        std.mem.eql(u8, name, "put") or
+        std.mem.eql(u8, name, "putAssumeCapacity") or
+        std.mem.eql(u8, name, "putNoClobber") or
+        std.mem.eql(u8, name, "addOne") or
+        std.mem.eql(u8, name, "addManyAsSlice");
+}
+
 /// Destructor-style fn names — used to skip the `<recv>.<field>`
 /// reset-check in rules where the receiver is about to be
 /// discarded anyway.  Prefix-match catches `deinit_slice` /
