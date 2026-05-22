@@ -6,19 +6,24 @@
 const std = @import("std");
 const Ast = std.zig.Ast;
 
-const sdk = @import("../analysis.zig");
+const lexer = @import("../lexer.zig");
+const scope = @import("../scope.zig");
+const problem = @import("../problem.zig");
+const testing = @import("../testing.zig");
 const config_mod = @import("../config.zig");
+
+const TokenIndex = lexer.TokenIndex;
 
 pub fn check(
     gpa: std.mem.Allocator,
     tree: *const Ast,
     config: *const config_mod.Config,
-    problems: *std.ArrayListUnmanaged(sdk.Problem),
+    problems: *std.ArrayListUnmanaged(problem.Problem),
 ) !void {
     if (!config_mod.isEnabled(config, .fd_write_after_close)) return;
 
     var proto_buf: [1]Ast.Node.Index = undefined;
-    var fns = sdk.iterFnDecls(tree);
+    var fns = lexer.iterFnDecls(tree);
     while (fns.next(&proto_buf)) |fn_entry| {
         try checkBody(gpa, tree, fn_entry.body, problems);
     }
@@ -26,15 +31,15 @@ pub fn check(
 
 const Binding = struct {
     x_name: []const u8,
-    name_token: sdk.TokenIndex,
-    end_token: sdk.TokenIndex,
+    name_token: TokenIndex,
+    end_token: TokenIndex,
 };
 
 fn checkBody(
     gpa: std.mem.Allocator,
     tree: *const Ast,
     body: Ast.Node.Index,
-    problems: *std.ArrayListUnmanaged(sdk.Problem),
+    problems: *std.ArrayListUnmanaged(problem.Problem),
 ) !void {
     const tags = tree.tokens.items(.tag);
     const first = tree.firstToken(body);
@@ -43,7 +48,7 @@ fn checkBody(
     var bindings: std.ArrayListUnmanaged(Binding) = .empty;
     defer bindings.deinit(gpa);
 
-    var walk = sdk.BodyWalk.init(tags, first, last);
+    var walk = scope.BodyWalk.init(tags, first, last);
     while (walk.t + 5 <= last) : (walk.t += 1) {
         if (walk.atNestedFn()) {
             walk.skipNestedFn();
@@ -54,7 +59,7 @@ fn checkBody(
         if (tags[t + 1] != .identifier) continue;
 
         // Skip optional type annotation.
-        var after_name: sdk.TokenIndex = t + 2;
+        var after_name: TokenIndex = t + 2;
         if (after_name <= last and tags[after_name] == .colon) {
             var d: u32 = 0;
             while (after_name <= last) : (after_name += 1) {
@@ -70,7 +75,7 @@ fn checkBody(
         }
         if (after_name > last or tags[after_name] != .equal) continue;
 
-        var rhs_start: sdk.TokenIndex = after_name + 1;
+        var rhs_start: TokenIndex = after_name + 1;
         if (rhs_start <= last and tags[rhs_start] == .keyword_try) rhs_start += 1;
         if (rhs_start + 3 > last) continue;
         if (tags[rhs_start] != .identifier) continue;
@@ -79,7 +84,7 @@ fn checkBody(
         if (tags[rhs_start + 3] != .l_paren) continue;
         if (!isOpenerMethodName(tree.tokenSlice(rhs_start + 2))) continue;
 
-        const sc = sdk.findStmtSemicolon(tags, rhs_start + 4, last) orelse continue;
+        const sc = lexer.findStmtSemicolon(tags, rhs_start + 4, last) orelse continue;
         try bindings.append(gpa, .{
             .x_name = tree.tokenSlice(t + 1),
             .name_token = t + 1,
@@ -89,9 +94,9 @@ fn checkBody(
     }
 
     for (bindings.items) |b| {
-        const close_tok = sdk.findReceiverCallSameDepth(tree, b.end_token + 1, last, b.x_name, isCloseMethodName) orelse continue;
-        const after_close = sdk.findStmtSemicolon(tree.tokens.items(.tag), close_tok, last) orelse continue;
-        const use_tok = sdk.findIdentUseInEnclosingScope(tree, after_close + 1, last, b.x_name) orelse continue;
+        const close_tok = scope.findReceiverCallSameDepth(tree, b.end_token + 1, last, b.x_name, isCloseMethodName) orelse continue;
+        const after_close = lexer.findStmtSemicolon(tree.tokens.items(.tag), close_tok, last) orelse continue;
+        const use_tok = scope.findIdentUseInEnclosingScope(tree, after_close + 1, last, b.x_name) orelse continue;
         try report(gpa, problems, tree, b, close_tok, use_tok);
     }
 }
@@ -117,11 +122,11 @@ fn isCloseMethodName(name: []const u8) bool {
 
 fn report(
     gpa: std.mem.Allocator,
-    problems: *std.ArrayListUnmanaged(sdk.Problem),
+    problems: *std.ArrayListUnmanaged(problem.Problem),
     tree: *const Ast,
     b: Binding,
-    close_tok: sdk.TokenIndex,
-    use_tok: sdk.TokenIndex,
+    close_tok: TokenIndex,
+    use_tok: TokenIndex,
 ) !void {
     _ = close_tok;
     const msg = try std.fmt.allocPrint(
@@ -134,19 +139,19 @@ fn report(
     const note_label = try std.fmt.allocPrint(gpa, "file handle opened here", .{});
     errdefer gpa.free(note_label);
 
-    var notes = try gpa.alloc(sdk.Note, 1);
+    var notes = try gpa.alloc(problem.Note, 1);
     errdefer gpa.free(notes);
     notes[0] = .{
-        .start = sdk.Pos.fromTokenStart(tree, b.name_token),
-        .end = sdk.Pos.fromTokenEnd(tree, b.name_token),
+        .start = problem.Pos.fromTokenStart(tree, b.name_token),
+        .end = problem.Pos.fromTokenEnd(tree, b.name_token),
         .label = note_label,
     };
 
     try problems.append(gpa, .{
         .rule_id = "fd-write-after-close",
         .severity = .@"error",
-        .start = sdk.Pos.fromTokenStart(tree, use_tok),
-        .end = sdk.Pos.fromTokenEnd(tree, use_tok),
+        .start = problem.Pos.fromTokenStart(tree, use_tok),
+        .end = problem.Pos.fromTokenEnd(tree, use_tok),
         .message = msg,
         .notes = notes,
     });
@@ -154,55 +159,32 @@ fn report(
 
 // ── Tests ──────────────────────────────────────────────────
 
-fn runOn(gpa: std.mem.Allocator, src: []const u8) !std.ArrayListUnmanaged(sdk.Problem) {
-    const src_z = try gpa.dupeSentinel(u8, src, 0);
-    defer gpa.free(src_z);
-    var tree = try Ast.parse(gpa, src_z, .zig);
-    defer tree.deinit(gpa);
-    var problems: std.ArrayListUnmanaged(sdk.Problem) = .empty;
-    try check(gpa, &tree, &config_mod.Default, &problems);
-    return problems;
-}
+const R = "fd-write-after-close";
 
-fn freeProblems(gpa: std.mem.Allocator, p: *std.ArrayListUnmanaged(sdk.Problem)) void {
-    for (p.items) |*x| x.deinit(gpa);
-    p.deinit(gpa);
-}
-
-test "fd-write-after-close: createFile then close then writeAll fires" {
-    const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+test "createFile then close then writeAll fires" {
+    try testing.expectFires(check, R,
         \\const std = @import("std");
         \\pub fn buggy(dir: std.fs.Dir) !void {
         \\    const file = try dir.createFile("x", .{});
         \\    file.close();
         \\    try file.writeAll("hi");
         \\}
-        \\
     );
-    defer freeProblems(gpa, &problems);
-    try std.testing.expectEqual(@as(usize, 1), problems.items.len);
-    try std.testing.expectEqualStrings("fd-write-after-close", problems.items[0].rule_id);
 }
 
-test "fd-write-after-close: defer close doesn't fire" {
-    const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+test "defer close doesn't fire" {
+    try testing.expectNoFire(check,
         \\const std = @import("std");
         \\pub fn ok(dir: std.fs.Dir) !void {
         \\    const file = try dir.createFile("x", .{});
         \\    defer file.close();
         \\    try file.writeAll("hi");
         \\}
-        \\
     );
-    defer freeProblems(gpa, &problems);
-    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
 }
 
-test "fd-write-after-close: errdefer close also skipped" {
-    const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+test "errdefer close also skipped" {
+    try testing.expectNoFire(check,
         \\const std = @import("std");
         \\pub fn ok(dir: std.fs.Dir) !void {
         \\    const file = try dir.createFile("x", .{});
@@ -210,15 +192,11 @@ test "fd-write-after-close: errdefer close also skipped" {
         \\    try file.writeAll("hi");
         \\    file.close();
         \\}
-        \\
     );
-    defer freeProblems(gpa, &problems);
-    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
 }
 
-test "fd-write-after-close: close inside catch block (diverges) is skipped" {
-    const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+test "close inside catch block (diverges) is skipped" {
+    try testing.expectNoFire(check,
         \\const std = @import("std");
         \\pub fn ok(dir: std.fs.Dir) !void {
         \\    const file = try dir.createFile("x", .{});
@@ -228,30 +206,22 @@ test "fd-write-after-close: close inside catch block (diverges) is skipped" {
         \\    };
         \\    try file.writeAll("b");
         \\}
-        \\
     );
-    defer freeProblems(gpa, &problems);
-    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
 }
 
-test "fd-write-after-close: openFile variant caught" {
-    const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+test "openFile variant caught" {
+    try testing.expectFires(check, R,
         \\const std = @import("std");
         \\pub fn buggy(dir: std.fs.Dir) !void {
         \\    const file = try dir.openFile("x", .{});
         \\    file.close();
         \\    _ = try file.read(undefined);
         \\}
-        \\
     );
-    defer freeProblems(gpa, &problems);
-    try std.testing.expectEqual(@as(usize, 1), problems.items.len);
 }
 
-test "fd-write-after-close: field access (file.handle) after close fires" {
-    const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+test "field access (file.handle) after close fires" {
+    try testing.expectFires(check, R,
         \\const std = @import("std");
         \\pub fn buggy(dir: std.fs.Dir) !void {
         \\    const file = try dir.createFile("x", .{});
@@ -259,15 +229,11 @@ test "fd-write-after-close: field access (file.handle) after close fires" {
         \\    const h = file.handle;
         \\    _ = h;
         \\}
-        \\
     );
-    defer freeProblems(gpa, &problems);
-    try std.testing.expectEqual(@as(usize, 1), problems.items.len);
 }
 
-test "fd-write-after-close: shadowed name in sibling scope doesn't fire" {
-    const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+test "shadowed name in sibling scope doesn't fire" {
+    try testing.expectNoFire(check,
         \\const std = @import("std");
         \\pub fn ok(dir: std.fs.Dir, files: []std.fs.File) !void {
         \\    {
@@ -278,8 +244,5 @@ test "fd-write-after-close: shadowed name in sibling scope doesn't fire" {
         \\        _ = file;
         \\    }
         \\}
-        \\
     );
-    defer freeProblems(gpa, &problems);
-    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
 }

@@ -7,19 +7,24 @@
 const std = @import("std");
 const Ast = std.zig.Ast;
 
-const sdk = @import("../analysis.zig");
+const lexer = @import("../lexer.zig");
+const scope = @import("../scope.zig");
+const problem = @import("../problem.zig");
+const testing = @import("../testing.zig");
 const config_mod = @import("../config.zig");
+
+const TokenIndex = lexer.TokenIndex;
 
 pub fn check(
     gpa: std.mem.Allocator,
     tree: *const Ast,
     config: *const config_mod.Config,
-    problems: *std.ArrayListUnmanaged(sdk.Problem),
+    problems: *std.ArrayListUnmanaged(problem.Problem),
 ) !void {
     if (!config_mod.isEnabled(config, .self_undefined_after_destroy)) return;
 
     var proto_buf: [1]Ast.Node.Index = undefined;
-    var fns = sdk.iterFnDecls(tree);
+    var fns = lexer.iterFnDecls(tree);
     while (fns.next(&proto_buf)) |fn_entry| {
         try checkBody(gpa, tree, fn_entry.body, problems);
     }
@@ -29,13 +34,13 @@ fn checkBody(
     gpa: std.mem.Allocator,
     tree: *const Ast,
     body: Ast.Node.Index,
-    problems: *std.ArrayListUnmanaged(sdk.Problem),
+    problems: *std.ArrayListUnmanaged(problem.Problem),
 ) !void {
     const tags = tree.tokens.items(.tag);
     const first = tree.firstToken(body);
     const last = tree.lastToken(body);
 
-    var walk = sdk.BodyWalk.init(tags, first, last);
+    var walk = scope.BodyWalk.init(tags, first, last);
     while (walk.t + 4 <= last) : (walk.t += 1) {
         if (walk.atNestedFn()) {
             walk.skipNestedFn();
@@ -58,7 +63,7 @@ fn checkBody(
         // Defensive: skip `<name>.destroy(<name>)` (nonsense).
         if (t >= 2 and tags[t - 2] == .identifier and
             std.mem.eql(u8, tree.tokenSlice(t - 2), x_name)) continue;
-        const sc = sdk.findStmtSemicolon(tags, t + 4, last) orelse continue;
+        const sc = lexer.findStmtSemicolon(tags, t + 4, last) orelse continue;
         const write_tok = findWriteThroughX(tree, sc + 1, last, x_name) orelse {
             walk.t = sc;
             continue;
@@ -74,21 +79,21 @@ fn checkBody(
 /// reassignment of `<X>`.
 fn findWriteThroughX(
     tree: *const Ast,
-    start: sdk.TokenIndex,
-    last: sdk.TokenIndex,
+    start: TokenIndex,
+    last: TokenIndex,
     x_name: []const u8,
-) ?sdk.TokenIndex {
+) ?TokenIndex {
     const tags = tree.tokens.items(.tag);
     if (start > last) return null;
-    var t: sdk.TokenIndex = start;
+    var t: TokenIndex = start;
     while (t + 2 <= last) : (t += 1) {
         if (tags[t] == .l_brace) {
-            t = sdk.matchBrace(tags, t, last) orelse return null;
+            t = lexer.matchBrace(tags, t, last) orelse return null;
             continue;
         }
         if (tags[t] == .r_brace) return null;
         if (tags[t] == .keyword_defer or tags[t] == .keyword_errdefer) {
-            t = sdk.skipDeferStmt(tags, t, last) orelse return null;
+            t = lexer.skipDeferStmt(tags, t, last) orelse return null;
             continue;
         }
         if (tags[t] != .identifier) continue;
@@ -112,9 +117,9 @@ fn findWriteThroughX(
 
 fn report(
     gpa: std.mem.Allocator,
-    problems: *std.ArrayListUnmanaged(sdk.Problem),
+    problems: *std.ArrayListUnmanaged(problem.Problem),
     tree: *const Ast,
-    write_tok: sdk.TokenIndex,
+    write_tok: TokenIndex,
     x_name: []const u8,
     method: []const u8,
 ) !void {
@@ -128,32 +133,18 @@ fn report(
     try problems.append(gpa, .{
         .rule_id = "self-undefined-after-destroy",
         .severity = .@"error",
-        .start = sdk.Pos.fromTokenStart(tree, write_tok),
-        .end = sdk.Pos.fromTokenEnd(tree, write_tok),
+        .start = problem.Pos.fromTokenStart(tree, write_tok),
+        .end = problem.Pos.fromTokenEnd(tree, write_tok),
         .message = msg,
     });
 }
 
 // ── Tests ──────────────────────────────────────────────────
 
-fn runOn(gpa: std.mem.Allocator, src: []const u8) !std.ArrayListUnmanaged(sdk.Problem) {
-    const src_z = try gpa.dupeSentinel(u8, src, 0);
-    defer gpa.free(src_z);
-    var tree = try Ast.parse(gpa, src_z, .zig);
-    defer tree.deinit(gpa);
-    var problems: std.ArrayListUnmanaged(sdk.Problem) = .empty;
-    try check(gpa, &tree, &config_mod.Default, &problems);
-    return problems;
-}
+const R = "self-undefined-after-destroy";
 
-fn freeProblems(gpa: std.mem.Allocator, p: *std.ArrayListUnmanaged(sdk.Problem)) void {
-    for (p.items) |*x| x.deinit(gpa);
-    p.deinit(gpa);
-}
-
-test "self-undefined-after-destroy: TigerBeetle inspect.zig pattern fires" {
-    const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+test "TigerBeetle inspect.zig pattern fires" {
+    try testing.expectFires(check, R,
         \\const std = @import("std");
         \\const Inspector = struct {
         \\    allocator: std.mem.Allocator,
@@ -162,16 +153,11 @@ test "self-undefined-after-destroy: TigerBeetle inspect.zig pattern fires" {
         \\        inspector.* = undefined;
         \\    }
         \\};
-        \\
     );
-    defer freeProblems(gpa, &problems);
-    try std.testing.expectEqual(@as(usize, 1), problems.items.len);
-    try std.testing.expectEqualStrings("self-undefined-after-destroy", problems.items[0].rule_id);
 }
 
-test "self-undefined-after-destroy: correct order (undefined THEN destroy) doesn't fire" {
-    const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+test "correct order (undefined THEN destroy) doesn't fire" {
+    try testing.expectNoFire(check,
         \\const std = @import("std");
         \\const Inspector = struct {
         \\    allocator: std.mem.Allocator,
@@ -180,15 +166,11 @@ test "self-undefined-after-destroy: correct order (undefined THEN destroy) doesn
         \\        inspector.allocator.destroy(inspector);
         \\    }
         \\};
-        \\
     );
-    defer freeProblems(gpa, &problems);
-    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
 }
 
-test "self-undefined-after-destroy: field write after destroy fires" {
-    const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+test "field write after destroy fires" {
+    try testing.expectFires(check, R,
         \\const std = @import("std");
         \\const T = struct {
         \\    flag: bool = false,
@@ -197,15 +179,11 @@ test "self-undefined-after-destroy: field write after destroy fires" {
         \\        self.flag = true;
         \\    }
         \\};
-        \\
     );
-    defer freeProblems(gpa, &problems);
-    try std.testing.expectEqual(@as(usize, 1), problems.items.len);
 }
 
-test "self-undefined-after-destroy: reassignment of X stops the scan" {
-    const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+test "reassignment of X stops the scan" {
+    try testing.expectNoFire(check,
         \\const std = @import("std");
         \\const T = struct {
         \\    pub fn rebind(self: *T, alloc: std.mem.Allocator) !void {
@@ -214,15 +192,11 @@ test "self-undefined-after-destroy: reassignment of X stops the scan" {
         \\        _ = self_new;
         \\    }
         \\};
-        \\
     );
-    defer freeProblems(gpa, &problems);
-    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
 }
 
-test "self-undefined-after-destroy: destroy inside defer is skipped" {
-    const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+test "destroy inside defer is skipped" {
+    try testing.expectNoFire(check,
         \\const std = @import("std");
         \\const T = struct {
         \\    pub fn work(self: *T, alloc: std.mem.Allocator) void {
@@ -230,8 +204,5 @@ test "self-undefined-after-destroy: destroy inside defer is skipped" {
         \\        self.* = .{};
         \\    }
         \\};
-        \\
     );
-    defer freeProblems(gpa, &problems);
-    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
 }

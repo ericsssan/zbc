@@ -784,6 +784,9 @@ test {
     _ = move_out_without_restore_mod;
     _ = deinit_order_violates_construction_dep_mod;
     _ = borrowed_slice_into_stack_buffer_returned_mod;
-    _ = @import("analysis.zig");
+    _ = @import("lexer.zig");
+    _ = @import("scope.zig");
+    _ = @import("receiver.zig");
+    _ = @import("testing.zig");
     std.testing.refAllDecls(@This());
 }

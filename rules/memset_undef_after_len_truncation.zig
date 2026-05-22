@@ -12,19 +12,24 @@
 const std = @import("std");
 const Ast = std.zig.Ast;
 
-const sdk = @import("../analysis.zig");
+const lexer = @import("../lexer.zig");
+const scope = @import("../scope.zig");
+const problem = @import("../problem.zig");
+const testing = @import("../testing.zig");
 const config_mod = @import("../config.zig");
+
+const TokenIndex = lexer.TokenIndex;
 
 pub fn check(
     gpa: std.mem.Allocator,
     tree: *const Ast,
     config: *const config_mod.Config,
-    problems: *std.ArrayListUnmanaged(sdk.Problem),
+    problems: *std.ArrayListUnmanaged(problem.Problem),
 ) !void {
     if (!config_mod.isEnabled(config, .memset_undef_after_len_truncation)) return;
 
     var proto_buf: [1]Ast.Node.Index = undefined;
-    var fns = sdk.iterFnDecls(tree);
+    var fns = lexer.iterFnDecls(tree);
     while (fns.next(&proto_buf)) |fn_entry| {
         try checkBody(gpa, tree, fn_entry.body, problems);
     }
@@ -34,13 +39,13 @@ fn checkBody(
     gpa: std.mem.Allocator,
     tree: *const Ast,
     body: Ast.Node.Index,
-    problems: *std.ArrayListUnmanaged(sdk.Problem),
+    problems: *std.ArrayListUnmanaged(problem.Problem),
 ) !void {
     const tags = tree.tokens.items(.tag);
     const first = tree.firstToken(body);
     const last = tree.lastToken(body);
 
-    var walk = sdk.BodyWalk.init(tags, first, last);
+    var walk = scope.BodyWalk.init(tags, first, last);
     while (walk.t + 5 <= last) : (walk.t += 1) {
         if (walk.atNestedFn()) {
             walk.skipNestedFn();
@@ -57,7 +62,7 @@ fn checkBody(
         if (t + 5 > last or tags[t + 5] != .equal) continue;
         const x_name = tree.tokenSlice(t);
         const field_name = tree.tokenSlice(t + 2);
-        const sc = sdk.findStmtSemicolon(tags, t + 6, last) orelse continue;
+        const sc = lexer.findStmtSemicolon(tags, t + 6, last) orelse continue;
         const memset_tok = findMemsetOnSlice(tree, sc + 1, last, x_name, field_name) orelse {
             walk.t = sc;
             continue;
@@ -71,14 +76,14 @@ fn checkBody(
 /// target slice.
 fn findMemsetOnSlice(
     tree: *const Ast,
-    start: sdk.TokenIndex,
-    last: sdk.TokenIndex,
+    start: TokenIndex,
+    last: TokenIndex,
     x_name: []const u8,
     field_name: []const u8,
-) ?sdk.TokenIndex {
+) ?TokenIndex {
     const tags = tree.tokens.items(.tag);
     if (start > last) return null;
-    var t: sdk.TokenIndex = start;
+    var t: TokenIndex = start;
     while (t + 4 <= last) : (t += 1) {
         if (tags[t] == .r_brace) return null;
         if (tags[t] != .builtin) continue;
@@ -96,9 +101,9 @@ fn findMemsetOnSlice(
 
 fn report(
     gpa: std.mem.Allocator,
-    problems: *std.ArrayListUnmanaged(sdk.Problem),
+    problems: *std.ArrayListUnmanaged(problem.Problem),
     tree: *const Ast,
-    memset_tok: sdk.TokenIndex,
+    memset_tok: TokenIndex,
     x_name: []const u8,
     field_name: []const u8,
 ) !void {
@@ -112,32 +117,18 @@ fn report(
     try problems.append(gpa, .{
         .rule_id = "memset-undef-after-len-truncation",
         .severity = .@"error",
-        .start = sdk.Pos.fromTokenStart(tree, memset_tok),
-        .end = sdk.Pos.fromTokenEnd(tree, memset_tok),
+        .start = problem.Pos.fromTokenStart(tree, memset_tok),
+        .end = problem.Pos.fromTokenEnd(tree, memset_tok),
         .message = msg,
     });
 }
 
 // ── Tests ──────────────────────────────────────────────────
 
-fn runOn(gpa: std.mem.Allocator, src: []const u8) !std.ArrayListUnmanaged(sdk.Problem) {
-    const src_z = try gpa.dupeSentinel(u8, src, 0);
-    defer gpa.free(src_z);
-    var tree = try Ast.parse(gpa, src_z, .zig);
-    defer tree.deinit(gpa);
-    var problems: std.ArrayListUnmanaged(sdk.Problem) = .empty;
-    try check(gpa, &tree, &config_mod.Default, &problems);
-    return problems;
-}
+const R = "memset-undef-after-len-truncation";
 
-fn freeProblems(gpa: std.mem.Allocator, p: *std.ArrayListUnmanaged(sdk.Problem)) void {
-    for (p.items) |*x| x.deinit(gpa);
-    p.deinit(gpa);
-}
-
-test "memset-undef-after-len: shrink-then-memset (canonical bug) fires" {
-    const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+test "shrink-then-memset (canonical bug) fires" {
+    try testing.expectFires(check, R,
         \\const T = struct {
         \\    items: []u8,
         \\    pub fn shrink(self: *T, new_len: usize) void {
@@ -145,16 +136,11 @@ test "memset-undef-after-len: shrink-then-memset (canonical bug) fires" {
         \\        @memset(self.items[new_len..], undefined);
         \\    }
         \\};
-        \\
     );
-    defer freeProblems(gpa, &problems);
-    try std.testing.expectEqual(@as(usize, 1), problems.items.len);
-    try std.testing.expectEqualStrings("memset-undef-after-len-truncation", problems.items[0].rule_id);
 }
 
-test "memset-undef-after-len: clear-then-memset-all (clearRetainingCapacity bug) fires" {
-    const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+test "clear-then-memset-all (clearRetainingCapacity bug) fires" {
+    try testing.expectFires(check, R,
         \\const T = struct {
         \\    items: []u8,
         \\    pub fn clear(self: *T) void {
@@ -162,15 +148,11 @@ test "memset-undef-after-len: clear-then-memset-all (clearRetainingCapacity bug)
         \\        @memset(self.items, undefined);
         \\    }
         \\};
-        \\
     );
-    defer freeProblems(gpa, &problems);
-    try std.testing.expectEqual(@as(usize, 1), problems.items.len);
 }
 
-test "memset-undef-after-len: memset BEFORE truncation (correct order) doesn't fire" {
-    const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+test "memset BEFORE truncation (correct order) doesn't fire" {
+    try testing.expectNoFire(check,
         \\const T = struct {
         \\    items: []u8,
         \\    pub fn shrinkFixed(self: *T, new_len: usize) void {
@@ -178,15 +160,11 @@ test "memset-undef-after-len: memset BEFORE truncation (correct order) doesn't f
         \\        self.items.len = new_len;
         \\    }
         \\};
-        \\
     );
-    defer freeProblems(gpa, &problems);
-    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
 }
 
-test "memset-undef-after-len: memset on a different field doesn't fire" {
-    const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+test "memset on a different field doesn't fire" {
+    try testing.expectNoFire(check,
         \\const T = struct {
         \\    items: []u8,
         \\    other: []u8,
@@ -195,8 +173,5 @@ test "memset-undef-after-len: memset on a different field doesn't fire" {
         \\        @memset(self.other, undefined);
         \\    }
         \\};
-        \\
     );
-    defer freeProblems(gpa, &problems);
-    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
 }
