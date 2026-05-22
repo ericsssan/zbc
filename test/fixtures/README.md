@@ -44,6 +44,7 @@ Bun's.
 | `return_borrowed_payload.zig` | `return-borrowed-payload` | [ghostty-org/ghostty#8358](https://github.com/ghostty-org/ghostty/pull/8358), [ghostty-org/ghostty#7711](https://github.com/ghostty-org/ghostty/pull/7711) |
 | `unreleased_factory_handle.zig` | `unreleased-factory-handle` | hexops/mach `ca08255e` + `3d4888f4` commits (mined; canonical class, no PR — Mach mirror has issues disabled) |
 | `memset_undef_after_len_truncation.zig` | `memset-undef-after-len-truncation` | [ziglang/zig#25810](https://github.com/ziglang/zig/pull/25810), [ziglang/zig#25832](https://github.com/ziglang/zig/pull/25832) |
+| `publish_then_touch_self.zig` | `publish-then-touch-self` | [oven-sh/bun#29128](https://github.com/oven-sh/bun/pull/29128), [oven-sh/bun#31177](https://github.com/oven-sh/bun/pull/31177), [oven-sh/bun#30185](https://github.com/oven-sh/bun/pull/30185) |
 
 ## Re-fetching the actual pre-merge buggy files
 

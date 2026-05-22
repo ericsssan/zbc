@@ -37,6 +37,7 @@ const reset_skips_pooled_resource_release_mod = @import("reset_skips_pooled_reso
 const return_borrowed_payload_mod = @import("return_borrowed_payload.zig");
 const unreleased_factory_handle_mod = @import("unreleased_factory_handle.zig");
 const memset_undef_after_len_truncation_mod = @import("memset_undef_after_len_truncation.zig");
+const publish_then_touch_self_mod = @import("publish_then_touch_self.zig");
 const rule_catalog_mod = @import("rule_catalog.zig");
 
 pub const Config = config_mod.Config;
@@ -250,6 +251,10 @@ pub fn analyzeEscape(
     // @memset(<X>.<field>..., undefined);` — memset runs on the
     // already-truncated empty slice, becoming a no-op.
     try memset_undef_after_len_truncation_mod.check(gpa, &tree, config, &problems);
+
+    // Publish-then-touch-self — `queue.push(this);` then `this.field`
+    // — consumer thread may have freed `this` before access.
+    try publish_then_touch_self_mod.check(gpa, &tree, config, &problems);
 
     return problems.toOwnedSlice(gpa);
 }
@@ -722,5 +727,6 @@ test {
     _ = return_borrowed_payload_mod;
     _ = unreleased_factory_handle_mod;
     _ = memset_undef_after_len_truncation_mod;
+    _ = publish_then_touch_self_mod;
     std.testing.refAllDecls(@This());
 }

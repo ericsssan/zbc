@@ -204,6 +204,11 @@ pub const all = [_]Rule{
         .title = "`@memset(<X>.<field>..., undefined)` AFTER `<X>.<field>.len = ...` truncation — memset is a no-op on the now-empty slice",
         .body = @embedFile("rules/memset-undef-after-len-truncation.md"),
     },
+    .{
+        .id = "publish-then-touch-self",
+        .title = "use of `this`/`self` after publishing it to a concurrent queue — consumer thread may have freed it",
+        .body = @embedFile("rules/publish-then-touch-self.md"),
+    },
 };
 
 /// Look up a rule by id.  Returns null on unknown id so callers can

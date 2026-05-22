@@ -327,9 +327,17 @@ pub const Invariant = enum {
     /// bytes, defeating Zig's `undefined` use-after-shrink safety.
     /// Catches ziglang/zig#25810 + #25832 class.
     memset_undef_after_len_truncation,
+    /// `<chain>.<publish-method>(this);` (or `(self)`) where the
+    /// chain or method suggests concurrent / cross-thread dispatch
+    /// (`queue.push`, `thread_pool.dispatch`, `enqueueTaskConcurrent`,
+    /// etc.), followed by any further use of `this`/`self` in the
+    /// same scope.  The consumer thread may have freed `this`
+    /// before the access lands → cross-thread UAF.  Catches
+    /// oven-sh/bun#29128 + #31177 + #30185 class.
+    publish_then_touch_self,
 };
 
-pub const all_invariants: [35]Invariant = .{
+pub const all_invariants: [36]Invariant = .{
     .arena_escape,
     .stack_escape,
     .use_undefined,
@@ -365,6 +373,7 @@ pub const all_invariants: [35]Invariant = .{
     .return_borrowed_payload,
     .unreleased_factory_handle,
     .memset_undef_after_len_truncation,
+    .publish_then_touch_self,
 };
 
 pub const Default: Config = .{};
