@@ -22,24 +22,25 @@ const problem = @import("../problem.zig");
 const testing = @import("../testing.zig");
 const trace = @import("../trace.zig");
 const config_mod = @import("../config.zig");
+const file_cache_mod = @import("../file_cache.zig");
 
 const R = "owned-field-no-outer-cleanup";
 
 pub fn check(
     gpa: std.mem.Allocator,
     tree: *const Ast,
+    cache: *file_cache_mod.FileCache,
     config: *const config_mod.Config,
     problems: *std.ArrayListUnmanaged(problem.Problem),
 ) !void {
     if (!config_mod.isEnabled(config, .owned_field_no_outer_cleanup)) return;
 
-    var model = try fmodel.build(gpa, tree);
-    defer model.deinit();
+    const model = try cache.fileModel();
 
     // Find all structs that lack ANY cleanup method.  The
     // missing-deinit-on-composed-owner rule covers the case where
     // a cleanup method DOES exist but forgets the field.
-    const outers = try mq.findTypes(gpa, &model, .{
+    const outers = try mq.findTypes(gpa, model, .{
         .kind = .struct_,
         .no_method = .{ .name_pred = isCleanupName },
     });
@@ -49,7 +50,7 @@ pub fn check(
         // Find the first value-typed field whose type has a cleanup
         // method.  Only one fire per outer (the design gap is the
         // missing method, not the field count).
-        const fields = try mq.findFields(gpa, &model, tree, outer, .{
+        const fields = try mq.findFields(gpa, model, tree, outer, .{
             .value_typed = true,
             .type_matches = .{ .has_method = .{ .name_pred = isCleanupName } },
         });
@@ -57,7 +58,7 @@ pub fn check(
 
         if (fields.len == 0) continue;
         const field = fields[0];
-        const inner = mq.resolveFieldType(tree, &model, field).?;
+        const inner = mq.resolveFieldType(tree, model, field).?;
         trace.match(R, tree, field.name_token, "owned field with no outer cleanup");
         try report(gpa, problems, tree, outer.name, field.name_token, field.name, inner.name);
     }

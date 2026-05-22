@@ -15,6 +15,7 @@ const query = @import("../query.zig");
 const problem = @import("../problem.zig");
 const testing = @import("../testing.zig");
 const config_mod = @import("../config.zig");
+const file_cache_mod = @import("../file_cache.zig");
 
 const Atom = query.Atom;
 const R = "self-undefined-after-destroy";
@@ -48,10 +49,12 @@ const rebind_x = &[_]Atom{
 pub fn check(
     gpa: std.mem.Allocator,
     tree: *const Ast,
+    cache: *file_cache_mod.FileCache,
     config: *const config_mod.Config,
     problems: *std.ArrayListUnmanaged(problem.Problem),
 ) !void {
     if (!config_mod.isEnabled(config, .self_undefined_after_destroy)) return;
+    _ = cache;
     try lexer.forEachFnBody(gpa, tree, problems, checkBody);
 }
 

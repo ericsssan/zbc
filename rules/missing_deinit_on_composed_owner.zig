@@ -23,22 +23,23 @@ const query = @import("../query.zig");
 const problem = @import("../problem.zig");
 const testing = @import("../testing.zig");
 const config_mod = @import("../config.zig");
+const file_cache_mod = @import("../file_cache.zig");
 
 const R = "missing-deinit-on-composed-owner";
 
 pub fn check(
     gpa: std.mem.Allocator,
     tree: *const Ast,
+    cache: *file_cache_mod.FileCache,
     config: *const config_mod.Config,
     problems: *std.ArrayListUnmanaged(problem.Problem),
 ) !void {
     if (!config_mod.isEnabled(config, .missing_deinit_on_composed_owner)) return;
 
-    var model = try fmodel.build(gpa, tree);
-    defer model.deinit();
+    const model = try cache.fileModel();
 
     // Find all structs that have a `deinit` method.
-    const outers = try mq.findTypes(gpa, &model, .{
+    const outers = try mq.findTypes(gpa, model, .{
         .kind = .struct_,
         .has_method = .{ .name_eq = "deinit" },
     });
@@ -49,7 +50,7 @@ pub fn check(
 
         // Find this struct's value-typed fields whose declared type
         // is a struct in this file that exposes a cleanup method.
-        const fields = try mq.findFields(gpa, &model, tree, outer, .{
+        const fields = try mq.findFields(gpa, model, tree, outer, .{
             .value_typed = true,
             .type_matches = .{ .has_method = .{ .name_pred = isCleanupName } },
         });
@@ -69,7 +70,7 @@ pub fn check(
             };
             if (mq.methodBodyContains(tree, deinit, cleanup_call)) continue;
 
-            const ti = mq.resolveFieldType(tree, &model, field).?;
+            const ti = mq.resolveFieldType(tree, model, field).?;
             try report(gpa, problems, tree, field.name_token, field.name, ti.name);
         }
     }

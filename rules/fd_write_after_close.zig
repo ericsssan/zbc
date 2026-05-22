@@ -16,6 +16,7 @@ const problem = @import("../problem.zig");
 const testing = @import("../testing.zig");
 const trace = @import("../trace.zig");
 const config_mod = @import("../config.zig");
+const file_cache_mod = @import("../file_cache.zig");
 
 const Atom = query.Atom;
 const R = "fd-write-after-close";
@@ -48,10 +49,12 @@ const use_of_x = &[_]Atom{.{ .ref = 0 }};
 pub fn check(
     gpa: std.mem.Allocator,
     tree: *const Ast,
+    cache: *file_cache_mod.FileCache,
     config: *const config_mod.Config,
     problems: *std.ArrayListUnmanaged(problem.Problem),
 ) !void {
     if (!config_mod.isEnabled(config, .fd_write_after_close)) return;
+    _ = cache;
     try lexer.forEachFnBody(gpa, tree, problems, checkBody);
 }
 

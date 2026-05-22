@@ -15,14 +15,17 @@ const Ast = std.zig.Ast;
 const config_mod = @import("config.zig");
 const problem_mod = @import("problem.zig");
 const annotations_mod = @import("annotations.zig");
+const file_cache = @import("file_cache.zig");
 
 const Problem = problem_mod.Problem;
 const Config = config_mod.Config;
 const Db = annotations_mod.Db;
+const FileCache = file_cache.FileCache;
 
 pub const CheckPlain = *const fn (
     std.mem.Allocator,
     *const Ast,
+    *FileCache,
     *const Config,
     *std.ArrayListUnmanaged(Problem),
 ) anyerror!void;
@@ -31,6 +34,7 @@ pub const CheckWithDb = *const fn (
     std.mem.Allocator,
     *const Ast,
     *const Db,
+    *FileCache,
     *const Config,
     *std.ArrayListUnmanaged(Problem),
 ) anyerror!void;
@@ -125,18 +129,21 @@ pub const escape_rules = [_]Rule{
 };
 
 /// Dispatch all registered escape rules against `tree`.
-/// Run after CFG/analyzer populates `db`.
+/// Run after CFG/analyzer populates `db`.  `cache` is amortized
+/// per-file shared state — rules borrow FileModel + LocalBindings
+/// from it instead of building their own copies.
 pub fn runEscape(
     gpa: std.mem.Allocator,
     tree: *const Ast,
     db: *const Db,
+    cache: *FileCache,
     config: *const Config,
     problems: *std.ArrayListUnmanaged(Problem),
 ) !void {
     for (escape_rules) |rule| {
         switch (rule.check) {
-            .plain => |fp| try fp(gpa, tree, config, problems),
-            .with_db => |fp| try fp(gpa, tree, db, config, problems),
+            .plain => |fp| try fp(gpa, tree, cache, config, problems),
+            .with_db => |fp| try fp(gpa, tree, db, cache, config, problems),
         }
     }
 }

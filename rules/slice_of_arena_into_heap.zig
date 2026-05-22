@@ -27,6 +27,7 @@ const receiver = @import("../receiver.zig");
 const problem_mod = @import("../problem.zig");
 const testing = @import("../testing.zig");
 const config_mod = @import("../config.zig");
+const file_cache_mod = @import("../file_cache.zig");
 
 const Problem = problem_mod.Problem;
 const Pos = problem_mod.Pos;
@@ -64,11 +65,12 @@ const store_call = &[_]Atom{
 pub fn check(
     gpa: std.mem.Allocator,
     tree: *const Ast,
+    cache: *file_cache_mod.FileCache,
     config: *const config_mod.Config,
     problems: *std.ArrayListUnmanaged(Problem),
 ) !void {
     if (!config_mod.isEnabled(config, .slice_of_arena_into_heap)) return;
-    try lexer.forEachFn(gpa, tree, problems, checkFn);
+    try lexer.forEachFnCached(gpa, tree, cache, problems, checkFn);
 }
 
 const ArenaVar = struct {
@@ -89,6 +91,7 @@ const ArenaSlice = struct {
 fn checkFn(
     gpa: std.mem.Allocator,
     tree: *const Ast,
+    cache: *file_cache_mod.FileCache,
     proto: Ast.full.FnProto,
     body: Ast.Node.Index,
     problems: *std.ArrayListUnmanaged(Problem),
@@ -102,8 +105,7 @@ fn checkFn(
     // that have no arena.
     if (!lexer.hasIdentInRange(tree, body_first, body_last, "ArenaAllocator")) return;
 
-    var bindings = try local.build(gpa, tree, proto, body);
-    defer bindings.deinit();
+    const bindings = try cache.localBindings(proto, body);
 
     // Fused pass: classify each binding as arena / handle / slice.
     var arenas: std.ArrayListUnmanaged(ArenaVar) = .empty;

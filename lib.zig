@@ -12,6 +12,7 @@ const config_mod = @import("config.zig");
 const problem_mod = @import("problem.zig");
 const rule_registry = @import("rule_registry.zig");
 const rule_catalog_mod = @import("rule_catalog.zig");
+const file_cache_mod = @import("file_cache.zig");
 
 const require_borrowed_from = @import("rules/require_borrowed_from.zig");
 
@@ -103,7 +104,11 @@ pub fn analyzeEscape(
 
     // Pattern detectors — dispatched via the comptime registry so
     // adding a rule is a one-file change (see rule_registry.zig).
-    try rule_registry.runEscape(gpa, &tree, &db, config, &problems);
+    // The cache amortizes FileModel + per-fn LocalBindings across
+    // rules that consume them.
+    var rule_cache = file_cache_mod.FileCache.init(gpa, &tree);
+    defer rule_cache.deinit();
+    try rule_registry.runEscape(gpa, &tree, &db, &rule_cache, config, &problems);
 
     return problems.toOwnedSlice(gpa);
 }
@@ -553,6 +558,7 @@ test {
     // Pattern rules — registered in rule_registry; pulling it in
     // refAllDecls'es every rule module so inline tests run.
     _ = rule_registry;
+    _ = file_cache_mod;
     _ = @import("lexer.zig");
     _ = @import("scope.zig");
     _ = @import("receiver.zig");

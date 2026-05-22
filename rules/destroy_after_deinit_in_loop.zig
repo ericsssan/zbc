@@ -23,6 +23,7 @@ const local = @import("../local.zig");
 const annotations_mod = @import("../annotations.zig");
 const problem_mod = @import("../problem.zig");
 const config_mod = @import("../config.zig");
+const file_cache_mod = @import("../file_cache.zig");
 const testing = @import("../testing.zig");
 
 const Db = annotations_mod.Db;
@@ -35,6 +36,7 @@ const bodyOf = lexer.bodyOf;
 pub fn check(
     gpa: std.mem.Allocator,
     tree: *const Ast,
+    cache: *file_cache_mod.FileCache,
     config: *const config_mod.Config,
     problems: *std.ArrayListUnmanaged(Problem),
 ) !void {
@@ -44,13 +46,14 @@ pub fn check(
     var fns = lexer.iterFnDecls(tree);
     while (fns.next(&proto_buf)) |fn_entry| {
         if (!isDestructorName(tree.tokenSlice(fn_entry.name_token))) continue;
-        try checkFn(gpa, tree, fn_entry.proto, fn_entry.body, problems);
+        try checkFn(gpa, tree, cache, fn_entry.proto, fn_entry.body, problems);
     }
 }
 
 fn checkFn(
     gpa: std.mem.Allocator,
     tree: *const Ast,
+    cache: *file_cache_mod.FileCache,
     proto: Ast.full.FnProto,
     body: Ast.Node.Index,
     problems: *std.ArrayListUnmanaged(Problem),
@@ -58,8 +61,7 @@ fn checkFn(
     const tags = tree.tokens.items(.tag);
     const last = tree.lastToken(body);
 
-    var bindings = try local.build(gpa, tree, proto, body);
-    defer bindings.deinit();
+    const bindings = try cache.localBindings(proto, body);
 
     for (bindings.items) |b| {
         if (b.origin != .loop_capture) continue;
@@ -277,7 +279,9 @@ fn runOn(gpa: std.mem.Allocator, src: []const u8) !std.ArrayListUnmanaged(Proble
     var tree = try Ast.parse(gpa, src_z, .zig);
     defer tree.deinit(gpa);
     var problems: std.ArrayListUnmanaged(Problem) = .empty;
-    try check(gpa, &tree, &config_mod.Default, &problems);
+    var cache = file_cache_mod.FileCache.init(gpa, &tree);
+    defer cache.deinit();
+    try check(gpa, &tree, &cache, &config_mod.Default, &problems);
     return problems;
 }
 

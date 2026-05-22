@@ -350,6 +350,23 @@ pub fn forEachFn(
     }
 }
 
+/// As `forEachFn` but threads a per-file `cache` to the callback.
+/// Use when the rule wants amortized LocalBindings via
+/// `cache.localBindings(proto, body)`.
+pub fn forEachFnCached(
+    gpa: std.mem.Allocator,
+    tree: *const Ast,
+    cache: anytype,
+    problems: anytype,
+    comptime callback: anytype,
+) !void {
+    var proto_buf: [1]Ast.Node.Index = undefined;
+    var fns = iterFnDecls(tree);
+    while (fns.next(&proto_buf)) |fn_entry| {
+        try callback(gpa, tree, cache, fn_entry.proto, fn_entry.body, problems);
+    }
+}
+
 // ── Tests ──────────────────────────────────────────────────
 
 test "matchBrace pairs simple braces" {

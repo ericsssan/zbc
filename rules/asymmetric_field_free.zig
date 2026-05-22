@@ -24,6 +24,7 @@ const Ast = std.zig.Ast;
 const annotations_mod = @import("../annotations.zig");
 const problem_mod = @import("../problem.zig");
 const config_mod = @import("../config.zig");
+const file_cache_mod = @import("../file_cache.zig");
 
 const lexer = @import("../lexer.zig");
 const testing = @import("../testing.zig");
@@ -38,10 +39,12 @@ pub fn check(
     gpa: std.mem.Allocator,
     tree: *const Ast,
     db: *const Db,
+    cache: *file_cache_mod.FileCache,
     config: *const config_mod.Config,
     problems: *std.ArrayListUnmanaged(Problem),
 ) !void {
     if (!config_mod.isEnabled(config, .asymmetric_field_free)) return;
+    _ = cache;
 
     // Build sibling groups per containing type.
     var groups: std.StringHashMapUnmanaged(TypeGroups) = .empty;
@@ -473,7 +476,9 @@ fn runOn(gpa: std.mem.Allocator, src: []const u8) !std.ArrayListUnmanaged(Proble
     var db = try annotations_mod.buildFull(gpa, &tree, null, null);
     defer db.deinit(gpa);
     var problems: std.ArrayListUnmanaged(Problem) = .empty;
-    try check(gpa, &tree, &db, &config_mod.Default, &problems);
+    var cache = file_cache_mod.FileCache.init(gpa, &tree);
+    defer cache.deinit();
+    try check(gpa, &tree, &db, &cache, &config_mod.Default, &problems);
     return problems;
 }
 

@@ -23,6 +23,7 @@ const annotations_mod = @import("../annotations.zig");
 const problem_mod = @import("../problem.zig");
 const testing = @import("../testing.zig");
 const config_mod = @import("../config.zig");
+const file_cache_mod = @import("../file_cache.zig");
 
 const Db = annotations_mod.Db;
 const Problem = problem_mod.Problem;
@@ -33,6 +34,7 @@ pub fn check(
     gpa: std.mem.Allocator,
     tree: *const Ast,
     db: *const Db,
+    cache: *file_cache_mod.FileCache,
     config: *const config_mod.Config,
     problems: *std.ArrayListUnmanaged(Problem),
 ) !void {
@@ -41,7 +43,7 @@ pub fn check(
     var proto_buf: [1]Ast.Node.Index = undefined;
     var fns = lexer.iterFnDecls(tree);
     while (fns.next(&proto_buf)) |fn_entry| {
-        try checkFn(gpa, tree, db, fn_entry.proto, fn_entry.body, problems);
+        try checkFn(gpa, tree, cache, db, fn_entry.proto, fn_entry.body, problems);
     }
 }
 
@@ -57,6 +59,7 @@ const TrackedBinding = struct {
 fn checkFn(
     gpa: std.mem.Allocator,
     tree: *const Ast,
+    cache: *file_cache_mod.FileCache,
     db: *const Db,
     proto: Ast.full.FnProto,
     body: Ast.Node.Index,
@@ -69,8 +72,7 @@ fn checkFn(
     const last = tree.lastToken(body);
     if (!lexer.hasTokenInRange(tags, first, last, .keyword_try)) return;
 
-    var bindings = try local.build(gpa, tree, proto, body);
-    defer bindings.deinit();
+    const bindings = try cache.localBindings(proto, body);
 
     var tracked: std.ArrayListUnmanaged(TrackedBinding) = .empty;
     defer tracked.deinit(gpa);
@@ -291,7 +293,9 @@ fn runOn(gpa: std.mem.Allocator, src: []const u8) !std.ArrayListUnmanaged(Proble
     var db = try annotations_mod.buildFull(gpa, &tree, null, null);
     defer db.deinit(gpa);
     var problems: std.ArrayListUnmanaged(Problem) = .empty;
-    try check(gpa, &tree, &db, &config_mod.Default, &problems);
+    var cache = file_cache_mod.FileCache.init(gpa, &tree);
+    defer cache.deinit();
+    try check(gpa, &tree, &db, &cache, &config_mod.Default, &problems);
     return problems;
 }
 

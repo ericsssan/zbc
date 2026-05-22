@@ -13,6 +13,7 @@ const Ast = std.zig.Ast;
 
 const problem_mod = @import("../problem.zig");
 const config_mod = @import("../config.zig");
+const file_cache_mod = @import("../file_cache.zig");
 const testing = @import("../testing.zig");
 
 const Problem = problem_mod.Problem;
@@ -21,10 +22,12 @@ const Pos = problem_mod.Pos;
 pub fn check(
     gpa: std.mem.Allocator,
     tree: *const Ast,
+    cache: *file_cache_mod.FileCache,
     config: *const config_mod.Config,
     problems: *std.ArrayListUnmanaged(Problem),
 ) !void {
     if (!config_mod.isEnabled(config, .realloc_byte_count)) return;
+    _ = cache;
 
     const tags = tree.tokens.items(.tag);
     const last_tok: Ast.TokenIndex = @intCast(tree.tokens.len -| 1);

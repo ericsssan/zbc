@@ -19,6 +19,7 @@ const query = @import("../query.zig");
 const problem_mod = @import("../problem.zig");
 const testing = @import("../testing.zig");
 const config_mod = @import("../config.zig");
+const file_cache_mod = @import("../file_cache.zig");
 
 const Problem = problem_mod.Problem;
 const Pos = problem_mod.Pos;
@@ -36,16 +37,18 @@ const parse_call = &[_]Atom{
 pub fn check(
     gpa: std.mem.Allocator,
     tree: *const Ast,
+    cache: *file_cache_mod.FileCache,
     config: *const config_mod.Config,
     problems: *std.ArrayListUnmanaged(Problem),
 ) !void {
     if (!config_mod.isEnabled(config, .borrowed_slice_into_stack_buffer_returned)) return;
-    try lexer.forEachFn(gpa, tree, problems, checkFn);
+    try lexer.forEachFnCached(gpa, tree, cache, problems, checkFn);
 }
 
 fn checkFn(
     gpa: std.mem.Allocator,
     tree: *const Ast,
+    cache: *file_cache_mod.FileCache,
     proto: Ast.full.FnProto,
     body: Ast.Node.Index,
     problems: *std.ArrayListUnmanaged(Problem),
@@ -57,8 +60,7 @@ fn checkFn(
     // Cheap pre-scan: no return → nothing to escape, no fire possible.
     if (!lexer.hasTokenInRange(tags, first, last, .keyword_return)) return;
 
-    var bindings = try local.build(gpa, tree, proto, body);
-    defer bindings.deinit();
+    const bindings = try cache.localBindings(proto, body);
 
     // Pass 1: stack array locals.
     // Shape: `var <name>: [<...>]<T> = undefined;`.  local.zig doesn't

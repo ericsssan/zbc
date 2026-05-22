@@ -23,6 +23,7 @@ const Ast = std.zig.Ast;
 const annotations_mod = @import("../annotations.zig");
 const problem_mod = @import("../problem.zig");
 const config_mod = @import("../config.zig");
+const file_cache_mod = @import("../file_cache.zig");
 
 const lexer = @import("../lexer.zig");
 const local = @import("../local.zig");
@@ -42,6 +43,7 @@ pub fn check(
     gpa: std.mem.Allocator,
     tree: *const Ast,
     db: *const Db,
+    cache: *file_cache_mod.FileCache,
     config: *const config_mod.Config,
     problems: *std.ArrayListUnmanaged(Problem),
 ) !void {
@@ -51,13 +53,14 @@ pub fn check(
     while (node_idx < tree.nodes.len) : (node_idx += 1) {
         const node: Ast.Node.Index = @enumFromInt(node_idx);
         if (tree.nodeTag(node) != .fn_decl) continue;
-        try checkFn(gpa, tree, db, node, problems);
+        try checkFn(gpa, tree, cache, db, node, problems);
     }
 }
 
 fn checkFn(
     gpa: std.mem.Allocator,
     tree: *const Ast,
+    cache: *file_cache_mod.FileCache,
     db: *const Db,
     fn_decl: Ast.Node.Index,
     problems: *std.ArrayListUnmanaged(Problem),
@@ -83,12 +86,13 @@ fn checkFn(
     const flag_fields = fields_buf[0..field_count];
 
     const body = bodyOf(tree, fn_decl) orelse return;
-    try checkBody(gpa, tree, fn_proto, T, flag_fields, body, problems);
+    try checkBody(gpa, tree, cache, fn_proto, T, flag_fields, body, problems);
 }
 
 fn checkBody(
     gpa: std.mem.Allocator,
     tree: *const Ast,
+    cache: *file_cache_mod.FileCache,
     proto: Ast.full.FnProto,
     type_name: []const u8,
     flag_fields: []const []const u8,
@@ -101,8 +105,7 @@ fn checkBody(
     // ends in `.*` — a bitwise copy from a pointer.  Iterates over
     // local.zig's pre-built bindings instead of re-parsing the
     // var/=/; sequence by hand.
-    var bindings = try local.build(gpa, tree, proto, body);
-    defer bindings.deinit();
+    const bindings = try cache.localBindings(proto, body);
     var dups_buf: [8]Dup = undefined;
     var dup_count: usize = 0;
     for (bindings.items) |b| {
@@ -334,7 +337,9 @@ fn runOn(gpa: std.mem.Allocator, src: []const u8) !std.ArrayListUnmanaged(Proble
     var db = try annotations_mod.buildFull(gpa, &tree, null, null);
     defer db.deinit(gpa);
     var problems: std.ArrayListUnmanaged(Problem) = .empty;
-    try check(gpa, &tree, &db, &config_mod.Default, &problems);
+    var cache = file_cache_mod.FileCache.init(gpa, &tree);
+    defer cache.deinit();
+    try check(gpa, &tree, &db, &cache, &config_mod.Default, &problems);
     return problems;
 }
 

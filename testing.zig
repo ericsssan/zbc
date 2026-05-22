@@ -16,13 +16,18 @@ const Ast = std.zig.Ast;
 
 const config_mod = @import("config.zig");
 const problem = @import("problem.zig");
+const file_cache = @import("file_cache.zig");
 
 const Problem = problem.Problem;
+const FileCache = file_cache.FileCache;
 
-/// Signature every rule's `check` fn satisfies.
+/// Signature every rule's `check` fn satisfies.  `cache` provides
+/// amortized per-file state (FileModel, per-fn LocalBindings); rules
+/// that don't need it can ignore the parameter.
 pub const CheckFn = *const fn (
     gpa: std.mem.Allocator,
     tree: *const Ast,
+    cache: *FileCache,
     config: *const config_mod.Config,
     problems: *std.ArrayListUnmanaged(Problem),
 ) anyerror!void;
@@ -39,8 +44,10 @@ pub fn runRule(
     defer gpa.free(src_z);
     var tree = try Ast.parse(gpa, src_z, .zig);
     defer tree.deinit(gpa);
+    var cache = FileCache.init(gpa, &tree);
+    defer cache.deinit();
     var problems: std.ArrayListUnmanaged(Problem) = .empty;
-    try check_fn(gpa, &tree, &config_mod.Default, &problems);
+    try check_fn(gpa, &tree, &cache, &config_mod.Default, &problems);
     return problems;
 }
 
@@ -56,8 +63,10 @@ pub fn runRuleWithConfig(
     defer gpa.free(src_z);
     var tree = try Ast.parse(gpa, src_z, .zig);
     defer tree.deinit(gpa);
+    var cache = FileCache.init(gpa, &tree);
+    defer cache.deinit();
     var problems: std.ArrayListUnmanaged(Problem) = .empty;
-    try check_fn(gpa, &tree, config, &problems);
+    try check_fn(gpa, &tree, &cache, config, &problems);
     return problems;
 }
 
@@ -141,6 +150,7 @@ const test_rule_fires = struct {
     fn check(
         gpa: std.mem.Allocator,
         tree: *const Ast,
+        _: *FileCache,
         _: *const config_mod.Config,
         problems: *std.ArrayListUnmanaged(Problem),
     ) !void {
@@ -159,6 +169,7 @@ const test_rule_silent = struct {
     fn check(
         _: std.mem.Allocator,
         _: *const Ast,
+        _: *FileCache,
         _: *const config_mod.Config,
         _: *std.ArrayListUnmanaged(Problem),
     ) !void {}

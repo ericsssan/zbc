@@ -32,6 +32,7 @@ const Ast = std.zig.Ast;
 
 const problem_mod = @import("../problem.zig");
 const config_mod = @import("../config.zig");
+const file_cache_mod = @import("../file_cache.zig");
 
 const lexer = @import("../lexer.zig");
 const local = @import("../local.zig");
@@ -49,6 +50,7 @@ const Pos = problem_mod.Pos;
 pub fn check(
     gpa: std.mem.Allocator,
     tree: *const Ast,
+    cache: *file_cache_mod.FileCache,
     config: *const config_mod.Config,
     problems: *std.ArrayListUnmanaged(Problem),
 ) !void {
@@ -57,13 +59,14 @@ pub fn check(
     var proto_buf: [1]Ast.Node.Index = undefined;
     var fns = lexer.iterFnDecls(tree);
     while (fns.next(&proto_buf)) |fn_entry| {
-        try checkFn(gpa, tree, fn_entry.proto, fn_entry.name_token, fn_entry.body, problems);
+        try checkFn(gpa, tree, cache, fn_entry.proto, fn_entry.name_token, fn_entry.body, problems);
     }
 }
 
 fn checkFn(
     gpa: std.mem.Allocator,
     tree: *const Ast,
+    cache: *file_cache_mod.FileCache,
     proto: Ast.full.FnProto,
     name_tok: Ast.TokenIndex,
     body: Ast.Node.Index,
@@ -85,8 +88,7 @@ fn checkFn(
     const fn_name = tree.tokenSlice(name_tok);
     if (!isParserName(fn_name)) return;
 
-    var bindings = try local.build(gpa, tree, proto, body);
-    defer bindings.deinit();
+    const bindings = try cache.localBindings(proto, body);
 
     // Collect param names whose declared type starts with `[` (slice
     // or array type), tolerating an optional `const` prefix.

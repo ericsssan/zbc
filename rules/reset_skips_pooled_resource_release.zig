@@ -26,6 +26,7 @@ const Ast = std.zig.Ast;
 
 const problem_mod = @import("../problem.zig");
 const config_mod = @import("../config.zig");
+const file_cache_mod = @import("../file_cache.zig");
 
 const lexer = @import("../lexer.zig");
 const testing = @import("../testing.zig");
@@ -37,10 +38,12 @@ const Pos = problem_mod.Pos;
 pub fn check(
     gpa: std.mem.Allocator,
     tree: *const Ast,
+    cache: *file_cache_mod.FileCache,
     config: *const config_mod.Config,
     problems: *std.ArrayListUnmanaged(Problem),
 ) !void {
     if (!config_mod.isEnabled(config, .reset_skips_pooled_resource_release)) return;
+    _ = cache;
 
     const tags = tree.tokens.items(.tag);
     const tok_count: u32 = @intCast(tree.tokens.len);
