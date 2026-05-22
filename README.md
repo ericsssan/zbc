@@ -38,18 +38,20 @@ caret + secondary span pointing at the free / kill / borrow site.
 
 ## Rules
 
-45 rules organized into three families:
+46 rules in two analysis families:
 
-**Layer 1 — CFG-based escape analysis** (full per-fn control-flow
-graph + abstract interpretation):
+**Flow analysis** — full per-fn control-flow graph + abstract
+interpretation:
 
 - `heap-use-after-free`, `heap-double-free`, `arena-use-after-kill`,
   `arena-escape`, `stack-escape`, `use-undefined`,
   `allocator-mismatch`, `interior-pointer-destroy`,
   `require-borrowed-from`
 
-**Layer 2 — Pattern detectors** (per-fn token-walk over canonical
-bug shapes mined from open-source Zig PRs):
+**Pattern detectors** — per-fn token-walk over canonical bug shapes
+mined from open-source Zig PRs.  Shared infrastructure in `lexer.zig`
+/ `scope.zig` / `receiver.zig` / `model.zig` / `local.zig`; see
+[ARCHITECTURE.md](ARCHITECTURE.md).
 
 - Heap-leak / aliasing: `heap-leak`, `partial-union-write`,
   `aliased-heap-dupe`, `clobbered-by-struct-reset`,
@@ -76,6 +78,7 @@ bug shapes mined from open-source Zig PRs):
 - Lifecycle / sibling-method consistency:
   `reset-skips-pooled-resource-release`,
   `missing-deinit-on-composed-owner`,
+  `owned-field-no-outer-cleanup`,
   `deinit-order-violates-construction-dep`,
   `defer-and-errdefer-free-overlap`,
   `move-out-without-restore`
