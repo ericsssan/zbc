@@ -1,48 +1,11 @@
 # zbc
 
-A borrow checker for Zig, inspired by Rust's.
+A Bug Checker for Zig.  Catches use-after-free, double-free,
+arena escape, missing errdefer, stack-fallback escape, refcount
+leaks, pointer-stability footguns, and 30+ other lifetime /
+ownership / cleanup bugs.
 
-## Rules
-
-| Rule | Catches |
-|---|---|
-| `heap-use-after-free` | Reading a heap pointer after `free` / `destroy` |
-| `heap-double-free` | Freeing the same heap pointer twice |
-| `arena-use-after-kill` | Reading an arena-borrowed value after the arena's `deinit` |
-| `arena-escape` | Returning a value borrowed from a function-local arena |
-| `stack-escape` | Returning a pointer to a function-local stack variable |
-| `use-undefined` | Reading a value that is still `undefined` |
-| `require-borrowed-from` | Public borrowed-shape return without `@returns borrowed_from(...)` |
-
-Cross-function chains, struct-literal aliases, stack-owner borrows
-(`var o = ...; const x = &o.field; o.die(); use(x)`), and
-`@borrowed`-annotated field copies are all tracked.
-
-## Usage
-
-```sh
-zig build -Doptimize=ReleaseFast
-zbc path/to/file.zig
-zbc --format=compact path/to/file.zig    # grep-friendly
-zbc --list-rules
-zbc --explain heap-use-after-free
-```
-
-Exit 0 if clean, 1 if problems found.  Default output is Rustc-style
-with caret + secondary span for the free / kill site.
-
-## Annotations
-
-Most analysis is inference-driven.  Annotations fill the gaps where
-source shape is ambiguous:
-
-```zig
-/// @returns owned | borrowed_from(<param>) | owns_locals | heap
-/// @takes ownership(<param>)
-/// @borrowed                              (on a struct field)
-```
-
-Borrow example:
+## Quick example
 
 ```zig
 const Owner = struct {
@@ -57,6 +20,80 @@ var owner: Owner = .{};
 const x = owner.data;       // borrow of owner
 owner.die();
 _ = x;                      // → heap-use-after-free
+```
+
+## Usage
+
+```sh
+zig build -Doptimize=ReleaseFast
+zbc path/to/file.zig
+zbc path/to/dir              # recursive
+zbc --format=compact path     # grep-friendly
+zbc --list-rules
+zbc --explain <rule-id>
+```
+
+Exit 0 if clean, 1 if problems found.  Default output uses a
+caret + secondary span pointing at the free / kill / borrow site.
+
+## Rules
+
+40 rules organized into three families:
+
+**Layer 1 — CFG-based escape analysis** (full per-fn control-flow
+graph + abstract interpretation):
+
+- `heap-use-after-free`, `heap-double-free`, `arena-use-after-kill`,
+  `arena-escape`, `stack-escape`, `use-undefined`,
+  `allocator-mismatch`, `interior-pointer-destroy`,
+  `require-borrowed-from`
+
+**Layer 2 — Pattern detectors** (per-fn token-walk over canonical
+bug shapes mined from open-source Zig PRs):
+
+- Heap-leak / aliasing: `heap-leak`, `partial-union-write`,
+  `aliased-heap-dupe`, `clobbered-by-struct-reset`,
+  `realloc-byte-count`, `asymmetric-field-free`,
+  `free-without-null-then-check`,
+  `overwrite-without-deinit`
+- Error-path cleanup: `missing-errdefer-between-tries`,
+  `free-then-try-realloc`, `destroy-after-deinit-in-loop`,
+  `dead-errdefer-in-result-fn`, `duplicate-errdefer`,
+  `missing-errdefer-on-out-param`, `unreleased-refs-on-error`,
+  `unreleased-factory-handle`
+- Pointer/slice stability: `hashmap-getptr-rehash`,
+  `arraylist-items-slice`, `fd-write-after-close`,
+  `stack-fallback-escape`, `slice-of-arena-into-heap`,
+  `borrowed-slice-into-out-param`,
+  `memset-undef-after-len-truncation`
+- Tagged-union semantics:
+  `tagged-union-retag-with-old-payload-read`,
+  `union-deinit-without-inert-reset`,
+  `self-undefined-after-destroy`,
+  `return-borrowed-payload`
+- Lifecycle / sibling-method consistency:
+  `reset-skips-pooled-resource-release`,
+  `missing-deinit-on-composed-owner`
+- Concurrency / hardening: `publish-then-touch-self`,
+  `assert-on-untrusted-input`
+
+Run `zbc --list-rules` for the full descriptions, or
+`zbc --explain <rule-id>` for the rule's rationale, canonical bug,
+fix, and detection notes.
+
+Each rule was extracted from real bug-fix PRs in Bun, TigerBeetle,
+Ghostty, Mach, or ziglang/zig's standard library.  The fixture
+in `test/fixtures/` documents the PR each rule was mined from.
+
+## Annotations
+
+Most analysis is inference-driven.  Annotations fill the gaps
+where source shape is ambiguous:
+
+```zig
+/// @returns owned | borrowed_from(<param>) | owns_locals | heap
+/// @takes ownership(<param>)
+/// @borrowed                              (on a struct field)
 ```
 
 ## Library use
