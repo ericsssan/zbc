@@ -355,9 +355,16 @@ pub const Invariant = enum {
     /// the defer fires on return.  Catches oven-sh/bun#30151 +
     /// #30223 + #25563 class.
     borrowed_slice_into_out_param,
+    /// `defer <alloc>.free(<X>);` + `errdefer { ... <lhs> = <X>; }`
+    /// (resurrects X into a field) + a subsequent `try` — on
+    /// error, errdefer fires (frees NEW, restores OLD into the
+    /// field), then defer fires (frees OLD).  The field is now a
+    /// dangling pointer.  Catches ghostty-org/ghostty#8249
+    /// (`Atlas.grow`).
+    defer_and_errdefer_free_overlap,
 };
 
-pub const all_invariants: [39]Invariant = .{
+pub const all_invariants: [40]Invariant = .{
     .arena_escape,
     .stack_escape,
     .use_undefined,
@@ -397,6 +404,7 @@ pub const all_invariants: [39]Invariant = .{
     .assert_on_untrusted_input,
     .missing_deinit_on_composed_owner,
     .borrowed_slice_into_out_param,
+    .defer_and_errdefer_free_overlap,
 };
 
 pub const Default: Config = .{};

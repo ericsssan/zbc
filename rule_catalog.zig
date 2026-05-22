@@ -224,6 +224,11 @@ pub const all = [_]Rule{
         .title = "write into pointer out-param uses a `defer ... .deinit()`-bound local — out-param dangles after return",
         .body = @embedFile("rules/borrowed-slice-into-out-param.md"),
     },
+    .{
+        .id = "defer-and-errdefer-free-overlap",
+        .title = "`defer alloc.free(X)` + `errdefer { ...; <lhs> = X; }` — both fire on error, leaving field dangling",
+        .body = @embedFile("rules/defer-and-errdefer-free-overlap.md"),
+    },
 };
 
 /// Look up a rule by id.  Returns null on unknown id so callers can

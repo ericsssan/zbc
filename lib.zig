@@ -41,6 +41,7 @@ const publish_then_touch_self_mod = @import("publish_then_touch_self.zig");
 const assert_on_untrusted_input_mod = @import("assert_on_untrusted_input.zig");
 const missing_deinit_on_composed_owner_mod = @import("missing_deinit_on_composed_owner.zig");
 const borrowed_slice_into_out_param_mod = @import("borrowed_slice_into_out_param.zig");
+const defer_and_errdefer_free_overlap_mod = @import("defer_and_errdefer_free_overlap.zig");
 const rule_catalog_mod = @import("rule_catalog.zig");
 
 pub const Config = config_mod.Config;
@@ -272,6 +273,12 @@ pub fn analyzeEscape(
     // `<out-ptr-param>.* = ...X...` → out-param holds dangling
     // slice once defer fires.
     try borrowed_slice_into_out_param_mod.check(gpa, &tree, config, &problems);
+
+    // Defer-and-errdefer-free-overlap — `defer alloc.free(X);` +
+    // `errdefer { ... <lhs> = X; }` + subsequent `try` → on
+    // error, errdefer fires (frees NEW, restores OLD into the
+    // field), then defer frees OLD → field dangles.
+    try defer_and_errdefer_free_overlap_mod.check(gpa, &tree, config, &problems);
 
     return problems.toOwnedSlice(gpa);
 }
@@ -748,5 +755,6 @@ test {
     _ = assert_on_untrusted_input_mod;
     _ = missing_deinit_on_composed_owner_mod;
     _ = borrowed_slice_into_out_param_mod;
+    _ = defer_and_errdefer_free_overlap_mod;
     std.testing.refAllDecls(@This());
 }
