@@ -383,9 +383,16 @@ pub const Invariant = enum {
     /// which is already torn down.  Catches
     /// tigerbeetle/tigerbeetle#3732 (manifest_log_fuzz).
     deinit_order_violates_construction_dep,
+    /// A stack-local `var <buf>: [N]<T> = undefined;` is passed
+    /// to an aliasing parser (`SemanticVersion.parse`, etc.),
+    /// and the returned struct (whose sub-slice fields alias
+    /// the buffer) is then `return`-ed.  The caller receives a
+    /// struct whose `.pre`/`.build`-style fields point at the
+    /// now-dead stack buffer.  Catches ziglang/zig#25713 class.
+    borrowed_slice_into_stack_buffer_returned,
 };
 
-pub const all_invariants: [43]Invariant = .{
+pub const all_invariants: [44]Invariant = .{
     .arena_escape,
     .stack_escape,
     .use_undefined,
@@ -429,6 +436,7 @@ pub const all_invariants: [43]Invariant = .{
     .sentinel_strip_free_size_mismatch,
     .move_out_without_restore,
     .deinit_order_violates_construction_dep,
+    .borrowed_slice_into_stack_buffer_returned,
 };
 
 pub const Default: Config = .{};

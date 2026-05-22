@@ -244,6 +244,11 @@ pub const all = [_]Rule{
         .title = "`B.deinit()` before `A.deinit()` where `A` was init'd via `.init(&B, ...)` — LIFO violation; A's deinit may UAF",
         .body = @embedFile("rules/deinit-order-violates-construction-dep.md"),
     },
+    .{
+        .id = "borrowed-slice-into-stack-buffer-returned",
+        .title = "`<T>.parse(&stack_buf)` result returned — sub-slice fields point at the now-dead stack buffer",
+        .body = @embedFile("rules/borrowed-slice-into-stack-buffer-returned.md"),
+    },
 };
 
 /// Look up a rule by id.  Returns null on unknown id so callers can

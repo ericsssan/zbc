@@ -52,6 +52,7 @@ Bun's.
 | `sentinel_strip_free_size_mismatch.zig` | `sentinel-strip-free-size-mismatch` | [ghostty-org/ghostty#8886](https://github.com/ghostty-org/ghostty/pull/8886) |
 | `move_out_without_restore.zig` | `move-out-without-restore` | [ziglang/zig#24452](https://github.com/ziglang/zig/pull/24452) |
 | `deinit_order_violates_construction_dep.zig` | `deinit-order-violates-construction-dep` | [tigerbeetle/tigerbeetle#3732](https://github.com/tigerbeetle/tigerbeetle/pull/3732) |
+| `borrowed_slice_into_stack_buffer_returned.zig` | `borrowed-slice-into-stack-buffer-returned` | [ziglang/zig#25713](https://github.com/ziglang/zig/pull/25713) |
 
 ## Re-fetching the actual pre-merge buggy files
 

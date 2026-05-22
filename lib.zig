@@ -45,6 +45,7 @@ const defer_and_errdefer_free_overlap_mod = @import("defer_and_errdefer_free_ove
 const sentinel_strip_free_size_mismatch_mod = @import("sentinel_strip_free_size_mismatch.zig");
 const move_out_without_restore_mod = @import("move_out_without_restore.zig");
 const deinit_order_violates_construction_dep_mod = @import("deinit_order_violates_construction_dep.zig");
+const borrowed_slice_into_stack_buffer_returned_mod = @import("borrowed_slice_into_stack_buffer_returned.zig");
 const rule_catalog_mod = @import("rule_catalog.zig");
 
 pub const Config = config_mod.Config;
@@ -297,6 +298,11 @@ pub fn analyzeEscape(
     // before `A.deinit()` where `A` was init'd via
     // `.init(&B, ...)` → A's deinit may UAF B.
     try deinit_order_violates_construction_dep_mod.check(gpa, &tree, config, &problems);
+
+    // Borrowed-slice-into-stack-buffer-returned —
+    // `<T>.parse(&stack_buf)` result returned → caller holds
+    // a struct whose sub-slice fields alias the dead stack buf.
+    try borrowed_slice_into_stack_buffer_returned_mod.check(gpa, &tree, config, &problems);
 
     return problems.toOwnedSlice(gpa);
 }
@@ -777,5 +783,6 @@ test {
     _ = sentinel_strip_free_size_mismatch_mod;
     _ = move_out_without_restore_mod;
     _ = deinit_order_violates_construction_dep_mod;
+    _ = borrowed_slice_into_stack_buffer_returned_mod;
     std.testing.refAllDecls(@This());
 }
