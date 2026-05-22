@@ -28,14 +28,18 @@ zbc/
 ├── main.zig                  — CLI
 ├── problem.zig               — Problem / Note / Pos / Severity
 ├── config.zig                — Config + Invariant enum
+├── rule_registry.zig         — comptime list of pattern rules + dispatch
+├── file_cache.zig            — per-file shared state (FileModel + LocalBindings)
 │
 ├── lexer.zig                 — token primitives (matchBrace, FnDeclIter, …)
 ├── scope.zig                 — scope-aware iterators (BodyWalk, …)
 ├── receiver.zig              — name classifiers (isAllocatorishName, …)
 ├── model.zig                 — FileModel: per-file TypeTable + FnTable
+├── model_query.zig           — AST-level DSL: find types/fields/methods
 ├── local.zig                 — LocalBindings: per-fn binding-origin tracker
+├── query.zig                 — token-level pattern DSL (Atom / Match / findAll)
 ├── testing.zig               — expectFires / expectNoFire / expectCount
-├── trace.zig                 — --trace=<rule-id> decision log
+├── trace.zig                 — --trace=<rule-id> decision log (opt-in)
 │
 ├── cfg.zig                   — flow-analysis CFG builder
 ├── analyzer.zig              — flow-analysis dispatch
@@ -50,15 +54,54 @@ zbc/
 Files at root are imported directly by rules:
 
 ```zig
-const lexer   = @import("../lexer.zig");
-const scope   = @import("../scope.zig");
-const fmodel  = @import("../model.zig");
-const local   = @import("../local.zig");
-const testing = @import("../testing.zig");
-const trace   = @import("../trace.zig");
+const lexer      = @import("../lexer.zig");
+const scope      = @import("../scope.zig");
+const fmodel     = @import("../model.zig");
+const local      = @import("../local.zig");
+const query      = @import("../query.zig");     // token patterns
+const mq         = @import("../model_query.zig"); // AST-level queries
+const testing    = @import("../testing.zig");
+const trace      = @import("../trace.zig");      // optional
+const file_cache_mod = @import("../file_cache.zig");
 ```
 
 No umbrella module.  Each module is a clean dependency.
+
+## Per-file dispatch + amortized shared state
+
+`lib.zig::analyzeEscape` owns one `FileCache` per file.  After CFG
+analysis populates the annotation `Db`, it calls
+`rule_registry.runEscape(gpa, &tree, &db, &cache, config, &problems)` —
+ONE call that iterates the comptime `escape_rules` list and dispatches
+each rule.
+
+Every rule's `check` signature is uniform-ish:
+
+```zig
+pub fn check(
+    gpa: std.mem.Allocator,
+    tree: *const Ast,
+    cache: *file_cache_mod.FileCache,   // shared state
+    config: *const config_mod.Config,
+    problems: *std.ArrayListUnmanaged(Problem),
+) !void { ... }
+```
+
+…with the 5 db-dependent rules taking an extra `db: *const Db`
+parameter between `tree` and `cache`.  `rule_registry.Rule` is a
+union(`plain` | `with_db`) so the dispatcher hands each rule the right
+args.  Rules that don't use `cache` can `_ = cache;` and move on.
+
+`FileCache` is lazy:
+
+- `cache.fileModel()` builds the FileModel on first call, caches it.
+- `cache.localBindings(proto, body)` builds LocalBindings on first
+  call per-body, caches by `Ast.Node.Index`.
+
+This is what ARCHITECTURE.md historically promised but didn't deliver:
+rules that need bindings for the same fn share one build instead of
+rebuilding per rule.  Measured ~40-50% sweep speedup vs. the
+pre-cache version on the bun corpus.
 
 ## Shared infrastructure for pattern detectors
 
@@ -158,6 +201,42 @@ Out of scope (v1; add when a rule needs them):
 - Anonymous types (`return struct { ... }`).
 - extern fns / extern structs.
 
+### `query.zig` — token-level pattern DSL
+
+Rules describe SHAPES instead of writing bespoke token-walk loops.
+A Pattern is a sequence of `Atom`s; matching it against a token
+position returns a `Match` (with captures) or null.
+
+Atom kinds:
+
+- `tok: TokenTag` — match one token by tag (no text check)
+- `text: []const u8` / `text_at: { slot, text }` — identifier-equals
+- `pred: fn` / `pred_at: { slot, pred }` — identifier-passes-pred
+- `capture: u8` — capture any identifier into slot N
+- `ref: u8` — match identifier whose text equals capture[N]
+- `opt: [...]` — optional sub-pattern (rewind on fail)
+- `any_of: [...]` — first-matching alternative wins
+- `paren_args` / `bracket_args` / `brace_args` — balanced delimiter skip
+- `capture_until: { slot, stops }` — token-range capture up to stop
+- `ref_range: u8` — match a previously-captured token range
+
+Combine with `findAll` / `findAllInBody` / `findInSameScope` /
+`findInEnclosingScope` to express the "bind X here, find use of X
+later" pattern most rules need.
+
+The `*_at` variants exist so report sites use stable capture slots
+instead of fragile `m.start + N` offsets.
+
+### `model_query.zig` — AST-level (FileModel) DSL
+
+Companion to query.zig.  Where query.zig matches token sequences,
+model_query.zig matches entities in the FileModel — types, fields,
+methods — via `TypePred` / `FieldPred` / `MethodPred`.
+
+The two compose: use `mq.findTypes` / `findFields` / `findMethods`
+to narrow down WHICH bodies to scan, then use `query.*` to scan
+those bodies for token patterns.
+
 ### `local.zig` — LocalBindings (per-fn binding origins)
 
 Per-fn-body model.  For every `const NAME = <expr>` / `var NAME =
@@ -216,9 +295,9 @@ failing test gives full context — no need for printf-recompile.
 Lower-level `runRule(gpa, check, src)` + `freeProblems(gpa, &p)`
 are available for tests that need raw problem inspection.
 
-### `trace.zig` — `--trace=<rule-id>` decision log
+### `trace.zig` — `--trace=<rule-id>` decision log (opt-in)
 
-Rules emit decision events:
+Rules can emit decision events:
 
 ```zig
 const trace = @import("../trace.zig");
@@ -239,6 +318,15 @@ zbc --trace='*' path/                           # all rules
 ```
 
 … and stderr fills with `[trace:<rule-id>] <kind> @ <line:col>: <msg>`.
+
+**Adoption is opt-in, not required.**  Most rules don't bother.  Add
+trace calls when:
+- The rule has multiple decision points whose interaction is hard to
+  reason about from inspection.
+- You're debugging a false positive / negative on a real-world corpus
+  hit and want a decision log without recompile cycles.
+
+A clean diff that adds a new rule without trace calls is fine.
 
 ## Adding a new rule
 
@@ -268,33 +356,49 @@ zbc --trace='*' path/                           # all rules
    const scope = @import("../scope.zig");           // if you need scope iteration
    const fmodel = @import("../model.zig");          // if you need type/fn info
    const local = @import("../local.zig");           // if you need binding origins
+   const query = @import("../query.zig");           // if your rule shape fits a token pattern
+   const mq = @import("../model_query.zig");        // if you need AST-level entity queries
    const problem = @import("../problem.zig");
    const testing = @import("../testing.zig");
-   const trace = @import("../trace.zig");
    const config_mod = @import("../config.zig");
+   const file_cache_mod = @import("../file_cache.zig");
 
    const R = "my-rule-id";
 
    pub fn check(
        gpa: std.mem.Allocator,
        tree: *const Ast,
+       cache: *file_cache_mod.FileCache,
        config: *const config_mod.Config,
        problems: *std.ArrayListUnmanaged(problem.Problem),
    ) !void {
        if (!config_mod.isEnabled(config, .my_rule_name)) return;
+       _ = cache;  // delete if you use cache.localBindings / cache.fileModel
        // ... detection logic ...
    }
    ```
+
+   For rules that need annotation data, the signature additionally
+   takes a `db: *const annotations.Db` between `tree` and `cache`.
+
+   For rules that walk per-fn AND need LocalBindings, use
+   `lexer.forEachFnCached(gpa, tree, cache, problems, checkFn)`
+   instead of `lexer.forEachFn` — the helper threads cache to the
+   per-fn callback so you can call `cache.localBindings(proto, body)`.
 
 4. **Add inline tests** at the bottom of the rule file using
    `testing.expectFires` / `testing.expectNoFire`.  Cover the
    canonical bug + the most likely false-positive shape +
    2-3 edge cases.
 
-5. **Wire it into the analyzer** in `lib.zig`:
+5. **Register it** in `rule_registry.zig`:
    - `const my_rule_mod = @import("rules/my_rule_name.zig");`
-   - In `analyzeEscape`: `try my_rule_mod.check(gpa, &tree, config, &problems);`
-   - In the test block: `_ = my_rule_mod;`
+   - Append `.{ .id = "my-rule-id", .check = .{ .plain = my_rule_mod.check } }`
+     to `escape_rules` (or `.with_db = ...` if your rule takes a Db arg).
+   - Append `_ = my_rule_mod;` to the test block at the bottom of
+     the file (refAllDecls includes inline tests in the test binary).
+
+   No edit to `lib.zig` needed — the dispatch loop iterates the registry.
 
 6. **Add to the rule catalog** in `rule_catalog.zig`:
    ```zig
@@ -309,9 +413,10 @@ zbc --trace='*' path/                           # all rules
    examples, and detection notes.  This is what `zbc --explain
    my-rule-id` prints.
 
-8. **Sprinkle trace calls** at decision points — `trace.skip`
-   for early exits, `trace.match` for the fire point.  Future
-   you debugging will thank present you.
+8. **(Optional) Sprinkle trace calls** at decision points — `trace.skip`
+   for early exits, `trace.match` for the fire point.  Most rules
+   don't bother; do it when the rule has multi-stage gating you'll
+   want to debug later.  See the trace section above.
 
 9. **Sweep the corpora** to validate behavior:
    ```bash
@@ -331,8 +436,10 @@ zbc --trace='*' path/                           # all rules
   sweeps.  Debug-mode runs are ~10× slower.
 - The `Io.Group.concurrent` thread pool is lazy in Debug — it
   effectively runs single-threaded.  Always sweep with
-  ReleaseFast.
+  ReleaseFast.  `main.zig` uses raw `std.Thread.spawn` (one
+  worker per CPU) instead, which saturates properly.
 - Each rule's `check` fn runs on the parsed Ast.  Parsing the
-  Ast is the dominant cost; rule checks are cheap.  Building
-  FileModel / LocalBindings is amortized — they're built ONCE
-  per file regardless of how many rules use them.
+  Ast is the dominant cost; rule checks are cheap.  FileModel
+  and LocalBindings are amortized by `FileCache` — built at
+  most once per file (FileModel) / once per fn body
+  (LocalBindings) regardless of how many rules consume them.
