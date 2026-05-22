@@ -264,6 +264,16 @@ pub fn bodyOf(tree: *const Ast, node: Ast.Node.Index) ?Ast.Node.Index {
     return tree.nodeData(node).node_and_node[1];
 }
 
+/// Return the text of a fn's first parameter name, if any.
+/// Useful for rules that need to identify the method-receiver
+/// param (commonly `self` / `this`) without building full bindings.
+pub fn firstParamName(tree: *const Ast, fp: Ast.full.FnProto) ?[]const u8 {
+    var it = fp.iterate(tree);
+    const first = it.next() orelse return null;
+    const tok = first.name_token orelse return null;
+    return tree.tokenSlice(tok);
+}
+
 /// Iterator over every fn_decl in a tree.  The common outer loop
 /// every rule has — extracted so rules don't reimplement the
 /// `1..tree.nodes.len`, `nodeTag != .fn_decl`, `returnsType`,

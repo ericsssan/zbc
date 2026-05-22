@@ -327,7 +327,7 @@ fn checkFn(
 
     // First param name — typically "this" or "self".  Used as the
     // identifier to scan against for `<param>.<field>`.
-    const first_param_name = firstParamName(tree, fp) orelse return;
+    const first_param_name = lexer.firstParamName(tree, fp) orelse return;
 
     const body = bodyOf(tree, fn_decl) orelse return;
 
@@ -436,13 +436,6 @@ fn isDestructorName(name: []const u8) bool {
     return std.mem.eql(u8, name, "deinit") or
         std.mem.eql(u8, name, "finalize") or
         std.mem.eql(u8, name, "destroy");
-}
-
-fn firstParamName(tree: *const Ast, fp: Ast.full.FnProto) ?[]const u8 {
-    var it = fp.iterate(tree);
-    const first = it.next() orelse return null;
-    const tok = first.name_token orelse return null;
-    return tree.tokenSlice(tok);
 }
 
 fn report(

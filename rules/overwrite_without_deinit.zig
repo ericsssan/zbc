@@ -59,7 +59,7 @@ pub fn check(
         const name_tok = fp.name_token orelse continue;
         if (isConstructorName(tree.tokenSlice(name_tok))) continue;
         const ct = db.containingType(node) orelse continue;
-        const this_name = firstParamName(tree, fp) orelse continue;
+        const this_name = lexer.firstParamName(tree, fp) orelse continue;
         const body = bodyOf(tree, node) orelse continue;
         try checkBody(gpa, tree, db, ct, this_name, body, problems);
     }
@@ -287,13 +287,6 @@ fn returnsType(tree: *const Ast, fp: Ast.full.FnProto) bool {
     if (first != last) return false;
     return tree.tokens.items(.tag)[first] == .identifier and
         std.mem.eql(u8, tree.tokenSlice(first), "type");
-}
-
-fn firstParamName(tree: *const Ast, fp: Ast.full.FnProto) ?[]const u8 {
-    var it = fp.iterate(tree);
-    const first = it.next() orelse return null;
-    const tok = first.name_token orelse return null;
-    return tree.tokenSlice(tok);
 }
 
 fn skipNestedFn(tags: []const std.zig.Token.Tag, kw_fn: Ast.TokenIndex, last: Ast.TokenIndex) Ast.TokenIndex {
