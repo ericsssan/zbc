@@ -41,6 +41,24 @@ pub const TokenIndex = Ast.TokenIndex;
 pub const TokenTag = lexer.TokenTag;
 
 pub const MAX_CAPTURES: u8 = 8;
+pub const MAX_RANGE_CAPTURES: u8 = 4;
+
+/// Inclusive token range captured by `.capture_until`.  `end` >=
+/// `start` when non-empty; the range CAN be empty (`start > end`)
+/// if the stop tag was hit immediately.
+pub const TokenRange = struct {
+    start: TokenIndex,
+    end: TokenIndex,
+
+    pub fn isEmpty(self: TokenRange) bool {
+        return self.start > self.end;
+    }
+
+    pub fn len(self: TokenRange) u32 {
+        if (self.isEmpty()) return 0;
+        return (self.end - self.start) + 1;
+    }
+};
 
 /// One atomic match step.
 pub const Atom = union(enum) {
@@ -76,6 +94,18 @@ pub const Atom = union(enum) {
     bracket_args,
     /// Consume a balanced `{...}`.
     brace_args,
+    /// Consume tokens until (but NOT including) any of the `stops`
+    /// tags at brace/paren/bracket depth 0 (relative to where the
+    /// capture started).  Record the consumed range in
+    /// range_captures[slot].  Used for `.free(<expr>)` style
+    /// "capture this expression for later reference":
+    ///     .{ .capture_until = .{ .slot = 0, .stops = &.{.r_paren} } }
+    /// Empty captures (stop tag immediately) are allowed.
+    capture_until: struct { slot: u8, stops: []const TokenTag },
+    /// Match the previously-captured range token-by-token (both tag
+    /// AND source-text must match for each token).  Advances past
+    /// the matched range.  Fails on any mismatch or if slot empty.
+    ref_range: u8,
 };
 
 /// Result of matching a Pattern at a position.
@@ -87,6 +117,9 @@ pub const Match = struct {
     /// captures[slot] is the token index of an identifier captured
     /// by `.capture = slot`; null if that slot wasn't filled.
     captures: [MAX_CAPTURES]?TokenIndex = .{null} ** MAX_CAPTURES,
+    /// range_captures[slot] is the token range captured by
+    /// `.capture_until = .{ .slot = slot, ... }`; null if unfilled.
+    range_captures: [MAX_RANGE_CAPTURES]?TokenRange = .{null} ** MAX_RANGE_CAPTURES,
 
     /// Convenience: text of capture slot N.
     pub fn captureText(self: Match, tree: *const Ast, slot: u8) ?[]const u8 {
@@ -106,9 +139,12 @@ pub fn matchAt(
     inherited: ?*const Match,
 ) ?Match {
     var m: Match = .{ .start = pos, .end = pos };
-    if (inherited) |i| m.captures = i.captures;
+    if (inherited) |i| {
+        m.captures = i.captures;
+        m.range_captures = i.range_captures;
+    }
     var t: TokenIndex = pos;
-    if (matchSlice(tree, atoms, &t, last, &m.captures)) {
+    if (matchSlice(tree, atoms, &t, last, &m.captures, &m.range_captures)) {
         if (t == pos) return null; // matched zero tokens — reject
         m.end = t - 1;
         return m;
@@ -125,6 +161,7 @@ fn matchSlice(
     t: *TokenIndex,
     last: TokenIndex,
     captures: *[MAX_CAPTURES]?TokenIndex,
+    range_captures: *[MAX_RANGE_CAPTURES]?TokenRange,
 ) bool {
     const tags = tree.tokens.items(.tag);
     for (atoms) |a| {
@@ -172,9 +209,11 @@ fn matchSlice(
                 // Try to match nested; on failure, restore t and continue.
                 const save = t.*;
                 const save_caps = captures.*;
-                if (!matchSlice(tree, sub, t, last, captures)) {
+                const save_ranges = range_captures.*;
+                if (!matchSlice(tree, sub, t, last, captures, range_captures)) {
                     t.* = save;
                     captures.* = save_caps;
+                    range_captures.* = save_ranges;
                 }
             },
             .any_of => |alts| {
@@ -183,14 +222,16 @@ fn matchSlice(
                 // continues with the next sibling atom).
                 const save = t.*;
                 const save_caps = captures.*;
+                const save_ranges = range_captures.*;
                 var matched = false;
                 for (alts) |alt| {
-                    if (matchSlice(tree, alt, t, last, captures)) {
+                    if (matchSlice(tree, alt, t, last, captures, range_captures)) {
                         matched = true;
                         break;
                     }
                     t.* = save;
                     captures.* = save_caps;
+                    range_captures.* = save_ranges;
                 }
                 if (!matched) return false;
             },
@@ -208,6 +249,60 @@ fn matchSlice(
                 if (t.* > last or tags[t.*] != .l_brace) return false;
                 const close = lexer.matchBrace(tags, t.*, last) orelse return false;
                 t.* = close + 1;
+            },
+            .capture_until => |cu| {
+                if (cu.slot >= MAX_RANGE_CAPTURES) return false;
+                const range_start = t.*;
+                var depth: u32 = 0;
+                var found = false;
+                while (t.* <= last) : (t.* += 1) {
+                    const tag = tags[t.*];
+                    switch (tag) {
+                        .l_paren, .l_brace, .l_bracket => depth += 1,
+                        .r_paren, .r_brace, .r_bracket => {
+                            if (depth > 0) {
+                                depth -= 1;
+                                continue;
+                            }
+                            // depth 0 closer — eligible stop
+                        },
+                        else => {},
+                    }
+                    if (depth == 0) {
+                        for (cu.stops) |stop| {
+                            if (tag == stop) {
+                                found = true;
+                                break;
+                            }
+                        }
+                        if (found) break;
+                    }
+                }
+                if (!found) return false;
+                const range_end: TokenIndex = if (t.* == range_start) range_start else t.* - 1;
+                range_captures[cu.slot] = .{
+                    .start = range_start,
+                    .end = range_end,
+                };
+                // Don't consume the stop token — caller's next atom does.
+            },
+            .ref_range => |slot| {
+                if (slot >= MAX_RANGE_CAPTURES) return false;
+                const range = range_captures[slot] orelse return false;
+                if (range.isEmpty()) {
+                    // Matches zero tokens — succeed without advancing.
+                    continue;
+                }
+                const n = range.len();
+                if (t.* + n - 1 > last) return false;
+                var i: u32 = 0;
+                while (i < n) : (i += 1) {
+                    const cap_t: TokenIndex = range.start + i;
+                    const cur_t: TokenIndex = t.* + i;
+                    if (tags[cap_t] != tags[cur_t]) return false;
+                    if (!std.mem.eql(u8, tree.tokenSlice(cap_t), tree.tokenSlice(cur_t))) return false;
+                }
+                t.* += n;
             },
         }
     }
@@ -505,6 +600,63 @@ test "matchAt: predicate" {
     const dir_pos = findIdent(&tree, "dir");
     const m = matchAt(&tree, atoms, dir_pos, last, null).?;
     try testing.expectEqual(@as(TokenIndex, dir_pos), m.start);
+}
+
+test "matchAt: capture_until + ref_range" {
+    // Match `.free(<expr>);` followed (after closing brace skipping)
+    // by `<same-expr> = try ...` — the canonical free_then_try_realloc shape.
+    var tree = try parseTokens("fn f() void { x.free(s.cols); s.cols = try x.realloc(s.cols, 1); }");
+    defer tree.deinit(testing.allocator);
+    const last: TokenIndex = @intCast(tree.tokens.len - 1);
+
+    const free_pattern = &[_]Atom{
+        .{ .tok = .identifier }, // receiver (x)
+        .{ .tok = .period },
+        .{ .text = "free" },
+        .{ .tok = .l_paren },
+        .{ .capture_until = .{ .slot = 0, .stops = &.{.r_paren} } },
+        .{ .tok = .r_paren },
+        .{ .tok = .semicolon },
+    };
+    const reassign_pattern = &[_]Atom{
+        .{ .ref_range = 0 },
+        .{ .tok = .equal },
+        .{ .tok = .keyword_try },
+    };
+
+    const free_matches = try findAll(testing.allocator, &tree, free_pattern, 0, last);
+    defer testing.allocator.free(free_matches);
+    try testing.expectEqual(@as(usize, 1), free_matches.len);
+
+    // Now look for the reassignment immediately after the `;` of the free.
+    const after_free = free_matches[0].end + 1;
+    const reassign = matchAt(&tree, reassign_pattern, after_free, last, &free_matches[0]);
+    try testing.expect(reassign != null);
+}
+
+test "matchAt: ref_range mismatch fails" {
+    var tree = try parseTokens("fn f() void { x.free(a.b); c.d = try x.alloc(); }");
+    defer tree.deinit(testing.allocator);
+    const last: TokenIndex = @intCast(tree.tokens.len - 1);
+
+    const free_pattern = &[_]Atom{
+        .{ .tok = .identifier },
+        .{ .tok = .period },
+        .{ .text = "free" },
+        .{ .tok = .l_paren },
+        .{ .capture_until = .{ .slot = 0, .stops = &.{.r_paren} } },
+        .{ .tok = .r_paren },
+        .{ .tok = .semicolon },
+    };
+    const reassign_pattern = &[_]Atom{
+        .{ .ref_range = 0 },
+        .{ .tok = .equal },
+    };
+    const fm = (try findAll(testing.allocator, &tree, free_pattern, 0, last))[0..];
+    defer testing.allocator.free(fm);
+    // Captured `a.b` but next stmt is `c.d = ...` — ref_range should fail.
+    const r = matchAt(&tree, reassign_pattern, fm[0].end + 1, last, &fm[0]);
+    try testing.expect(r == null);
 }
 
 test "matchAt: any_of picks the first matching alternative" {

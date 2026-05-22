@@ -3,20 +3,41 @@
 //! If the `try` propagates an error, `X` is left pointing at
 //! freed memory; a subsequent `deinit` then re-frees it.
 //!
-//! Pure two-adjacent-statements token scan per fn body.
+//! Rewritten via the query DSL: `capture_until` captures the freed
+//! arg's token range; `ref_range` checks the next statement starts
+//! with the same range followed by `= try`.
 
 const std = @import("std");
 const Ast = std.zig.Ast;
 
 const lexer = @import("../lexer.zig");
+const query = @import("../query.zig");
 const problem_mod = @import("../problem.zig");
 const config_mod = @import("../config.zig");
 const testing = @import("../testing.zig");
 
 const Problem = problem_mod.Problem;
 const Pos = problem_mod.Pos;
+const Atom = query.Atom;
 
 const bodyOf = lexer.bodyOf;
+
+// `<recv>.free(<arg>);` — captures the freed arg as range slot 0.
+const free_call = &[_]Atom{
+    .{ .tok = .period },
+    .{ .text = "free" },
+    .{ .tok = .l_paren },
+    .{ .capture_until = .{ .slot = 0, .stops = &.{.r_paren} } },
+    .{ .tok = .r_paren },
+    .{ .tok = .semicolon },
+};
+
+// `<same-tokens-as-slot-0> = try ...` — the dangling-reassignment shape.
+const realloc_pattern = &[_]Atom{
+    .{ .ref_range = 0 },
+    .{ .tok = .equal },
+    .{ .tok = .keyword_try },
+};
 
 pub fn check(
     gpa: std.mem.Allocator,
@@ -45,90 +66,22 @@ fn checkBody(
     const first = tree.firstToken(body);
     const last = tree.lastToken(body);
 
-    var t: Ast.TokenIndex = first;
-    while (t + 4 < last) : (t += 1) {
-        // Locate `<…>.free(<X>);` at statement position.
-        // Pattern: `period identifier(free) l_paren <X> r_paren semicolon`.
-        if (tags[t] != .period) continue;
-        if (tags[t + 1] != .identifier) continue;
-        if (!std.mem.eql(u8, tree.tokenSlice(t + 1), "free")) continue;
-        if (tags[t + 2] != .l_paren) continue;
-        // Find matching `)` at depth 1 of the `(`.
-        const open = t + 2;
-        var depth: u32 = 1;
-        var u: Ast.TokenIndex = open + 1;
-        while (u <= last) : (u += 1) {
-            switch (tags[u]) {
-                .l_paren => depth += 1,
-                .r_paren => {
-                    depth -= 1;
-                    if (depth == 0) break;
-                },
-                else => {},
-            }
-        }
-        if (depth != 0) continue;
-        const close = u;
-        if (close + 1 > last) continue;
-        if (tags[close + 1] != .semicolon) continue;
-        const sc = close + 1;
+    const frees = try query.findAllInBody(gpa, tree, free_call, first, last);
+    defer gpa.free(frees);
 
-        // Capture the free's argument tokens (between open and close,
-        // exclusive of both).  These are the X we expect on the
-        // next statement's LHS.
-        const arg_first: Ast.TokenIndex = open + 1;
-        const arg_last: Ast.TokenIndex = close - 1;
-        if (arg_first > arg_last) {
-            t = sc;
-            continue;
-        }
+    for (frees) |fm| {
+        // After the free's `;`, skip any closing `}` tokens — the
+        // free might be inside `if (cond) { … }` while the realloc
+        // sits in the enclosing scope.  Don't skip past other
+        // tokens — intervening code may legitimately change <arg>.
+        var next: Ast.TokenIndex = fm.end + 1;
+        while (next <= last and tags[next] == .r_brace) : (next += 1) {}
+        if (next > last) continue;
 
-        // Check the next stmt's start.  Skip closing braces (`}`)
-        // — the free is often inside an `if` / `while` block while
-        // the realloc-try lives in the enclosing scope.  Skipping
-        // `}` (without going further past intervening statements)
-        // pairs the two correctly.  We DON'T skip past other tokens
-        // because real code between the free and the realloc may
-        // change `X` in ways we can't reason about.
-        var stmt_start: Ast.TokenIndex = sc + 1;
-        while (stmt_start <= last and tags[stmt_start] == .r_brace) : (stmt_start += 1) {}
-        const lhs_first: Ast.TokenIndex = stmt_start;
-        const lhs_count = (arg_last - arg_first) + 1;
-        if (lhs_first + lhs_count + 1 > last) {
-            t = sc;
-            continue;
-        }
-        var ok = true;
-        var i: usize = 0;
-        while (i < lhs_count) : (i += 1) {
-            const a = arg_first + @as(Ast.TokenIndex, @intCast(i));
-            const b = lhs_first + @as(Ast.TokenIndex, @intCast(i));
-            if (tags[a] != tags[b]) {
-                ok = false;
-                break;
-            }
-            if (!std.mem.eql(u8, tree.tokenSlice(a), tree.tokenSlice(b))) {
-                ok = false;
-                break;
-            }
-        }
-        if (!ok) {
-            t = sc;
-            continue;
-        }
-        const eq_tok = lhs_first + @as(Ast.TokenIndex, @intCast(lhs_count));
-        if (eq_tok > last or tags[eq_tok] != .equal) {
-            t = sc;
-            continue;
-        }
-        if (eq_tok + 1 > last or tags[eq_tok + 1] != .keyword_try) {
-            t = sc;
-            continue;
-        }
+        if (query.matchAt(tree, realloc_pattern, next, last, &fm) == null) continue;
 
-        // Match — fire at the `.free(` call's period.
-        try report(gpa, problems, tree, t, arg_first, arg_last);
-        t = sc;
+        const range = fm.range_captures[0].?;
+        try report(gpa, problems, tree, fm.start, range);
     }
 }
 
@@ -137,12 +90,11 @@ fn report(
     problems: *std.ArrayListUnmanaged(Problem),
     tree: *const Ast,
     period_tok: Ast.TokenIndex,
-    arg_first: Ast.TokenIndex,
-    arg_last: Ast.TokenIndex,
+    arg_range: query.TokenRange,
 ) !void {
     const starts = tree.tokens.items(.start);
-    const arg_start = starts[arg_first];
-    const arg_end = starts[arg_last] + tree.tokenSlice(arg_last).len;
+    const arg_start = starts[arg_range.start];
+    const arg_end = starts[arg_range.end] + tree.tokenSlice(arg_range.end).len;
     const arg_text = tree.source[arg_start..arg_end];
 
     const msg = try std.fmt.allocPrint(
