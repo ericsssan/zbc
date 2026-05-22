@@ -19,6 +19,7 @@ const std = @import("std");
 const Ast = std.zig.Ast;
 
 const lexer = @import("../lexer.zig");
+const local = @import("../local.zig");
 const annotations_mod = @import("../annotations.zig");
 const problem_mod = @import("../problem.zig");
 const config_mod = @import("../config.zig");
@@ -39,79 +40,65 @@ pub fn check(
 ) !void {
     if (!config_mod.isEnabled(config, .destroy_after_deinit_in_loop)) return;
 
-    var node_idx: u32 = 1;
-    while (node_idx < tree.nodes.len) : (node_idx += 1) {
-        const node: Ast.Node.Index = @enumFromInt(node_idx);
-        if (tree.nodeTag(node) != .fn_decl) continue;
-        var buf: [1]Ast.Node.Index = undefined;
-        const fp = fnProto(tree, &buf, node) orelse continue;
-        const name_tok = fp.name_token orelse continue;
-        if (!isDestructorName(tree.tokenSlice(name_tok))) continue;
-        const body = bodyOf(tree, node) orelse continue;
-        try checkBody(gpa, tree, body, problems);
+    var proto_buf: [1]Ast.Node.Index = undefined;
+    var fns = lexer.iterFnDecls(tree);
+    while (fns.next(&proto_buf)) |fn_entry| {
+        if (!isDestructorName(tree.tokenSlice(fn_entry.name_token))) continue;
+        try checkFn(gpa, tree, fn_entry.proto, fn_entry.body, problems);
     }
 }
 
-fn checkBody(
+fn checkFn(
     gpa: std.mem.Allocator,
     tree: *const Ast,
+    proto: Ast.full.FnProto,
     body: Ast.Node.Index,
     problems: *std.ArrayListUnmanaged(Problem),
 ) !void {
     const tags = tree.tokens.items(.tag);
-    const first = tree.firstToken(body);
     const last = tree.lastToken(body);
 
-    var t: Ast.TokenIndex = first;
-    while (t + 5 < last) : (t += 1) {
-        if (tags[t] != .keyword_for) continue;
-        if (tags[t + 1] != .l_paren) continue;
-        // Find matching `)` of the for's iterable list.
-        var depth: u32 = 1;
-        var u: Ast.TokenIndex = t + 2;
-        while (u <= last) : (u += 1) {
-            switch (tags[u]) {
-                .l_paren => depth += 1,
-                .r_paren => {
-                    depth -= 1;
-                    if (depth == 0) break;
-                },
-                else => {},
-            }
-        }
-        if (depth != 0) continue;
-        const close_paren = u;
-        // Expect `|<capture>|` right after `)` (single iterable).
-        // For multi-iterable `for (a, b) |x, y|` we only handle the
-        // first capture; same shape works.
-        if (close_paren + 1 > last or tags[close_paren + 1] != .pipe) continue;
-        if (close_paren + 2 > last or tags[close_paren + 2] != .identifier) continue;
-        const capture_tok = close_paren + 2;
-        const capture_name = tree.tokenSlice(capture_tok);
-        // Find the matching second `|` (may be after a comma).
-        var v: Ast.TokenIndex = capture_tok + 1;
+    var bindings = try local.build(gpa, tree, proto, body);
+    defer bindings.deinit();
+
+    for (bindings.items) |b| {
+        if (b.origin != .loop_capture) continue;
+        // Find the closing `|` of the capture clause (after name_token,
+        // possibly past comma-separated extra captures).
+        var v: Ast.TokenIndex = b.name_token + 1;
         while (v <= last and tags[v] != .pipe) : (v += 1) {}
         if (v > last) continue;
         const body_start = v + 1;
-        // Find loop body's end — single stmt up to `;` or block.
         const body_end = findLoopBodyEnd(tags, body_start, last) orelse continue;
 
-        // Check the body: `<capture>.deinit();` appears AND no
-        // `<allocator>.destroy(<capture>)` / `.free(<capture>)` call.
-        if (!bodyHasDeinit(tree, body_start, body_end, capture_name)) continue;
-        if (bodyHasDestroyOrFree(tree, body_start, body_end, capture_name)) continue;
+        if (!bodyHasDeinit(tree, body_start, body_end, b.name)) continue;
+        if (bodyHasDestroyOrFree(tree, body_start, body_end, b.name)) continue;
 
-        // List-shape gate: the iterable expression's leading
-        // identifier (e.g. `element_handlers` in
-        // `this.element_handlers.items`) should be the name of a
-        // pointer-list field — check the file source for a
-        // declaration of `<name>:` whose type-expr contains `(*`.
-        const list_field_name = lastFieldIdentBefore(tree, close_paren) orelse continue;
+        // List-shape gate: the iterable expression's trailing identifier
+        // (e.g. `element_handlers` in `this.element_handlers.items`) is
+        // the name of a pointer-list field.  Binding.rhs_last is the
+        // last token of the iterable; the `)` is at rhs_last + 1.
+        const list_field_name = lastFieldIdentBefore(tree, b.rhs_last + 1) orelse continue;
         if (!isPointerListField(tree, list_field_name)) continue;
 
-        try report(gpa, problems, tree, t, capture_name, list_field_name);
-        t = body_end;
+        // Report at the `for` keyword.  Walk back from name_token to
+        // find the enclosing `keyword_for`.
+        const for_tok = findEnclosingFor(tags, b.name_token) orelse continue;
+        try report(gpa, problems, tree, for_tok, b.name, list_field_name);
     }
+}
+
+/// Walk back from a capture-name token to find the enclosing
+/// `keyword_for` / `keyword_while` / `keyword_if`.  Stops at the
+/// nearest one.
+fn findEnclosingFor(tags: []const std.zig.Token.Tag, name_token: Ast.TokenIndex) ?Ast.TokenIndex {
+    if (name_token == 0) return null;
+    var t: Ast.TokenIndex = name_token - 1;
+    while (t > 0) : (t -= 1) {
+        if (tags[t] == .keyword_for) return t;
+        if (tags[t] == .keyword_while or tags[t] == .keyword_if) return t;
+    }
+    return null;
 }
 
 /// Walk tokens at `start` to find the end of a for-loop's body.
