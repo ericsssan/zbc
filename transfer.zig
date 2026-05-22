@@ -857,3 +857,453 @@ fn reportWithNote(
         .notes = notes,
     });
 }
+
+// ── Tests ──────────────────────────────────────────────────
+//
+// Unit tests for the per-stmt transfer functions.  These exercise the
+// state-mutation contracts in isolation — analyzer.zig's 78 end-to-end
+// tests cover the CFG-builder + worklist + transfer composition; these
+// localize regressions to a single transfer.
+
+const testing = std.testing;
+const LocalInfoSlice = []const LocalInfo;
+
+fn pos0() cfg.SrcPos {
+    return .{ .line = 1, .column = 1, .byte = 0 };
+}
+fn pos1() cfg.SrcPos {
+    return .{ .line = 1, .column = 2, .byte = 1 };
+}
+
+const LId = state_mod.LocalId;
+const AId = state_mod.ArenaId;
+const HId = state_mod.HeapId;
+
+fn mkLocals(comptime names: []const []const u8) LocalInfoSlice {
+    comptime var infos: [names.len]LocalInfo = undefined;
+    inline for (names, 0..) |n, i| {
+        infos[i] = .{ .name = n, .decl_pos = .{ .line = 1, .column = 1, .byte = 0 } };
+    }
+    const out = infos;
+    return &out;
+}
+
+fn freeProblems(gpa: std.mem.Allocator, list: *std.ArrayListUnmanaged(Problem)) void {
+    for (list.items) |*p| p.deinit(gpa);
+    list.deinit(gpa);
+}
+
+test "transferDecl: heap_alloc binds local to .heap and marks heap live" {
+    const gpa = testing.allocator;
+    var state: AbstractState = .{};
+    defer state.deinit(gpa);
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    defer freeProblems(gpa, &problems);
+    const locals = mkLocals(&.{"x"});
+    const ctx: Ctx = .{ .gpa = gpa, .locals = locals, .problems = &problems, .path = "test" };
+
+    const x: LId = @enumFromInt(0);
+    const hid: HId = @enumFromInt(7);
+    try transferDecl(ctx, &state, .{
+        .local = x,
+        .init_kind = .{ .heap_alloc = .{ .id = hid } },
+    }, pos0());
+
+    const origin = state.locals.get(x).?;
+    try testing.expect(origin == .heap);
+    try testing.expectEqual(hid, origin.heap);
+    try testing.expect(state.heaps.get(hid).?.state == .live);
+}
+
+test "transferDecl: undef init produces .undef origin" {
+    const gpa = testing.allocator;
+    var state: AbstractState = .{};
+    defer state.deinit(gpa);
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    defer freeProblems(gpa, &problems);
+    const ctx: Ctx = .{ .gpa = gpa, .locals = mkLocals(&.{"x"}), .problems = &problems, .path = "test" };
+
+    const x: LId = @enumFromInt(0);
+    try transferDecl(ctx, &state, .{ .local = x, .init_kind = .undef }, pos0());
+    try testing.expect(state.locals.get(x).? == .undef);
+}
+
+test "transferDecl: stack_ref produces .stack" {
+    const gpa = testing.allocator;
+    var state: AbstractState = .{};
+    defer state.deinit(gpa);
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    defer freeProblems(gpa, &problems);
+    const ctx: Ctx = .{ .gpa = gpa, .locals = mkLocals(&.{ "x", "y" }), .problems = &problems, .path = "test" };
+
+    const x: LId = @enumFromInt(0);
+    const y: LId = @enumFromInt(1);
+    try transferDecl(ctx, &state, .{ .local = y, .init_kind = .{ .stack_ref = x } }, pos0());
+    const o = state.locals.get(y).?;
+    try testing.expect(o == .stack);
+    try testing.expectEqual(x, o.stack);
+}
+
+test "transferAssign: overwrites prior origin" {
+    const gpa = testing.allocator;
+    var state: AbstractState = .{};
+    defer state.deinit(gpa);
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    defer freeProblems(gpa, &problems);
+    const ctx: Ctx = .{ .gpa = gpa, .locals = mkLocals(&.{"x"}), .problems = &problems, .path = "test" };
+
+    const x: LId = @enumFromInt(0);
+    try state.locals.put(gpa, x, .undef);
+    try transferAssign(ctx, &state, .{ .target = x, .rhs_kind = .plain }, pos0());
+    try testing.expect(state.locals.get(x).? == .plain);
+}
+
+test "transferArenaKill: marks arena dead with kill site" {
+    const gpa = testing.allocator;
+    var state: AbstractState = .{};
+    defer state.deinit(gpa);
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    defer freeProblems(gpa, &problems);
+    const ctx: Ctx = .{ .gpa = gpa, .locals = mkLocals(&.{"a"}), .problems = &problems, .path = "test" };
+
+    const a: LId = @enumFromInt(0);
+    const aid: AId = @enumFromInt(3);
+    try state.arenas.put(gpa, aid, .{ .state = .live });
+    try state.locals.put(gpa, a, .{ .arena = aid });
+
+    try transferArenaKill(ctx, &state, .{ .arena_local = a }, pos0(), pos1());
+
+    const st = state.arenas.get(aid).?;
+    try testing.expect(st.state == .dead);
+    try testing.expect(st.killed_at != null);
+}
+
+test "transferHeapFree: live heap marked dead, no problem" {
+    const gpa = testing.allocator;
+    var state: AbstractState = .{};
+    defer state.deinit(gpa);
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    defer freeProblems(gpa, &problems);
+    const ctx: Ctx = .{ .gpa = gpa, .locals = mkLocals(&.{ "p", "gpa_l" }), .problems = &problems, .path = "test" };
+
+    const p: LId = @enumFromInt(0);
+    const hid: HId = @enumFromInt(1);
+    try state.heaps.put(gpa, hid, .{ .state = .live });
+    try state.locals.put(gpa, p, .{ .heap = hid });
+
+    try transferHeapFree(ctx, &state, .{
+        .freed_local = p,
+        .fallback_hid = @enumFromInt(99),
+    }, pos0(), pos1());
+
+    try testing.expect(state.heaps.get(hid).?.state == .dead);
+    try testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
+test "transferHeapFree: second free fires heap-double-free" {
+    const gpa = testing.allocator;
+    var state: AbstractState = .{};
+    defer state.deinit(gpa);
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    defer freeProblems(gpa, &problems);
+    const ctx: Ctx = .{ .gpa = gpa, .locals = mkLocals(&.{"p"}), .problems = &problems, .path = "test" };
+
+    const p: LId = @enumFromInt(0);
+    const hid: HId = @enumFromInt(2);
+    try state.heaps.put(gpa, hid, .{ .state = .dead });
+    try state.locals.put(gpa, p, .{ .heap = hid });
+
+    try transferHeapFree(ctx, &state, .{
+        .freed_local = p,
+        .fallback_hid = @enumFromInt(99),
+    }, pos0(), pos1());
+
+    try testing.expectEqual(@as(usize, 1), problems.items.len);
+    try testing.expectEqualStrings("heap-double-free", problems.items[0].rule_id);
+}
+
+test "transferHeapFree: allocator mismatch fires" {
+    const gpa = testing.allocator;
+    var state: AbstractState = .{};
+    defer state.deinit(gpa);
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    defer freeProblems(gpa, &problems);
+    const ctx: Ctx = .{ .gpa = gpa, .locals = mkLocals(&.{ "p", "gpa_a", "gpa_b" }), .problems = &problems, .path = "test" };
+
+    const p: LId = @enumFromInt(0);
+    const ga: LId = @enumFromInt(1);
+    const gb: LId = @enumFromInt(2);
+    const hid: HId = @enumFromInt(3);
+    try state.heaps.put(gpa, hid, .{ .state = .live, .allocator_local = ga });
+    try state.locals.put(gpa, p, .{ .heap = hid });
+
+    try transferHeapFree(ctx, &state, .{
+        .freed_local = p,
+        .fallback_hid = @enumFromInt(99),
+        .allocator_local = gb,
+    }, pos0(), pos1());
+
+    try testing.expectEqual(@as(usize, 1), problems.items.len);
+    try testing.expectEqualStrings("allocator-mismatch", problems.items[0].rule_id);
+}
+
+test "transferHeapFree: inter-procedural fallback records dead heap" {
+    const gpa = testing.allocator;
+    var state: AbstractState = .{};
+    defer state.deinit(gpa);
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    defer freeProblems(gpa, &problems);
+    const ctx: Ctx = .{ .gpa = gpa, .locals = mkLocals(&.{"p"}), .problems = &problems, .path = "test" };
+
+    const p: LId = @enumFromInt(0);
+    const fb: HId = @enumFromInt(42);
+    try state.locals.put(gpa, p, .plain);
+
+    try transferHeapFree(ctx, &state, .{
+        .freed_local = p,
+        .fallback_hid = fb,
+    }, pos0(), pos1());
+
+    const st = state.heaps.get(fb).?;
+    try testing.expect(st.state == .dead);
+    try testing.expect(st.is_inter_procedural);
+    try testing.expect(state.locals.get(p).? == .heap);
+}
+
+test "transferUse: live heap origin produces no problem" {
+    const gpa = testing.allocator;
+    var state: AbstractState = .{};
+    defer state.deinit(gpa);
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    defer freeProblems(gpa, &problems);
+    const ctx: Ctx = .{ .gpa = gpa, .locals = mkLocals(&.{"x"}), .problems = &problems, .path = "test" };
+
+    const x: LId = @enumFromInt(0);
+    const hid: HId = @enumFromInt(1);
+    try state.heaps.put(gpa, hid, .{ .state = .live });
+    try state.locals.put(gpa, x, .{ .heap = hid });
+
+    try transferUse(ctx, &state, .{ .local = x }, pos0(), pos1());
+    try testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
+test "transferUse: dead heap origin fires heap-use-after-free" {
+    const gpa = testing.allocator;
+    var state: AbstractState = .{};
+    defer state.deinit(gpa);
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    defer freeProblems(gpa, &problems);
+    const ctx: Ctx = .{ .gpa = gpa, .locals = mkLocals(&.{"x"}), .problems = &problems, .path = "test" };
+
+    const x: LId = @enumFromInt(0);
+    const hid: HId = @enumFromInt(1);
+    try state.heaps.put(gpa, hid, .{ .state = .dead });
+    try state.locals.put(gpa, x, .{ .heap = hid });
+
+    try transferUse(ctx, &state, .{ .local = x }, pos0(), pos1());
+    try testing.expectEqual(@as(usize, 1), problems.items.len);
+    try testing.expectEqualStrings("heap-use-after-free", problems.items[0].rule_id);
+}
+
+test "transferUse: method-call on .undef clears to .plain (no fire)" {
+    const gpa = testing.allocator;
+    var state: AbstractState = .{};
+    defer state.deinit(gpa);
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    defer freeProblems(gpa, &problems);
+    const ctx: Ctx = .{ .gpa = gpa, .locals = mkLocals(&.{"x"}), .problems = &problems, .path = "test" };
+
+    const x: LId = @enumFromInt(0);
+    try state.locals.put(gpa, x, .undef);
+
+    try transferUse(ctx, &state, .{ .local = x, .from_method_call = true }, pos0(), pos1());
+
+    try testing.expectEqual(@as(usize, 0), problems.items.len);
+    try testing.expect(state.locals.get(x).? == .plain);
+}
+
+test "transferUse: bare read of .undef fires use-undefined" {
+    const gpa = testing.allocator;
+    var state: AbstractState = .{};
+    defer state.deinit(gpa);
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    defer freeProblems(gpa, &problems);
+    const ctx: Ctx = .{ .gpa = gpa, .locals = mkLocals(&.{"x"}), .problems = &problems, .path = "test" };
+
+    const x: LId = @enumFromInt(0);
+    try state.locals.put(gpa, x, .undef);
+
+    try transferUse(ctx, &state, .{ .local = x }, pos0(), pos1());
+
+    try testing.expectEqual(@as(usize, 1), problems.items.len);
+    try testing.expectEqualStrings("use-undefined", problems.items[0].rule_id);
+}
+
+test "transferGap: collapses .undef → .plain, preserves resource origins" {
+    const gpa = testing.allocator;
+    var state: AbstractState = .{};
+    defer state.deinit(gpa);
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    defer freeProblems(gpa, &problems);
+    const ctx: Ctx = .{ .gpa = gpa, .locals = mkLocals(&.{ "u", "h", "a" }), .problems = &problems, .path = "test" };
+
+    const u: LId = @enumFromInt(0);
+    const h: LId = @enumFromInt(1);
+    const a: LId = @enumFromInt(2);
+    try state.locals.put(gpa, u, .undef);
+    try state.locals.put(gpa, h, .{ .heap = @enumFromInt(1) });
+    try state.locals.put(gpa, a, .{ .arena = @enumFromInt(1) });
+
+    try transferGap(ctx, &state, .{ .note = "test" }, pos0());
+
+    try testing.expect(state.locals.get(u).? == .plain);
+    try testing.expect(state.locals.get(h).? == .heap);
+    try testing.expect(state.locals.get(a).? == .arena);
+}
+
+test "transferRet: returning .arena from borrowed-return-type fires arena-escape" {
+    const gpa = testing.allocator;
+    var state: AbstractState = .{};
+    defer state.deinit(gpa);
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    defer freeProblems(gpa, &problems);
+    const ctx: Ctx = .{ .gpa = gpa, .locals = mkLocals(&.{"x"}), .problems = &problems, .path = "test" };
+
+    const x: LId = @enumFromInt(0);
+    const aid: AId = @enumFromInt(1);
+    // arena must be registered in state.arenas — the escape check
+    // only fires when the arena id is tracked (function-local arenas).
+    try state.arenas.put(gpa, aid, .{ .state = .live });
+    // copy_of of an .arena local yields .arena_borrow per originOfInit's
+    // own contract; arena-escape covers both .arena and .arena_borrow.
+    try state.locals.put(gpa, x, .{ .arena = aid });
+
+    try transferRet(ctx, &state, .{
+        .value_kind = .{ .copy_of = x },
+        .is_borrowed_return_type = true,
+    }, pos0(), pos1());
+
+    try testing.expect(problems.items.len >= 1);
+    try testing.expectEqualStrings("arena-escape", problems.items[0].rule_id);
+}
+
+test "transferRet: returning .stack fires stack-escape" {
+    const gpa = testing.allocator;
+    var state: AbstractState = .{};
+    defer state.deinit(gpa);
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    defer freeProblems(gpa, &problems);
+    const ctx: Ctx = .{ .gpa = gpa, .locals = mkLocals(&.{ "y", "buf" }), .problems = &problems, .path = "test" };
+
+    const y: LId = @enumFromInt(0);
+    const buf: LId = @enumFromInt(1);
+    try state.locals.put(gpa, y, .{ .stack = buf });
+
+    try transferRet(ctx, &state, .{
+        .value_kind = .{ .copy_of = y },
+        .is_borrowed_return_type = true,
+    }, pos0(), pos1());
+
+    try testing.expect(problems.items.len >= 1);
+    try testing.expectEqualStrings("stack-escape", problems.items[0].rule_id);
+}
+
+test "transferFieldHeapFree: tracks field origin as dead" {
+    const gpa = testing.allocator;
+    var state: AbstractState = .{};
+    defer state.deinit(gpa);
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    defer freeProblems(gpa, &problems);
+    const ctx: Ctx = .{ .gpa = gpa, .locals = mkLocals(&.{"obj"}), .problems = &problems, .path = "test" };
+
+    const obj: LId = @enumFromInt(0);
+    const hid: HId = @enumFromInt(5);
+    try state.heaps.put(gpa, hid, .{ .state = .live });
+    try state.fields.putContext(gpa, .{ .parent = obj, .name = "buf" }, .{ .heap = hid }, .{});
+
+    try transferFieldHeapFree(ctx, &state, .{
+        .parent = obj,
+        .name = "buf",
+        .fallback_hid = @enumFromInt(99),
+    }, pos0(), pos1());
+
+    try testing.expect(state.heaps.get(hid).?.state == .dead);
+}
+
+test "originOfInit: copy_of arena yields .arena_borrow" {
+    const gpa = testing.allocator;
+    var state: AbstractState = .{};
+    defer state.deinit(gpa);
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    defer freeProblems(gpa, &problems);
+    const ctx: Ctx = .{ .gpa = gpa, .locals = mkLocals(&.{ "a", "b" }), .problems = &problems, .path = "test" };
+
+    const a: LId = @enumFromInt(0);
+    const aid: AId = @enumFromInt(7);
+    try state.locals.put(gpa, a, .{ .arena = aid });
+
+    const o = try originOfInit(ctx, &state, .{ .copy_of = a }, pos0());
+    try testing.expect(o == .arena_borrow);
+    try testing.expectEqual(aid, o.arena_borrow);
+}
+
+test "originOfInit: arena_init mints + registers live arena" {
+    const gpa = testing.allocator;
+    var state: AbstractState = .{};
+    defer state.deinit(gpa);
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    defer freeProblems(gpa, &problems);
+    const ctx: Ctx = .{ .gpa = gpa, .locals = mkLocals(&.{"a"}), .problems = &problems, .path = "test" };
+
+    const aid: AId = @enumFromInt(11);
+    const o = try originOfInit(ctx, &state, .{ .arena_init = .{ .id = aid } }, pos0());
+    try testing.expect(o == .arena);
+    try testing.expectEqual(aid, o.arena);
+    try testing.expect(state.arenas.get(aid).?.state == .live);
+}
+
+test "transfer: reset_capture clears local to .plain + drops field tracking" {
+    const gpa = testing.allocator;
+    var state: AbstractState = .{};
+    defer state.deinit(gpa);
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    defer freeProblems(gpa, &problems);
+    const ctx: Ctx = .{ .gpa = gpa, .locals = mkLocals(&.{"bin"}), .problems = &problems, .path = "test" };
+
+    const bin: LId = @enumFromInt(0);
+    try state.locals.put(gpa, bin, .{ .heap = @enumFromInt(1) });
+    try state.fields.putContext(gpa, .{ .parent = bin, .name = "path" }, .{ .heap = @enumFromInt(2) }, .{});
+
+    const stmt: Stmt = .{
+        .kind = .{ .reset_capture = .{ .local = bin } },
+        .pos = pos0(),
+        .end_pos = pos1(),
+    };
+    try transfer(ctx, &state, stmt);
+
+    try testing.expect(state.locals.get(bin).? == .plain);
+    try testing.expect(state.fields.count() == 0);
+}
+
+test "transfer: dispatches each StmtKind without panic" {
+    const gpa = testing.allocator;
+    var state: AbstractState = .{};
+    defer state.deinit(gpa);
+    var problems: std.ArrayListUnmanaged(Problem) = .empty;
+    defer freeProblems(gpa, &problems);
+    const ctx: Ctx = .{ .gpa = gpa, .locals = mkLocals(&.{"x"}), .problems = &problems, .path = "test" };
+
+    const x: LId = @enumFromInt(0);
+    try state.locals.put(gpa, x, .plain);
+
+    // Smoke-test the dispatcher: every kind should at least not crash
+    // on a minimal valid input.
+    const kinds = [_]Stmt{
+        .{ .kind = .{ .decl = .{ .local = x, .init_kind = .plain } }, .pos = pos0(), .end_pos = pos1() },
+        .{ .kind = .{ .assign = .{ .target = x, .rhs_kind = .plain } }, .pos = pos0(), .end_pos = pos1() },
+        .{ .kind = .{ .pointer_write = .{ .target = x } }, .pos = pos0(), .end_pos = pos1() },
+        .{ .kind = .{ .use = .{ .local = x } }, .pos = pos0(), .end_pos = pos1() },
+        .{ .kind = .{ .lowering_gap = .{ .note = "smoke" } }, .pos = pos0(), .end_pos = pos1() },
+    };
+    for (kinds) |s| try transfer(ctx, &state, s);
+}
