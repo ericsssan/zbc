@@ -25,6 +25,7 @@ const problem_mod = @import("../problem.zig");
 const config_mod = @import("../config.zig");
 
 const lexer = @import("../lexer.zig");
+const local = @import("../local.zig");
 const fnProto = lexer.fnProto;
 const bodyOf = lexer.bodyOf;
 
@@ -81,94 +82,61 @@ fn checkFn(
     const flag_fields = fields_buf[0..field_count];
 
     const body = bodyOf(tree, fn_decl) orelse return;
-    try checkBody(gpa, tree, T, flag_fields, body, problems);
+    try checkBody(gpa, tree, fn_proto, T, flag_fields, body, problems);
 }
 
 fn checkBody(
     gpa: std.mem.Allocator,
     tree: *const Ast,
+    proto: Ast.full.FnProto,
     type_name: []const u8,
     flag_fields: []const []const u8,
     body: Ast.Node.Index,
     problems: *std.ArrayListUnmanaged(Problem),
 ) !void {
     const tags = tree.tokens.items(.tag);
-    const first = tree.firstToken(body);
-    const last = tree.lastToken(body);
 
-    // Phase 1: find every `var <dst> = …; … .*;` declaration whose RHS
-    // ends in `.*`.  We record (dst_name, decl_token) for each.  The
-    // `.*` immediately preceding the trailing `;` is the discriminator
-    // for a bitwise copy from a pointer.
+    // Phase 1: find every `var <dst> = …; … .*;` binding whose RHS
+    // ends in `.*` — a bitwise copy from a pointer.  Iterates over
+    // local.zig's pre-built bindings instead of re-parsing the
+    // var/=/; sequence by hand.
+    var bindings = try local.build(gpa, tree, proto, body);
+    defer bindings.deinit();
     var dups_buf: [8]Dup = undefined;
     var dup_count: usize = 0;
-    var t: Ast.TokenIndex = first;
-    while (t <= last) : (t += 1) {
-        if (tags[t] != .keyword_var) continue;
-        if (t + 1 > last or tags[t + 1] != .identifier) continue;
-        if (t + 2 > last or tags[t + 2] != .equal) continue;
-        // Walk forward until the semicolon at our nesting level (the
-        // statement terminator).  Track paren / brace depth so we
-        // don't match a `;` inside an inner block / call.
-        var paren: u32 = 0;
-        var brace: u32 = 0;
-        var bracket: u32 = 0;
-        var u: Ast.TokenIndex = t + 3;
-        var end_tok: ?Ast.TokenIndex = null;
-        while (u <= last) : (u += 1) {
-            switch (tags[u]) {
-                .l_paren => paren += 1,
-                .r_paren => if (paren > 0) {
-                    paren -= 1;
-                },
-                .l_brace => brace += 1,
-                .r_brace => if (brace > 0) {
-                    brace -= 1;
-                },
-                .l_bracket => bracket += 1,
-                .r_bracket => if (bracket > 0) {
-                    bracket -= 1;
-                },
-                .semicolon => if (paren == 0 and brace == 0 and bracket == 0) {
-                    end_tok = u;
-                    break;
-                },
-                else => {},
-            }
-            if (end_tok != null) break;
-        }
-        const sc = end_tok orelse continue;
-        // The `.*` deref must immediately precede the semicolon —
-        // the RHS evaluates to a bitwise copy of a pointer's pointee.
-        // Zig's tokenizer fuses `.*` into a single `period_asterisk`.
-        if (sc < 1) continue;
-        if (tags[sc - 1] != .period_asterisk) continue;
-        if (dup_count < dups_buf.len) {
-            // Capture the source identifier when the RHS is a bare
-            // `<ident>.*` — only that shape has an identifiable
-            // "source local" we can match against later in the
-            // ownership-transfer (`<src>.* = undefined`) check.
-            const src_name: ?[]const u8 = if (sc >= 2 and tags[sc - 2] == .identifier and (t + 3) == (sc - 2))
-                tree.tokenSlice(sc - 2)
-            else
-                null;
-            dups_buf[dup_count] = .{
-                .dst_name = tree.tokenSlice(t + 1),
-                .src_name = src_name,
-                .decl_token = t,
-            };
-            dup_count += 1;
-        }
-        t = sc;
+    for (bindings.items) |b| {
+        if (b.is_const) continue;
+        if (b.origin == .param) continue;
+        if (tags[b.rhs_last] != .period_asterisk) continue;
+        if (dup_count >= dups_buf.len) break;
+        // Source identifier when the RHS is a BARE `<ident>.*` —
+        // exactly two tokens, identifier then period_asterisk.  Only
+        // this shape has an identifiable "source local" we can match
+        // against the `<src>.* = undefined` ownership-transfer check.
+        const src_name: ?[]const u8 = if (b.rhs_first + 1 == b.rhs_last and
+            tags[b.rhs_first] == .identifier)
+            tree.tokenSlice(b.rhs_first)
+        else
+            null;
+        // decl_token points at the `var` keyword (one before the name).
+        dups_buf[dup_count] = .{
+            .dst_name = b.name,
+            .src_name = src_name,
+            .decl_token = b.name_token - 1,
+        };
+        dup_count += 1;
     }
     if (dup_count == 0) return;
+
+    const first = tree.firstToken(body);
+    const last = tree.lastToken(body);
 
     // Phase 2: confirm at least one `dup` is RETURNED (the dst name
     // appears immediately after a `return` keyword in the body, with
     // an optional `.<...>` field chain accepted — `return dup;` and
     // `return dup;` only for v1, no `return wrap(dup);` style).
     var returned_buf: [8]bool = .{false} ** 8;
-    t = first;
+    var t: Ast.TokenIndex = first;
     while (t <= last) : (t += 1) {
         if (tags[t] != .keyword_return) continue;
         if (t + 1 > last or tags[t + 1] != .identifier) continue;
