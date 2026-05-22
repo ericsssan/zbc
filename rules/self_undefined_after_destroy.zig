@@ -30,17 +30,13 @@ const destroy_or_free = &[_]Atom{
 };
 
 // Pattern: write through X — `$X.* = ...` or `$X.<field> = ...`.
-// Two alternatives expressed as two patterns (DSL has no "or" yet).
-const write_deref = &[_]Atom{
+// Disjunction expresses the two write forms in a single pattern.
+const write_through_x = &[_]Atom{
     .{ .ref = 0 },
-    .{ .tok = .period_asterisk },
-    .{ .tok = .equal },
-};
-const write_field = &[_]Atom{
-    .{ .ref = 0 },
-    .{ .tok = .period },
-    .{ .tok = .identifier },
-    .{ .tok = .equal },
+    .{ .any_of = &[_][]const Atom{
+        &[_]Atom{ .{ .tok = .period_asterisk }, .{ .tok = .equal } },
+        &[_]Atom{ .{ .tok = .period }, .{ .tok = .identifier }, .{ .tok = .equal } },
+    } },
 };
 
 // Pattern: rebinding of X — stops the scan.  `$X = ...` (no leading `.`).
@@ -86,23 +82,16 @@ fn checkBody(
                 std.mem.eql(u8, tree.tokenSlice(before), tree.tokenSlice(d.captures[0].?)))
                 continue;
         }
-        // Look for `.* = ...` first, then `.<field> = ...`, OR
-        // a rebinding `<X> = ...` that ends the scan.
+        // Look for `<X>.* = ...` or `<X>.<field> = ...` (single
+        // disjunction pattern), OR a rebinding `<X> = ...` that
+        // ends the scan.
         const after = d.end + 1;
         const reb = query.findInSameScope(tree, rebind_x, after, last, &d);
-        const w_deref = query.findInSameScope(tree, write_deref, after, last, &d);
-        const w_field = query.findInSameScope(tree, write_field, after, last, &d);
-        const write = pickFirst(w_deref, w_field) orelse continue;
+        const write = query.findInSameScope(tree, write_through_x, after, last, &d) orelse continue;
         // If the rebind is BEFORE the write, treat as rebinding → no fire.
         if (reb) |r| if (r.start < write.start) continue;
         try report(gpa, problems, tree, write.start, d.captures[0].?, d.start + 1);
     }
-}
-
-fn pickFirst(a: ?query.Match, b: ?query.Match) ?query.Match {
-    if (a == null) return b;
-    if (b == null) return a;
-    return if (a.?.start <= b.?.start) a else b;
 }
 
 fn isDestroyOrFree(name: []const u8) bool {

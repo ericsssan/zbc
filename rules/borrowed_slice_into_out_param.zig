@@ -49,19 +49,13 @@ const defer_free = &[_]Atom{
     .{ .capture = 0 },
 };
 
-// `<out>.* = ...` — $0 = out.
-const write_deref = &[_]Atom{
+// `<out>.* = ...` OR `<out>.<field> = ...` — $0 = out.
+const write_via_out = &[_]Atom{
     .{ .capture = 0 },
-    .{ .tok = .period_asterisk },
-    .{ .tok = .equal },
-};
-
-// `<out>.<field> = ...` — $0 = out, field name not captured.
-const write_field = &[_]Atom{
-    .{ .capture = 0 },
-    .{ .tok = .period },
-    .{ .tok = .identifier },
-    .{ .tok = .equal },
+    .{ .any_of = &[_][]const Atom{
+        &[_]Atom{ .{ .tok = .period_asterisk }, .{ .tok = .equal } },
+        &[_]Atom{ .{ .tok = .period }, .{ .tok = .identifier }, .{ .tok = .equal } },
+    } },
 };
 
 pub fn check(
@@ -140,8 +134,7 @@ fn checkFn(
     if (deferred.items.len == 0) return;
 
     // Find writes through pointer params; check RHS for any deferred name.
-    try scanWrites(gpa, tree, write_deref, first, last, pointer_params.items, deferred.items, problems);
-    try scanWrites(gpa, tree, write_field, first, last, pointer_params.items, deferred.items, problems);
+    try scanWrites(gpa, tree, write_via_out, first, last, pointer_params.items, deferred.items, problems);
 }
 
 fn scanWrites(
