@@ -1,18 +1,15 @@
 //! zbc CLI — thin shell over the lib.zig library API.
-//! Walks the .zig files passed on argv, runs the requested analysis
-//! mode, prints any Problems found in a grep-friendly format, and
-//! exits 0 if all-clean / 1 if any problems.
+//! Walks the .zig files passed on argv, runs escape analysis on each,
+//! prints any Problems found in a grep-friendly format, and exits 0 if
+//! all-clean / 1 if any problems.
 //!
 //! Usage:
 //!   zbc [options] <file.zig>...
 //!
-//! Default mode is escape analysis — drop-in: run zbc on any Zig
-//! source and signature-driven inference fills in the annotations
-//! needed for invariant checks (see lib.zig for the rules).
+//! Drop-in: run zbc on any Zig source; lifetime inference + the
+//! pattern-detector rules fire without annotation requirements.
 //!
 //! Options:
-//!   --hygiene            Run Layer-1 annotation-presence rules
-//!                        instead of escape analysis.
 //!   --enable=<list>      Comma-separated invariant names to enable.
 //!   --disable=<list>     Comma-separated invariant names to disable.
 //!   --arena-init=<csv>   Source-text patterns that mint a fresh
@@ -41,7 +38,6 @@ pub fn main(init: std.process.Init) !void {
     var enabled: std.ArrayListUnmanaged(lib.Invariant) = .empty;
     defer enabled.deinit(gpa);
     try enabled.appendSlice(gpa, &lib.all_invariants);
-    var mode: Mode = .escape;
     var enabled_explicit = false;
     var format: Format = .rich;
     var color_off = false;
@@ -80,14 +76,6 @@ pub fn main(init: std.process.Init) !void {
                 std.process.exit(2);
             };
             explainAndExit(id);
-        }
-        if (std.mem.eql(u8, a, "--hygiene")) {
-            mode = .hygiene;
-            continue;
-        }
-        if (std.mem.eql(u8, a, "--escape")) {
-            mode = .escape;
-            continue;
         }
         if (std.mem.startsWith(u8, a, "--enable=")) {
             if (!enabled_explicit) {
@@ -175,8 +163,8 @@ pub fn main(init: std.process.Init) !void {
         .enabled = enabled.items,
     };
 
-    var shared_cache: ?lib.Cache = if (mode == .escape) lib.Cache.init(gpa, io) else null;
-    defer if (shared_cache) |*c| c.deinit();
+    var shared_cache: lib.Cache = lib.Cache.init(gpa, io);
+    defer shared_cache.deinit();
 
     const tasks = try gpa.alloc(Task, expanded.items.len);
     defer gpa.free(tasks);
@@ -185,9 +173,8 @@ pub fn main(init: std.process.Init) !void {
             .gpa = gpa,
             .io = io,
             .path = path,
-            .mode = mode,
             .config = &config,
-            .cache = if (shared_cache) |*c| c else null,
+            .cache = &shared_cache,
             .problems = &.{},
             .err = null,
         };
@@ -304,7 +291,6 @@ fn expandPath(
     }
 }
 
-const Mode = enum { escape, hygiene };
 const Format = enum { rich, compact, json };
 const Op = enum { add, remove };
 
@@ -356,11 +342,11 @@ fn printUsage() void {
     std.debug.print(
         \\usage: zbc [options] <file.zig>...
         \\
-        \\Default mode is escape analysis — flags slices borrowed from a
-        \\function-local arena that are returned past the arena's death.
+        \\Escape analysis: flags slices borrowed from a function-local
+        \\arena that are returned past the arena's death, plus a battery
+        \\of pattern-detector rules for memory-lifetime bug classes.
         \\
         \\options:
-        \\  --hygiene             Run annotation-presence rules instead.
         \\  --enable=a,b,c        Enable only these invariants.
         \\  --disable=a,b         Disable these invariants from the set.
         \\  --arena-init=A,B      Patterns that mint a fresh arena
@@ -388,9 +374,8 @@ const Task = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
     path: []const u8,
-    mode: Mode,
     config: *const lib.Config,
-    cache: ?*lib.Cache,
+    cache: *lib.Cache,
     problems: []lib.Problem,
     err: ?anyerror,
 };
@@ -422,16 +407,10 @@ fn workerLoop(ctx: WorkerCtx) void {
 }
 
 fn runOne(t: *Task) std.Io.Cancelable!void {
-    const problems = if (t.mode == .escape)
-        lib.analyzeEscape(t.gpa, t.io, t.path, t.cache.?, t.config) catch |err| {
-            t.err = err;
-            return;
-        }
-    else
-        lib.analyzeHygiene(t.gpa, t.io, t.path) catch |err| {
-            t.err = err;
-            return;
-        };
+    const problems = lib.analyzeEscape(t.gpa, t.io, t.path, t.cache, t.config) catch |err| {
+        t.err = err;
+        return;
+    };
     t.problems = problems;
 }
 

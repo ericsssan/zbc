@@ -15,8 +15,6 @@ const rule_catalog_mod = @import("rule_catalog.zig");
 const file_cache_mod = @import("file_cache.zig");
 const suppressions_mod = @import("suppressions.zig");
 
-const require_borrowed_from = @import("rules/require_borrowed_from.zig");
-
 pub const Config = config_mod.Config;
 pub const DefaultConfig = config_mod.Default;
 pub const Invariant = config_mod.Invariant;
@@ -140,34 +138,6 @@ fn filterSuppressed(
     }
     problems.deinit(gpa);
     return kept.toOwnedSlice(gpa);
-}
-
-pub fn analyzeHygiene(
-    gpa: std.mem.Allocator,
-    io: std.Io,
-    path: []const u8,
-) ![]Problem {
-    const src_bytes = try std.Io.Dir.cwd().readFileAlloc(
-        io,
-        path,
-        gpa,
-        std.Io.Limit.limited(16 * 1024 * 1024),
-    );
-    defer gpa.free(src_bytes);
-
-    const src = try gpa.allocSentinel(u8, src_bytes.len, 0);
-    defer gpa.free(src);
-    @memcpy(src[0..src_bytes.len], src_bytes);
-
-    var tree = try Ast.parse(gpa, src, .zig);
-    defer tree.deinit(gpa);
-
-    var problems: std.ArrayListUnmanaged(Problem) = .empty;
-    errdefer freeProblemsArrayList(gpa, &problems);
-
-    try require_borrowed_from.check(gpa, &tree, .{}, &problems);
-
-    return problems.toOwnedSlice(gpa);
 }
 
 pub fn freeProblems(gpa: std.mem.Allocator, slice: []Problem) void {
@@ -582,7 +552,6 @@ test {
     _ = problem_mod;
     _ = @import("abstract_state.zig");
     _ = @import("transfer.zig");
-    _ = require_borrowed_from;
     _ = rule_catalog_mod;
     // Pattern rules — registered in rule_registry; pulling it in
     // refAllDecls'es every rule module so inline tests run.

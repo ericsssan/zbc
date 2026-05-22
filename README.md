@@ -38,15 +38,14 @@ caret + secondary span pointing at the free / kill / borrow site.
 
 ## Rules
 
-46 rules in two analysis families:
+45 rules in two analysis families:
 
 **Flow analysis** — full per-fn control-flow graph + abstract
 interpretation:
 
 - `heap-use-after-free`, `heap-double-free`, `arena-use-after-kill`,
   `arena-escape`, `stack-escape`, `use-undefined`,
-  `allocator-mismatch`, `interior-pointer-destroy`,
-  `require-borrowed-from`
+  `allocator-mismatch`, `interior-pointer-destroy`
 
 **Pattern detectors** — per-fn token-walk over canonical bug shapes
 mined from open-source Zig PRs.  Shared infrastructure in `lexer.zig`

@@ -55,11 +55,6 @@ pub const all = [_]Rule{
         .body = @embedFile("rules/use-undefined.md"),
     },
     .{
-        .id = "require-borrowed-from",
-        .title = "public borrowed-shape return without a @returns borrowed_from() annotation",
-        .body = @embedFile("rules/require-borrowed-from.md"),
-    },
-    .{
         .id = "allocator-mismatch",
         .title = "freeing with an allocator different from the one that allocated",
         .body = @embedFile("rules/allocator-mismatch.md"),
