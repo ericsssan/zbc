@@ -42,26 +42,26 @@ inside a single atom.
 
 **Fix:** add `.{ .any_of = &[_][]const Atom{...} }` atom variant.
 
-### G3. method-call chains lose the outermost call
+### G3. ~~method-call chains lose the outermost call~~ — FIXED
 
-`local.classifyOrigin` captures only the FIRST two identifiers
-of a method-call chain:
+**Resolution:** added `outermost_method` / `outermost_method_token`
+/ `outermost_paren_token` to `CallInfo` (commit dfc5b58), plus
+convenience methods `lastMethod() / lastParen() / isChained()`.
 
-- `arena.allocator()` → `method_call(receiver=arena, method=allocator)` ✓
-- `arena.allocator().alloc(...)` → ALSO `method_call(receiver=arena,
-  method=allocator)` ✗ — loses the `.alloc(...)` outer call
+Multi-segment receiver paths (`std.heap.page_allocator.alloc(...)`)
+also now classify properly — they're a single call with deep
+receiver (chain walk collects all chain identifiers; the LAST
+before the `(` is the method).
 
-**Why it matters:** the chained form is common in idiomatic Zig
-(`std.heap.page_allocator.alloc(...)`, `arena.allocator().dupe(...)`).
-Rules like `slice-of-arena-into-heap` need the OUTER method
-(`alloc`/`dupe`) to classify; they fall back to a token pattern
-(`inline_arena_alloc`) for the chained form.
+Witness migration: `slice-of-arena-into-heap`'s Shape A
+(`handle.alloc`) and Shape B (`arena.allocator().alloc`)
+collapsed into one classification branch via `lastMethod() +
+isChained()`.  The `inline_arena_alloc` fallback pattern is
+deleted.
 
-**Fix shapes:**
-- Add `Origin.chained_method_call` capturing the OUTERMOST call's
-  receiver+method, with `inner` pointing at the first-call info.
-- OR replace `CallInfo.method` with a `methods: []const []const u8`
-  slice covering the full chain.
+Future beneficiaries: `missing-errdefer-between-tries` has a
+custom `parseTypeMethodAfter` that could be replaced with
+`b.asCall() + lastMethod`.
 
 ### G4. `local.zig` doesn't track loop captures
 
@@ -154,12 +154,12 @@ corpus sweeps, every trace event looks alike.  Easy fix
 |---|---|---|
 | G1 (field-paths) | **fixed** | query.capture_until + ref_range; free_then_try_realloc migrated -56 LOC |
 | G2 (disjunction) | **fixed** | query.any_of; self_undefined + borrowed_slice cleaned up |
-| G3 (chained calls) | open | medium-cost extension to local.zig |
+| G3 (chained calls) | **fixed** | local.CallInfo gains outermost_*; slice_of_arena -23 LOC |
 | G4 (loop captures) | **fixed** | local.loop_capture; destroy_after_deinit_in_loop migrated |
 | G5 (nested types) | open | latent FN; not yet surfaced in real corpora |
 | G6 (capture+pred) | open | fragile offset arithmetic workaround in 1 rule |
 | G7 (try distinction) | open | mild |
 | G8 (classifier naming) | open | naming-convention not duplication |
 
-3 of 8 fixed, 4 of 5 remaining are open by choice (low frequency
-or low workaround cost).
+4 of 8 fixed.  Remaining gaps are either low-frequency (G5),
+low-workaround-cost (G6, G7), or naming rather than DSL shape (G8).
