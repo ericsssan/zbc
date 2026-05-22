@@ -78,19 +78,36 @@ fn checkFn(
     for (bindings.items) |b| {
         if (!b.is_const) continue;
         if (b.origin == .param) continue;
-        // Must be a try-wrapped expression.
+        // Must be a try-wrapped binding.  Includes captures
+        // (`if (try Loader.fromJS(...)) |x|`) AND const bindings
+        // (`const X = try ...`) — both have rhs_first pointing at
+        // the `try` keyword.
+        if (b.rhs_first > b.rhs_last) continue;
         if (tags[b.rhs_first] != .keyword_try) continue;
-        // Walk the RHS chain (after `try`) to find the LAST
-        // identifier-pair before `(` — local.zig's CallInfo only
-        // captures the FIRST two of a chain, which loses
-        // `std.fs.cwd().createFile(...)`-style chains.
+
+        // Extract the FIRST call's (type, method) — the OLD walker
+        // semantics.  Works for any rhs shape including chains and
+        // loop-capture scrutinees.
         const parsed = parseTypeMethodAfter(tree, b.rhs_first + 1, b.rhs_last) orelse continue;
 
+        // For chained calls like `std.fs.cwd().createFile(...)`,
+        // the FIRST method (cwd) isn't an opener but the OUTER call
+        // (createFile) is.  When asCall is available (.try_method_call
+        // origins), check the outermost method as a fallback.
+        var meth = parsed.method;
+        if (!isOwnershipTransferMethod(meth) and !isFileHandleOpenerMethod(meth)) {
+            if (b.asCall()) |c| {
+                if (c.outermost_method) |outer| {
+                    if (isFileHandleOpenerMethod(outer)) meth = outer;
+                }
+            }
+        }
+
         var is_fd_open = false;
-        if (isOwnershipTransferMethod(parsed.method)) {
+        if (isOwnershipTransferMethod(meth)) {
             if (parsed.type_name.len == 0 or parsed.type_name[0] < 'A' or parsed.type_name[0] > 'Z') continue;
             if (!typeHasDeinit(db, parsed.type_name)) continue;
-        } else if (isFileHandleOpenerMethod(parsed.method)) {
+        } else if (isFileHandleOpenerMethod(meth)) {
             is_fd_open = true;
         } else continue;
 
@@ -130,11 +147,11 @@ const ParsedCall = struct {
     method: []const u8,
 };
 
-/// Walk forward through an `<ident>.<ident>.<ident>(...)` chain
-/// starting at `start`.  Return (type_name, method) where method is
-/// the LAST identifier before the `(` and type_name is the one
-/// immediately preceding it.  Returns null when the chain isn't at
-/// least `<Type>.<method>(`.
+/// Walk forward through an `<ident>(.<ident>)*(...)` chain starting
+/// at `start`.  Returns (type_name, method) where `method` is the
+/// LAST identifier before the first `(`, and `type_name` is the
+/// one immediately before it.  Returns null when the chain isn't
+/// at least `<Type>.<method>(`.
 fn parseTypeMethodAfter(tree: *const Ast, start: Ast.TokenIndex, last: Ast.TokenIndex) ?ParsedCall {
     const tags = tree.tokens.items(.tag);
     var t: Ast.TokenIndex = start;
