@@ -22,15 +22,15 @@ Bun's.
 | `clobbered_by_struct_reset.zig` | `clobbered-by-struct-reset` | [oven-sh/bun#29854](https://github.com/oven-sh/bun/pull/29854) |
 | `realloc_byte_count.zig` | `realloc-byte-count` | [oven-sh/bun#29452](https://github.com/oven-sh/bun/pull/29452) |
 | `asymmetric_field_free.zig` | `asymmetric-field-free` | [oven-sh/bun#29853](https://github.com/oven-sh/bun/pull/29853) |
-| `missing_errdefer_between_tries.zig` | `missing-errdefer-between-tries` | [oven-sh/bun#30169](https://github.com/oven-sh/bun/pull/30169) |
+| `missing_errdefer_between_tries.zig` | `missing-errdefer-between-tries` | [oven-sh/bun#30169](https://github.com/oven-sh/bun/pull/30169), [ziglang/zig#22131](https://github.com/ziglang/zig/pull/22131) |
 | `free_then_try_realloc.zig` | `free-then-try-realloc` | [oven-sh/bun#29968](https://github.com/oven-sh/bun/pull/29968) |
 | `free_then_try_realloc_mysql.zig` | `free-then-try-realloc` (faithful MySQL repro, no `#`-private fields) | [oven-sh/bun#29968](https://github.com/oven-sh/bun/pull/29968) |
 | `destroy_after_deinit_in_loop.zig` | `destroy-after-deinit-in-loop` | [oven-sh/bun#29879](https://github.com/oven-sh/bun/pull/29879) |
 | `dead_errdefer_in_result_fn.zig` | `dead-errdefer-in-result-fn` | [oven-sh/bun#27706](https://github.com/oven-sh/bun/pull/27706) |
 | `duplicate_errdefer.zig` | `duplicate-errdefer` | [tigerbeetle/tigerbeetle#2700](https://github.com/tigerbeetle/tigerbeetle/pull/2700) |
-| `overwrite_without_deinit.zig` | `overwrite-without-deinit` | [oven-sh/bun#28633](https://github.com/oven-sh/bun/pull/28633), [oven-sh/bun#29864](https://github.com/oven-sh/bun/pull/29864) |
+| `overwrite_without_deinit.zig` | `overwrite-without-deinit` | [oven-sh/bun#28633](https://github.com/oven-sh/bun/pull/28633), [oven-sh/bun#29864](https://github.com/oven-sh/bun/pull/29864), hexops/mach `d690814b` (setter-without-prior-free; mined commit, no PR) |
 | `stack_fallback_escape.zig` | `stack-fallback-escape` | [ghostty-org/ghostty#9885](https://github.com/ghostty-org/ghostty/pull/9885) |
-| `unreleased_refs_on_error.zig` | `unreleased-refs-on-error` | hexops/mach `sysgpu/vulkan.zig:1887` (mined; no PR) |
+| `unreleased_refs_on_error.zig` | `unreleased-refs-on-error` | hexops/mach `sysgpu/vulkan.zig:1887` (mined; no PR).  Related Bun PRs (same family — `pendingActivityRef`/`Unref` mismatch on errdefer path; current rule requires the addref to be in a loop body so doesn't fire on these single-addref cases): [oven-sh/bun#29329](https://github.com/oven-sh/bun/pull/29329), [oven-sh/bun#29900](https://github.com/oven-sh/bun/pull/29900), [oven-sh/bun#29901](https://github.com/oven-sh/bun/pull/29901), [oven-sh/bun#29907](https://github.com/oven-sh/bun/pull/29907) |
 | `hashmap_getptr_rehash.zig` | `hashmap-getptr-rehash` | Zig std `HashMap` pointer-stability footgun (canonical class, no specific PR) |
 | `arraylist_items_slice.zig` | `arraylist-items-slice` | Zig std `ArrayList.items` pointer-stability footgun (canonical class, no specific PR) |
 | `fd_write_after_close.zig` | `fd-write-after-close` | POSIX/Windows file-handle use-after-close (canonical class, no specific PR) |

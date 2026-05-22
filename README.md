@@ -38,7 +38,7 @@ caret + secondary span pointing at the free / kill / borrow site.
 
 ## Rules
 
-40 rules organized into three families:
+45 rules organized into three families:
 
 **Layer 1 — CFG-based escape analysis** (full per-fn control-flow
 graph + abstract interpretation):
@@ -65,7 +65,9 @@ bug shapes mined from open-source Zig PRs):
   `arraylist-items-slice`, `fd-write-after-close`,
   `stack-fallback-escape`, `slice-of-arena-into-heap`,
   `borrowed-slice-into-out-param`,
-  `memset-undef-after-len-truncation`
+  `borrowed-slice-into-stack-buffer-returned`,
+  `memset-undef-after-len-truncation`,
+  `sentinel-strip-free-size-mismatch`
 - Tagged-union semantics:
   `tagged-union-retag-with-old-payload-read`,
   `union-deinit-without-inert-reset`,
@@ -73,7 +75,10 @@ bug shapes mined from open-source Zig PRs):
   `return-borrowed-payload`
 - Lifecycle / sibling-method consistency:
   `reset-skips-pooled-resource-release`,
-  `missing-deinit-on-composed-owner`
+  `missing-deinit-on-composed-owner`,
+  `deinit-order-violates-construction-dep`,
+  `defer-and-errdefer-free-overlap`,
+  `move-out-without-restore`
 - Concurrency / hardening: `publish-then-touch-self`,
   `assert-on-untrusted-input`
 
