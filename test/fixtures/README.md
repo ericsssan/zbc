@@ -50,6 +50,7 @@ Bun's.
 | `borrowed_slice_into_out_param.zig` | `borrowed-slice-into-out-param` | [oven-sh/bun#30151](https://github.com/oven-sh/bun/pull/30151), [oven-sh/bun#30223](https://github.com/oven-sh/bun/pull/30223), [oven-sh/bun#25563](https://github.com/oven-sh/bun/pull/25563) |
 | `defer_and_errdefer_free_overlap.zig` | `defer-and-errdefer-free-overlap` | [ghostty-org/ghostty#8249](https://github.com/ghostty-org/ghostty/pull/8249) |
 | `sentinel_strip_free_size_mismatch.zig` | `sentinel-strip-free-size-mismatch` | [ghostty-org/ghostty#8886](https://github.com/ghostty-org/ghostty/pull/8886) |
+| `move_out_without_restore.zig` | `move-out-without-restore` | [ziglang/zig#24452](https://github.com/ziglang/zig/pull/24452) |
 
 ## Re-fetching the actual pre-merge buggy files
 

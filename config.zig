@@ -370,9 +370,16 @@ pub const Invariant = enum {
     /// does not match free size N").  Catches
     /// ghostty-org/ghostty#8886.
     sentinel_strip_free_size_mismatch,
+    /// `var <X> = <OBJ>.toArrayList(...)` (or similar move-out
+    /// method that clears OBJ's state) + fallible op on <X> +
+    /// no `defer <OBJ>.setArrayList(<X>);` between.  On error,
+    /// X is dropped with partial allocation and OBJ is left
+    /// holding cleared/stale state.  Catches ziglang/zig#24452
+    /// class (`Io.Writer.Allocating.toOwnedSlice*`).
+    move_out_without_restore,
 };
 
-pub const all_invariants: [41]Invariant = .{
+pub const all_invariants: [42]Invariant = .{
     .arena_escape,
     .stack_escape,
     .use_undefined,
@@ -414,6 +421,7 @@ pub const all_invariants: [41]Invariant = .{
     .borrowed_slice_into_out_param,
     .defer_and_errdefer_free_overlap,
     .sentinel_strip_free_size_mismatch,
+    .move_out_without_restore,
 };
 
 pub const Default: Config = .{};

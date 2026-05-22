@@ -234,6 +234,11 @@ pub const all = [_]Rule{
         .title = "`alloc.free(X.ptr[0..X.len])` — strips sentinel; allocator's free-size check fails on `[:0]` slices",
         .body = @embedFile("rules/sentinel-strip-free-size-mismatch.md"),
     },
+    .{
+        .id = "move-out-without-restore",
+        .title = "`var X = obj.toArrayList()` + fallible op on X with no `defer obj.setArrayList(X)` — leak on error",
+        .body = @embedFile("rules/move-out-without-restore.md"),
+    },
 };
 
 /// Look up a rule by id.  Returns null on unknown id so callers can
