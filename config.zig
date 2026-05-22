@@ -399,9 +399,16 @@ pub const Invariant = enum {
     /// struct whose `.pre`/`.build`-style fields point at the
     /// now-dead stack buffer.  Catches ziglang/zig#25713 class.
     borrowed_slice_into_stack_buffer_returned,
+    /// Transition rule: a fn carries a `/// @returns owned`,
+    /// `/// @returns borrowed_from(p)`, or `/// @returns heap`
+    /// doc-comment annotation, but the body's inferred behavior
+    /// CONTRADICTS the annotation.  Catches stale annotations during
+    /// the annotation-to-inference migration — the annotation lied
+    /// about what the body does.
+    stale_annotation,
 };
 
-pub const all_invariants: [45]Invariant = .{
+pub const all_invariants: [46]Invariant = .{
     .arena_escape,
     .stack_escape,
     .use_undefined,
@@ -447,6 +454,7 @@ pub const all_invariants: [45]Invariant = .{
     .move_out_without_restore,
     .deinit_order_violates_construction_dep,
     .borrowed_slice_into_stack_buffer_returned,
+    .stale_annotation,
 };
 
 pub const Default: Config = .{};

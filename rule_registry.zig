@@ -82,6 +82,7 @@ const slice_of_arena_into_heap_mod = @import("rules/slice_of_arena_into_heap.zig
 const stack_fallback_escape_mod = @import("rules/stack_fallback_escape.zig");
 const tagged_union_retag_with_old_payload_read_mod = @import("rules/tagged_union_retag_with_old_payload_read.zig");
 const union_deinit_without_inert_reset_mod = @import("rules/union_deinit_without_inert_reset.zig");
+const stale_annotation_mod = @import("rules/stale_annotation.zig");
 const unreleased_factory_handle_mod = @import("rules/unreleased_factory_handle.zig");
 const unreleased_refs_on_error_mod = @import("rules/unreleased_refs_on_error.zig");
 
@@ -126,6 +127,7 @@ pub const escape_rules = [_]Rule{
     .{ .id = "move-out-without-restore",                   .check = .{ .plain = move_out_without_restore_mod.check } },
     .{ .id = "deinit-order-violates-construction-dep",     .check = .{ .plain = deinit_order_violates_construction_dep_mod.check } },
     .{ .id = "borrowed-slice-into-stack-buffer-returned",  .check = .{ .plain = borrowed_slice_into_stack_buffer_returned_mod.check } },
+    .{ .id = "stale-annotation",                           .check = .{ .plain = stale_annotation_mod.check } },
 };
 
 /// Dispatch all registered escape rules against `tree`.
@@ -201,6 +203,7 @@ test "registry: pull in every rule module so inline tests run" {
     _ = stack_fallback_escape_mod;
     _ = tagged_union_retag_with_old_payload_read_mod;
     _ = union_deinit_without_inert_reset_mod;
+    _ = stale_annotation_mod;
     _ = unreleased_factory_handle_mod;
     _ = unreleased_refs_on_error_mod;
 }
