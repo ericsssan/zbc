@@ -59,6 +59,16 @@ pub const Atom = union(enum) {
     /// Try to match the nested sequence; if any atom fails, rewind to
     /// before this opt and continue with the next atom.
     opt: []const Atom,
+    /// Try each alternative in order; the first that matches wins.
+    /// Each alternative is itself an atom sequence — useful for
+    /// "pattern A OR pattern B at this position":
+    ///     .{ .any_of = &[_][]const Atom{
+    ///         &[_]Atom{ .{ .tok = .period_asterisk }, .{ .tok = .equal } },
+    ///         &[_]Atom{ .{ .tok = .period }, .{ .tok = .identifier }, .{ .tok = .equal } },
+    ///     }},
+    /// If no alternative matches, the parent match fails (no rewind-
+    /// and-continue like `.opt`).
+    any_of: []const []const Atom,
     /// Consume a balanced `(...)`: opens with `(`, skips to matching
     /// `)`, advances past `)`.  Used for "ignore the call args".
     paren_args,
@@ -166,6 +176,23 @@ fn matchSlice(
                     t.* = save;
                     captures.* = save_caps;
                 }
+            },
+            .any_of => |alts| {
+                // First alternative that matches wins.  On all-fail the
+                // parent match fails (unlike `.opt` which silently
+                // continues with the next sibling atom).
+                const save = t.*;
+                const save_caps = captures.*;
+                var matched = false;
+                for (alts) |alt| {
+                    if (matchSlice(tree, alt, t, last, captures)) {
+                        matched = true;
+                        break;
+                    }
+                    t.* = save;
+                    captures.* = save_caps;
+                }
+                if (!matched) return false;
             },
             .paren_args => {
                 if (t.* > last or tags[t.*] != .l_paren) return false;
@@ -478,6 +505,43 @@ test "matchAt: predicate" {
     const dir_pos = findIdent(&tree, "dir");
     const m = matchAt(&tree, atoms, dir_pos, last, null).?;
     try testing.expectEqual(@as(TokenIndex, dir_pos), m.start);
+}
+
+test "matchAt: any_of picks the first matching alternative" {
+    var tree = try parseTokens("fn f() void { x.* = 1; y.field = 2; z = 3; }");
+    defer tree.deinit(testing.allocator);
+    const last: TokenIndex = @intCast(tree.tokens.len - 1);
+    // Pattern: `<id> (.* = | . <id> =) ...` — capture the LHS.
+    const atoms = &[_]Atom{
+        .{ .capture = 0 },
+        .{ .any_of = &[_][]const Atom{
+            &[_]Atom{ .{ .tok = .period_asterisk }, .{ .tok = .equal } },
+            &[_]Atom{ .{ .tok = .period }, .{ .tok = .identifier }, .{ .tok = .equal } },
+        } },
+    };
+    const matches = try findAll(testing.allocator, &tree, atoms, 0, last);
+    defer testing.allocator.free(matches);
+    // Should match `x.* =` and `y.field =` but NOT bare `z = 3` (no
+    // alternative covers a bare `=` after the identifier).
+    try testing.expectEqual(@as(usize, 2), matches.len);
+    try testing.expectEqualStrings("x", matches[0].captureText(&tree, 0).?);
+    try testing.expectEqualStrings("y", matches[1].captureText(&tree, 0).?);
+}
+
+test "matchAt: any_of fails if no alternative matches" {
+    var tree = try parseTokens("fn f() void { x = 1; }");
+    defer tree.deinit(testing.allocator);
+    const last: TokenIndex = @intCast(tree.tokens.len - 1);
+    const atoms = &[_]Atom{
+        .{ .capture = 0 },
+        .{ .any_of = &[_][]const Atom{
+            &[_]Atom{ .{ .tok = .period_asterisk } },
+            &[_]Atom{ .{ .tok = .period } },
+        } },
+    };
+    const matches = try findAll(testing.allocator, &tree, atoms, 0, last);
+    defer testing.allocator.free(matches);
+    try testing.expectEqual(@as(usize, 0), matches.len);
 }
 
 test "matchAt: opt" {

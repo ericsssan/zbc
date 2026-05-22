@@ -39,6 +39,10 @@ const TokenTag = lexer.TokenTag;
 pub const OriginKind = enum {
     /// Fn parameter binding (declared in the proto).
     param,
+    /// Loop / control-flow capture: `for (xs) |x|`, `for (xs) |x, i|`,
+    /// `if (opt) |x|`, `while (it.next()) |x|`, `catch |err|`.
+    /// `rhs_first` / `rhs_last` span the iterable / scrutinee expr.
+    loop_capture,
     /// Literal value: `42`, `\"x\"`, `null`, `undefined`, `true`,
     /// `.{...}`, `.tag`, `[N]u8{...}`, etc.
     literal,
@@ -84,6 +88,7 @@ pub const FieldAccess = struct {
 
 pub const Origin = union(OriginKind) {
     param,
+    loop_capture,
     literal,
     call: CallInfo,
     method_call: CallInfo,
@@ -204,12 +209,36 @@ pub fn build(
         });
     }
 
-    // ── Pass 2: local decls in body ────────────────────────
+    // ── Pass 2: local decls + capture clauses in body ──────
     const tags = tree.tokens.items(.tag);
     const first = tree.firstToken(body);
     const last = tree.lastToken(body);
     var t: TokenIndex = first;
     while (t < last) : (t += 1) {
+        // Capture clauses on for/while/if/catch.  Pattern:
+        //   - for (it) |x|       — pipe pair after the iterable
+        //   - for (it) |x, i|    — multi-capture
+        //   - if (opt) |x|       — pipe pair after the condition
+        //   - while (it.next()) |x| ...
+        //   - <expr> catch |err| { ... }
+        // We detect by walking to the closing `)`/keyword_catch and
+        // checking for a `|name(, name)?|` clause right after.
+        if (tags[t] == .keyword_for or tags[t] == .keyword_while or tags[t] == .keyword_if) {
+            // Skip past the (cond/iter) and walk to optional `|...|`.
+            if (t + 1 > last or tags[t + 1] != .l_paren) continue;
+            const close = lexer.matchParen(tags, t + 1, last) orelse continue;
+            if (close + 1 > last or tags[close + 1] != .pipe) {
+                continue;
+            }
+            try captureItemsBetween(a, &items, tree, t + 2, close - 1, close + 1, last);
+            // Don't advance t past the capture — body still needs walking.
+        } else if (tags[t] == .keyword_catch) {
+            if (t + 1 > last or tags[t + 1] != .pipe) continue;
+            // `catch` has no enclosing parens for the scrutinee — the
+            // expression before `catch` is the scrutinee but we don't
+            // track its range as the capture's rhs (rare to need).
+            try captureItemsBetween(a, &items, tree, t, t, t + 1, last);
+        }
         if (tags[t] != .keyword_const and tags[t] != .keyword_var) continue;
         if (t + 1 > last or tags[t + 1] != .identifier) continue;
         const name_tok = t + 1;
@@ -262,6 +291,41 @@ pub fn build(
         .tree = tree,
         .items = try items.toOwnedSlice(a),
     };
+}
+
+/// Parse a `|name|` / `|name, name|` capture clause starting at
+/// the first `|` (at `pipe_open`).  Append each captured identifier
+/// as a Binding with origin `.loop_capture` and rhs spanning the
+/// iterable / scrutinee range `[iter_first, iter_last]`.  Tolerates
+/// `*` pointer-capture prefix (`for (xs) |*x|`) and underscores
+/// (`for (xs) |_, i|` — skipped, not bound).
+fn captureItemsBetween(
+    a: std.mem.Allocator,
+    items: *std.ArrayListUnmanaged(Binding),
+    tree: *const Ast,
+    iter_first: TokenIndex,
+    iter_last: TokenIndex,
+    pipe_open: TokenIndex,
+    last: TokenIndex,
+) !void {
+    const tags = tree.tokens.items(.tag);
+    if (pipe_open > last or tags[pipe_open] != .pipe) return;
+    var t: TokenIndex = pipe_open + 1;
+    while (t <= last and tags[t] != .pipe) : (t += 1) {
+        if (tags[t] == .asterisk) continue; // `|*x|` pointer capture
+        if (tags[t] == .comma) continue;
+        if (tags[t] != .identifier) continue;
+        const name = tree.tokenSlice(t);
+        if (std.mem.eql(u8, name, "_")) continue;
+        try items.append(a, .{
+            .name = name,
+            .name_token = t,
+            .is_const = true,
+            .rhs_first = iter_first,
+            .rhs_last = iter_last,
+            .origin = .loop_capture,
+        });
+    }
 }
 
 fn isBuiltinValueIdent(name: []const u8) bool {
@@ -530,4 +594,96 @@ test "build: var binding" {
 
     const x = bindings.find("x").?;
     try testing.expect(!x.is_const);
+}
+
+test "build: for-loop capture" {
+    var r = try parseFn(
+        \\fn f(items: []u8) void {
+        \\    for (items) |item| {
+        \\        _ = item;
+        \\    }
+        \\}
+    );
+    defer r.tree.deinit(testing.allocator);
+    var bindings = r.bindings;
+    defer bindings.deinit();
+
+    const item = bindings.find("item").?;
+    try testing.expectEqual(OriginKind.loop_capture, std.meta.activeTag(item.origin));
+}
+
+test "build: for-loop multi-capture" {
+    var r = try parseFn(
+        \\fn f(items: []u8) void {
+        \\    for (items, 0..) |item, i| {
+        \\        _ = item;
+        \\        _ = i;
+        \\    }
+        \\}
+    );
+    defer r.tree.deinit(testing.allocator);
+    var bindings = r.bindings;
+    defer bindings.deinit();
+
+    const item = bindings.find("item").?;
+    try testing.expectEqual(OriginKind.loop_capture, std.meta.activeTag(item.origin));
+    const i = bindings.find("i").?;
+    try testing.expectEqual(OriginKind.loop_capture, std.meta.activeTag(i.origin));
+}
+
+test "build: pointer-capture |*x|" {
+    var r = try parseFn(
+        \\fn f(items: []u8) void {
+        \\    for (items) |*item| {
+        \\        item.* = 0;
+        \\    }
+        \\}
+    );
+    defer r.tree.deinit(testing.allocator);
+    var bindings = r.bindings;
+    defer bindings.deinit();
+    try testing.expect(bindings.find("item") != null);
+}
+
+test "build: if-optional capture" {
+    var r = try parseFn(
+        \\fn f(maybe: ?u8) void {
+        \\    if (maybe) |v| {
+        \\        _ = v;
+        \\    }
+        \\}
+    );
+    defer r.tree.deinit(testing.allocator);
+    var bindings = r.bindings;
+    defer bindings.deinit();
+    try testing.expect(bindings.find("v") != null);
+}
+
+test "build: while capture" {
+    var r = try parseFn(
+        \\fn f(it: anytype) void {
+        \\    while (it.next()) |v| {
+        \\        _ = v;
+        \\    }
+        \\}
+    );
+    defer r.tree.deinit(testing.allocator);
+    var bindings = r.bindings;
+    defer bindings.deinit();
+    try testing.expect(bindings.find("v") != null);
+}
+
+test "build: underscore capture is skipped" {
+    var r = try parseFn(
+        \\fn f(items: []u8) void {
+        \\    for (items, 0..) |_, i| {
+        \\        _ = i;
+        \\    }
+        \\}
+    );
+    defer r.tree.deinit(testing.allocator);
+    var bindings = r.bindings;
+    defer bindings.deinit();
+    try testing.expect(bindings.find("_") == null);
+    try testing.expect(bindings.find("i") != null);
 }
