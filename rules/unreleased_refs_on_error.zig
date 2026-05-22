@@ -35,6 +35,7 @@ const problem_mod = @import("../problem.zig");
 const config_mod = @import("../config.zig");
 
 const lexer = @import("../lexer.zig");
+const query = @import("../query.zig");
 const testing = @import("../testing.zig");
 const matchBrace = lexer.matchBrace;
 const matchParen = lexer.matchParen;
@@ -44,6 +45,21 @@ const hasTokenInRange = lexer.hasTokenInRange;
 const returnsType = lexer.returnsType;
 const fnProto = lexer.fnProto;
 const bodyOf = lexer.bodyOf;
+const Atom = query.Atom;
+
+// `.<addrefMethod>(` — preceded by `.` so it's a method call.
+const addref_call_pattern = &[_]Atom{
+    .{ .tok = .period },
+    .{ .pred = isAddrefMethodName },
+    .{ .tok = .l_paren },
+};
+
+// `.<releaseMethod>(` — used inside defer/errdefer body scans.
+const release_call_pattern = &[_]Atom{
+    .{ .tok = .period },
+    .{ .pred = isReleaseMethodName },
+    .{ .tok = .l_paren },
+};
 
 const Problem = problem_mod.Problem;
 const Pos = problem_mod.Pos;
@@ -88,33 +104,17 @@ fn checkBody(
     // rate.
     if (fnHasReleaseDeferOrErrdefer(tree, first, last)) return;
 
-    // Walk for addref call sites — anywhere in the fn body, in or
-    // out of loops.  Track addref sites we already fired on so we
-    // don't double-fire when the same addref appears inside a loop
-    // AND the outer pass.  In practice both sweeps converge on the
-    // same token range, so a single walk suffices.
-    var t: Ast.TokenIndex = first;
-    while (t + 2 <= last) : (t += 1) {
-        // Skip past nested fns so inner-fn addrefs aren't
-        // double-scanned through the outer.
-        if (tags[t] == .keyword_fn) {
-            t = skipNestedFn(tags, t, last);
-            continue;
-        }
-        // `<X>.<addref>(` — `<addref>` is preceded by `.`.
-        if (tags[t] != .period) continue;
-        if (tags[t + 1] != .identifier) continue;
-        if (t + 2 > last or tags[t + 2] != .l_paren) continue;
-        if (!isAddrefMethodName(tree.tokenSlice(t + 1))) continue;
-        // Locate the addref's `;` (end of its statement).
-        const sc = findStmtSemicolon(tags, t + 2, last) orelse continue;
-        // Require a `try` later in the fn body.
-        if (!hasTokenInRange(tags, sc + 1, last, .keyword_try)) {
-            t = sc;
-            continue;
-        }
-        try report(gpa, problems, tree, t + 1);
-        t = sc;
+    // Walk for addref call sites — anywhere in the fn body, skipping
+    // nested fns.  For each, require a `try` later in the body
+    // (the error path that would leak the unreleased ref).
+    const addrefs = try query.findAllInBody(gpa, tree, addref_call_pattern, first, last);
+    defer gpa.free(addrefs);
+    for (addrefs) |m| {
+        // Match layout: m.start = `.`, +1 = method, +2 = `(`.
+        const method_tok = m.start + 1;
+        const sc = findStmtSemicolon(tags, m.start + 2, last) orelse continue;
+        if (!hasTokenInRange(tags, sc + 1, last, .keyword_try)) continue;
+        try report(gpa, problems, tree, method_tok);
     }
 }
 
@@ -189,18 +189,9 @@ fn fnHasReleaseDeferOrErrdefer(tree: *const Ast, start: Ast.TokenIndex, end: Ast
 }
 
 fn rangeHasReleaseCall(tree: *const Ast, start: Ast.TokenIndex, end: Ast.TokenIndex) bool {
-    const tags = tree.tokens.items(.tag);
-    var t: Ast.TokenIndex = start;
-    while (t + 2 <= end) : (t += 1) {
-        if (tags[t] != .period) continue;
-        if (tags[t + 1] != .identifier) continue;
-        if (tags[t + 2] != .l_paren) continue;
-        if (isReleaseMethodName(tree.tokenSlice(t + 1))) return true;
-    }
-    return false;
+    return query.anyMatchAnywhere(tree, release_call_pattern, start, end, null);
 }
 
-/// Given a token index at `l_paren`, find the matching `r_paren`.
 fn report(
     gpa: std.mem.Allocator,
     problems: *std.ArrayListUnmanaged(Problem),
