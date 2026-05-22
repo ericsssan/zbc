@@ -10,49 +10,26 @@
 //! the handle transiently (as input to another create call) leak
 //! one ref each invocation.
 //!
-//! Distinct from existing `unreleased-refs-on-error` which catches
+//! Distinct from `unreleased-refs-on-error` which catches
 //! `manager.reference()` increments on a loop without paired
 //! release errdefer — that rule is about the addref side.  This
 //! rule is about the INITIAL ref returned by a factory method on
 //! the happy path.
-//!
-//! Detection (purely syntactic, per-fn token walk):
-//!   1. Skip comptime type-builder fns.
-//!   2. Find `const|var <X> = [try] <recv>.<create>(...);` where
-//!      `<create>` is in the GPU-factory allowlist below.
-//!   3. Skip if the fn body contains `defer <X>.release()` /
-//!      `errdefer <X>.release()` / `defer <X>.deinit()`.
-//!   4. Skip if the fn body contains `return <X>;` or
-//!      `<self>.<field> = <X>;` (ownership transfer).
-//!   5. Skip if `<X>` is passed as an arg to a `set*`/`use*`
-//!      method that conventionally takes ownership.
-//!   6. Fire on the binding.
-//!
-//! Create-method allowlist (GPU-flavored):
-//!   createShaderModule / createPipelineLayout / createBindGroup
-//!   / createBindGroupLayout / createComputePipeline /
-//!   createRenderPipeline / createBuffer / createTexture /
-//!   createSampler / createCommandEncoder / createComputePassEncoder
-//!   / createRenderPassEncoder / createRenderBundleEncoder /
-//!   createQuerySet / getQueue / acquireCurrentTexture /
-//!   createTextureView.
 
 const std = @import("std");
 const Ast = std.zig.Ast;
 
-const problem_mod = @import("../problem.zig");
-const config_mod = @import("../config.zig");
-
 const lexer = @import("../lexer.zig");
-const matchBrace = lexer.matchBrace;
-const findStmtSemicolon = lexer.findStmtSemicolon;
-const skipNestedFn = lexer.skipNestedFn;
-const returnsType = lexer.returnsType;
-const fnProto = lexer.fnProto;
-const bodyOf = lexer.bodyOf;
+const local = @import("../local.zig");
+const query = @import("../query.zig");
+const problem_mod = @import("../problem.zig");
+const testing = @import("../testing.zig");
+const config_mod = @import("../config.zig");
 
 const Problem = problem_mod.Problem;
 const Pos = problem_mod.Pos;
+const Atom = query.Atom;
+const R = "unreleased-factory-handle";
 
 pub fn check(
     gpa: std.mem.Allocator,
@@ -62,13 +39,10 @@ pub fn check(
 ) !void {
     if (!config_mod.isEnabled(config, .unreleased_factory_handle)) return;
 
-    var node_idx: u32 = 1;
-    while (node_idx < tree.nodes.len) : (node_idx += 1) {
-        const node: Ast.Node.Index = @enumFromInt(node_idx);
-        if (tree.nodeTag(node) != .fn_decl) continue;
-        if (returnsType(tree, node)) continue;
-        const body = bodyOf(tree, node) orelse continue;
-        try checkBody(gpa, tree, body, problems);
+    var proto_buf: [1]Ast.Node.Index = undefined;
+    var fns = lexer.iterFnDecls(tree);
+    while (fns.next(&proto_buf)) |fn_entry| {
+        try checkFn(gpa, tree, fn_entry.proto, fn_entry.body, problems);
     }
 }
 
@@ -78,59 +52,37 @@ const Handle = struct {
     method_tok: Ast.TokenIndex,
 };
 
-fn checkBody(
+fn checkFn(
     gpa: std.mem.Allocator,
     tree: *const Ast,
+    proto: Ast.full.FnProto,
     body: Ast.Node.Index,
     problems: *std.ArrayListUnmanaged(Problem),
 ) !void {
-    const tags = tree.tokens.items(.tag);
-    const first = tree.firstToken(body);
-    const last = tree.lastToken(body);
+    var bindings = try local.build(gpa, tree, proto, body);
+    defer bindings.deinit();
 
     var handles: std.ArrayListUnmanaged(Handle) = .empty;
     defer handles.deinit(gpa);
 
-    var t: Ast.TokenIndex = first;
-    while (t + 5 <= last) : (t += 1) {
-        if (tags[t] == .keyword_fn) {
-            t = skipNestedFn(tags, t, last);
-            continue;
-        }
-        if (tags[t] != .keyword_const and tags[t] != .keyword_var) continue;
-        if (tags[t + 1] != .identifier) continue;
-        var after_name: Ast.TokenIndex = t + 2;
-        if (after_name <= last and tags[after_name] == .colon) {
-            var d: u32 = 0;
-            while (after_name <= last) : (after_name += 1) {
-                switch (tags[after_name]) {
-                    .l_paren, .l_brace, .l_bracket => d += 1,
-                    .r_paren, .r_brace, .r_bracket => if (d > 0) {
-                        d -= 1;
-                    },
-                    .equal => if (d == 0) break,
-                    else => {},
-                }
-            }
-        }
-        if (after_name > last or tags[after_name] != .equal) continue;
-        var rhs: Ast.TokenIndex = after_name + 1;
-        if (rhs <= last and tags[rhs] == .keyword_try) rhs += 1;
-        if (rhs + 3 > last) continue;
-        if (tags[rhs] != .identifier) continue;
-        if (tags[rhs + 1] != .period) continue;
-        if (tags[rhs + 2] != .identifier) continue;
-        if (tags[rhs + 3] != .l_paren) continue;
-        if (!isFactoryMethodName(tree.tokenSlice(rhs + 2))) continue;
+    // Find `const|var X = [try] <recv>.<factoryMethod>(...)` bindings.
+    for (bindings.items) |b| {
+        if (b.origin == .param) continue;
+        const c = b.asCall() orelse continue;
+        const method = c.method orelse continue;
+        if (!isFactoryMethodName(method)) continue;
         try handles.append(gpa, .{
-            .name = tree.tokenSlice(t + 1),
-            .name_token = t + 1,
-            .method_tok = rhs + 2,
+            .name = b.name,
+            .name_token = b.name_token,
+            .method_tok = c.method_token.?,
         });
     }
+    if (handles.items.len == 0) return;
 
+    const first = tree.firstToken(body);
+    const last = tree.lastToken(body);
     for (handles.items) |h| {
-        if (handleHasDeferRelease(tree, first, last, h.name)) continue;
+        if (hasDeferRelease(tree, first, last, h.name)) continue;
         if (handleEscapes(tree, first, last, h.name)) continue;
         try report(gpa, problems, tree, h);
     }
@@ -160,9 +112,19 @@ fn isFactoryMethodName(name: []const u8) bool {
         std.mem.eql(u8, name, "createTextureView");
 }
 
-/// True iff `[start, last]` contains `defer <name>.<release-method>()`
-/// or `errdefer <name>.<release-method>()`.
-fn handleHasDeferRelease(
+fn isReleaseMethodName(name: []const u8) bool {
+    return std.mem.eql(u8, name, "release") or
+        std.mem.eql(u8, name, "deinit") or
+        std.mem.eql(u8, name, "destroy") or
+        std.mem.eql(u8, name, "deref") or
+        std.mem.eql(u8, name, "unref");
+}
+
+/// True iff `[start, last]` contains `defer <name>.<release>()` or
+/// `errdefer <name>.<release>()`.  Block-form `defer { <name>...`
+/// is also accepted (one leading `{` between the keyword and the
+/// receiver).
+fn hasDeferRelease(
     tree: *const Ast,
     start: Ast.TokenIndex,
     last: Ast.TokenIndex,
@@ -173,7 +135,7 @@ fn handleHasDeferRelease(
     while (t + 4 <= last) : (t += 1) {
         if (tags[t] != .keyword_defer and tags[t] != .keyword_errdefer) continue;
         var u: Ast.TokenIndex = t + 1;
-        // Optional `|err|` capture.
+        // Optional `|err|` capture on errdefer.
         if (u <= last and tags[u] == .pipe) {
             u += 1;
             while (u <= last and tags[u] != .pipe) : (u += 1) {}
@@ -183,32 +145,24 @@ fn handleHasDeferRelease(
         // Optional `{` (block form).
         if (u <= last and tags[u] == .l_brace) u += 1;
         if (u + 3 > last) continue;
-        if (tags[u] != .identifier) continue;
-        if (!std.mem.eql(u8, tree.tokenSlice(u), name)) continue;
-        if (tags[u + 1] != .period) continue;
-        if (tags[u + 2] != .identifier) continue;
-        if (tags[u + 3] != .l_paren) continue;
-        const m = tree.tokenSlice(u + 2);
-        if (isReleaseMethodName(m)) return true;
+        const release_call = [_]Atom{
+            .{ .text = name },
+            .{ .tok = .period },
+            .{ .pred = isReleaseMethodName },
+            .{ .tok = .l_paren },
+        };
+        if (query.matchAt(tree, &release_call, u, last, null) != null) return true;
     }
     return false;
-}
-
-fn isReleaseMethodName(name: []const u8) bool {
-    return std.mem.eql(u8, name, "release") or
-        std.mem.eql(u8, name, "deinit") or
-        std.mem.eql(u8, name, "destroy") or
-        std.mem.eql(u8, name, "deref") or
-        std.mem.eql(u8, name, "unref");
 }
 
 /// True iff the handle escapes via:
 ///   - `return <expr ...name...>` — return statement
 ///   - `<X> = <expr ...name...>` — assignment RHS (struct-field
 ///     or `.field = name` in a struct literal)
-///   - any place where `<name>` is preceded by `=` (assignment-
-///     RHS contexts) — broad enough to catch struct literals,
-///     locals, etc.
+///   - positional arg to a fn call (`foo(name)` / `foo(a, name, b)`).
+///
+/// Skips the binding site itself.  Skips `_ = name;` discards.
 fn handleEscapes(
     tree: *const Ast,
     start: Ast.TokenIndex,
@@ -220,12 +174,9 @@ fn handleEscapes(
     while (t + 1 <= last) : (t += 1) {
         if (tags[t] != .identifier) continue;
         if (!std.mem.eql(u8, tree.tokenSlice(t), name)) continue;
-        // Skip the binding site itself (`const <name> = ...`).
+        // Skip the binding site itself (`const|var <name> = ...`).
         if (t >= 1 and (tags[t - 1] == .keyword_const or tags[t - 1] == .keyword_var)) continue;
-        if (t >= 2 and tags[t - 2] == .keyword_const and tags[t - 1] != .equal) continue;
-        // Preceded by `=` (assignment RHS) → escape.  EXCEPT when
-        // the LHS is `_` — that's just an unused-variable silencer,
-        // not real transfer.
+        // Preceded by `=` → assignment RHS = escape.  EXCEPT `_ = name`.
         if (t >= 1 and tags[t - 1] == .equal) {
             const lhs_is_underscore = t >= 2 and
                 tags[t - 2] == .identifier and
@@ -235,22 +186,14 @@ fn handleEscapes(
         }
         // Preceded by `return` → escape.
         if (t >= 1 and tags[t - 1] == .keyword_return) return true;
-        // Preceded by `,` followed by something inside a struct
-        // literal or call: `, name,` or `, name)` — count as escape
-        // (positional arg / continuation of struct literal).  This
-        // is approximate but catches common cases.
-        if (t >= 1 and tags[t - 1] == .comma) {
-            if (t + 1 <= last and (tags[t + 1] == .comma or tags[t + 1] == .r_paren or tags[t + 1] == .r_brace)) {
-                return true;
-            }
-        }
-        // Preceded by `(` and followed by `,` or `)`: positional
-        // first arg `foo(name)` or `foo(name, ...)`.
-        if (t >= 1 and tags[t - 1] == .l_paren) {
-            if (t + 1 <= last and (tags[t + 1] == .comma or tags[t + 1] == .r_paren)) {
-                return true;
-            }
-        }
+        // `, name [,)]` — positional arg continuation.
+        if (t >= 1 and tags[t - 1] == .comma and
+            t + 1 <= last and (tags[t + 1] == .comma or tags[t + 1] == .r_paren or tags[t + 1] == .r_brace))
+            return true;
+        // `( name [,)]` — positional first arg.
+        if (t >= 1 and tags[t - 1] == .l_paren and
+            t + 1 <= last and (tags[t + 1] == .comma or tags[t + 1] == .r_paren))
+            return true;
     }
     return false;
 }
@@ -270,7 +213,7 @@ fn report(
     errdefer gpa.free(msg);
 
     try problems.append(gpa, .{
-        .rule_id = "unreleased-factory-handle",
+        .rule_id = R,
         .severity = .@"error",
         .start = Pos.fromTokenStart(tree, h.name_token),
         .end = Pos.fromTokenEnd(tree, h.name_token),
@@ -280,24 +223,8 @@ fn report(
 
 // ── Tests ──────────────────────────────────────────────────
 
-fn runOn(gpa: std.mem.Allocator, src: []const u8) !std.ArrayListUnmanaged(Problem) {
-    const src_z = try gpa.dupeSentinel(u8, src, 0);
-    defer gpa.free(src_z);
-    var tree = try Ast.parse(gpa, src_z, .zig);
-    defer tree.deinit(gpa);
-    var problems: std.ArrayListUnmanaged(Problem) = .empty;
-    try check(gpa, &tree, &config_mod.Default, &problems);
-    return problems;
-}
-
-fn freeProblems(gpa: std.mem.Allocator, p: *std.ArrayListUnmanaged(Problem)) void {
-    for (p.items) |*x| x.deinit(gpa);
-    p.deinit(gpa);
-}
-
-test "unreleased-factory-handle: createPipelineLayout without defer release fires" {
-    const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+test "createPipelineLayout without defer release fires" {
+    try testing.expectFires(check, R,
         \\const std = @import("std");
         \\const Device = struct {
         \\    pub fn createPipelineLayout(_: *Device, _: anytype) *u8 { return undefined; }
@@ -306,16 +233,11 @@ test "unreleased-factory-handle: createPipelineLayout without defer release fire
         \\    const layout = device.createPipelineLayout(desc);
         \\    _ = layout;
         \\}
-        \\
     );
-    defer freeProblems(gpa, &problems);
-    try std.testing.expectEqual(@as(usize, 1), problems.items.len);
-    try std.testing.expectEqualStrings("unreleased-factory-handle", problems.items[0].rule_id);
 }
 
-test "unreleased-factory-handle: with defer release doesn't fire" {
-    const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+test "with defer release doesn't fire" {
+    try testing.expectNoFire(check,
         \\const Layout = struct { pub fn release(_: *Layout) void {} };
         \\const Device = struct {
         \\    pub fn createPipelineLayout(_: *Device, _: anytype) *Layout { return undefined; }
@@ -325,15 +247,11 @@ test "unreleased-factory-handle: with defer release doesn't fire" {
         \\    defer layout.release();
         \\    _ = layout;
         \\}
-        \\
     );
-    defer freeProblems(gpa, &problems);
-    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
 }
 
-test "unreleased-factory-handle: returned handle doesn't fire (ownership transfer)" {
-    const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+test "returned handle doesn't fire (ownership transfer)" {
+    try testing.expectNoFire(check,
         \\const Layout = struct {};
         \\const Device = struct {
         \\    pub fn createPipelineLayout(_: *Device, _: anytype) *Layout { return undefined; }
@@ -342,15 +260,11 @@ test "unreleased-factory-handle: returned handle doesn't fire (ownership transfe
         \\    const layout = device.createPipelineLayout(desc);
         \\    return layout;
         \\}
-        \\
     );
-    defer freeProblems(gpa, &problems);
-    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
 }
 
-test "unreleased-factory-handle: stored in struct field doesn't fire" {
-    const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+test "stored in struct field doesn't fire" {
+    try testing.expectNoFire(check,
         \\const Layout = struct {};
         \\const Device = struct {
         \\    pub fn createPipelineLayout(_: *Device, _: anytype) *Layout { return undefined; }
@@ -362,15 +276,11 @@ test "unreleased-factory-handle: stored in struct field doesn't fire" {
         \\        self.layout = layout;
         \\    }
         \\};
-        \\
     );
-    defer freeProblems(gpa, &problems);
-    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
 }
 
-test "unreleased-factory-handle: non-factory method (getStatus) skipped" {
-    const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+test "non-factory method (getStatus) skipped" {
+    try testing.expectNoFire(check,
         \\const Device = struct {
         \\    pub fn getStatus(_: *Device) u8 { return 0; }
         \\};
@@ -378,8 +288,5 @@ test "unreleased-factory-handle: non-factory method (getStatus) skipped" {
         \\    const status = device.getStatus();
         \\    _ = status;
         \\}
-        \\
     );
-    defer freeProblems(gpa, &problems);
-    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
 }
