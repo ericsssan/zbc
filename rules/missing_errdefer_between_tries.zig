@@ -3,30 +3,31 @@
 //! `errdefer X.deinit();` registered between.  If the second try
 //! propagates an error, X's allocation leaks.
 //!
-//! Detection is purely syntactic per-fn token-walk:
-//!   1. Find every `const <X> = try <Type>.<method>(...);`
-//!      binding where `<Type>` plausibly has a `deinit` method.
-//!   2. From each binding, scan forward for the next `try` keyword.
-//!   3. If an `errdefer` referencing `X.deinit` appears between
-//!      the binding's semicolon and the next try, the binding is
-//!      protected.  Otherwise fire at the binding site.
+//! Detection (per-fn binding-walk):
+//!   1. Find every `const X = try …<Type>.<method>(...)` binding
+//!      where `<method>` ∈ {fromJS} (ownership transfer) OR an
+//!      fd-opener (createFile/openFile/...).
+//!   2. For ownership-transfer methods, require `<Type>` to be
+//!      title-cased AND to have a `deinit` (or be unknown — we
+//!      pass through cross-file types conservatively).
+//!   3. From each binding, scan forward for the next `try`.  If a
+//!      `defer`/`errdefer` referencing X appears between, protected.
+//!      Otherwise fire.
 
 const std = @import("std");
 const Ast = std.zig.Ast;
 
+const lexer = @import("../lexer.zig");
+const local = @import("../local.zig");
 const annotations_mod = @import("../annotations.zig");
 const problem_mod = @import("../problem.zig");
+const testing = @import("../testing.zig");
 const config_mod = @import("../config.zig");
-
-const lexer = @import("../lexer.zig");
-const findStmtSemicolon = lexer.findStmtSemicolon;
-const returnsType = lexer.returnsType;
-const fnProto = lexer.fnProto;
-const bodyOf = lexer.bodyOf;
 
 const Db = annotations_mod.Db;
 const Problem = problem_mod.Problem;
 const Pos = problem_mod.Pos;
+const R = "missing-errdefer-between-tries";
 
 pub fn check(
     gpa: std.mem.Allocator,
@@ -37,87 +38,54 @@ pub fn check(
 ) !void {
     if (!config_mod.isEnabled(config, .missing_errdefer_between_tries)) return;
 
-    var node_idx: u32 = 1;
-    while (node_idx < tree.nodes.len) : (node_idx += 1) {
-        const node: Ast.Node.Index = @enumFromInt(node_idx);
-        if (tree.nodeTag(node) != .fn_decl) continue;
-        // Skip comptime type-builder fns (`fn T() type { return
-        // struct { … }; }`).  Their body contains nested fn_decls;
-        // walking it as one would double-count each inner fn's
-        // bindings via the outer wrapper.
-        if (returnsType(tree, node)) continue;
-        const body = bodyOf(tree, node) orelse continue;
-        try checkBody(gpa, tree, db, body, problems);
+    var proto_buf: [1]Ast.Node.Index = undefined;
+    var fns = lexer.iterFnDecls(tree);
+    while (fns.next(&proto_buf)) |fn_entry| {
+        try checkFn(gpa, tree, db, fn_entry.proto, fn_entry.body, problems);
     }
 }
 
-const Binding = struct {
+const TrackedBinding = struct {
     x_name: []const u8,
-    /// Token of the bound local's identifier — used as the report
-    /// anchor.
     name_token: Ast.TokenIndex,
-    /// Token of the statement-terminating semicolon — scan for
-    /// subsequent `try` / `errdefer` starts from after this.
+    /// Token of the binding's terminating semicolon — scans for
+    /// subsequent `try` / `errdefer` start from after this.
     end_token: Ast.TokenIndex,
-    /// True when the binding was an fd-opening call (`createFile`,
-    /// `openFile`, …) — the suggested cleanup in the diagnostic is
-    /// `.close()` rather than `.deinit()`.
-    is_fd_open: bool = false,
+    is_fd_open: bool,
 };
 
-fn checkBody(
+fn checkFn(
     gpa: std.mem.Allocator,
     tree: *const Ast,
     db: *const Db,
+    proto: Ast.full.FnProto,
     body: Ast.Node.Index,
     problems: *std.ArrayListUnmanaged(Problem),
 ) !void {
     const tags = tree.tokens.items(.tag);
+
+    // Cheap pre-scan: skip fns with no `try` at all.
     const first = tree.firstToken(body);
     const last = tree.lastToken(body);
+    if (!lexer.hasTokenInRange(tags, first, last, .keyword_try)) return;
 
-    var bindings: std.ArrayListUnmanaged(Binding) = .empty;
-    defer bindings.deinit(gpa);
+    var bindings = try local.build(gpa, tree, proto, body);
+    defer bindings.deinit();
 
-    var t: Ast.TokenIndex = first;
-    while (t <= last) : (t += 1) {
-        if (tags[t] != .keyword_const) continue;
-        if (t + 4 > last) continue;
-        if (tags[t + 1] != .identifier) continue;
-        // Skip past optional type annotation: `const X: T = …`.
-        var after_name: Ast.TokenIndex = t + 2;
-        if (tags[after_name] == .colon) {
-            // Advance past the type expression up to `=`.
-            var d: u32 = 0;
-            while (after_name <= last) : (after_name += 1) {
-                switch (tags[after_name]) {
-                    .l_paren, .l_brace, .l_bracket => d += 1,
-                    .r_paren, .r_brace, .r_bracket => if (d > 0) {
-                        d -= 1;
-                    },
-                    .equal => if (d == 0) break,
-                    else => {},
-                }
-            }
-        }
-        if (after_name > last) continue;
-        if (tags[after_name] != .equal) continue;
-        if (after_name + 1 > last) continue;
-        if (tags[after_name + 1] != .keyword_try) continue;
-        // After `try`: expect `<...>.<Type>.<method>(...)` with a
-        // method name from the ownership-transfer allowlist.  Walk
-        // the identifier-period chain to find the LAST two idents
-        // before the `(` — the second-to-last is the type, the
-        // last is the method.
-        const try_tok = after_name + 1;
-        const parsed = parseTypeMethodAfter(tree, try_tok + 1, last) orelse continue;
-        // Two acceptance paths:
-        //   A. Ownership-transfer methods (e.g. `<Type>.fromJS(...)`)
-        //      where Type is title-cased and has a `deinit`.
-        //   B. File-handle openers (`createFile`, `openFile`,
-        //      `openat`, etc.) where the receiver can be any
-        //      `dir` / `posix` / `std.fs.cwd()` chain — the cleanup
-        //      is `.close()` rather than `.deinit()`.
+    var tracked: std.ArrayListUnmanaged(TrackedBinding) = .empty;
+    defer tracked.deinit(gpa);
+
+    for (bindings.items) |b| {
+        if (!b.is_const) continue;
+        if (b.origin == .param) continue;
+        // Must be a try-wrapped expression.
+        if (tags[b.rhs_first] != .keyword_try) continue;
+        // Walk the RHS chain (after `try`) to find the LAST
+        // identifier-pair before `(` — local.zig's CallInfo only
+        // captures the FIRST two of a chain, which loses
+        // `std.fs.cwd().createFile(...)`-style chains.
+        const parsed = parseTypeMethodAfter(tree, b.rhs_first + 1, b.rhs_last) orelse continue;
+
         var is_fd_open = false;
         if (isOwnershipTransferMethod(parsed.method)) {
             if (parsed.type_name.len == 0 or parsed.type_name[0] < 'A' or parsed.type_name[0] > 'Z') continue;
@@ -126,23 +94,16 @@ fn checkBody(
             is_fd_open = true;
         } else continue;
 
-        // Find the binding's terminating semicolon at statement depth.
-        const sc = findStmtSemicolon(tags, try_tok + 4, last) orelse continue;
-        try bindings.append(gpa, .{
-            .x_name = tree.tokenSlice(t + 1),
-            .name_token = t + 1,
-            .end_token = sc,
+        try tracked.append(gpa, .{
+            .x_name = b.name,
+            .name_token = b.name_token,
+            // local.Binding.rhs_last is the token before `;`.
+            .end_token = b.rhs_last + 1,
             .is_fd_open = is_fd_open,
         });
-        t = sc;
     }
 
-    // For each binding, scan forward for the first subsequent `try`
-    // at statement level.  If a `defer` or `errdefer` referencing
-    // X's cleanup appears between, the binding is protected.
-    // `defer` is even stronger than `errdefer` (runs on success AND
-    // failure) and is a common idiom for short-lived owned values.
-    for (bindings.items) |b| {
+    for (tracked.items) |b| {
         var has_cleanup = false;
         var found_try = false;
         var u: Ast.TokenIndex = b.end_token + 1;
@@ -197,22 +158,14 @@ fn parseTypeMethodAfter(tree: *const Ast, start: Ast.TokenIndex, last: Ast.Token
 }
 
 /// Restricted to the canonical "convert a JS value into an owned
-/// Zig value" entry point — `<Type>.fromJS`.  This is the strongest
-/// ownership-transfer signal in Bun-style codebases (the result is
-/// always heap-backed and needs a matching `deinit`), and gating on
-/// it keeps the rule's FP rate at zero.  Broader allowlists (`init`,
-/// `create`, `parse`, `dupe`) inflated Bun's hit count tenfold with
-/// many borderline / hard-to-verify cases — the narrow gate trades
-/// recall for precision.
+/// Zig value" entry point — `<Type>.fromJS`.  Bun's strongest
+/// ownership-transfer signal; broadening adds many FPs.
 fn isOwnershipTransferMethod(name: []const u8) bool {
     return std.mem.eql(u8, name, "fromJS");
 }
 
-/// Methods that return an owned OS file/socket handle.  The cleanup
-/// for these is `.close()` rather than `.deinit()`.  Receivers are
-/// usually lowercase locals or `std`/`posix` namespace chains, so the
-/// uppercase-Type filter doesn't apply — the method name itself is
-/// the entire selectivity.
+/// Methods that return an owned OS file/socket handle; cleanup is
+/// `.close()` rather than `.deinit()`.
 fn isFileHandleOpenerMethod(name: []const u8) bool {
     return std.mem.eql(u8, name, "createFile") or
         std.mem.eql(u8, name, "createFileZ") or
@@ -228,10 +181,9 @@ fn isFileHandleOpenerMethod(name: []const u8) bool {
 }
 
 /// True iff `Type` has a `deinit` method discoverable in the Db.
-/// Conservative: cross-file / unknown types pass through as true
-/// so we don't miss real bugs whose types are declared in another
-/// file (the canonical oven-sh/bun#30169 case has `PathLike` in a separate
-/// module).  Returns false only when the type IS in the local file
+/// Conservative: cross-file / unknown types pass through (true) so
+/// we don't miss real bugs whose types are declared in another
+/// file.  Returns false only when the type IS in the local file
 /// AND demonstrably has no `deinit`.
 fn typeHasDeinit(db: *const Db, type_name: []const u8) bool {
     if (db.hasType(type_name) and db.lookupTyped(type_name, "deinit") == null) {
@@ -240,20 +192,14 @@ fn typeHasDeinit(db: *const Db, type_name: []const u8) bool {
     return true;
 }
 
-/// Starting from `start`, walk tokens at statement depth (paren /
-/// brace / bracket all zero) until we find the first `;`.  Returns
-/// its index, or null if the stmt's terminating semicolon isn't in
-/// `[start, last]`.
-/// True iff the `defer` / `errdefer` at `kw` references some
-/// cleanup call on `X` — `X.<deinit/deref/destroy/close/free>(...)`.
-/// Accepts the inline form and the block form `{ … X.cleanup() … }`,
-/// with optional capture `|err|` for errdefer.
+/// True iff the `defer` / `errdefer` at `kw` mentions `x_name` in
+/// its (inline or block) body.  Any mention is treated as cleanup
+/// — covers receiver form (`X.cleanup()`) AND arg form
+/// (`self.close_socket(X)`, `alloc.free(X)`).
 fn cleanupReferencesLocal(tree: *const Ast, kw: Ast.TokenIndex, x_name: []const u8, last: Ast.TokenIndex) bool {
     const tags = tree.tokens.items(.tag);
     if (kw + 1 > last) return false;
-    // Inline form (no block): scan to the next `;` at our paren
-    // depth.  If `X` appears anywhere in that range (as a receiver,
-    // an argument to a helper, etc.), accept as cleanup.
+    // Inline form: scan until the next `;` at depth 0.
     if (tags[kw + 1] != .l_brace and tags[kw + 1] != .pipe) {
         var paren: u32 = 0;
         var t: Ast.TokenIndex = kw + 1;
@@ -264,9 +210,7 @@ fn cleanupReferencesLocal(tree: *const Ast, kw: Ast.TokenIndex, x_name: []const 
                     paren -= 1;
                 },
                 .semicolon => if (paren == 0) break,
-                .identifier => {
-                    if (std.mem.eql(u8, tree.tokenSlice(t), x_name)) return true;
-                },
+                .identifier => if (std.mem.eql(u8, tree.tokenSlice(t), x_name)) return true,
                 else => {},
             }
         }
@@ -290,37 +234,18 @@ fn cleanupReferencesLocal(tree: *const Ast, kw: Ast.TokenIndex, x_name: []const 
                 depth -= 1;
                 if (depth == 0) break;
             },
-            .identifier => {
-                // Any mention of X inside the defer/errdefer body
-                // counts as cleanup — either as a receiver
-                // (`X.cleanup()`) or as an argument to a helper
-                // (`self.close_socket(X)`, `allocator.free(X)`).
-                // Anything else inside a defer/errdefer with X is
-                // either real cleanup or so unusual that not firing
-                // is the right call.
-                if (std.mem.eql(u8, tree.tokenSlice(t), x_name)) return true;
-            },
+            .identifier => if (std.mem.eql(u8, tree.tokenSlice(t), x_name)) return true,
             else => {},
         }
     }
     return false;
 }
 
-fn isCleanupMethodName(name: []const u8) bool {
-    return std.mem.eql(u8, name, "deinit") or
-        std.mem.eql(u8, name, "deref") or
-        std.mem.eql(u8, name, "destroy") or
-        std.mem.eql(u8, name, "close") or
-        std.mem.eql(u8, name, "free") or
-        std.mem.eql(u8, name, "release") or
-        std.mem.eql(u8, name, "finalize");
-}
-
 fn report(
     gpa: std.mem.Allocator,
     problems: *std.ArrayListUnmanaged(Problem),
     tree: *const Ast,
-    b: Binding,
+    b: TrackedBinding,
 ) !void {
     const cleanup = if (b.is_fd_open) "close" else "deinit";
     const msg = try std.fmt.allocPrint(
@@ -331,7 +256,7 @@ fn report(
     errdefer gpa.free(msg);
 
     try problems.append(gpa, .{
-        .rule_id = "missing-errdefer-between-tries",
+        .rule_id = R,
         .severity = .@"error",
         .start = Pos.fromTokenStart(tree, b.name_token),
         .end = Pos.fromTokenEnd(tree, b.name_token),
@@ -353,12 +278,9 @@ fn runOn(gpa: std.mem.Allocator, src: []const u8) !std.ArrayListUnmanaged(Proble
     return problems;
 }
 
-fn freeProblems(gpa: std.mem.Allocator, p: *std.ArrayListUnmanaged(Problem)) void {
-    for (p.items) |*x| x.deinit(gpa);
-    p.deinit(gpa);
-}
+const freeProblems = testing.freeProblems;
 
-test "missing-errdefer-between-tries: `fromJS` binding without errdefer fires" {
+test "fromJS binding without errdefer fires" {
     const gpa = std.testing.allocator;
     var problems = try runOn(gpa,
         \\const std = @import("std");
@@ -371,14 +293,13 @@ test "missing-errdefer-between-tries: `fromJS` binding without errdefer fires" {
         \\    const new_path = try PathLike.fromJS(ctx, b) orelse return error.Invalid;
         \\    return .{ .o = old_path, .n = new_path };
         \\}
-        \\
     );
     defer freeProblems(gpa, &problems);
     try std.testing.expectEqual(@as(usize, 1), problems.items.len);
-    try std.testing.expectEqualStrings("missing-errdefer-between-tries", problems.items[0].rule_id);
+    try std.testing.expectEqualStrings(R, problems.items[0].rule_id);
 }
 
-test "missing-errdefer-between-tries: errdefer between tries is OK" {
+test "errdefer between tries is OK" {
     const gpa = std.testing.allocator;
     var problems = try runOn(gpa,
         \\const std = @import("std");
@@ -393,13 +314,12 @@ test "missing-errdefer-between-tries: errdefer between tries is OK" {
         \\    errdefer new_path.deinit();
         \\    return .{ .o = old_path, .n = new_path };
         \\}
-        \\
     );
     defer freeProblems(gpa, &problems);
     try std.testing.expectEqual(@as(usize, 0), problems.items.len);
 }
 
-test "missing-errdefer-between-tries: `defer X.deref()` is also accepted as protection" {
+test "defer X.deref() is also accepted as protection" {
     const gpa = std.testing.allocator;
     var problems = try runOn(gpa,
         \\const Str = struct {
@@ -413,13 +333,12 @@ test "missing-errdefer-between-tries: `defer X.deref()` is also accepted as prot
         \\    _ = try otherFallible();
         \\}
         \\fn otherFallible() !void {}
-        \\
     );
     defer freeProblems(gpa, &problems);
     try std.testing.expectEqual(@as(usize, 0), problems.items.len);
 }
 
-test "missing-errdefer-between-tries: lowercase receiver (gpa.dupe) doesn't fire" {
+test "lowercase receiver (gpa.dupe) doesn't fire" {
     const gpa = std.testing.allocator;
     var problems = try runOn(gpa,
         \\const std = @import("std");
@@ -429,13 +348,12 @@ test "missing-errdefer-between-tries: lowercase receiver (gpa.dupe) doesn't fire
         \\    _ = try otherFallible();
         \\}
         \\fn otherFallible() !void {}
-        \\
     );
     defer freeProblems(gpa, &problems);
     try std.testing.expectEqual(@as(usize, 0), problems.items.len);
 }
 
-test "missing-errdefer-between-tries: file-handle open (createFile/openFile) without errdefer fires" {
+test "file-handle open (createFile/openFile) without errdefer fires" {
     const gpa = std.testing.allocator;
     var problems = try runOn(gpa,
         \\const std = @import("std");
@@ -444,14 +362,13 @@ test "missing-errdefer-between-tries: file-handle open (createFile/openFile) wit
         \\    try file.sync();
         \\    file.close();
         \\}
-        \\
     );
     defer freeProblems(gpa, &problems);
     try std.testing.expectEqual(@as(usize, 1), problems.items.len);
-    try std.testing.expectEqualStrings("missing-errdefer-between-tries", problems.items[0].rule_id);
+    try std.testing.expectEqualStrings(R, problems.items[0].rule_id);
 }
 
-test "missing-errdefer-between-tries: file open with `errdefer file.close()` is OK" {
+test "file open with errdefer file.close() is OK" {
     const gpa = std.testing.allocator;
     var problems = try runOn(gpa,
         \\const std = @import("std");
@@ -460,13 +377,12 @@ test "missing-errdefer-between-tries: file open with `errdefer file.close()` is 
         \\    errdefer file.close();
         \\    try file.sync();
         \\}
-        \\
     );
     defer freeProblems(gpa, &problems);
     try std.testing.expectEqual(@as(usize, 0), problems.items.len);
 }
 
-test "missing-errdefer-between-tries: non-`fromJS` method doesn't fire" {
+test "non-fromJS method doesn't fire" {
     const gpa = std.testing.allocator;
     var problems = try runOn(gpa,
         \\const T = struct {
@@ -479,9 +395,7 @@ test "missing-errdefer-between-tries: non-`fromJS` method doesn't fire" {
         \\    _ = try otherFallible();
         \\}
         \\fn otherFallible() !void {}
-        \\
     );
     defer freeProblems(gpa, &problems);
-    // Method is `create`, not `fromJS`; narrow gate skips it.
     try std.testing.expectEqual(@as(usize, 0), problems.items.len);
 }
