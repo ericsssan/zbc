@@ -47,6 +47,7 @@ Bun's.
 | `publish_then_touch_self.zig` | `publish-then-touch-self` | [oven-sh/bun#29128](https://github.com/oven-sh/bun/pull/29128), [oven-sh/bun#31177](https://github.com/oven-sh/bun/pull/31177), [oven-sh/bun#30185](https://github.com/oven-sh/bun/pull/30185) |
 | `assert_on_untrusted_input.zig` | `assert-on-untrusted-input` | [tigerbeetle/tigerbeetle#3709](https://github.com/tigerbeetle/tigerbeetle/pull/3709), [tigerbeetle/tigerbeetle#3726](https://github.com/tigerbeetle/tigerbeetle/pull/3726), [tigerbeetle/tigerbeetle#2980](https://github.com/tigerbeetle/tigerbeetle/pull/2980) |
 | `missing_deinit_on_composed_owner.zig` | `missing-deinit-on-composed-owner` | [ziglang/zig#22683](https://github.com/ziglang/zig/pull/22683), [ziglang/zig#20192](https://github.com/ziglang/zig/pull/20192), [ziglang/zig#18651](https://github.com/ziglang/zig/pull/18651) |
+| `borrowed_slice_into_out_param.zig` | `borrowed-slice-into-out-param` | [oven-sh/bun#30151](https://github.com/oven-sh/bun/pull/30151), [oven-sh/bun#30223](https://github.com/oven-sh/bun/pull/30223), [oven-sh/bun#25563](https://github.com/oven-sh/bun/pull/25563) |
 
 ## Re-fetching the actual pre-merge buggy files
 

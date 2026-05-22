@@ -349,9 +349,15 @@ pub const Invariant = enum {
     /// class (StackIterator forgot to call ma.deinit → /proc fd
     /// leak); related to ziglang/zig#20192 and #18651.
     missing_deinit_on_composed_owner,
+    /// `defer <X>.deinit()` (or `defer <alloc>.free(<X>)`) and a
+    /// later write `<out>.* = ...<X>...` into a pointer-typed
+    /// fn parameter — the out-param holds a dangling slice once
+    /// the defer fires on return.  Catches oven-sh/bun#30151 +
+    /// #30223 + #25563 class.
+    borrowed_slice_into_out_param,
 };
 
-pub const all_invariants: [38]Invariant = .{
+pub const all_invariants: [39]Invariant = .{
     .arena_escape,
     .stack_escape,
     .use_undefined,
@@ -390,6 +396,7 @@ pub const all_invariants: [38]Invariant = .{
     .publish_then_touch_self,
     .assert_on_untrusted_input,
     .missing_deinit_on_composed_owner,
+    .borrowed_slice_into_out_param,
 };
 
 pub const Default: Config = .{};

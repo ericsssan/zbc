@@ -219,6 +219,11 @@ pub const all = [_]Rule{
         .title = "outer `deinit` doesn't call `<self>.<field>.deinit()` for a field whose type has a deinit — inner resources leak",
         .body = @embedFile("rules/missing-deinit-on-composed-owner.md"),
     },
+    .{
+        .id = "borrowed-slice-into-out-param",
+        .title = "write into pointer out-param uses a `defer ... .deinit()`-bound local — out-param dangles after return",
+        .body = @embedFile("rules/borrowed-slice-into-out-param.md"),
+    },
 };
 
 /// Look up a rule by id.  Returns null on unknown id so callers can

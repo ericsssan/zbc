@@ -40,6 +40,7 @@ const memset_undef_after_len_truncation_mod = @import("memset_undef_after_len_tr
 const publish_then_touch_self_mod = @import("publish_then_touch_self.zig");
 const assert_on_untrusted_input_mod = @import("assert_on_untrusted_input.zig");
 const missing_deinit_on_composed_owner_mod = @import("missing_deinit_on_composed_owner.zig");
+const borrowed_slice_into_out_param_mod = @import("borrowed_slice_into_out_param.zig");
 const rule_catalog_mod = @import("rule_catalog.zig");
 
 pub const Config = config_mod.Config;
@@ -266,6 +267,11 @@ pub fn analyzeEscape(
     // call `<self>.<field>.deinit()` for a field whose type has
     // a deinit → inner non-memory resources leak.
     try missing_deinit_on_composed_owner_mod.check(gpa, &tree, config, &problems);
+
+    // Borrowed-slice-into-out-param — `defer X.deinit()` +
+    // `<out-ptr-param>.* = ...X...` → out-param holds dangling
+    // slice once defer fires.
+    try borrowed_slice_into_out_param_mod.check(gpa, &tree, config, &problems);
 
     return problems.toOwnedSlice(gpa);
 }
@@ -741,5 +747,6 @@ test {
     _ = publish_then_touch_self_mod;
     _ = assert_on_untrusted_input_mod;
     _ = missing_deinit_on_composed_owner_mod;
+    _ = borrowed_slice_into_out_param_mod;
     std.testing.refAllDecls(@This());
 }
