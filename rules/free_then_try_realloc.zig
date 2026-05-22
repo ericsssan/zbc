@@ -8,11 +8,14 @@
 const std = @import("std");
 const Ast = std.zig.Ast;
 
+const lexer = @import("../lexer.zig");
 const problem_mod = @import("../problem.zig");
 const config_mod = @import("../config.zig");
 
 const Problem = problem_mod.Problem;
 const Pos = problem_mod.Pos;
+
+const bodyOf = lexer.bodyOf;
 
 pub fn check(
     gpa: std.mem.Allocator,
@@ -126,11 +129,6 @@ fn checkBody(
         try report(gpa, problems, tree, t, arg_first, arg_last);
         t = sc;
     }
-}
-
-fn bodyOf(tree: *const Ast, node: Ast.Node.Index) ?Ast.Node.Index {
-    if (tree.nodeTag(node) != .fn_decl) return null;
-    return tree.nodeData(node).node_and_node[1];
 }
 
 fn report(
