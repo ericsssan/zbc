@@ -788,5 +788,6 @@ test {
     _ = @import("scope.zig");
     _ = @import("receiver.zig");
     _ = @import("testing.zig");
+    _ = @import("model.zig");
     std.testing.refAllDecls(@This());
 }
