@@ -38,9 +38,27 @@ const Pos = problem_mod.Pos;
 const hasTokenInRange = lexer.hasTokenInRange;
 const matchBrace = lexer.matchBrace;
 const skipNestedFn = lexer.skipNestedFn;
-const returnsType = lexer.returnsType;
-const fnProto = lexer.fnProto;
 const bodyOf = lexer.bodyOf;
+
+const query = @import("../query.zig");
+const Atom = query.Atom;
+
+// `defer <alloc>.free(<X>...)` — captures the freed arg into slot 0.
+const defer_free_pattern = &[_]Atom{
+    .{ .tok = .keyword_defer },
+    .{ .tok = .identifier },
+    .{ .tok = .period },
+    .{ .text = "free" },
+    .{ .tok = .l_paren },
+    .{ .capture = 0 },
+};
+
+// `.<free|destroy>(` — used to check errdefer body contains a free.
+const free_or_destroy_call = &[_]Atom{
+    .{ .tok = .period },
+    .{ .pred = isFreeOrDestroyName },
+    .{ .tok = .l_paren },
+};
 
 pub fn check(
     gpa: std.mem.Allocator,
@@ -50,13 +68,10 @@ pub fn check(
 ) !void {
     if (!config_mod.isEnabled(config, .defer_and_errdefer_free_overlap)) return;
 
-    var node_idx: u32 = 1;
-    while (node_idx < tree.nodes.len) : (node_idx += 1) {
-        const node: Ast.Node.Index = @enumFromInt(node_idx);
-        if (tree.nodeTag(node) != .fn_decl) continue;
-        if (returnsType(tree, node)) continue;
-        const body = bodyOf(tree, node) orelse continue;
-        try checkBody(gpa, tree, body, problems);
+    var proto_buf: [1]Ast.Node.Index = undefined;
+    var fns = lexer.iterFnDecls(tree);
+    while (fns.next(&proto_buf)) |fn_entry| {
+        try checkBody(gpa, tree, fn_entry.body, problems);
     }
 }
 
@@ -73,29 +88,15 @@ fn checkBody(
     // Collect `defer <alloc>.free(<X>);` deferred names.
     var deferred_frees: std.ArrayListUnmanaged([]const u8) = .empty;
     defer deferred_frees.deinit(gpa);
-
-    var t: Ast.TokenIndex = first;
-    while (t + 5 <= last) : (t += 1) {
-        if (tags[t] == .keyword_fn) {
-            t = skipNestedFn(tags, t, last);
-            continue;
-        }
-        if (tags[t] != .keyword_defer) continue;
-        // Pattern: `defer <alloc> . free ( <X> )`
-        if (tags[t + 1] != .identifier) continue;
-        if (tags[t + 2] != .period) continue;
-        if (tags[t + 3] != .identifier) continue;
-        if (!std.mem.eql(u8, tree.tokenSlice(t + 3), "free")) continue;
-        if (tags[t + 4] != .l_paren) continue;
-        if (tags[t + 5] != .identifier) continue;
-        try deferred_frees.append(gpa, tree.tokenSlice(t + 5));
-    }
+    const defer_matches = try query.findAllInBody(gpa, tree, defer_free_pattern, first, last);
+    defer gpa.free(defer_matches);
+    for (defer_matches) |m| try deferred_frees.append(gpa, m.captureText(tree, 0).?);
     if (deferred_frees.items.len == 0) return;
 
     // Walk for `errdefer { ... }` blocks that contain an
     // assignment `<lhs> = <deferred-name>;` AND a free call
     // (different receiver).
-    t = first;
+    var t: Ast.TokenIndex = first;
     while (t + 2 <= last) : (t += 1) {
         if (tags[t] == .keyword_fn) {
             t = skipNestedFn(tags, t, last);
@@ -121,7 +122,7 @@ fn checkBody(
             t = body_end;
             continue;
         };
-        if (!errdeferContainsFree(tree, body_start + 1, body_end - 1)) {
+        if (!query.anyMatchAnywhere(tree, free_or_destroy_call, body_start + 1, body_end - 1, null)) {
             t = body_end;
             continue;
         }
@@ -158,24 +159,8 @@ fn errdeferRestoresDeferredName(
     return null;
 }
 
-/// True iff the errdefer body contains `<x>.free(...)` or
-/// `<x>.destroy(...)`.
-fn errdeferContainsFree(
-    tree: *const Ast,
-    start: Ast.TokenIndex,
-    end: Ast.TokenIndex,
-) bool {
-    const tags = tree.tokens.items(.tag);
-    if (start > end) return false;
-    var t: Ast.TokenIndex = start;
-    while (t + 2 <= end) : (t += 1) {
-        if (tags[t] != .period) continue;
-        if (tags[t + 1] != .identifier) continue;
-        if (tags[t + 2] != .l_paren) continue;
-        const m = tree.tokenSlice(t + 1);
-        if (std.mem.eql(u8, m, "free") or std.mem.eql(u8, m, "destroy")) return true;
-    }
-    return false;
+fn isFreeOrDestroyName(name: []const u8) bool {
+    return std.mem.eql(u8, name, "free") or std.mem.eql(u8, name, "destroy");
 }
 
 fn report(
