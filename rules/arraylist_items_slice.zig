@@ -46,6 +46,7 @@ const problem_mod = @import("../problem.zig");
 const config_mod = @import("../config.zig");
 
 const lexer = @import("../lexer.zig");
+const local = @import("../local.zig");
 const testing = @import("../testing.zig");
 const skipDeferStmt = lexer.skipDeferStmt;
 const matchBrace = lexer.matchBrace;
@@ -66,84 +67,59 @@ pub fn check(
 ) !void {
     if (!config_mod.isEnabled(config, .arraylist_items_slice)) return;
 
-    var node_idx: u32 = 1;
-    while (node_idx < tree.nodes.len) : (node_idx += 1) {
-        const node: Ast.Node.Index = @enumFromInt(node_idx);
-        if (tree.nodeTag(node) != .fn_decl) continue;
-        if (returnsType(tree, node)) continue;
-        const body = bodyOf(tree, node) orelse continue;
-        try checkBody(gpa, tree, body, problems);
+    var proto_buf: [1]Ast.Node.Index = undefined;
+    var fns = lexer.iterFnDecls(tree);
+    while (fns.next(&proto_buf)) |fn_entry| {
+        try checkFn(gpa, tree, fn_entry.proto, fn_entry.body, problems);
     }
 }
 
-const Binding = struct {
+const Borrow = struct {
     x_name: []const u8,
     recv_name: []const u8,
     name_token: Ast.TokenIndex,
+    /// Token of the binding's terminating `;`.
     end_token: Ast.TokenIndex,
 };
 
-fn checkBody(
+fn checkFn(
     gpa: std.mem.Allocator,
     tree: *const Ast,
+    proto: Ast.full.FnProto,
     body: Ast.Node.Index,
     problems: *std.ArrayListUnmanaged(Problem),
 ) !void {
     const tags = tree.tokens.items(.tag);
-    const first = tree.firstToken(body);
     const last = tree.lastToken(body);
 
-    var bindings: std.ArrayListUnmanaged(Binding) = .empty;
-    defer bindings.deinit(gpa);
+    var bindings = try local.build(gpa, tree, proto, body);
+    defer bindings.deinit();
 
-    var t: Ast.TokenIndex = first;
-    while (t + 5 <= last) : (t += 1) {
-        if (tags[t] == .keyword_fn) {
-            t = skipNestedFn(tags, t, last);
-            continue;
-        }
-        if (tags[t] != .keyword_const) continue;
-        if (tags[t + 1] != .identifier) continue;
+    var borrows: std.ArrayListUnmanaged(Borrow) = .empty;
+    defer borrows.deinit(gpa);
 
-        // Optional type annotation.
-        var after_name: Ast.TokenIndex = t + 2;
-        if (after_name <= last and tags[after_name] == .colon) {
-            var d: u32 = 0;
-            while (after_name <= last) : (after_name += 1) {
-                switch (tags[after_name]) {
-                    .l_paren, .l_brace, .l_bracket => d += 1,
-                    .r_paren, .r_brace, .r_bracket => if (d > 0) {
-                        d -= 1;
-                    },
-                    .equal => if (d == 0) break,
-                    else => {},
-                }
-            }
-        }
-        if (after_name > last or tags[after_name] != .equal) continue;
-
-        // RHS must be exactly `<recv> . items ;`.  Single-identifier
-        // receiver, no chaining, no slicing, no `&` prefix — those
-        // shapes have their own ambiguities and are out of scope
-        // until we see them in real bugs.
-        const rhs_start: Ast.TokenIndex = after_name + 1;
-        if (rhs_start + 3 > last) continue;
-        if (tags[rhs_start] != .identifier) continue;
-        if (tags[rhs_start + 1] != .period) continue;
-        if (tags[rhs_start + 2] != .identifier) continue;
-        if (!std.mem.eql(u8, tree.tokenSlice(rhs_start + 2), "items")) continue;
-        if (tags[rhs_start + 3] != .semicolon) continue;
-
-        try bindings.append(gpa, .{
-            .x_name = tree.tokenSlice(t + 1),
-            .recv_name = tree.tokenSlice(rhs_start),
-            .name_token = t + 1,
-            .end_token = rhs_start + 3,
+    // Find `const X = <recv>.items;` bindings.  local.zig classifies
+    // `<recv>.<field>` (no parens after) as .field_access when the
+    // RHS is exactly that 2-segment chain — perfect fit.  Single-
+    // identifier receiver enforced by chain_len == 2 (i.e. only one
+    // period between receiver and field) implicit in .field_access.
+    for (bindings.items) |b| {
+        if (!b.is_const) continue;
+        if (b.origin == .param) continue;
+        const fa = switch (b.origin) {
+            .field_access => |x| x,
+            else => continue,
+        };
+        if (!std.mem.eql(u8, fa.field, "items")) continue;
+        try borrows.append(gpa, .{
+            .x_name = b.name,
+            .recv_name = fa.receiver,
+            .name_token = b.name_token,
+            .end_token = b.rhs_last + 1, // the `;`
         });
-        t = rhs_start + 3;
     }
 
-    for (bindings.items) |b| {
+    for (borrows.items) |b| {
         const mutate_tok = findReceiverMutate(tree, b.end_token + 1, last, b.recv_name) orelse continue;
         const after_mutate = findStmtSemicolon(tags, mutate_tok, last) orelse continue;
         const use_tok = findIdentUse(tree, after_mutate + 1, last, b.x_name) orelse continue;
@@ -227,7 +203,7 @@ fn report(
     gpa: std.mem.Allocator,
     problems: *std.ArrayListUnmanaged(Problem),
     tree: *const Ast,
-    b: Binding,
+    b: Borrow,
     mutate_tok: Ast.TokenIndex,
     use_tok: Ast.TokenIndex,
 ) !void {
