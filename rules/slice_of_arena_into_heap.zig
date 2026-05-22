@@ -53,19 +53,6 @@ const allocator_call_exact = &[_]Atom{
     .{ .tok = .r_paren },
 };
 
-// `<arena>.allocator().<allocMethod>(...)` — inline form.
-// $0 = arena name.
-const inline_arena_alloc = &[_]Atom{
-    .{ .capture = 0 },
-    .{ .tok = .period },
-    .{ .text = "allocator" },
-    .{ .tok = .l_paren },
-    .{ .tok = .r_paren },
-    .{ .tok = .period },
-    .{ .pred = receiver.isAllocMethodName },
-    .paren_args,
-};
-
 // Store call: `<recv>.<storeMethod>(...)`.
 const store_call = &[_]Atom{
     .{ .capture = 0 },
@@ -132,10 +119,11 @@ fn checkFn(
     defer slices.deinit(gpa);
 
     // Classification precedence (mutually exclusive by early-continue):
-    //   Arena    — RHS contains `ArenaAllocator.init(`
-    //   Handle   — RHS is exactly `<arena>.allocator()`
-    //   Slice-A  — `[try] <handle>.<allocMethod>(...)`
-    //   Slice-B  — `[try] <arena>.allocator().<allocMethod>(...)` inline
+    //   Arena   — RHS contains `ArenaAllocator.init(`
+    //   Handle  — RHS is exactly `<arena>.allocator()`
+    //   Slice   — single call `<handle>.<allocMethod>(...)` OR chained
+    //             call `<arena>.allocator().<allocMethod>(...)`.  Both
+    //             collapse via CallInfo.lastMethod + isChained.
     for (bindings.items) |b| {
         if (b.origin == .param) continue;
         const rhs_start = b.rhsFirstAfterTry(tags);
@@ -153,34 +141,30 @@ fn checkFn(
             }
         }
 
-        // Slice — shape A: <handle>.<allocMethod>(...).  Uses asCall()
-        // to short-circuit non-call bindings.
-        if (b.asCall()) |c| {
-            if (c.method != null and receiver.isAllocMethodName(c.method.?)) {
-                if (findHandle(handles.items, c.receiver)) |h| {
-                    try slices.append(gpa, .{
-                        .name = b.name,
-                        .arena_name = h.arena_name,
-                        .name_token = b.name_token,
-                    });
-                    continue;
-                }
+        // Slice classification: the outermost method in a chained
+        // method-call must be in the alloc-method set.  Receiver is
+        // either a known handle (single call) or a known arena
+        // (chained `<arena>.allocator().<allocMethod>()`).
+        const c = b.asCall() orelse continue;
+        const last_method = c.lastMethod() orelse continue;
+        if (!receiver.isAllocMethodName(last_method)) continue;
+        const arena_name: ?[]const u8 = blk: {
+            if (c.isChained()) {
+                // Chained: must be `.allocator().<alloc>(...)` on an arena.
+                if (c.method == null or !std.mem.eql(u8, c.method.?, "allocator")) break :blk null;
+                if (findArena(arenas.items, c.receiver)) |a| break :blk a.name;
+                break :blk null;
             }
-        }
-
-        // Slice — shape B: <arena>.allocator().<allocMethod>(...) inline.
-        // asCall above only captures the outermost `<arena>.allocator(`
-        // of the chain, so we fall back to a prefix match for the full
-        // inline shape.
-        if (query.matchAt(tree, inline_arena_alloc, rhs_start, b.rhs_last, null)) |m| {
-            const arena_name = m.captureText(tree, 0).?;
-            if (findArena(arenas.items, arena_name)) |a| {
-                try slices.append(gpa, .{
-                    .name = b.name,
-                    .arena_name = a.name,
-                    .name_token = b.name_token,
-                });
-            }
+            // Single call: receiver must be a known handle.
+            if (findHandle(handles.items, c.receiver)) |h| break :blk h.arena_name;
+            break :blk null;
+        };
+        if (arena_name) |an| {
+            try slices.append(gpa, .{
+                .name = b.name,
+                .arena_name = an,
+                .name_token = b.name_token,
+            });
         }
     }
 

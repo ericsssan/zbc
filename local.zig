@@ -68,15 +68,51 @@ pub const OriginKind = enum {
 
 /// The receiver + method tokens for a call/method_call origin.
 /// For free `foo()`, `receiver` is the fn name (token slice "foo"),
-/// `method` is null.  For `obj.foo()`, `receiver = \"obj\"`,
-/// `method = \"foo\"`.
+/// `method` is null.  For `obj.foo()`, `receiver = "obj"`,
+/// `method = "foo"`.
+///
+/// For multi-segment receiver paths (`std.heap.page_allocator.alloc(...)`),
+/// `receiver` is the FIRST identifier (`std`) and `method` is the
+/// LAST identifier before the call's `(` (`alloc`).  The
+/// intermediate segments aren't stored separately — rules that
+/// care can scan `[receiver_token, method_token]`.
+///
+/// For chained method calls (`arena.allocator().alloc(...)`),
+/// `method` describes the FIRST call (`allocator`) and the
+/// `outermost_*` fields describe the LAST call in the chain
+/// (`alloc`).  When the RHS is a single (non-chained) call, the
+/// outermost fields stay null.
 pub const CallInfo = struct {
     receiver: []const u8,
     receiver_token: TokenIndex,
     method: ?[]const u8,
     method_token: ?TokenIndex,
-    /// Token index of the call's opening `(`.
+    /// Token index of the FIRST call's opening `(`.
     paren_token: TokenIndex,
+    /// LAST method in a `.foo().bar()` chain, when the RHS chains
+    /// past the first call.  Null when the binding is a single call.
+    outermost_method: ?[]const u8 = null,
+    outermost_method_token: ?TokenIndex = null,
+    outermost_paren_token: ?TokenIndex = null,
+
+    /// Convenience: the outermost method name if the call is chained,
+    /// else the first method.  Returns null only when the call is a
+    /// free-fn call AND not chained.
+    pub fn lastMethod(self: CallInfo) ?[]const u8 {
+        return self.outermost_method orelse self.method;
+    }
+
+    /// Convenience: the outermost `(` token if chained, else the
+    /// first.  Always non-null (callers know there's at least one
+    /// `(` since this is a Call origin).
+    pub fn lastParen(self: CallInfo) TokenIndex {
+        return self.outermost_paren_token orelse self.paren_token;
+    }
+
+    /// True iff the RHS chains past the first call.
+    pub fn isChained(self: CallInfo) bool {
+        return self.outermost_method != null;
+    }
 };
 
 pub const FieldAccess = struct {
@@ -385,49 +421,76 @@ fn classifyOrigin(tree: *const Ast, first: TokenIndex, last: TokenIndex) Origin 
             if (t == last) {
                 break :blk .{ .alias = id };
             }
-            // identifier `(` — free fn call.
-            if (t + 1 <= last and tags[t + 1] == .l_paren) {
-                const info: CallInfo = .{
-                    .receiver = id,
-                    .receiver_token = id_tok,
-                    .method = null,
-                    .method_token = null,
-                    .paren_token = t + 1,
-                };
-                break :blk if (wrapped_in_try) .{ .try_call = info } else .{ .call = info };
+            // identifier `[` ... — index/slice op.  Check first since
+            // chain-walking below assumes no leading bracket.
+            if (tags[t + 1] == .l_bracket) {
+                break :blk .index_op;
             }
-            // identifier `.` identifier — could be field access OR method call.
-            if (t + 2 <= last and tags[t + 1] == .period and tags[t + 2] == .identifier) {
-                const field = tree.tokenSlice(t + 2);
-                const field_tok = t + 2;
-                // identifier `.` identifier `(` — method call.
-                if (t + 3 <= last and tags[t + 3] == .l_paren) {
-                    const info: CallInfo = .{
-                        .receiver = id,
-                        .receiver_token = id_tok,
-                        .method = field,
-                        .method_token = field_tok,
-                        .paren_token = t + 3,
-                    };
-                    break :blk if (wrapped_in_try) .{ .try_method_call = info } else .{ .method_call = info };
-                }
-                // identifier `.` identifier (no paren after) — field access.
-                // ONLY if rhs ends at field_tok; otherwise it's a chain.
-                if (field_tok == last) {
+            // Walk a chain `<id>(.<id>)*` collecting identifier positions.
+            // Stops at `(` (call), end-of-range, or non-(period+identifier).
+            var chain_buf: [16]TokenIndex = undefined;
+            var chain_len: usize = 1;
+            chain_buf[0] = id_tok;
+            var u: TokenIndex = t + 1;
+            while (u <= last) {
+                if (tags[u] != .period) break;
+                if (u + 1 > last or tags[u + 1] != .identifier) break;
+                if (chain_len >= chain_buf.len) break;
+                chain_buf[chain_len] = u + 1;
+                chain_len += 1;
+                u += 2;
+            }
+            // After the chain walk, u is past the last chain segment.
+            // Three possibilities:
+            //   (1) u > last  → pure field-chain (no call).  field_access if
+            //                  chain_len == 2 and chain_buf[1] == last,
+            //                  else .unknown.
+            //   (2) tags[u] == .l_paren → call at chain_buf[chain_len - 1].
+            //   (3) anything else → unknown.
+            if (u > last) {
+                if (chain_len == 2 and chain_buf[1] == last) {
                     break :blk .{ .field_access = .{
                         .receiver = id,
                         .receiver_token = id_tok,
-                        .field = field,
-                        .field_token = field_tok,
+                        .field = tree.tokenSlice(chain_buf[1]),
+                        .field_token = chain_buf[1],
                     } };
                 }
                 break :blk .unknown;
             }
-            // identifier `[` ... — index/slice op.
-            if (t + 1 <= last and tags[t + 1] == .l_bracket) {
-                break :blk .index_op;
+            if (tags[u] != .l_paren) break :blk .unknown;
+
+            // Build the first-call CallInfo.  For chain_len == 1, this is a
+            // free-fn call (no method).  For chain_len >= 2, the LAST chain
+            // segment is the method, with the rest forming the receiver path.
+            const first_paren = u;
+            const first_is_free = chain_len == 1;
+            var info: CallInfo = .{
+                .receiver = id,
+                .receiver_token = id_tok,
+                .method = if (first_is_free) null else tree.tokenSlice(chain_buf[chain_len - 1]),
+                .method_token = if (first_is_free) null else chain_buf[chain_len - 1],
+                .paren_token = first_paren,
+            };
+
+            // Walk chained calls past the first `()`: `(...).<id>(`.
+            var cp = lexer.matchParen(tags, first_paren, last);
+            while (cp) |close| {
+                const v = close + 1;
+                if (v + 2 > last) break;
+                if (tags[v] != .period) break;
+                if (tags[v + 1] != .identifier) break;
+                if (tags[v + 2] != .l_paren) break;
+                info.outermost_method = tree.tokenSlice(v + 1);
+                info.outermost_method_token = v + 1;
+                info.outermost_paren_token = v + 2;
+                cp = lexer.matchParen(tags, v + 2, last);
             }
-            break :blk .unknown;
+
+            if (first_is_free) {
+                break :blk if (wrapped_in_try) .{ .try_call = info } else .{ .call = info };
+            }
+            break :blk if (wrapped_in_try) .{ .try_method_call = info } else .{ .method_call = info };
         },
         else => .unknown,
     };
@@ -560,6 +623,96 @@ test "build: addr_of and index_op" {
 
     const x = bindings.find("x").?;
     try testing.expectEqual(OriginKind.index_op, std.meta.activeTag(x.origin));
+}
+
+test "build: chained method call captures outermost" {
+    var r = try parseFn(
+        \\fn f() void {
+        \\    const a = arena.allocator().alloc(u8, 16);
+        \\}
+    );
+    defer r.tree.deinit(testing.allocator);
+    var bindings = r.bindings;
+    defer bindings.deinit();
+
+    const a = bindings.find("a").?;
+    const c = a.asCall().?;
+    try testing.expectEqualStrings("arena", c.receiver);
+    try testing.expectEqualStrings("allocator", c.method.?);
+    try testing.expect(c.isChained());
+    try testing.expectEqualStrings("alloc", c.outermost_method.?);
+    try testing.expectEqualStrings("alloc", c.lastMethod().?);
+}
+
+test "build: try-wrapped chained call" {
+    var r = try parseFn(
+        \\fn f() !void {
+        \\    const b = try arena.allocator().dupe(u8, "x");
+        \\}
+    );
+    defer r.tree.deinit(testing.allocator);
+    var bindings = r.bindings;
+    defer bindings.deinit();
+
+    const b = bindings.find("b").?;
+    try testing.expectEqual(OriginKind.try_method_call, std.meta.activeTag(b.origin));
+    const c = b.asCall().?;
+    try testing.expectEqualStrings("arena", c.receiver);
+    try testing.expectEqualStrings("allocator", c.method.?);
+    try testing.expectEqualStrings("dupe", c.outermost_method.?);
+}
+
+test "build: multi-segment receiver path (std.heap.page_allocator.alloc)" {
+    var r = try parseFn(
+        \\fn f() ![]u8 {
+        \\    const c = try std.heap.page_allocator.alloc(u8, 16);
+        \\    return c;
+        \\}
+    );
+    defer r.tree.deinit(testing.allocator);
+    var bindings = r.bindings;
+    defer bindings.deinit();
+
+    const c = bindings.find("c").?;
+    const ci = c.asCall().?;
+    try testing.expectEqualStrings("std", ci.receiver);
+    // `page_allocator` is the LAST identifier before the call's `(`
+    // — so it's our "method" name (receiver path was std.heap.page_allocator).
+    try testing.expectEqualStrings("alloc", ci.method.?);
+    try testing.expect(!ci.isChained()); // single call, just deep receiver
+}
+
+test "build: non-chained single call doesn't set outermost" {
+    var r = try parseFn(
+        \\fn f() void {
+        \\    const a = obj.method();
+        \\}
+    );
+    defer r.tree.deinit(testing.allocator);
+    var bindings = r.bindings;
+    defer bindings.deinit();
+
+    const a = bindings.find("a").?;
+    const c = a.asCall().?;
+    try testing.expect(!c.isChained());
+    try testing.expectEqual(@as(?[]const u8, null), c.outermost_method);
+    try testing.expectEqualStrings("method", c.lastMethod().?);
+}
+
+test "build: triple-chained call captures last" {
+    var r = try parseFn(
+        \\fn f() void {
+        \\    const a = obj.first().second().third();
+        \\}
+    );
+    defer r.tree.deinit(testing.allocator);
+    var bindings = r.bindings;
+    defer bindings.deinit();
+
+    const a = bindings.find("a").?;
+    const c = a.asCall().?;
+    try testing.expectEqualStrings("first", c.method.?);
+    try testing.expectEqualStrings("third", c.outermost_method.?);
 }
 
 test "Binding.asCall unifies try / non-try" {
