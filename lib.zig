@@ -799,5 +799,6 @@ test {
     _ = @import("model.zig");
     _ = @import("trace.zig");
     _ = @import("local.zig");
+    _ = @import("query.zig");
     std.testing.refAllDecls(@This());
 }
