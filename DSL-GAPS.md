@@ -6,30 +6,24 @@ real rule HIT during migration that the DSL didn't cleanly express.
 
 ## Hit during migration
 
-### G1. `local.zig` only tracks single-identifier bindings
+### G1. ~~`local.zig` only tracks single-identifier bindings~~ — FIXED
 
-`local.Binding` records `name` (single identifier).  Many rules
-need to track **field-path expressions** as the "thing being
-managed":
+**Resolution:** added `query.capture_until` + `query.ref_range`
+atoms (commit 597df5e).  Took the "more general" fix path from
+the original analysis: a token-range capture/ref pair that any
+rule can use, not just `local.zig`-style binding rules.
 
-- `free_then_try_realloc`: `<x>.free(s.columns); s.columns = try ...;` —
-  the freed/reassigned thing is `s.columns`, a 3-token field path.
-- `aliased_heap_dupe` Phase 3: `<dst>.<field>_allocated = false` —
-  remediation pattern keyed on the dst+field pair, not a binding.
+  .capture_until = .{ .slot, .stops = &.{TokenTag, ...} }
+  .ref_range = slot
 
-**Why it's a gap:** rules end up with custom token-walks for
-multi-token "path" patterns the DSL can't capture.
+`free_then_try_realloc` migrated as the witness: 264 → 208 LOC
+(-56, -21%), 100+ lines of token comparison collapsed to 2 atom
+patterns + a 10-line loop.
 
-**Workaround in use today:** rules with field-paths skip
-`local.zig` entirely (free_then_try_realloc was the cleanest
-example) OR fall back to bespoke token scans.
-
-**Fix shapes:**
-- Extend `local.zig` with a `FieldPathBinding` variant tracking
-  `<recv>.<field>...` sequences alongside identifier bindings.
-- OR add `query.zig` atoms for "capture token range, ref it
-  later" (`.capture_range = .{ .slot, .until = .r_paren }` + `.ref_range = N`).
-- The second is more general; the first is cheaper.
+`aliased_heap_dupe` Phase 3 (the other rule named in this gap)
+doesn't actually need this — its `<dst>.<field>_allocated`
+pattern is a runtime-constructed identifier, handled by the
+existing `.text = runtime_string` atom shape.
 
 ### G2. `query.zig` has no disjunction
 
@@ -154,24 +148,18 @@ Trace events show `line:col` but not the source file path.  In
 corpus sweeps, every trace event looks alike.  Easy fix
 (pass tree's filename into trace context).
 
-## Decision: which gap to fix next
+## Status
 
-Ranked by frequency-hit during migrations:
+| Gap | Status | Notes |
+|---|---|---|
+| G1 (field-paths) | **fixed** | query.capture_until + ref_range; free_then_try_realloc migrated -56 LOC |
+| G2 (disjunction) | **fixed** | query.any_of; self_undefined + borrowed_slice cleaned up |
+| G3 (chained calls) | open | medium-cost extension to local.zig |
+| G4 (loop captures) | **fixed** | local.loop_capture; destroy_after_deinit_in_loop migrated |
+| G5 (nested types) | open | latent FN; not yet surfaced in real corpora |
+| G6 (capture+pred) | open | fragile offset arithmetic workaround in 1 rule |
+| G7 (try distinction) | open | mild |
+| G8 (classifier naming) | open | naming-convention not duplication |
 
-| Gap | Migrations hit | Workaround cost | Fix size |
-|---|---|---|---|
-| G1 (field-paths) | 2 rules | high (rule skipped) | M |
-| G2 (disjunction) | 3 rules | low (call twice) | S |
-| G3 (chained calls) | 1 rule | medium (fallback pattern) | M |
-| G4 (loop captures) | 1 rule | high (rule skipped) | S |
-| G5 (nested types) | 1 rule (latent FN) | low (not surfaced) | M |
-| G6 (capture+pred) | 1 rule | low (offset arithmetic) | S |
-
-**Highest ROI**: G4 (loop captures) — small fix, unlocks
-`destroy_after_deinit_in_loop` migration.  G2 (disjunction) —
-small fix, eliminates ~3 lines of workaround across 3 rules.
-
-**Highest impact**: G1 (field-paths) — extends local.zig's
-reach to a whole class of rules currently using bespoke token
-walks (free_then_try_realloc, aliased_heap_dupe's Phase 3,
-possibly future rules around field mutation).
+3 of 8 fixed, 4 of 5 remaining are open by choice (low frequency
+or low workaround cost).
