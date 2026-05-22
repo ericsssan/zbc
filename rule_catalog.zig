@@ -214,6 +214,11 @@ pub const all = [_]Rule{
         .title = "`assert(...)` in a parser/decoder against untrusted-input parameter — crafted bytes panic the process",
         .body = @embedFile("rules/assert-on-untrusted-input.md"),
     },
+    .{
+        .id = "missing-deinit-on-composed-owner",
+        .title = "outer `deinit` doesn't call `<self>.<field>.deinit()` for a field whose type has a deinit — inner resources leak",
+        .body = @embedFile("rules/missing-deinit-on-composed-owner.md"),
+    },
 };
 
 /// Look up a rule by id.  Returns null on unknown id so callers can

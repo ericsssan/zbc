@@ -342,9 +342,16 @@ pub const Invariant = enum {
     /// external input requires `if (!<cond>) return error.Invalid;`.
     /// Catches tigerbeetle/tigerbeetle#3709 + #3726 + #2980 class.
     assert_on_untrusted_input,
+    /// Outer struct's `deinit` doesn't call `<self>.<field>.deinit(...)`
+    /// for a field whose type (same file) ALSO exposes a deinit.
+    /// The inner's owned non-memory resources (file handles,
+    /// sockets, refs, mmaps) leak.  Catches ziglang/zig#22683
+    /// class (StackIterator forgot to call ma.deinit → /proc fd
+    /// leak); related to ziglang/zig#20192 and #18651.
+    missing_deinit_on_composed_owner,
 };
 
-pub const all_invariants: [37]Invariant = .{
+pub const all_invariants: [38]Invariant = .{
     .arena_escape,
     .stack_escape,
     .use_undefined,
@@ -382,6 +389,7 @@ pub const all_invariants: [37]Invariant = .{
     .memset_undef_after_len_truncation,
     .publish_then_touch_self,
     .assert_on_untrusted_input,
+    .missing_deinit_on_composed_owner,
 };
 
 pub const Default: Config = .{};

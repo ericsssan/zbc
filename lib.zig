@@ -39,6 +39,7 @@ const unreleased_factory_handle_mod = @import("unreleased_factory_handle.zig");
 const memset_undef_after_len_truncation_mod = @import("memset_undef_after_len_truncation.zig");
 const publish_then_touch_self_mod = @import("publish_then_touch_self.zig");
 const assert_on_untrusted_input_mod = @import("assert_on_untrusted_input.zig");
+const missing_deinit_on_composed_owner_mod = @import("missing_deinit_on_composed_owner.zig");
 const rule_catalog_mod = @import("rule_catalog.zig");
 
 pub const Config = config_mod.Config;
@@ -260,6 +261,11 @@ pub fn analyzeEscape(
     // Assert-on-untrusted-input — `assert(<param>.<field>)` in a
     // parser/decoder fn → crafted input panics the process.
     try assert_on_untrusted_input_mod.check(gpa, &tree, config, &problems);
+
+    // Missing-deinit-on-composed-owner — outer deinit doesn't
+    // call `<self>.<field>.deinit()` for a field whose type has
+    // a deinit → inner non-memory resources leak.
+    try missing_deinit_on_composed_owner_mod.check(gpa, &tree, config, &problems);
 
     return problems.toOwnedSlice(gpa);
 }
@@ -734,5 +740,6 @@ test {
     _ = memset_undef_after_len_truncation_mod;
     _ = publish_then_touch_self_mod;
     _ = assert_on_untrusted_input_mod;
+    _ = missing_deinit_on_composed_owner_mod;
     std.testing.refAllDecls(@This());
 }
