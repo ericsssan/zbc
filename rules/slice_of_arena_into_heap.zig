@@ -11,47 +11,73 @@
 //!   const tokens = try tokenize(arena_alloc, input);  // arena-owned
 //!   try self.token_cache.appendSlice(self.gpa, tokens); // ← stored into
 //!                                                       //   heap container
-//!   // arena.deinit() fires at scope exit → self.token_cache now
-//!   // holds dangling slices.
 //!
 //! Complements zbc's existing `arena_escape` rule (caught via
 //! return) and `arena_use_after_kill` (caught via post-deinit
 //! read).  This rule catches the third escape path: STORE into a
 //! longer-lived container during the arena's lifetime.
 //!
-//! Detection (purely syntactic, per-fn token walk; four passes):
-//!   1. Find local arena vars: `var <A> = std.heap.ArenaAllocator.init(`
-//!      bindings.  Skip fns with no arena.
-//!   2. Find allocator handles: `const <H> = <A>.allocator();` —
-//!      `<H>` is then treated as an alias for `<A>.allocator()`.
-//!   3. Find arena-allocated slice bindings: `const <X> = [try]
-//!      <H>.<alloc-method>(...)` OR `const <X> = [try]
-//!      <A>.allocator().<alloc-method>(...)`.
-//!   4. Find store calls `<C>.<store-method>(<arg0>, ..., <argN>)`
-//!      where:
-//!        - `<store-method>` is in the container-store allowlist,
-//!        - `<arg0>` is the allocator slot and is NOT the arena
-//!          allocator (not `<H>`, not `<A>.allocator()`),
-//!        - any later arg is one of the arena-allocated `<X>`s.
-//!      Fire at the call site.
+//! Rewritten via local.zig (binding-origin tracker) + query.zig
+//! (token-pattern matcher).  The three binding-collection passes
+//! (arena vars, alloc handles, arena-allocated slices) are now
+//! one-shot iterations over `local.build`'s output, with RHS
+//! patterns expressed declaratively.
 
 const std = @import("std");
 const Ast = std.zig.Ast;
 
 const lexer = @import("../lexer.zig");
+const local = @import("../local.zig");
+const query = @import("../query.zig");
 const problem_mod = @import("../problem.zig");
+const testing = @import("../testing.zig");
 const config_mod = @import("../config.zig");
 
 const Problem = problem_mod.Problem;
 const Pos = problem_mod.Pos;
+const Atom = query.Atom;
+const R = "slice-of-arena-into-heap";
 
-const matchBrace = lexer.matchBrace;
-const matchParen = lexer.matchParen;
-const findStmtSemicolon = lexer.findStmtSemicolon;
-const skipNestedFn = lexer.skipNestedFn;
-const returnsType = lexer.returnsType;
-const fnProto = lexer.fnProto;
-const bodyOf = lexer.bodyOf;
+// ── Patterns ────────────────────────────────────────────────
+
+// `ArenaAllocator.init(...)` — appears somewhere in the binding's
+// RHS (we don't care about the prefix `std.heap.` etc.).
+const arena_init_pattern = &[_]Atom{
+    .{ .text = "ArenaAllocator" },
+    .{ .tok = .period },
+    .{ .text = "init" },
+    .paren_args,
+};
+
+// `<recv>.allocator()` — exact match (no chain after).  $0 = receiver.
+const allocator_call_exact = &[_]Atom{
+    .{ .capture = 0 },
+    .{ .tok = .period },
+    .{ .text = "allocator" },
+    .{ .tok = .l_paren },
+    .{ .tok = .r_paren },
+};
+
+// `<arena>.allocator().<allocMethod>(...)` — inline form.
+// $0 = arena name.
+const inline_arena_alloc = &[_]Atom{
+    .{ .capture = 0 },
+    .{ .tok = .period },
+    .{ .text = "allocator" },
+    .{ .tok = .l_paren },
+    .{ .tok = .r_paren },
+    .{ .tok = .period },
+    .{ .pred = isAllocMethodName },
+    .paren_args,
+};
+
+// Store call: `<recv>.<storeMethod>(...)`.
+const store_call = &[_]Atom{
+    .{ .capture = 0 },
+    .{ .tok = .period },
+    .{ .capture = 1 },
+    .{ .tok = .l_paren },
+};
 
 pub fn check(
     gpa: std.mem.Allocator,
@@ -61,13 +87,10 @@ pub fn check(
 ) !void {
     if (!config_mod.isEnabled(config, .slice_of_arena_into_heap)) return;
 
-    var node_idx: u32 = 1;
-    while (node_idx < tree.nodes.len) : (node_idx += 1) {
-        const node: Ast.Node.Index = @enumFromInt(node_idx);
-        if (tree.nodeTag(node) != .fn_decl) continue;
-        if (returnsType(tree, node)) continue;
-        const body = bodyOf(tree, node) orelse continue;
-        try checkBody(gpa, tree, body, problems);
+    var proto_buf: [1]Ast.Node.Index = undefined;
+    var fns = lexer.iterFnDecls(tree);
+    while (fns.next(&proto_buf)) |fn_entry| {
+        try checkBody(gpa, tree, fn_entry.proto, fn_entry.body, problems);
     }
 }
 
@@ -90,227 +113,119 @@ const ArenaSlice = struct {
 fn checkBody(
     gpa: std.mem.Allocator,
     tree: *const Ast,
+    proto: Ast.full.FnProto,
     body: Ast.Node.Index,
     problems: *std.ArrayListUnmanaged(Problem),
 ) !void {
-    const first = tree.firstToken(body);
-    const last = tree.lastToken(body);
+    var bindings = try local.build(gpa, tree, proto, body);
+    defer bindings.deinit();
 
+    // ── Pass 1: arena vars ─────────────────────────────────
+    // Binding whose RHS contains `ArenaAllocator.init(`.
     var arenas: std.ArrayListUnmanaged(ArenaVar) = .empty;
     defer arenas.deinit(gpa);
-    try collectArenaVars(gpa, tree, first, last, &arenas);
+    for (bindings.items) |b| {
+        if (b.origin == .param) continue;
+        if (!query.anyMatchAnywhere(tree, arena_init_pattern, b.rhs_first, b.rhs_last, null)) continue;
+        try arenas.append(gpa, .{ .name = b.name, .init_token = b.name_token });
+    }
     if (arenas.items.len == 0) return;
 
+    // ── Pass 2: alloc handles ──────────────────────────────
+    // Binding whose RHS is EXACTLY `<arena>.allocator()` (no chain).
     var handles: std.ArrayListUnmanaged(AllocHandle) = .empty;
     defer handles.deinit(gpa);
-    try collectAllocHandles(gpa, tree, first, last, arenas.items, &handles);
+    for (bindings.items) |b| {
+        if (b.origin == .param) continue;
+        // Peel a leading `try` if present (matchExact starts at rhs_first).
+        const start = peelTry(tree, b);
+        const m = query.matchExact(tree, allocator_call_exact, start, b.rhs_last, null) orelse continue;
+        const arena_name = m.captureText(tree, 0).?;
+        if (findArena(arenas.items, arena_name) == null) continue;
+        try handles.append(gpa, .{ .name = b.name, .arena_name = arena_name });
+    }
 
+    // ── Pass 3: arena-allocated slices ─────────────────────
+    // Binding whose RHS is `[try] <H>.<allocMethod>(...)` OR
+    // `[try] <arena>.allocator().<allocMethod>(...)`.
     var slices: std.ArrayListUnmanaged(ArenaSlice) = .empty;
     defer slices.deinit(gpa);
-    try collectArenaSlices(gpa, tree, first, last, arenas.items, handles.items, &slices);
-    if (slices.items.len == 0) return;
-
-    try findStores(gpa, tree, first, last, arenas.items, handles.items, slices.items, problems);
-}
-
-/// Walk for `var <A> = std.heap.ArenaAllocator.init(` (or `: T = .init(`
-/// shorthand, or chained construction).  We accept any binding whose
-/// RHS source-text contains `ArenaAllocator.init(` — the same heuristic
-/// the existing config uses (`arena_init_patterns`).
-fn collectArenaVars(
-    gpa: std.mem.Allocator,
-    tree: *const Ast,
-    first: Ast.TokenIndex,
-    last: Ast.TokenIndex,
-    out: *std.ArrayListUnmanaged(ArenaVar),
-) !void {
-    const tags = tree.tokens.items(.tag);
-    var t: Ast.TokenIndex = first;
-    while (t + 3 <= last) : (t += 1) {
-        if (tags[t] == .keyword_fn) {
-            t = skipNestedFn(tags, t, last);
-            continue;
-        }
-        if (tags[t] != .keyword_var) continue;
-        if (tags[t + 1] != .identifier) continue;
-        // Walk to `=`.
-        var after_name: Ast.TokenIndex = t + 2;
-        if (after_name <= last and tags[after_name] == .colon) {
-            var d: u32 = 0;
-            while (after_name <= last) : (after_name += 1) {
-                switch (tags[after_name]) {
-                    .l_paren, .l_brace, .l_bracket => d += 1,
-                    .r_paren, .r_brace, .r_bracket => if (d > 0) {
-                        d -= 1;
-                    },
-                    .equal => if (d == 0) break,
-                    else => {},
-                }
+    for (bindings.items) |b| {
+        if (b.origin == .param) continue;
+        const start = peelTry(tree, b);
+        // Shape A: <handle>.<allocMethod>(...)
+        const call = b.asCall();
+        if (call != null and call.?.method != null and isAllocMethodName(call.?.method.?)) {
+            if (findHandle(handles.items, call.?.receiver)) |h| {
+                try slices.append(gpa, .{
+                    .name = b.name,
+                    .arena_name = h.arena_name,
+                    .name_token = b.name_token,
+                });
+                continue;
             }
         }
-        if (after_name > last or tags[after_name] != .equal) continue;
-        const sc = findStmtSemicolon(tags, after_name + 1, last) orelse continue;
-        // Match `ArenaAllocator . init (` token sequence anywhere
-        // in the RHS.
-        var u: Ast.TokenIndex = after_name + 1;
-        var found = false;
-        while (u + 3 <= sc) : (u += 1) {
-            if (tags[u] != .identifier) continue;
-            if (!std.mem.eql(u8, tree.tokenSlice(u), "ArenaAllocator")) continue;
-            if (tags[u + 1] != .period) continue;
-            if (tags[u + 2] != .identifier) continue;
-            if (tags[u + 3] != .l_paren) continue;
-            if (std.mem.eql(u8, tree.tokenSlice(u + 2), "init")) {
-                found = true;
+        // Shape B: <arena>.allocator().<allocMethod>(...)
+        if (query.matchPrefix(tree, inline_arena_alloc, start, b.rhs_last, null)) |m| {
+            const arena_name = m.captureText(tree, 0).?;
+            if (findArena(arenas.items, arena_name)) |a| {
+                try slices.append(gpa, .{
+                    .name = b.name,
+                    .arena_name = a.name,
+                    .name_token = b.name_token,
+                });
+            }
+        }
+    }
+    if (slices.items.len == 0) return;
+
+    // ── Pass 4: store calls ────────────────────────────────
+    // For each `<recv>.<storeMethod>(...)` in the body, where recv
+    // is NOT an arena/handle, scan the args (after the first) for
+    // any identifier matching a known slice.
+    const first = tree.firstToken(body);
+    const last = tree.lastToken(body);
+    const calls = try query.findAllInBody(gpa, tree, store_call, first, last);
+    defer gpa.free(calls);
+    const tags = tree.tokens.items(.tag);
+
+    for (calls) |c| {
+        const method_tok = c.captures[1].?;
+        if (!isStoreMethodName(tree.tokenSlice(method_tok))) continue;
+        const recv_name = c.captureText(tree, 0).?;
+        if (findArena(arenas.items, recv_name) != null) continue;
+        if (findHandle(handles.items, recv_name) != null) continue;
+        // Find the call's matching `)` to bound the args.
+        const lp = method_tok + 1; // l_paren is right after method
+        const rp = lexer.matchParen(tags, lp, last) orelse continue;
+        // Split args at top-level commas.
+        var args: std.ArrayListUnmanaged(Arg) = .empty;
+        defer args.deinit(gpa);
+        collectTopLevelArgs(gpa, tags, lp + 1, rp, &args) catch continue;
+        if (args.items.len < 2) continue;
+        // First arg must not be the arena's allocator.
+        if (firstArgIsArenaAllocator(tree, args.items[0].start, args.items[0].end, arenas.items, handles.items)) continue;
+        // Scan later args for a slice name.
+        var i: usize = 1;
+        while (i < args.items.len) : (i += 1) {
+            const arg = args.items[i];
+            var u: Ast.TokenIndex = arg.start;
+            while (u <= arg.end) : (u += 1) {
+                if (tags[u] != .identifier) continue;
+                const s = findSlice(slices.items, tree.tokenSlice(u)) orelse continue;
+                try report(gpa, problems, tree, method_tok, u, s);
                 break;
             }
         }
-        if (!found) continue;
-        try out.append(gpa, .{
-            .name = tree.tokenSlice(t + 1),
-            .init_token = t + 1,
-        });
     }
 }
 
-/// Walk for `const <H> = <A>.allocator();` where `<A>` ∈ arena_vars.
-fn collectAllocHandles(
-    gpa: std.mem.Allocator,
-    tree: *const Ast,
-    first: Ast.TokenIndex,
-    last: Ast.TokenIndex,
-    arenas: []const ArenaVar,
-    out: *std.ArrayListUnmanaged(AllocHandle),
-) !void {
+fn peelTry(tree: *const Ast, b: local.Binding) Ast.TokenIndex {
     const tags = tree.tokens.items(.tag);
-    var t: Ast.TokenIndex = first;
-    while (t + 6 <= last) : (t += 1) {
-        if (tags[t] == .keyword_fn) {
-            t = skipNestedFn(tags, t, last);
-            continue;
-        }
-        if (tags[t] != .keyword_const) continue;
-        if (tags[t + 1] != .identifier) continue;
-        var after_name: Ast.TokenIndex = t + 2;
-        if (after_name <= last and tags[after_name] == .colon) {
-            var d: u32 = 0;
-            while (after_name <= last) : (after_name += 1) {
-                switch (tags[after_name]) {
-                    .l_paren, .l_brace, .l_bracket => d += 1,
-                    .r_paren, .r_brace, .r_bracket => if (d > 0) {
-                        d -= 1;
-                    },
-                    .equal => if (d == 0) break,
-                    else => {},
-                }
-            }
-        }
-        if (after_name > last or tags[after_name] != .equal) continue;
-        const rhs = after_name + 1;
-        if (rhs + 4 > last) continue;
-        if (tags[rhs] != .identifier) continue;
-        if (tags[rhs + 1] != .period) continue;
-        if (tags[rhs + 2] != .identifier) continue;
-        if (!std.mem.eql(u8, tree.tokenSlice(rhs + 2), "allocator")) continue;
-        if (tags[rhs + 3] != .l_paren) continue;
-        if (tags[rhs + 4] != .r_paren) continue;
-        const recv = tree.tokenSlice(rhs);
-        if (findArena(arenas, recv) == null) continue;
-        try out.append(gpa, .{
-            .name = tree.tokenSlice(t + 1),
-            .arena_name = recv,
-        });
+    if (b.rhs_first <= b.rhs_last and tags[b.rhs_first] == .keyword_try) {
+        return b.rhs_first + 1;
     }
-}
-
-/// Walk for `const <X> = [try] <H>.<alloc-method>(...)` where `<H>`
-/// is an alloc handle, OR `const <X> = [try] <A>.allocator().<alloc-method>(...)`
-/// inline form.
-fn collectArenaSlices(
-    gpa: std.mem.Allocator,
-    tree: *const Ast,
-    first: Ast.TokenIndex,
-    last: Ast.TokenIndex,
-    arenas: []const ArenaVar,
-    handles: []const AllocHandle,
-    out: *std.ArrayListUnmanaged(ArenaSlice),
-) !void {
-    const tags = tree.tokens.items(.tag);
-    var t: Ast.TokenIndex = first;
-    while (t + 5 <= last) : (t += 1) {
-        if (tags[t] == .keyword_fn) {
-            t = skipNestedFn(tags, t, last);
-            continue;
-        }
-        if (tags[t] != .keyword_const) continue;
-        if (tags[t + 1] != .identifier) continue;
-        var after_name: Ast.TokenIndex = t + 2;
-        if (after_name <= last and tags[after_name] == .colon) {
-            var d: u32 = 0;
-            while (after_name <= last) : (after_name += 1) {
-                switch (tags[after_name]) {
-                    .l_paren, .l_brace, .l_bracket => d += 1,
-                    .r_paren, .r_brace, .r_bracket => if (d > 0) {
-                        d -= 1;
-                    },
-                    .equal => if (d == 0) break,
-                    else => {},
-                }
-            }
-        }
-        if (after_name > last or tags[after_name] != .equal) continue;
-        var rhs: Ast.TokenIndex = after_name + 1;
-        if (rhs <= last and tags[rhs] == .keyword_try) rhs += 1;
-        if (rhs + 3 > last) continue;
-        const arena_name = matchAllocCall(tree, rhs, last, arenas, handles) orelse continue;
-        try out.append(gpa, .{
-            .name = tree.tokenSlice(t + 1),
-            .arena_name = arena_name,
-            .name_token = t + 1,
-        });
-    }
-}
-
-/// Recognize either `<H>.<alloc-method>(` or
-/// `<A>.allocator().<alloc-method>(`.  Returns the arena name on
-/// match, null otherwise.
-fn matchAllocCall(
-    tree: *const Ast,
-    rhs: Ast.TokenIndex,
-    last: Ast.TokenIndex,
-    arenas: []const ArenaVar,
-    handles: []const AllocHandle,
-) ?[]const u8 {
-    const tags = tree.tokens.items(.tag);
-    if (tags[rhs] != .identifier) return null;
-    // Shape A: `<H>.<method>(`
-    if (rhs + 3 <= last and tags[rhs + 1] == .period and
-        tags[rhs + 2] == .identifier and tags[rhs + 3] == .l_paren)
-    {
-        const m = tree.tokenSlice(rhs + 2);
-        if (isAllocMethodName(m)) {
-            const recv = tree.tokenSlice(rhs);
-            if (findHandle(handles, recv)) |h| return h.arena_name;
-        }
-    }
-    // Shape B: `<A>.allocator().<method>(`
-    if (rhs + 6 <= last and
-        tags[rhs + 1] == .period and
-        tags[rhs + 2] == .identifier and
-        std.mem.eql(u8, tree.tokenSlice(rhs + 2), "allocator") and
-        tags[rhs + 3] == .l_paren and
-        tags[rhs + 4] == .r_paren and
-        tags[rhs + 5] == .period and
-        tags[rhs + 6] == .identifier and
-        rhs + 7 <= last and tags[rhs + 7] == .l_paren)
-    {
-        const m = tree.tokenSlice(rhs + 6);
-        if (isAllocMethodName(m)) {
-            const recv = tree.tokenSlice(rhs);
-            if (findArena(arenas, recv)) |a| return a.name;
-        }
-    }
-    return null;
+    return b.rhs_first;
 }
 
 fn isAllocMethodName(name: []const u8) bool {
@@ -338,89 +253,25 @@ fn isStoreMethodName(name: []const u8) bool {
 }
 
 fn findArena(arenas: []const ArenaVar, name: []const u8) ?ArenaVar {
-    for (arenas) |a| {
-        if (std.mem.eql(u8, a.name, name)) return a;
-    }
+    for (arenas) |a| if (std.mem.eql(u8, a.name, name)) return a;
     return null;
 }
 
 fn findHandle(handles: []const AllocHandle, name: []const u8) ?AllocHandle {
-    for (handles) |h| {
-        if (std.mem.eql(u8, h.name, name)) return h;
-    }
+    for (handles) |h| if (std.mem.eql(u8, h.name, name)) return h;
     return null;
 }
 
 fn findSlice(slices: []const ArenaSlice, name: []const u8) ?ArenaSlice {
-    for (slices) |s| {
-        if (std.mem.eql(u8, s.name, name)) return s;
-    }
+    for (slices) |s| if (std.mem.eql(u8, s.name, name)) return s;
     return null;
-}
-
-/// Walk for store calls and fire on each match.
-fn findStores(
-    gpa: std.mem.Allocator,
-    tree: *const Ast,
-    first: Ast.TokenIndex,
-    last: Ast.TokenIndex,
-    arenas: []const ArenaVar,
-    handles: []const AllocHandle,
-    slices: []const ArenaSlice,
-    problems: *std.ArrayListUnmanaged(Problem),
-) !void {
-    const tags = tree.tokens.items(.tag);
-    var t: Ast.TokenIndex = first;
-    while (t + 4 <= last) : (t += 1) {
-        if (tags[t] == .keyword_fn) {
-            t = skipNestedFn(tags, t, last);
-            continue;
-        }
-        if (tags[t] != .identifier) continue;
-        if (tags[t + 1] != .period) continue;
-        if (tags[t + 2] != .identifier) continue;
-        if (tags[t + 3] != .l_paren) continue;
-        const method = tree.tokenSlice(t + 2);
-        if (!isStoreMethodName(method)) continue;
-        const recv_name = tree.tokenSlice(t);
-        // Receiver must NOT be an arena var or its handle — storing
-        // into a same-arena sub-container is fine.
-        if (findArena(arenas, recv_name) != null) continue;
-        if (findHandle(handles, recv_name) != null) continue;
-        // Find the matching close-paren and inspect args.
-        const cp = matchParen(tags, t + 3, last) orelse continue;
-        var args_buf: std.ArrayListUnmanaged(Arg) = .empty;
-        defer args_buf.deinit(gpa);
-        collectTopLevelArgs(gpa, tags, t + 4, cp, &args_buf) catch continue;
-        const args = args_buf.items;
-        if (args.len < 2) continue;
-        // First arg should be a non-arena allocator.  If it IS the
-        // arena's allocator (`<A>.allocator()` or `<H>`), this is a
-        // sub-container of the arena — skip.
-        if (firstArgIsArenaAllocator(tree, args[0].start, args[0].end, arenas, handles)) continue;
-        // Scan the remaining args for an arena-allocated slice.
-        var i: usize = 1;
-        while (i < args.len) : (i += 1) {
-            const arg = args[i];
-            // Look for any identifier in the arg that matches a known
-            // arena slice name.
-            var u: Ast.TokenIndex = arg.start;
-            while (u <= arg.end) : (u += 1) {
-                if (tags[u] != .identifier) continue;
-                const s = findSlice(slices, tree.tokenSlice(u)) orelse continue;
-                try report(gpa, problems, tree, t + 2, u, s);
-                break;
-            }
-        }
-        t = cp;
-    }
 }
 
 const Arg = struct { start: Ast.TokenIndex, end: Ast.TokenIndex };
 
-/// Split a call's args at top-level commas, appending one Arg per
-/// argument into `out`.  Caller owns `out` (and must `deinit` it).
-/// Returns an error on allocation failure.
+/// Split a call's args at top-level commas — used to inspect each
+/// arg of a store call independently.  `[start, end)` is the range
+/// between the `(` and `)` (exclusive of both).
 fn collectTopLevelArgs(
     gpa: std.mem.Allocator,
     tags: []const std.zig.Token.Tag,
@@ -428,7 +279,7 @@ fn collectTopLevelArgs(
     end: Ast.TokenIndex,
     out: *std.ArrayListUnmanaged(Arg),
 ) !void {
-    if (start > end) return;
+    if (start >= end) return;
     var paren: u32 = 0;
     var brace: u32 = 0;
     var bracket: u32 = 0;
@@ -460,8 +311,6 @@ fn collectTopLevelArgs(
     }
 }
 
-/// True if the arg at `[start, end]` is `<A>.allocator()` (with `<A>`
-/// in arenas) or just `<H>` (an alloc handle).
 fn firstArgIsArenaAllocator(
     tree: *const Ast,
     start: Ast.TokenIndex,
@@ -471,12 +320,9 @@ fn firstArgIsArenaAllocator(
 ) bool {
     const tags = tree.tokens.items(.tag);
     if (start > end) return false;
-    // Trim leading whitespace tokens? Tokens don't include whitespace.
     if (tags[start] != .identifier) return false;
     const name = tree.tokenSlice(start);
-    // Shape: bare `<H>`.
     if (start == end and findHandle(handles, name) != null) return true;
-    // Shape: `<A>.allocator()`.
     if (end >= start + 4 and
         tags[start + 1] == .period and
         tags[start + 2] == .identifier and
@@ -521,7 +367,7 @@ fn report(
     };
 
     try problems.append(gpa, .{
-        .rule_id = "slice-of-arena-into-heap",
+        .rule_id = R,
         .severity = .@"error",
         .start = Pos.fromTokenStart(tree, arg_tok),
         .end = Pos.fromTokenEnd(tree, arg_tok),
@@ -532,24 +378,8 @@ fn report(
 
 // ── Tests ──────────────────────────────────────────────────
 
-fn runOn(gpa: std.mem.Allocator, src: []const u8) !std.ArrayListUnmanaged(Problem) {
-    const src_z = try gpa.dupeSentinel(u8, src, 0);
-    defer gpa.free(src_z);
-    var tree = try Ast.parse(gpa, src_z, .zig);
-    defer tree.deinit(gpa);
-    var problems: std.ArrayListUnmanaged(Problem) = .empty;
-    try check(gpa, &tree, &config_mod.Default, &problems);
-    return problems;
-}
-
-fn freeProblems(gpa: std.mem.Allocator, p: *std.ArrayListUnmanaged(Problem)) void {
-    for (p.items) |*x| x.deinit(gpa);
-    p.deinit(gpa);
-}
-
-test "slice-of-arena-into-heap: arena slice stored into heap container fires" {
-    const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+test "arena slice stored into heap container fires" {
+    try testing.expectFires(check, R,
         \\const std = @import("std");
         \\const Self = struct {
         \\    gpa: std.mem.Allocator,
@@ -562,16 +392,11 @@ test "slice-of-arena-into-heap: arena slice stored into heap container fires" {
         \\        try self.cache.appendSlice(self.gpa, tokens);
         \\    }
         \\};
-        \\
     );
-    defer freeProblems(gpa, &problems);
-    try std.testing.expectEqual(@as(usize, 1), problems.items.len);
-    try std.testing.expectEqualStrings("slice-of-arena-into-heap", problems.items[0].rule_id);
 }
 
-test "slice-of-arena-into-heap: stored into ARENA sub-container doesn't fire" {
-    const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+test "stored into ARENA sub-container doesn't fire" {
+    try testing.expectNoFire(check,
         \\const std = @import("std");
         \\pub fn ok(gpa: std.mem.Allocator) !void {
         \\    var arena = std.heap.ArenaAllocator.init(gpa);
@@ -581,15 +406,11 @@ test "slice-of-arena-into-heap: stored into ARENA sub-container doesn't fire" {
         \\    var sub_list = std.ArrayList(u8).empty;
         \\    try sub_list.appendSlice(arena_alloc, tokens);
         \\}
-        \\
     );
-    defer freeProblems(gpa, &problems);
-    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
 }
 
-test "slice-of-arena-into-heap: inline arena.allocator() form caught" {
-    const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+test "inline arena.allocator() form caught" {
+    try testing.expectFires(check, R,
         \\const std = @import("std");
         \\const Self = struct {
         \\    gpa: std.mem.Allocator,
@@ -601,30 +422,22 @@ test "slice-of-arena-into-heap: inline arena.allocator() form caught" {
         \\        try self.cache.appendSlice(self.gpa, tokens);
         \\    }
         \\};
-        \\
     );
-    defer freeProblems(gpa, &problems);
-    try std.testing.expectEqual(@as(usize, 1), problems.items.len);
 }
 
-test "slice-of-arena-into-heap: no arena in fn → no work" {
-    const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+test "no arena in fn → no work" {
+    try testing.expectNoFire(check,
         \\const std = @import("std");
         \\pub fn ok(gpa: std.mem.Allocator) !void {
         \\    const tokens = try gpa.alloc(u8, 16);
         \\    var cache = std.ArrayList(u8).empty;
         \\    try cache.appendSlice(gpa, tokens);
         \\}
-        \\
     );
-    defer freeProblems(gpa, &problems);
-    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
 }
 
-test "slice-of-arena-into-heap: dupe through arena handle counts as alloc method" {
-    const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+test "dupe through arena handle counts as alloc method" {
+    try testing.expectFires(check, R,
         \\const std = @import("std");
         \\const Self = struct {
         \\    gpa: std.mem.Allocator,
@@ -637,8 +450,5 @@ test "slice-of-arena-into-heap: dupe through arena handle counts as alloc method
         \\        try self.names.append(self.gpa, dup);
         \\    }
         \\};
-        \\
     );
-    defer freeProblems(gpa, &problems);
-    try std.testing.expectEqual(@as(usize, 1), problems.items.len);
 }
