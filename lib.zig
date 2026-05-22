@@ -36,6 +36,7 @@ const missing_errdefer_on_out_param_mod = @import("missing_errdefer_on_out_param
 const reset_skips_pooled_resource_release_mod = @import("reset_skips_pooled_resource_release.zig");
 const return_borrowed_payload_mod = @import("return_borrowed_payload.zig");
 const unreleased_factory_handle_mod = @import("unreleased_factory_handle.zig");
+const memset_undef_after_len_truncation_mod = @import("memset_undef_after_len_truncation.zig");
 const rule_catalog_mod = @import("rule_catalog.zig");
 
 pub const Config = config_mod.Config;
@@ -244,6 +245,11 @@ pub fn analyzeEscape(
     // without `defer X.release()` and `X` not returned/stored as
     // struct field → refcounted handle leaks.
     try unreleased_factory_handle_mod.check(gpa, &tree, config, &problems);
+
+    // Memset-undef-after-len-truncation — `<X>.<field>.len = N;
+    // @memset(<X>.<field>..., undefined);` — memset runs on the
+    // already-truncated empty slice, becoming a no-op.
+    try memset_undef_after_len_truncation_mod.check(gpa, &tree, config, &problems);
 
     return problems.toOwnedSlice(gpa);
 }
@@ -715,5 +721,6 @@ test {
     _ = reset_skips_pooled_resource_release_mod;
     _ = return_borrowed_payload_mod;
     _ = unreleased_factory_handle_mod;
+    _ = memset_undef_after_len_truncation_mod;
     std.testing.refAllDecls(@This());
 }

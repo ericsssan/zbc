@@ -199,6 +199,11 @@ pub const all = [_]Rule{
         .title = "`const <X> = device.create*()` without `defer <X>.release()` and `<X>` not returned/stored — refcounted handle leaks",
         .body = @embedFile("rules/unreleased-factory-handle.md"),
     },
+    .{
+        .id = "memset-undef-after-len-truncation",
+        .title = "`@memset(<X>.<field>..., undefined)` AFTER `<X>.<field>.len = ...` truncation — memset is a no-op on the now-empty slice",
+        .body = @embedFile("rules/memset-undef-after-len-truncation.md"),
+    },
 };
 
 /// Look up a rule by id.  Returns null on unknown id so callers can

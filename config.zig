@@ -320,9 +320,16 @@ pub const Invariant = enum {
     /// `unreleased-refs-on-error` which is about loop-side addref
     /// without paired release.
     unreleased_factory_handle,
+    /// `<X>.<field>.len = NEW;` followed by `@memset(<X>.<field>...,
+    /// undefined);` in the same scope — the memset slices the
+    /// ALREADY-TRUNCATED items so the range is empty and the memset
+    /// is a no-op.  The freed-but-retained capacity keeps its old
+    /// bytes, defeating Zig's `undefined` use-after-shrink safety.
+    /// Catches ziglang/zig#25810 + #25832 class.
+    memset_undef_after_len_truncation,
 };
 
-pub const all_invariants: [34]Invariant = .{
+pub const all_invariants: [35]Invariant = .{
     .arena_escape,
     .stack_escape,
     .use_undefined,
@@ -357,6 +364,7 @@ pub const all_invariants: [34]Invariant = .{
     .reset_skips_pooled_resource_release,
     .return_borrowed_payload,
     .unreleased_factory_handle,
+    .memset_undef_after_len_truncation,
 };
 
 pub const Default: Config = .{};
