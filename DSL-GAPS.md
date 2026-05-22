@@ -74,58 +74,71 @@ extending `local.zig`.
 clauses into bindings with origin `.loop_capture`.  Capture
 clauses on `if`/`while` should also be handled.
 
-### G5. `model_query.zig` only handles top-level types
+### G5. ~~`model_query.zig` only handles top-level types~~ — FIXED
 
-`model.build` doesn't recurse into nested types (`const Inner =
-struct { const Nested = struct { ... }; };`).  Rules wanting
-`hasMethod` on nested types don't see them.
+**Resolution:** added recursive `collectTypesInRange` to
+`model.build`; `TypeInfo` gained a `parent: ?u32` field pointing
+at the index of the enclosing type.  Nested types land in the same
+flat `types` list, so `mq.findTypes(...)` picks them up
+automatically — no rule changes required.
 
-**Why it matters today:** owned-field-no-outer-cleanup misses
-nested struct fields with cleanup methods.  Bug yield is small
-(nested types with cleanup are uncommon), but the abstraction
-boundary is leaky.
+`FileModel.findType` is still first-match-wins; name collisions
+across nest levels accept the conservative behavior since the
+existing 2 consumers iterate the full list anyway.
 
-**Fix:** depth-first walk in `model.build`; `TypeInfo` gains a
-`parent: ?u32` field (index into types).  `FileModel.findType`
-becomes scoped or fully-qualified.
+Bug yield: bun corpus +16 new TPs (8 missing-deinit-on-composed-
+owner, 8 owned-field-no-outer-cleanup) for previously-invisible
+nested-type cleanup methods.  E.g., `ResultListEntry.Value` (a
+union inside `ResultListEntry` inside an outer struct) exposes a
+real `deinit` whose absence in the outer's destructor was a real
+leak.  Tigerbeetle: unchanged.
 
-### G6. No "capture WITH predicate" atom
+### G6. ~~No "capture WITH predicate" atom~~ — FIXED
 
-Common pattern: "match an identifier that passes a predicate, AND
-capture its position for later reference."
+**Resolution:** added `pred_at` and `text_at` Atom variants to
+query.zig.  Both match an identifier AND fill a capture slot in a
+single atom, eliminating the `m.start + N` offset arithmetic that
+was the fragile workaround.
 
-- `missing_errdefer_on_out_param`: wanted "capture `<out>` where
-  `<out>` is in canonical-out names."  Worked around with
-  `.{ .pred = isCanonicalOutName }` + post-hoc `tree.tokenSlice(m.start + 1)`
-  to retrieve the captured text (fragile — depends on atom-offset
-  arithmetic).
+Witness migration: `missing_errdefer_on_out_param` now uses
+`.{ .pred_at = .{ .slot = 1, .pred = isCanonicalOutName } }` and
+`.{ .pred_at = .{ .slot = 2, .pred = isAcquireMethodName } }` to
+capture `<out>` and `<method>` tokens by slot.  Report site
+references `m.captures[1].?` / `m.captures[2].?` — pattern atoms
+can be inserted/removed without silently breaking the offsets.
 
-**Fix:** add `.{ .capture_pred = .{ .slot, .pred } }` atom that
-both filters AND captures.
+Also adopted in three patterns from earlier session: sentinel_strip
+(slot for `free`), publish_call (slots for method + arg),
+addref_call_pattern (slot for method).
 
-### G7. method-call origins don't preserve `try` distinction
+### G7. ~~method-call origins don't preserve `try` distinction~~ — FIXED
 
-`Binding.asCall()` returns the unified CallInfo regardless of
-whether the binding was `try`-wrapped.  Most rules want this
-unification (don't care about `try`), but a few need to
-distinguish — currently they check `tags[b.rhs_first] ==
-.keyword_try` separately.
+**Resolution:** added `Binding.wasTryWrapped(tags) bool` helper.
+Returns true for `.try_call` / `.try_method_call` origins AND for
+non-call shapes whose RHS starts with `try` (e.g.
+`const X = try expr` where `expr` isn't a recognized call).
 
-**Mild gap.**  Could add `Binding.wasTryWrapped(tags) bool` helper.
+`missing_errdefer_between_tries` migrated as the witness: dropped
+the two-line `if (b.rhs_first > b.rhs_last) continue;` +
+`if (tags[b.rhs_first] != .keyword_try) continue;` to a single
+`if (!b.wasTryWrapped(tags)) continue;` call.
 
-### G8. The 16+ same-named local classifiers
+### G8. ~~The 16+ same-named local classifiers~~ — FIXED
 
-`isCleanupMethodName` exists in 3 rule files with DIFFERENT sets
-of names.  Not duplication (different semantics), but the shared
-name with `receiver.isCleanupMethodName` invites confusion.
+**Resolution:** renamed the two predicate functions that
+intentionally diverged from receiver.zig's canonical vocabulary:
 
-**Not a DSL gap so much as a naming-convention gap.**  Each rule
-needs a SPECIFIC name-set; receiver.zig's canonical version is
-just one of many.
+- `unreleased_refs_on_error.isAddrefMethodName` →
+  `isStrictAddrefMethodName` (excludes `acquire` to dodge
+  `mutex.acquire()` collisions).
+- `defer_and_errdefer_free_overlap.isFreeOrDestroyName` →
+  `isAllocPairCleanupName` (narrow subset of
+  `receiver.isCleanupMethodName`, only the alloc-pair cleanup
+  names that defer-free-overlap cares about).
 
-**Fix:** rename rule-local classifiers to be specific
-(`isStrictCleanupName`, `isResetFamilyName`, etc.) so they
-don't collide with the receiver.zig vocabulary.
+Other rule-local classifiers (already named after their semantic
+intent — `isDestroyOrFree`, `isOpenerMethod`, etc.) don't collide
+with the receiver.zig vocabulary and need no rename.
 
 ## Not hit (yet) — theoretical
 
@@ -156,10 +169,11 @@ corpus sweeps, every trace event looks alike.  Easy fix
 | G2 (disjunction) | **fixed** | query.any_of; self_undefined + borrowed_slice cleaned up |
 | G3 (chained calls) | **fixed** | local.CallInfo gains outermost_*; slice_of_arena -23 LOC |
 | G4 (loop captures) | **fixed** | local.loop_capture; destroy_after_deinit_in_loop migrated |
-| G5 (nested types) | open | latent FN; not yet surfaced in real corpora |
-| G6 (capture+pred) | open | fragile offset arithmetic workaround in 1 rule |
-| G7 (try distinction) | open | mild |
-| G8 (classifier naming) | open | naming-convention not duplication |
+| G5 (nested types) | **fixed** | model.collectTypesInRange recurses; +16 TPs on bun |
+| G6 (capture+pred) | **fixed** | query.pred_at + text_at; missing_errdefer_on_out_param cleaned |
+| G7 (try distinction) | **fixed** | Binding.wasTryWrapped helper; missing_errdefer_between_tries cleaned |
+| G8 (classifier naming) | **fixed** | renamed isAddrefMethodName / isFreeOrDestroyName |
 
-4 of 8 fixed.  Remaining gaps are either low-frequency (G5),
-low-workaround-cost (G6, G7), or naming rather than DSL shape (G8).
+All 8 hit-during-migration gaps closed.  Remaining items in this
+doc (T1-T3) are theoretical / out-of-scope for the pattern detector
+infrastructure.

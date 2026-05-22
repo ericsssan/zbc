@@ -48,7 +48,7 @@ const Atom = query.Atom;
 // Capture slot $0 = the addref method token (report site).
 const addref_call_pattern = &[_]Atom{
     .{ .tok = .period },
-    .{ .pred_at = .{ .slot = 0, .pred = isAddrefMethodName } },
+    .{ .pred_at = .{ .slot = 0, .pred = isStrictAddrefMethodName } },
     .{ .tok = .l_paren },
 };
 
@@ -114,7 +114,7 @@ fn checkBody(
 /// generic; collides with "borrow a sub-reference" usage like
 /// `cmd.ref(buf)` in command-buffer APIs).  `pendingActivityRef`
 /// is included for Bun's JSC pattern (#29329 family).
-fn isAddrefMethodName(name: []const u8) bool {
+fn isStrictAddrefMethodName(name: []const u8) bool {
     return std.mem.eql(u8, name, "reference") or
         std.mem.eql(u8, name, "retain") or
         std.mem.eql(u8, name, "addRef") or

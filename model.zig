@@ -109,6 +109,10 @@ pub const TypeInfo = struct {
     fields: []const FieldInfo,
     /// All `fn name(...)` declarations inside the body.
     methods: []const MethodInfo,
+    /// Index into FileModel.types of the enclosing type, if this is
+    /// a nested type declaration (`const Outer = struct { const Inner
+    /// = struct { ... }; };`).  null for top-level types.
+    parent: ?u32 = null,
 
     pub fn hasMethod(self: TypeInfo, name: []const u8) bool {
         return self.findMethod(name) != null;
@@ -212,71 +216,13 @@ pub fn build(gpa: std.mem.Allocator, tree: *const Ast) !FileModel {
     const last: TokenIndex = tok_count - 1;
 
     // ── Pass 1: top-level type decls ───────────────────────
-    // `[pub] const Name = struct/union/enum { ... };` at brace-depth 0.
-    var depth: u32 = 0;
-    var t: TokenIndex = 0;
-    while (t + 4 < last) : (t += 1) {
-        switch (tags[t]) {
-            .l_brace, .l_paren, .l_bracket => {
-                depth += 1;
-                continue;
-            },
-            .r_brace, .r_paren, .r_bracket => {
-                if (depth > 0) depth -= 1;
-                continue;
-            },
-            else => {},
-        }
-        if (depth != 0) continue;
-        // Look for `const Name = struct/union/enum/opaque { ... }`.
-        if (tags[t] != .keyword_const) continue;
-        if (tags[t + 1] != .identifier) continue;
-        var eq: TokenIndex = t + 2;
-        while (eq < last and tags[eq] != .equal and tags[eq] != .semicolon) : (eq += 1) {}
-        if (eq >= last or tags[eq] != .equal) continue;
-        if (eq + 2 > last) continue;
-        // Skip optional `extern`/`packed` qualifier.
-        var k: TokenIndex = eq + 1;
-        if (tags[k] == .keyword_extern or tags[k] == .keyword_packed) k += 1;
-        if (k + 1 > last) continue;
-        const kind: TypeKind = switch (tags[k]) {
-            .keyword_struct => .struct_,
-            .keyword_union => .union_,
-            .keyword_enum => .enum_,
-            .keyword_opaque => .opaque_,
-            else => continue,
-        };
-        // Body opens at the first `{` after the kind keyword.  For
-        // unions/enums there may be `(...)` tag-type parens first.
-        var b: TokenIndex = k + 1;
-        // Skip `(...)` tag-type.
-        if (b <= last and tags[b] == .l_paren) {
-            const cp = lexer.matchParen(tags, b, last) orelse continue;
-            b = cp + 1;
-        }
-        if (b > last or tags[b] != .l_brace) continue;
-        const body_last = lexer.matchBrace(tags, b, last) orelse continue;
-
-        const fields_slice = if (kind == .struct_)
-            try collectFields(a, tree, b + 1, body_last - 1)
-        else
-            &[_]FieldInfo{};
-        const methods_slice = try collectMethods(a, tree, b + 1, body_last - 1, tree.tokenSlice(t + 1));
-
-        try types.append(a, .{
-            .name = tree.tokenSlice(t + 1),
-            .name_token = t + 1,
-            .kind = kind,
-            .body_first = b,
-            .body_last = body_last,
-            .fields = fields_slice,
-            .methods = methods_slice,
-        });
-
-        // Skip past the body so we don't re-enter via depth tracking.
-        // Adjust `t` to body_last; the `for`'s `t += 1` will move past.
-        t = body_last;
-    }
+    // Walks file tokens for `[pub] const Name = struct/union/enum {
+    // ... };` at brace-depth 0; recurses into each collected type's
+    // body to pick up nested type declarations (`const Inner = struct
+    // { ... }` inside an outer struct's body).  Nested entries land in
+    // the same flat `types` list with `parent` set to the outer's
+    // index.
+    try collectTypesInRange(a, tree, &types, 0, last, null);
 
     // ── Pass 2: top-level fn decls ─────────────────────────
     // Walk Ast.fn_decl nodes; classify as top-level by checking that
@@ -321,7 +267,93 @@ pub fn build(gpa: std.mem.Allocator, tree: *const Ast) !FileModel {
     };
 }
 
-// ── Internal: field + method extraction ────────────────────
+// ── Internal: type, field, method extraction ──────────────
+
+/// Collect every `const Name = struct/union/enum/opaque { ... }`
+/// decl in `[start, end]` at brace-depth 0 (relative to `start`),
+/// then recurse into each collected type's body to pick up nested
+/// type decls.  All collected types share the same flat `types`
+/// list; nested entries carry `parent` = the index of the enclosing
+/// type at append time.
+fn collectTypesInRange(
+    a: std.mem.Allocator,
+    tree: *const Ast,
+    types: *std.ArrayListUnmanaged(TypeInfo),
+    start: TokenIndex,
+    end: TokenIndex,
+    parent: ?u32,
+) std.mem.Allocator.Error!void {
+    const tags = tree.tokens.items(.tag);
+    if (end < 4 or start + 4 >= end) return;
+
+    var depth: u32 = 0;
+    var t: TokenIndex = start;
+    while (t + 4 < end) : (t += 1) {
+        switch (tags[t]) {
+            .l_brace, .l_paren, .l_bracket => {
+                depth += 1;
+                continue;
+            },
+            .r_brace, .r_paren, .r_bracket => {
+                if (depth > 0) depth -= 1;
+                continue;
+            },
+            else => {},
+        }
+        if (depth != 0) continue;
+        if (tags[t] != .keyword_const) continue;
+        if (tags[t + 1] != .identifier) continue;
+        var eq: TokenIndex = t + 2;
+        while (eq < end and tags[eq] != .equal and tags[eq] != .semicolon) : (eq += 1) {}
+        if (eq >= end or tags[eq] != .equal) continue;
+        if (eq + 2 > end) continue;
+        var k: TokenIndex = eq + 1;
+        if (tags[k] == .keyword_extern or tags[k] == .keyword_packed) k += 1;
+        if (k + 1 > end) continue;
+        const kind: TypeKind = switch (tags[k]) {
+            .keyword_struct => .struct_,
+            .keyword_union => .union_,
+            .keyword_enum => .enum_,
+            .keyword_opaque => .opaque_,
+            else => continue,
+        };
+        var b: TokenIndex = k + 1;
+        if (b <= end and tags[b] == .l_paren) {
+            const cp = lexer.matchParen(tags, b, end) orelse continue;
+            b = cp + 1;
+        }
+        if (b > end or tags[b] != .l_brace) continue;
+        const body_last = lexer.matchBrace(tags, b, end) orelse continue;
+
+        const fields_slice = if (kind == .struct_)
+            try collectFields(a, tree, b + 1, body_last - 1)
+        else
+            &[_]FieldInfo{};
+        const methods_slice = try collectMethods(a, tree, b + 1, body_last - 1, tree.tokenSlice(t + 1));
+
+        const this_index: u32 = @intCast(types.items.len);
+        try types.append(a, .{
+            .name = tree.tokenSlice(t + 1),
+            .name_token = t + 1,
+            .kind = kind,
+            .body_first = b,
+            .body_last = body_last,
+            .fields = fields_slice,
+            .methods = methods_slice,
+            .parent = parent,
+        });
+
+        // Recurse into THIS type's body to collect any nested type
+        // decls.  `b + 1` skips the opening `{`; `body_last - 1`
+        // stops before the closing `}`.
+        if (body_last > b + 1) {
+            try collectTypesInRange(a, tree, types, b + 1, body_last - 1, this_index);
+        }
+
+        // Skip past the body so the outer scan doesn't re-enter it.
+        t = body_last;
+    }
+}
 
 fn collectFields(
     a: std.mem.Allocator,
@@ -701,4 +733,55 @@ test "build: empty source" {
     defer model.deinit();
     try testing.expectEqual(@as(usize, 0), model.types.len);
     try testing.expectEqual(@as(usize, 0), model.fns.len);
+}
+
+test "build: nested type decls collected with parent link" {
+    const src: [:0]const u8 =
+        \\const Outer = struct {
+        \\    x: u32,
+        \\    pub fn deinit(self: *Outer) void { _ = self; }
+        \\    const Inner = struct {
+        \\        y: u32,
+        \\        pub fn close(self: *Inner) void { _ = self; }
+        \\    };
+        \\};
+    ;
+    var tree = try Ast.parse(testing.allocator, src, .zig);
+    defer tree.deinit(testing.allocator);
+    var model = try build(testing.allocator, &tree);
+    defer model.deinit();
+
+    try testing.expectEqual(@as(usize, 2), model.types.len);
+    const outer = model.findType("Outer").?;
+    const inner = model.findType("Inner").?;
+    try testing.expect(outer.parent == null);
+    try testing.expect(inner.parent != null);
+    // Inner's parent index points to Outer.
+    try testing.expectEqual(outer, &model.types[inner.parent.?]);
+    // Both pick up their methods so hasCleanupMethod works.
+    try testing.expect(outer.hasMethod("deinit"));
+    try testing.expect(inner.hasMethod("close"));
+    try testing.expect(inner.hasCleanupMethod());
+}
+
+test "build: doubly-nested type chains parent links" {
+    const src: [:0]const u8 =
+        \\const A = struct {
+        \\    const B = struct {
+        \\        const C = struct { x: u32 };
+        \\    };
+        \\};
+    ;
+    var tree = try Ast.parse(testing.allocator, src, .zig);
+    defer tree.deinit(testing.allocator);
+    var model = try build(testing.allocator, &tree);
+    defer model.deinit();
+
+    try testing.expectEqual(@as(usize, 3), model.types.len);
+    const a = model.findType("A").?;
+    const b = model.findType("B").?;
+    const c = model.findType("C").?;
+    try testing.expect(a.parent == null);
+    try testing.expectEqual(a, &model.types[b.parent.?]);
+    try testing.expectEqual(b, &model.types[c.parent.?]);
 }

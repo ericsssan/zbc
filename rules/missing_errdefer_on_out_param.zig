@@ -41,15 +41,17 @@ const Pos = problem_mod.Pos;
 const Atom = query.Atom;
 const R = "missing-errdefer-on-out-param";
 
-// `try <out>.<field>.<acquire>(` — predicate-filtered on `<out>`
-// and `<acquire>`; `<field>` is captured for the diagnostic.
+// `try <out>.<field>.<acquire>(` — predicates filter on `<out>`
+// and `<acquire>`; both are captured (slots 1/2) alongside `<field>`
+// (slot 0) so the report site uses stable capture indices instead of
+// fragile `m.start + N` offset arithmetic.
 const acquire_pattern = &[_]Atom{
     .{ .tok = .keyword_try },
-    .{ .pred = isCanonicalOutName },
+    .{ .pred_at = .{ .slot = 1, .pred = isCanonicalOutName } }, // out
     .{ .tok = .period },
     .{ .capture = 0 }, // field
     .{ .tok = .period },
-    .{ .pred = isAcquireMethodName },
+    .{ .pred_at = .{ .slot = 2, .pred = isAcquireMethodName } }, // method
     .{ .tok = .l_paren },
 };
 
@@ -107,17 +109,13 @@ fn checkFn(
     var acquires: std.ArrayListUnmanaged(Acquire) = .empty;
     defer acquires.deinit(gpa);
     for (all_acquires) |m| {
-        // Pattern layout: m.start = keyword_try; +1 = out; +3 = field;
-        //                 +5 = method; +6 = l_paren.
-        const out_tok = m.start + 1;
-        const out_name = tree.tokenSlice(out_tok);
+        const out_name = m.captureText(tree, 1).?;
         if (!var_outs.contains(out_name)) continue;
-        const method_tok = m.start + 5;
         const sc = lexer.findStmtSemicolon(tags, m.end + 1, last) orelse continue;
         try acquires.append(gpa, .{
             .out_name = out_name,
             .field_name = m.captureText(tree, 0).?,
-            .method_tok = method_tok,
+            .method_tok = m.captures[2].?,
             .end_token = sc,
         });
     }

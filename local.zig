@@ -178,6 +178,20 @@ pub const Binding = struct {
         }
         return self.rhs_first;
     }
+
+    /// True iff the binding's RHS was prefixed with `try` (and so the
+    /// classified origin is `.try_call` / `.try_method_call`, OR the
+    /// RHS started with a literal `try` keyword for non-call shapes
+    /// like `const X = try expr`).  Use when a rule's logic differs
+    /// between a fallible `try`-wrapped init and a bare init —
+    /// `asCall()` deliberately erases this distinction.
+    pub fn wasTryWrapped(self: Binding, tags: []const TokenTag) bool {
+        return switch (self.origin) {
+            .try_call, .try_method_call => true,
+            else => self.rhs_first <= self.rhs_last and
+                tags[self.rhs_first] == .keyword_try,
+        };
+    }
 };
 
 pub const LocalBindings = struct {

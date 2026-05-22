@@ -82,10 +82,8 @@ fn checkFn(
         if (b.origin == .param) continue;
         // Must be a try-wrapped binding.  Includes captures
         // (`if (try Loader.fromJS(...)) |x|`) AND const bindings
-        // (`const X = try ...`) — both have rhs_first pointing at
-        // the `try` keyword.
-        if (b.rhs_first > b.rhs_last) continue;
-        if (tags[b.rhs_first] != .keyword_try) continue;
+        // (`const X = try ...`).
+        if (!b.wasTryWrapped(tags)) continue;
 
         // Extract the FIRST call's (type, method) — the OLD walker
         // semantics.  Works for any rhs shape including chains and

@@ -56,7 +56,7 @@ const defer_free_pattern = &[_]Atom{
 // `.<free|destroy>(` — used to check errdefer body contains a free.
 const free_or_destroy_call = &[_]Atom{
     .{ .tok = .period },
-    .{ .pred = isFreeOrDestroyName },
+    .{ .pred = isAllocPairCleanupName },
     .{ .tok = .l_paren },
 };
 
@@ -155,7 +155,7 @@ fn errdeferRestoresDeferredName(
     return null;
 }
 
-fn isFreeOrDestroyName(name: []const u8) bool {
+fn isAllocPairCleanupName(name: []const u8) bool {
     return std.mem.eql(u8, name, "free") or std.mem.eql(u8, name, "destroy");
 }
 
