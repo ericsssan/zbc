@@ -23,12 +23,14 @@ const Ast = std.zig.Ast;
 
 const fmodel = @import("model.zig");
 const local = @import("local.zig");
+const fn_summary = @import("fn_summary.zig");
 
 pub const FileCache = struct {
     gpa: std.mem.Allocator,
     tree: *const Ast,
     file_model: ?fmodel.FileModel = null,
     bindings: std.AutoHashMapUnmanaged(u32, local.LocalBindings) = .empty,
+    summaries: std.AutoHashMapUnmanaged(u32, fn_summary.FnSummary) = .empty,
 
     pub fn init(gpa: std.mem.Allocator, tree: *const Ast) FileCache {
         return .{ .gpa = gpa, .tree = tree };
@@ -39,6 +41,7 @@ pub const FileCache = struct {
         var it = self.bindings.valueIterator();
         while (it.next()) |b| b.deinit();
         self.bindings.deinit(self.gpa);
+        self.summaries.deinit(self.gpa);
     }
 
     /// Lazily build (and cache) the FileModel for this file.
@@ -62,6 +65,23 @@ pub const FileCache = struct {
         const gop = try self.bindings.getOrPut(self.gpa, key);
         if (!gop.found_existing) {
             gop.value_ptr.* = try local.build(self.gpa, self.tree, proto, body);
+        }
+        return gop.value_ptr;
+    }
+
+    /// Lazily infer (and cache) the behavioral summary for the given
+    /// fn body.  Same caching contract as localBindings.  Parallel
+    /// API to annotations.Db; new code should prefer this for the
+    /// queries it covers.
+    pub fn summaryOf(
+        self: *FileCache,
+        proto: Ast.full.FnProto,
+        body: Ast.Node.Index,
+    ) !*const fn_summary.FnSummary {
+        const key = @intFromEnum(body);
+        const gop = try self.summaries.getOrPut(self.gpa, key);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = fn_summary.inferFromBody(self.tree, proto, body);
         }
         return gop.value_ptr;
     }
@@ -109,4 +129,26 @@ test "FileCache: localBindings caches per body" {
     const b1 = try cache.localBindings(bar.proto, bar.body);
     try std.testing.expect(a1 == a2);
     try std.testing.expect(a1 != b1);
+}
+
+test "FileCache: summaryOf caches per body, classifies alloc as heap" {
+    const gpa = std.testing.allocator;
+    const src: [:0]const u8 =
+        \\fn alloc_one(gpa: std.mem.Allocator) ![]u8 {
+        \\    return try gpa.alloc(u8, 1);
+        \\}
+    ;
+    var tree = try Ast.parse(gpa, src, .zig);
+    defer tree.deinit(gpa);
+    var cache = FileCache.init(gpa, &tree);
+    defer cache.deinit();
+
+    var proto_buf: [1]Ast.Node.Index = undefined;
+    var fns = @import("lexer.zig").iterFnDecls(&tree);
+    const f = fns.next(&proto_buf).?;
+    const a = try cache.summaryOf(f.proto, f.body);
+    const b = try cache.summaryOf(f.proto, f.body);
+    try std.testing.expect(a == b);
+    try std.testing.expect(a.returns == .heap);
+    try std.testing.expect(a.allocates);
 }

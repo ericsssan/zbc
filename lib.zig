@@ -558,6 +558,8 @@ test {
     _ = rule_registry;
     _ = file_cache_mod;
     _ = suppressions_mod;
+    _ = @import("fn_summary.zig");
+    _ = @import("vocabulary.zig");
     _ = @import("lexer.zig");
     _ = @import("scope.zig");
     _ = @import("receiver.zig");
