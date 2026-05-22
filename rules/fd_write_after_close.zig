@@ -10,9 +10,11 @@ const lexer = @import("../lexer.zig");
 const scope = @import("../scope.zig");
 const problem = @import("../problem.zig");
 const testing = @import("../testing.zig");
+const trace = @import("../trace.zig");
 const config_mod = @import("../config.zig");
 
 const TokenIndex = lexer.TokenIndex;
+const R = "fd-write-after-close";
 
 pub fn check(
     gpa: std.mem.Allocator,
@@ -85,6 +87,7 @@ fn checkBody(
         if (!isOpenerMethodName(tree.tokenSlice(rhs_start + 2))) continue;
 
         const sc = lexer.findStmtSemicolon(tags, rhs_start + 4, last) orelse continue;
+        trace.note(R, tree, t + 1, "bound file handle via opener");
         try bindings.append(gpa, .{
             .x_name = tree.tokenSlice(t + 1),
             .name_token = t + 1,
@@ -94,9 +97,16 @@ fn checkBody(
     }
 
     for (bindings.items) |b| {
-        const close_tok = scope.findReceiverCallSameDepth(tree, b.end_token + 1, last, b.x_name, isCloseMethodName) orelse continue;
+        const close_tok = scope.findReceiverCallSameDepth(tree, b.end_token + 1, last, b.x_name, isCloseMethodName) orelse {
+            trace.skip(R, tree, b.name_token, "no inline .close() at same depth (defer/errdefer is fine)");
+            continue;
+        };
         const after_close = lexer.findStmtSemicolon(tree.tokens.items(.tag), close_tok, last) orelse continue;
-        const use_tok = scope.findIdentUseInEnclosingScope(tree, after_close + 1, last, b.x_name) orelse continue;
+        const use_tok = scope.findIdentUseInEnclosingScope(tree, after_close + 1, last, b.x_name) orelse {
+            trace.skip(R, tree, close_tok, "close found but no later use of binding in enclosing scope");
+            continue;
+        };
+        trace.match(R, tree, use_tok, "use after close");
         try report(gpa, problems, tree, b, close_tok, use_tok);
     }
 }
@@ -158,8 +168,6 @@ fn report(
 }
 
 // ── Tests ──────────────────────────────────────────────────
-
-const R = "fd-write-after-close";
 
 test "createFile then close then writeAll fires" {
     try testing.expectFires(check, R,

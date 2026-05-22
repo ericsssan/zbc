@@ -131,6 +131,15 @@ pub fn main(init: std.process.Init) !void {
             color_off = true;
             continue;
         }
+        if (std.mem.startsWith(u8, a, "--trace=")) {
+            const v = a["--trace=".len..];
+            if (std.mem.eql(u8, v, "*")) {
+                lib.trace.all_rules = true;
+            } else {
+                lib.trace.active_rule = v;
+            }
+            continue;
+        }
         if (std.mem.startsWith(u8, a, "--")) {
             std.debug.print("zbc: unknown flag: {s}\n", .{a});
             printUsage();

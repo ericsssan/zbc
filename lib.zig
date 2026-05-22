@@ -62,6 +62,7 @@ pub const Cache = remote_resolver_mod.Cache;
 pub const Rule = rule_catalog_mod.Rule;
 pub const rule_catalog = rule_catalog_mod.all;
 pub const lookupRule = rule_catalog_mod.lookup;
+pub const trace = @import("trace.zig");
 
 pub fn analyzeEscape(
     gpa: std.mem.Allocator,
@@ -789,5 +790,6 @@ test {
     _ = @import("receiver.zig");
     _ = @import("testing.zig");
     _ = @import("model.zig");
+    _ = @import("trace.zig");
     std.testing.refAllDecls(@This());
 }
