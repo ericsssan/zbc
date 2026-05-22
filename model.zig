@@ -346,9 +346,17 @@ fn collectFields(
             t = lexer.skipNestedFnProtoAndBody(tags, t, end);
             continue;
         }
-        // Skip `pub`/`const`/`var` (method modifiers, nested decls).
-        if (tags[t] == .keyword_pub or tags[t] == .keyword_const or tags[t] == .keyword_var)
+        // Skip nested decls — `[pub] const/var Name ...;` — the
+        // entire statement, terminator inclusive.  Without this we'd
+        // misread `pub const empty: T = ...` as a field named `empty`.
+        if (tags[t] == .keyword_pub or tags[t] == .keyword_const or
+            tags[t] == .keyword_var or tags[t] == .keyword_comptime or
+            tags[t] == .keyword_threadlocal)
+        {
+            const sc = lexer.findStmtSemicolon(tags, t, end) orelse break;
+            t = sc;
             continue;
+        }
         // Field shape: `<identifier>: <type-tokens>(= <default>)?,`
         if (tags[t] != .identifier) continue;
         if (t + 1 > end or tags[t + 1] != .colon) continue;
