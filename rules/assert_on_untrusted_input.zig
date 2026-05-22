@@ -34,6 +34,7 @@ const problem_mod = @import("../problem.zig");
 const config_mod = @import("../config.zig");
 
 const lexer = @import("../lexer.zig");
+const local = @import("../local.zig");
 const testing = @import("../testing.zig");
 const matchBrace = lexer.matchBrace;
 const matchParen = lexer.matchParen;
@@ -53,22 +54,17 @@ pub fn check(
 ) !void {
     if (!config_mod.isEnabled(config, .assert_on_untrusted_input)) return;
 
-    var node_idx: u32 = 1;
-    while (node_idx < tree.nodes.len) : (node_idx += 1) {
-        const node: Ast.Node.Index = @enumFromInt(node_idx);
-        if (tree.nodeTag(node) != .fn_decl) continue;
-        if (returnsType(tree, node)) continue;
-        var buf: [1]Ast.Node.Index = undefined;
-        const fp = fnProto(tree, &buf, node) orelse continue;
-        const name_tok = fp.name_token orelse continue;
-        const body = bodyOf(tree, node) orelse continue;
-        try checkFn(gpa, tree, name_tok, body, problems);
+    var proto_buf: [1]Ast.Node.Index = undefined;
+    var fns = lexer.iterFnDecls(tree);
+    while (fns.next(&proto_buf)) |fn_entry| {
+        try checkFn(gpa, tree, fn_entry.proto, fn_entry.name_token, fn_entry.body, problems);
     }
 }
 
 fn checkFn(
     gpa: std.mem.Allocator,
     tree: *const Ast,
+    proto: Ast.full.FnProto,
     name_tok: Ast.TokenIndex,
     body: Ast.Node.Index,
     problems: *std.ArrayListUnmanaged(Problem),
@@ -88,9 +84,22 @@ fn checkFn(
     // already-validated typed wrappers).
     const fn_name = tree.tokenSlice(name_tok);
     if (!isParserName(fn_name)) return;
+
+    var bindings = try local.build(gpa, tree, proto, body);
+    defer bindings.deinit();
+
+    // Collect param names whose declared type starts with `[` (slice
+    // or array type), tolerating an optional `const` prefix.
     var params: std.ArrayListUnmanaged([]const u8) = .empty;
     defer params.deinit(gpa);
-    try collectByteLikeParams(gpa, tree, name_tok, &params);
+    for (bindings.items) |b| {
+        if (b.origin != .param) continue;
+        if (b.rhs_first > b.rhs_last) continue;
+        var ty: Ast.TokenIndex = b.rhs_first;
+        if (tags[ty] == .keyword_const and ty < b.rhs_last) ty += 1;
+        if (tags[ty] != .l_bracket) continue;
+        try params.append(gpa, b.name);
+    }
     if (params.items.len == 0) return;
 
     // Scan body for `assert(<expr>)` calls.
@@ -112,55 +121,6 @@ fn checkFn(
         }
         try report(gpa, problems, tree, t);
         t = cp;
-    }
-}
-
-/// Walk forward from the fn name's identifier to find the `(` of
-/// the parameter list, then collect parameter names whose declared
-/// type is an EXPLICIT slice (`[]const u8`, `[]u8`, `[*]const u8`,
-/// `[*]u8`).  Other types — even structured wrappers like
-/// `*Message` or `Header` — are too commonly used for INTERNAL
-/// invariants in this codebase to be reliably classified as
-/// untrusted.
-fn collectByteLikeParams(
-    gpa: std.mem.Allocator,
-    tree: *const Ast,
-    name_tok: Ast.TokenIndex,
-    out: *std.ArrayListUnmanaged([]const u8),
-) !void {
-    const tags = tree.tokens.items(.tag);
-    const tok_count: u32 = @intCast(tree.tokens.len);
-    if (name_tok + 1 >= tok_count) return;
-    if (tags[name_tok + 1] != .l_paren) return;
-    const last: Ast.TokenIndex = tok_count - 1;
-    const cp = matchParen(tags, name_tok + 1, last) orelse return;
-    var t: Ast.TokenIndex = name_tok + 2;
-    var paren: u32 = 0;
-    while (t < cp) : (t += 1) {
-        switch (tags[t]) {
-            .l_paren => paren += 1,
-            .r_paren => if (paren > 0) {
-                paren -= 1;
-            },
-            .identifier => if (paren == 0) {
-                if (t + 2 < cp and tags[t + 1] == .colon) {
-                    // Look at the type token immediately after `:`.
-                    // We accept slice (`[`) or sentinel-array
-                    // (`[:`) starts.  Skip past any `const`
-                    // modifier.
-                    var ty: Ast.TokenIndex = t + 2;
-                    if (tags[ty] == .keyword_const) ty += 1;
-                    if (ty < cp and tags[ty] == .l_bracket) {
-                        // `[...]u8`-style slice type.  Accept any
-                        // bracket-starting parameter type; the
-                        // narrow check is enough to drop structured
-                        // wrappers.
-                        try out.append(gpa, tree.tokenSlice(t));
-                    }
-                }
-            },
-            else => {},
-        }
     }
 }
 
