@@ -220,6 +220,11 @@ pub const all = [_]Rule{
         .body = @embedFile("rules/missing-deinit-on-composed-owner.md"),
     },
     .{
+        .id = "owned-field-no-outer-cleanup",
+        .title = "outer struct has a value-typed field whose type exposes `deinit`/`close`/etc., but outer has no cleanup method — dropped values silently leak",
+        .body = @embedFile("rules/owned-field-no-outer-cleanup.md"),
+    },
+    .{
         .id = "borrowed-slice-into-out-param",
         .title = "write into pointer out-param uses a `defer ... .deinit()`-bound local — out-param dangles after return",
         .body = @embedFile("rules/borrowed-slice-into-out-param.md"),

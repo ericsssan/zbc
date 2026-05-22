@@ -349,6 +349,15 @@ pub const Invariant = enum {
     /// class (StackIterator forgot to call ma.deinit → /proc fd
     /// leak); related to ziglang/zig#20192 and #18651.
     missing_deinit_on_composed_owner,
+    /// Outer struct has a value-typed field whose type (same file)
+    /// exposes a cleanup method (deinit/close/destroy/free/stop/
+    /// finalize/dispose) — but the outer struct exposes NO cleanup
+    /// method of its own.  Users who treat `Outer` as a plain value
+    /// silently leak the inner's owned resource on drop.  The
+    /// complement to `missing-deinit-on-composed-owner`: that rule
+    /// fires when deinit EXISTS but is incomplete; this one fires
+    /// when deinit is missing entirely.
+    owned_field_no_outer_cleanup,
     /// `defer <X>.deinit()` (or `defer <alloc>.free(<X>)`) and a
     /// later write `<out>.* = ...<X>...` into a pointer-typed
     /// fn parameter — the out-param holds a dangling slice once
@@ -392,7 +401,7 @@ pub const Invariant = enum {
     borrowed_slice_into_stack_buffer_returned,
 };
 
-pub const all_invariants: [44]Invariant = .{
+pub const all_invariants: [45]Invariant = .{
     .arena_escape,
     .stack_escape,
     .use_undefined,
@@ -431,6 +440,7 @@ pub const all_invariants: [44]Invariant = .{
     .publish_then_touch_self,
     .assert_on_untrusted_input,
     .missing_deinit_on_composed_owner,
+    .owned_field_no_outer_cleanup,
     .borrowed_slice_into_out_param,
     .defer_and_errdefer_free_overlap,
     .sentinel_strip_free_size_mismatch,

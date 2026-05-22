@@ -40,6 +40,7 @@ const memset_undef_after_len_truncation_mod = @import("rules/memset_undef_after_
 const publish_then_touch_self_mod = @import("rules/publish_then_touch_self.zig");
 const assert_on_untrusted_input_mod = @import("rules/assert_on_untrusted_input.zig");
 const missing_deinit_on_composed_owner_mod = @import("rules/missing_deinit_on_composed_owner.zig");
+const owned_field_no_outer_cleanup_mod = @import("rules/owned_field_no_outer_cleanup.zig");
 const borrowed_slice_into_out_param_mod = @import("rules/borrowed_slice_into_out_param.zig");
 const defer_and_errdefer_free_overlap_mod = @import("rules/defer_and_errdefer_free_overlap.zig");
 const sentinel_strip_free_size_mismatch_mod = @import("rules/sentinel_strip_free_size_mismatch.zig");
@@ -273,6 +274,11 @@ pub fn analyzeEscape(
     // call `<self>.<field>.deinit()` for a field whose type has
     // a deinit → inner non-memory resources leak.
     try missing_deinit_on_composed_owner_mod.check(gpa, &tree, config, &problems);
+
+    // Owned-field-no-outer-cleanup — outer has a field whose type
+    // exposes cleanup, but outer itself has NO cleanup method.
+    // Complement to the above; dropped values silently leak.
+    try owned_field_no_outer_cleanup_mod.check(gpa, &tree, config, &problems);
 
     // Borrowed-slice-into-out-param — `defer X.deinit()` +
     // `<out-ptr-param>.* = ...X...` → out-param holds dangling
@@ -779,6 +785,7 @@ test {
     _ = publish_then_touch_self_mod;
     _ = assert_on_untrusted_input_mod;
     _ = missing_deinit_on_composed_owner_mod;
+    _ = owned_field_no_outer_cleanup_mod;
     _ = borrowed_slice_into_out_param_mod;
     _ = defer_and_errdefer_free_overlap_mod;
     _ = sentinel_strip_free_size_mismatch_mod;
