@@ -9,34 +9,29 @@
 //! parsed a kernel version into `SemanticVersion`, returned the
 //! result whose `.pre` / `.build` fields aliased a stack buffer
 //! freed at function return.
-//!
-//! Detection (purely syntactic, per-fn token walk):
-//!   1. Skip comptime type-builder fns.
-//!   2. Collect stack-array locals: `var <buf>: [...]<T> =
-//!      undefined;` declarations.
-//!   3. Find `const <X> = <T>.parse(<expr>)` (or `try
-//!      <T>.parse(...)`) where `<expr>` mentions one of the
-//!      stack buffers.  Track `<X>`.
-//!   4. If the fn body contains `return <X>` or `return <expr
-//!      mentioning X>`, fire on the `return`.
 
 const std = @import("std");
 const Ast = std.zig.Ast;
 
-const problem_mod = @import("../problem.zig");
-const config_mod = @import("../config.zig");
-
 const lexer = @import("../lexer.zig");
-const matchBrace = lexer.matchBrace;
-const matchParen = lexer.matchParen;
-const findStmtSemicolon = lexer.findStmtSemicolon;
-const skipNestedFn = lexer.skipNestedFn;
-const returnsType = lexer.returnsType;
-const fnProto = lexer.fnProto;
-const bodyOf = lexer.bodyOf;
+const local = @import("../local.zig");
+const query = @import("../query.zig");
+const problem_mod = @import("../problem.zig");
+const testing = @import("../testing.zig");
+const config_mod = @import("../config.zig");
 
 const Problem = problem_mod.Problem;
 const Pos = problem_mod.Pos;
+const Atom = query.Atom;
+const R = "borrowed-slice-into-stack-buffer-returned";
+
+// `<AliasingType>.parse(` anywhere in a binding's RHS.
+const parse_call = &[_]Atom{
+    .{ .pred = isAliasingParserType },
+    .{ .tok = .period },
+    .{ .text = "parse" },
+    .{ .tok = .l_paren },
+};
 
 pub fn check(
     gpa: std.mem.Allocator,
@@ -46,19 +41,17 @@ pub fn check(
 ) !void {
     if (!config_mod.isEnabled(config, .borrowed_slice_into_stack_buffer_returned)) return;
 
-    var node_idx: u32 = 1;
-    while (node_idx < tree.nodes.len) : (node_idx += 1) {
-        const node: Ast.Node.Index = @enumFromInt(node_idx);
-        if (tree.nodeTag(node) != .fn_decl) continue;
-        if (returnsType(tree, node)) continue;
-        const body = bodyOf(tree, node) orelse continue;
-        try checkBody(gpa, tree, body, problems);
+    var proto_buf: [1]Ast.Node.Index = undefined;
+    var fns = lexer.iterFnDecls(tree);
+    while (fns.next(&proto_buf)) |fn_entry| {
+        try checkFn(gpa, tree, fn_entry.proto, fn_entry.body, problems);
     }
 }
 
-fn checkBody(
+fn checkFn(
     gpa: std.mem.Allocator,
     tree: *const Ast,
+    proto: Ast.full.FnProto,
     body: Ast.Node.Index,
     problems: *std.ArrayListUnmanaged(Problem),
 ) !void {
@@ -66,120 +59,106 @@ fn checkBody(
     const first = tree.firstToken(body);
     const last = tree.lastToken(body);
 
+    // Cheap pre-scan: no return → nothing to escape, no fire possible.
+    if (!lexer.hasTokenInRange(tags, first, last, .keyword_return)) return;
+
+    var bindings = try local.build(gpa, tree, proto, body);
+    defer bindings.deinit();
+
+    // Pass 1: stack array locals.
+    // Shape: `var <name>: [<...>]<T> = undefined;`.  local.zig doesn't
+    // store the type annotation, but the syntax around name_token
+    // gives it away: name_token+1 is `:` and name_token+2 is `[`.
+    // RHS is the identifier "undefined" (classified as .literal by
+    // local.zig).
     var stack_bufs: std.ArrayListUnmanaged([]const u8) = .empty;
     defer stack_bufs.deinit(gpa);
-    try collectStackArrayLocals(gpa, tree, first, last, &stack_bufs);
+    for (bindings.items) |b| {
+        if (b.is_const) continue;
+        if (b.origin != .literal) continue;
+        if (b.name_token + 2 > last) continue;
+        if (tags[b.name_token + 1] != .colon) continue;
+        if (tags[b.name_token + 2] != .l_bracket) continue;
+        // RHS sanity-check: "undefined".
+        if (!std.mem.eql(u8, tree.tokenSlice(b.rhs_first), "undefined")) continue;
+        try stack_bufs.append(gpa, b.name);
+    }
     if (stack_bufs.items.len == 0) return;
 
-    // Find `const <X> = ... <T>.parse(<expr-mentioning-buf>) ...`
-    // bindings.
+    // Pass 2: tainted bindings.
+    // Shape: `[const|var] <X> = ...<AliasingType>.parse(<expr mentioning buf>)...`.
     var tainted: std.ArrayListUnmanaged([]const u8) = .empty;
     defer tainted.deinit(gpa);
-    var t: Ast.TokenIndex = first;
-    while (t + 5 <= last) : (t += 1) {
-        if (tags[t] == .keyword_fn) {
-            t = skipNestedFn(tags, t, last);
-            continue;
-        }
-        if (tags[t] != .keyword_const and tags[t] != .keyword_var) continue;
-        if (tags[t + 1] != .identifier) continue;
-        // Walk to `=`.
-        var after_name: Ast.TokenIndex = t + 2;
-        if (after_name <= last and tags[after_name] == .colon) {
-            var d: u32 = 0;
-            while (after_name <= last) : (after_name += 1) {
-                switch (tags[after_name]) {
-                    .l_paren, .l_brace, .l_bracket => d += 1,
-                    .r_paren, .r_brace, .r_bracket => if (d > 0) {
-                        d -= 1;
-                    },
-                    .equal => if (d == 0) break,
-                    else => {},
-                }
-            }
-        }
-        if (after_name > last or tags[after_name] != .equal) continue;
-        const sc = findStmtSemicolon(tags, after_name + 1, last) orelse continue;
-        // RHS contains `<KnownAliasingType>.parse(` ?
-        const parse_call = findParseCall(tree, tags, after_name + 1, sc) orelse {
-            t = sc;
-            continue;
-        };
-        // Inside the parse call's args, does it mention a stack buf?
-        const cp = matchParen(tags, parse_call + 1, last) orelse {
-            t = sc;
-            continue;
-        };
-        if (!callArgsMentionStackBuf(tree, parse_call + 2, cp - 1, stack_bufs.items)) {
-            t = sc;
-            continue;
-        }
-        try tainted.append(gpa, tree.tokenSlice(t + 1));
-        t = sc;
+    for (bindings.items) |b| {
+        if (b.origin == .param) continue;
+        // Find the parse-call's `(` in the RHS, then check its args.
+        // The parse_call pattern's last atom is `.l_paren`, so the
+        // match's end token IS the `(`.
+        const parse_m = findFirstMatchInRange(tree, parse_call, b.rhs_first, b.rhs_last) orelse continue;
+        const lp = parse_m.end;
+        const rp = lexer.matchParen(tags, lp, b.rhs_last) orelse continue;
+        if (!rangeMentionsAny(tree, lp + 1, rp - 1, stack_bufs.items)) continue;
+        try tainted.append(gpa, b.name);
     }
     if (tainted.items.len == 0) return;
 
-    // Find `return <expr mentioning tainted>`.
-    t = first;
-    while (t + 1 <= last) : (t += 1) {
+    // Pass 3: scan returns for any tainted ident.
+    var t: Ast.TokenIndex = first;
+    while (t <= last) : (t += 1) {
         if (tags[t] == .keyword_fn) {
-            t = skipNestedFn(tags, t, last);
+            t = lexer.skipNestedFn(tags, t, last);
             continue;
         }
         if (tags[t] != .keyword_return) continue;
-        const sc = findStmtSemicolon(tags, t + 1, last) orelse continue;
-        if (returnMentionsTainted(tree, t + 1, sc, tainted.items)) |n| {
+        const sc = lexer.findStmtSemicolon(tags, t + 1, last) orelse continue;
+        if (sc <= t + 1) continue;
+        if (rangeMentionsName(tree, t + 1, sc - 1, tainted.items)) |n| {
             try report(gpa, problems, tree, t, n);
         }
         t = sc;
     }
 }
 
-/// Collect `var <name>: [<expr>]<T> = undefined;` declarations.
-fn collectStackArrayLocals(
-    gpa: std.mem.Allocator,
+/// Find the first match of `atoms` in `[start, end]` via a forward
+/// scan.  No scope/defer/nested-fn skipping — used to scan a single
+/// binding's RHS where those concerns don't apply.
+fn findFirstMatchInRange(
     tree: *const Ast,
-    first: Ast.TokenIndex,
-    last: Ast.TokenIndex,
-    out: *std.ArrayListUnmanaged([]const u8),
-) !void {
-    const tags = tree.tokens.items(.tag);
-    var t: Ast.TokenIndex = first;
-    while (t + 5 <= last) : (t += 1) {
-        if (tags[t] == .keyword_fn) {
-            t = skipNestedFn(tags, t, last);
-            continue;
-        }
-        if (tags[t] != .keyword_var) continue;
-        if (tags[t + 1] != .identifier) continue;
-        if (tags[t + 2] != .colon) continue;
-        if (tags[t + 3] != .l_bracket) continue;
-        // Type is `[<expr>]<T>` — array, not slice.
-        try out.append(gpa, tree.tokenSlice(t + 1));
-    }
-}
-
-/// Find a call shaped `<Aliasing-Type>.parse(`.  Restricted to a
-/// narrow allowlist of known-aliasing parser types — most
-/// `.parse()` methods return owned values (or numbers), so a
-/// general "any .parse" match produces too many FPs.
-fn findParseCall(
-    tree: *const Ast,
-    tags: []const std.zig.Token.Tag,
+    atoms: []const Atom,
     start: Ast.TokenIndex,
     end: Ast.TokenIndex,
-) ?Ast.TokenIndex {
+) ?query.Match {
+    if (start > end) return null;
     var t: Ast.TokenIndex = start;
-    while (t + 1 <= end) : (t += 1) {
+    while (t <= end) : (t += 1) {
+        if (query.matchAt(tree, atoms, t, end, null)) |m| return m;
+    }
+    return null;
+}
+
+/// True iff `[start, end]` mentions any name in `names` as an
+/// identifier.
+fn rangeMentionsAny(tree: *const Ast, start: Ast.TokenIndex, end: Ast.TokenIndex, names: []const []const u8) bool {
+    const tags = tree.tokens.items(.tag);
+    if (start > end) return false;
+    var t: Ast.TokenIndex = start;
+    while (t <= end) : (t += 1) {
         if (tags[t] != .identifier) continue;
-        if (!std.mem.eql(u8, tree.tokenSlice(t), "parse")) continue;
-        if (t > 0 and tags[t - 1] != .period) continue;
-        if (t + 1 > end or tags[t + 1] != .l_paren) continue;
-        // Receiver (token before the `.`) must be in the
-        // known-aliasing-parser allowlist.
-        if (t < 2 or tags[t - 2] != .identifier) continue;
-        if (!isAliasingParserType(tree.tokenSlice(t - 2))) continue;
-        return t;
+        const id = tree.tokenSlice(t);
+        for (names) |n| if (std.mem.eql(u8, n, id)) return true;
+    }
+    return false;
+}
+
+/// Like rangeMentionsAny but returns the matched name on hit.
+fn rangeMentionsName(tree: *const Ast, start: Ast.TokenIndex, end: Ast.TokenIndex, names: []const []const u8) ?[]const u8 {
+    const tags = tree.tokens.items(.tag);
+    if (start > end) return null;
+    var t: Ast.TokenIndex = start;
+    while (t <= end) : (t += 1) {
+        if (tags[t] != .identifier) continue;
+        const id = tree.tokenSlice(t);
+        for (names) |n| if (std.mem.eql(u8, n, id)) return n;
     }
     return null;
 }
@@ -188,46 +167,6 @@ fn isAliasingParserType(name: []const u8) bool {
     return std.mem.eql(u8, name, "SemanticVersion") or
         std.mem.eql(u8, name, "Uri") or
         std.mem.eql(u8, name, "Url");
-}
-
-/// True iff `[start, end]` mentions one of the stack buffer
-/// names as an identifier.
-fn callArgsMentionStackBuf(
-    tree: *const Ast,
-    start: Ast.TokenIndex,
-    end: Ast.TokenIndex,
-    bufs: []const []const u8,
-) bool {
-    const tags = tree.tokens.items(.tag);
-    if (start > end) return false;
-    var t: Ast.TokenIndex = start;
-    while (t <= end) : (t += 1) {
-        if (tags[t] != .identifier) continue;
-        const name = tree.tokenSlice(t);
-        for (bufs) |b| {
-            if (std.mem.eql(u8, b, name)) return true;
-        }
-    }
-    return false;
-}
-
-fn returnMentionsTainted(
-    tree: *const Ast,
-    start: Ast.TokenIndex,
-    end: Ast.TokenIndex,
-    tainted: []const []const u8,
-) ?[]const u8 {
-    const tags = tree.tokens.items(.tag);
-    if (start > end) return null;
-    var t: Ast.TokenIndex = start;
-    while (t <= end) : (t += 1) {
-        if (tags[t] != .identifier) continue;
-        const name = tree.tokenSlice(t);
-        for (tainted) |n| {
-            if (std.mem.eql(u8, n, name)) return n;
-        }
-    }
-    return null;
 }
 
 fn report(
@@ -245,7 +184,7 @@ fn report(
     errdefer gpa.free(msg);
 
     try problems.append(gpa, .{
-        .rule_id = "borrowed-slice-into-stack-buffer-returned",
+        .rule_id = R,
         .severity = .@"error",
         .start = Pos.fromTokenStart(tree, return_tok),
         .end = Pos.fromTokenEnd(tree, return_tok),
@@ -255,24 +194,8 @@ fn report(
 
 // ── Tests ──────────────────────────────────────────────────
 
-fn runOn(gpa: std.mem.Allocator, src: []const u8) !std.ArrayListUnmanaged(Problem) {
-    const src_z = try gpa.dupeSentinel(u8, src, 0);
-    defer gpa.free(src_z);
-    var tree = try Ast.parse(gpa, src_z, .zig);
-    defer tree.deinit(gpa);
-    var problems: std.ArrayListUnmanaged(Problem) = .empty;
-    try check(gpa, &tree, &config_mod.Default, &problems);
-    return problems;
-}
-
-fn freeProblems(gpa: std.mem.Allocator, p: *std.ArrayListUnmanaged(Problem)) void {
-    for (p.items) |*x| x.deinit(gpa);
-    p.deinit(gpa);
-}
-
-test "borrowed-slice-into-stack-buffer-returned: SemanticVersion.parse pattern fires" {
-    const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+test "SemanticVersion.parse pattern fires" {
+    try testing.expectFires(check, R,
         \\const std = @import("std");
         \\const SemanticVersion = struct {
         \\    pre: ?[]const u8 = null,
@@ -284,16 +207,11 @@ test "borrowed-slice-into-stack-buffer-returned: SemanticVersion.parse pattern f
         \\    const ver = SemanticVersion.parse(&buf);
         \\    return ver;
         \\}
-        \\
     );
-    defer freeProblems(gpa, &problems);
-    try std.testing.expect(problems.items.len >= 1);
-    try std.testing.expectEqualStrings("borrowed-slice-into-stack-buffer-returned", problems.items[0].rule_id);
 }
 
-test "borrowed-slice-into-stack-buffer-returned: parse on a non-stack-buf doesn't fire" {
-    const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+test "parse on a non-stack-buf doesn't fire" {
+    try testing.expectNoFire(check,
         \\const std = @import("std");
         \\const SemanticVersion = struct {
         \\    pub fn parse(_: []const u8) SemanticVersion { return .{}; }
@@ -302,15 +220,11 @@ test "borrowed-slice-into-stack-buffer-returned: parse on a non-stack-buf doesn'
         \\    const ver = SemanticVersion.parse(text);
         \\    return ver;
         \\}
-        \\
     );
-    defer freeProblems(gpa, &problems);
-    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
 }
 
-test "borrowed-slice-into-stack-buffer-returned: parse result not returned doesn't fire" {
-    const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+test "parse result not returned doesn't fire" {
+    try testing.expectNoFire(check,
         \\const std = @import("std");
         \\const SemanticVersion = struct {
         \\    pub fn parse(_: []const u8) SemanticVersion { return .{}; }
@@ -320,8 +234,5 @@ test "borrowed-slice-into-stack-buffer-returned: parse result not returned doesn
         \\    const ver = SemanticVersion.parse(&buf);
         \\    _ = ver;
         \\}
-        \\
     );
-    defer freeProblems(gpa, &problems);
-    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
 }
