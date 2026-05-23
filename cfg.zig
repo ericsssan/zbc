@@ -1278,6 +1278,29 @@ const Builder = struct {
     /// doesn't claim it frees self, return the type's name.  Used
     /// by `lowerFunctionBody` to emit a leak_warning stmt at body
     /// start.  Returns null in all other cases.
+    /// True iff `type_name`'s body declares a bun refcount mixin
+    /// — `RefCount(...)` or `ThreadSafeRefCount(...)`.  Used by
+    /// `leakyDestructorTypeName` to suppress the leak fire on
+    /// types whose destruction goes through `deref()` rather than
+    /// the finalize callback.  Token-scans the type body for the
+    /// canonical declaration shape.
+    fn typeBodyHasRefCountMixin(self: *Builder, type_name: []const u8) bool {
+        const cache = self.cache orelse return false;
+        const model = cache.fileModel() catch return false;
+        const ti = model.findType(type_name) orelse return false;
+        const tags = self.tree.tokens.items(.tag);
+        if (ti.body_first >= ti.body_last) return false;
+        var t: Ast.TokenIndex = ti.body_first;
+        while (t + 1 <= ti.body_last) : (t += 1) {
+            if (tags[t] != .identifier) continue;
+            if (tags[t + 1] != .l_paren) continue;
+            const s = self.tree.tokenSlice(t);
+            if (std.mem.eql(u8, s, "RefCount") or
+                std.mem.eql(u8, s, "ThreadSafeRefCount")) return true;
+        }
+        return false;
+    }
+
     fn leakyDestructorTypeName(self: *Builder) ?[]const u8 {
         const tree = self.tree;
         const proto = self.fn_proto orelse return null;
@@ -1308,6 +1331,15 @@ const Builder = struct {
             const has_destroy = cache.typeHasMethod(ct, "destroy") catch false;
             if (has_destroy) return null;
         }
+        // Refcount-managed lifecycle: types with bun's refcount
+        // mixin follow `ref()` / `deref()`; the destructor is
+        // chained from `deref()` when the count hits zero, not
+        // from `deinit` / `finalize`.  Detect via the mixin's
+        // canonical declaration tokens (`RefCount(` /
+        // `ThreadSafeRefCount(`) in the type body.  Methods are
+        // declared as `pub const ref = RefCount.ref;` aliases —
+        // not `fn` decls — so `hasMethod` misses them.
+        if (self.typeBodyHasRefCountMixin(ct)) return null;
 
         // The destructor must NOT have @takes(self) — that would
         // mean it does free self, no leak.
