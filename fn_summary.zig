@@ -320,6 +320,21 @@ pub fn inferDirectTakes(
 /// Scan `body` for `<param>.<field>.<destroy_method>(...)` chains.
 /// Returns one entry per chain.  Caller owns the returned slice;
 /// pass an arena allocator so per-fn deinit is cheap.
+/// True for cleanup methods whose RECEIVER is the freed value
+/// (`<X>.deinit()` / `<X>.close()` etc.).  Excludes .free / .destroy
+/// because those take their ARG, not their receiver — e.g.
+/// `self.allocator.free(self.slices)` does NOT consume self.allocator.
+fn isReceiverCleanupMethodName(name: []const u8) bool {
+    return std.mem.eql(u8, name, "deinit") or
+        std.mem.eql(u8, name, "close") or
+        std.mem.eql(u8, name, "release") or
+        std.mem.eql(u8, name, "deref") or
+        std.mem.eql(u8, name, "unref") or
+        std.mem.eql(u8, name, "removeRef") or
+        std.mem.eql(u8, name, "finalize") or
+        std.mem.eql(u8, name, "dispose");
+}
+
 pub fn inferMayFreeFields(
     arena: std.mem.Allocator,
     tree: *const Ast,
@@ -346,13 +361,16 @@ pub fn inferMayFreeFields(
         const recv = tree.tokenSlice(t);
         const idx = paramIndex(tree, proto, recv) orelse continue;
         const method = tree.tokenSlice(t + 4);
-        if (vocabulary.lookupMethod(method)) |vs| {
-            if (!vs.deallocates) continue;
-            try out.append(arena, .{
-                .param = idx,
-                .field = tree.tokenSlice(t + 2),
-            });
-        }
+        // The chain shape <param>.<field>.<method>() means <param>.<field>
+        // is the call's RECEIVER.  Only methods that consume their
+        // receiver (deinit/close/release/...) count — `.free` /
+        // `.destroy` take their ARG instead, so e.g.
+        // `self.allocator.free(self.slices)` does NOT free self.allocator.
+        if (!isReceiverCleanupMethodName(method)) continue;
+        try out.append(arena, .{
+            .param = idx,
+            .field = tree.tokenSlice(t + 2),
+        });
     }
     return out.toOwnedSlice(arena);
 }

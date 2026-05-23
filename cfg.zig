@@ -3094,7 +3094,14 @@ const Builder = struct {
         else
             null;
 
-        // Resolve callee entry: typed local → cross-file → null.
+        // may_free_fields resolution stays on the db path: cache's
+        // body-only inferMayFreeFields fires on `<param>.<field>.deinit()`
+        // shapes without knowing whether `<field>` is a value or a
+        // pointer.  For pointer-typed fields the deinit consumes the
+        // pointee (not the parent's field), so cache fires false
+        // positives in that case.  db's R10 inference uses field_types
+        // to check this — until cache gets the same type-aware filter,
+        // db remains the source of truth here.
         const entry: annotations.FnEntry = blk: {
             if (self.db) |db| {
                 if (db.lookupTyped(recv_ty, callee_name)) |e| break :blk e;
