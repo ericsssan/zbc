@@ -53,6 +53,12 @@ const TrackedBinding = struct {
     /// subsequent `try` / `errdefer` start from after this.
     end_token: Ast.TokenIndex,
     is_fd_open: bool,
+    /// True iff the binding is a control-flow capture (`if (try ...)
+    /// |x|`, `while (try ...) |x|`, `catch |err|`).  Captures are
+    /// scoped to the body that follows the `|...|` — the scan must
+    /// step INTO that body and break on its closing brace, not on
+    /// the enclosing fn block's brace.
+    is_capture: bool,
 };
 
 fn checkFn(
@@ -116,23 +122,47 @@ fn checkFn(
             // local.Binding.rhs_last is the token before `;`.
             .end_token = b.rhs_last + 1,
             .is_fd_open = is_fd_open,
+            .is_capture = b.origin == .loop_capture,
         });
     }
 
     for (tracked.items) |b| {
         var has_cleanup = false;
         var found_try = false;
+        // Track brace depth so the scan stops when the binding leaves
+        // scope.  Two cases:
+        //   - const/var binding: scope extends to the enclosing block's
+        //     `}`.  Scan starts at end_token+1 (already inside the
+        //     block); we break when depth dips below 0.
+        //   - capture (`if (try ...) |x| { ... }`): scope is the body
+        //     braces themselves.  Advance the scan past the opening
+        //     `{` so depth=0 there means "still inside the body"; we
+        //     break when the closing `}` pops us back to depth=-1.
         var u: Ast.TokenIndex = b.end_token + 1;
+        if (b.is_capture) {
+            while (u <= last and tags[u] != .l_brace) : (u += 1) {}
+            if (u > last) continue; // malformed; skip
+            u += 1; // step inside the body
+        }
+        var depth: i32 = 0;
         while (u <= last) : (u += 1) {
-            if (tags[u] == .keyword_defer or tags[u] == .keyword_errdefer) {
-                if (cleanupReferencesLocal(tree, u, b.x_name, last)) {
-                    has_cleanup = true;
+            switch (tags[u]) {
+                .l_brace => depth += 1,
+                .r_brace => {
+                    depth -= 1;
+                    if (depth < 0) break; // left binding's scope
+                },
+                .keyword_defer, .keyword_errdefer => {
+                    if (cleanupReferencesLocal(tree, u, b.x_name, last)) {
+                        has_cleanup = true;
+                        break;
+                    }
+                },
+                .keyword_try => {
+                    found_try = true;
                     break;
-                }
-            }
-            if (tags[u] == .keyword_try) {
-                found_try = true;
-                break;
+                },
+                else => {},
             }
         }
         if (found_try and !has_cleanup) {
@@ -384,6 +414,71 @@ test "file open with errdefer file.close() is OK" {
         \\    const file = try dir.createFile(path, .{});
         \\    errdefer file.close();
         \\    try file.sync();
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
+test "if-let capture: binding scope ends at body brace; outer try doesn't fire" {
+    // `if (try Type.fromJS(...)) |x| { ... }` — `x`'s scope is the
+    // if-body braces.  A try AFTER the closing `}` is in an unrelated
+    // scope; the binding is already gone, no leak possible.
+    const gpa = std.testing.allocator;
+    var problems = try runOn(gpa,
+        \\const Target = struct {
+        \\    pub fn fromJS(_: i32) ?Target { return .{}; }
+        \\    pub fn deinit(_: *Target) void {}
+        \\};
+        \\fn other() !void {}
+        \\pub fn caller(g: i32) !void {
+        \\    if (try Target.fromJS(g)) |t| {
+        \\        _ = t;
+        \\    }
+        \\    try other();
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
+test "if-let capture: try INSIDE the body without errdefer still fires" {
+    const gpa = std.testing.allocator;
+    var problems = try runOn(gpa,
+        \\const Target = struct {
+        \\    pub fn fromJS(_: i32) ?Target { return .{}; }
+        \\    pub fn deinit(_: *Target) void {}
+        \\};
+        \\fn other() !void {}
+        \\pub fn caller(g: i32) !void {
+        \\    if (try Target.fromJS(g)) |t| {
+        \\        _ = t;
+        \\        try other();
+        \\    }
+        \\}
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 1), problems.items.len);
+    try std.testing.expectEqualStrings(R, problems.items[0].rule_id);
+}
+
+test "binding in `brk:` block: outer try doesn't fire" {
+    const gpa = std.testing.allocator;
+    var problems = try runOn(gpa,
+        \\const T = struct {
+        \\    pub fn fromJS(_: i32) ?T { return .{}; }
+        \\    pub fn deinit(_: *T) void {}
+        \\};
+        \\fn other() !void {}
+        \\pub fn caller(g: i32) !void {
+        \\    const v = brk: {
+        \\        if (try T.fromJS(g)) |inner| {
+        \\            break :brk inner;
+        \\        }
+        \\        break :brk T{};
+        \\    };
+        \\    _ = v;
+        \\    try other();
         \\}
     );
     defer freeProblems(gpa, &problems);
