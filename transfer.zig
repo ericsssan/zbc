@@ -153,6 +153,22 @@ fn transferAssign(
 ) !void {
     const origin = try originOfInit(ctx, state, a.rhs_kind, pos);
     try state.locals.put(ctx.gpa, a.target, origin);
+    // Whole-local reassignment invalidates any tracked field
+    // origins for this local — the new value is independent of the
+    // old.  Common cases: `&local` passed to a fn (cfg emits an
+    // .assign with .unknown to clear .undef; the called fn may
+    // also have initialised any field), and `x = foo()` rebinding
+    // x.  Stale field state would surface as use-undefined / leak
+    // FPs on the new value's fields.
+    var i: usize = 0;
+    while (i < state.fields.count()) {
+        const key = state.fields.keys()[i];
+        if (key.parent == a.target) {
+            state.fields.swapRemoveAt(i);
+        } else {
+            i += 1;
+        }
+    }
 }
 
 fn transferArenaKill(
