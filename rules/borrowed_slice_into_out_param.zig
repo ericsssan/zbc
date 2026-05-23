@@ -207,6 +207,12 @@ fn scanWrites(
         const sc = lexer.findStmtSemicolon(tags, w.end + 1, last) orelse continue;
         if (sc <= w.end + 1) continue;
         if (rhsContainsCopyingCall(tree, w.end + 1, sc - 1)) continue;
+        // RHS ending in `].*` — array dereference produces a
+        // by-value array copy.  Common pattern:
+        //   `.salt = salt_data.slice()[0..4].*`
+        // After the copy the field holds independent bytes; the
+        // deferred local's storage going away doesn't dangle it.
+        if (rhsEndsWithArrayDeref(tree, w.end + 1, sc - 1)) continue;
         const dn = rhsMentionsDeferred(tree, w.end + 1, sc - 1, deferred) orelse continue;
         try report(gpa, problems, tree, w.start, out_name, dn);
     }
@@ -346,6 +352,24 @@ fn isPrimitiveTypeName(name: []const u8) bool {
 /// True iff `[start, end]` contains a `.<copy_method>(` shape where
 /// `<copy_method>` is a known copying call (returns owned, doesn't
 /// borrow from args).
+/// Token-level check for an `].*` suffix anywhere in the RHS — an
+/// array-value dereference.  When the assignment's value is the
+/// result of `<slice>[N..M].*` (or `<arr>[N..M].*`), the LHS gets
+/// a fresh stack-copied array, not a borrow into the slice's
+/// allocation.  The local's `defer .deinit()` freeing the slice
+/// doesn't dangle the copied bytes.
+fn rhsEndsWithArrayDeref(tree: *const Ast, start: Ast.TokenIndex, end: Ast.TokenIndex) bool {
+    const tags = tree.tokens.items(.tag);
+    if (start + 1 > end) return false;
+    var t: Ast.TokenIndex = start;
+    while (t + 1 <= end) : (t += 1) {
+        if (tags[t] != .r_bracket) continue;
+        if (tags[t + 1] != .period_asterisk) continue;
+        return true;
+    }
+    return false;
+}
+
 fn rhsContainsCopyingCall(tree: *const Ast, start: Ast.TokenIndex, end: Ast.TokenIndex) bool {
     const tags = tree.tokens.items(.tag);
     if (start + 2 > end) return false;
@@ -412,6 +436,11 @@ fn rhsMentionsDeferred(
         // Skip `&deferred` — by-reference pass; the fn doesn't
         // necessarily retain the borrow.
         if (t > 0 and tags[t - 1] == .ampersand) continue;
+        // Skip `<recv>.<deferred>` — a field/method named the
+        // same as a deferred local isn't the local itself.
+        // Without this, `ctx.body` matches a `body` local on the
+        // post-`.` identifier.
+        if (t > 0 and tags[t - 1] == .period) continue;
         const name = tree.tokenSlice(t);
         for (deferred) |d| {
             if (!std.mem.eql(u8, d.name, name)) continue;
