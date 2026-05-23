@@ -58,6 +58,17 @@ pub fn check(
         defer gpa.free(fields);
 
         for (fields) |field| {
+            // Refcount-machinery field: e.g. `ref_count: Route.RefCount`
+            // where RefCount comes from `bun.ptr.RefCount(@This(), ...)`.
+            // The field IS the refcount; cleanup happens via the
+            // outer's ref/deref methods, not direct field deinit.
+            // Check the LAST identifier of the declared type chain —
+            // resolveFieldType returns the FIRST-identifier's type info
+            // (e.g. "Route" for `Route.RefCount`), but the suffix
+            // signal lives at the chain's tail.
+            if (fieldTypeTrailingNameEndsWith(tree, field, "RefCount")) continue;
+            const inner_ti = mq.resolveFieldType(tree, model, field) orelse continue;
+
             // Direct: `<X>.<field>.<cleanup>(`.  X is wildcarded
             // (typically self/this).  The body pattern is built
             // per-field since `.text` needs the field's name.
@@ -76,10 +87,89 @@ pub fn check(
             // cleanup on the unwrapped capture — no leak.
             if (bodyHandlesFieldViaUnwrap(tree, deinit, field.name)) continue;
 
-            const ti = mq.resolveFieldType(tree, model, field).?;
-            try report(gpa, problems, tree, field.name_token, field.name, ti.name);
+            // Helper-delegation: outer's deinit calls `<self>.<helper>()`
+            // on the same type, and that helper's body cleans up the
+            // field.  Common Bun shape:
+            //     pub fn deinit(this: *Subprocess) void {
+            //         this.finalizeSync();   ← helper does the cleanup
+            //         alloc.destroy(this);
+            //     }
+            // One level of delegation only (no transitive chains).
+            if (bodyHandlesFieldViaHelper(tree, model, deinit, outer, field.name, cleanup_call)) continue;
+
+            try report(gpa, problems, tree, field.name_token, field.name, inner_ti.name);
         }
     }
+}
+
+/// True iff the field's declared type ends with `<suffix>`.  Looks
+/// at the LAST identifier of the type chain (handles `Route.RefCount`
+/// → "RefCount", `*lib.T.Inner` → "Inner") rather than the resolved
+/// type's name which is the FIRST identifier.
+fn fieldTypeTrailingNameEndsWith(tree: *const Ast, field: *const fmodel.FieldInfo, suffix: []const u8) bool {
+    const tags = tree.tokens.items(.tag);
+    var t = field.type_first;
+    var last_id: ?[]const u8 = null;
+    while (t <= field.type_last) : (t += 1) {
+        if (tags[t] == .identifier) last_id = tree.tokenSlice(t);
+    }
+    const name = last_id orelse return false;
+    return std.mem.endsWith(u8, name, suffix);
+}
+
+/// True iff `deinit`'s body calls `<self>.<helper>(...)` for a
+/// helper method on the same outer type whose body mentions
+/// `<self>.<field>` in any cleanup-shaped context.  Catches both:
+///   1. helper does `<self>.<field>.<cleanup>(...)` directly
+///   2. helper does `<self>.<field> = ...` reset followed by cleanup
+///      elsewhere, or dispatches via tag-enum (`closeIO(.stdin)`).
+/// One level of delegation only — chains of helpers aren't followed.
+fn bodyHandlesFieldViaHelper(
+    tree: *const Ast,
+    model: *const fmodel.FileModel,
+    deinit: *const fmodel.MethodInfo,
+    outer: *const fmodel.TypeInfo,
+    field_name: []const u8,
+    cleanup_call: []const query.Atom,
+) bool {
+    _ = model;
+    const tags = tree.tokens.items(.tag);
+    const first = deinit.body_first;
+    const last = deinit.body_last;
+    var t: Ast.TokenIndex = first;
+    while (t + 3 <= last) : (t += 1) {
+        if (tags[t] != .identifier) continue;
+        if (tags[t + 1] != .period) continue;
+        if (tags[t + 2] != .identifier) continue;
+        if (tags[t + 3] != .l_paren) continue;
+        const helper_name = tree.tokenSlice(t + 2);
+        if (std.mem.eql(u8, helper_name, "deinit")) continue;
+        const helper = outer.findMethod(helper_name) orelse continue;
+        // Tight check: helper does the canonical cleanup pattern.
+        if (mq.methodBodyContains(tree, helper, cleanup_call)) return true;
+        // Loose check: helper's body MENTIONS `<self>.<field>` at all
+        // (covers tag-dispatch wrappers like `closeIO(.stdin)` whose
+        // body inspects `<self>.stdin` and does the cleanup there).
+        if (methodBodyMentionsField(tree, helper, field_name)) return true;
+    }
+    return false;
+}
+
+/// True iff the method's body contains either:
+///   - `<id>.<field>` token-pair (object-field reference), OR
+///   - `.<field>` tag-style reference (e.g. `closeIO(.stdin)` where
+///     the field name matches a tag enum's variant).
+/// Looser than a cleanup pattern match — used as a fall-through
+/// signal that the helper at least references the field in some way.
+fn methodBodyMentionsField(tree: *const Ast, method: *const fmodel.MethodInfo, field_name: []const u8) bool {
+    const tags = tree.tokens.items(.tag);
+    var t: Ast.TokenIndex = method.body_first;
+    while (t + 1 <= method.body_last) : (t += 1) {
+        if (tags[t] != .period) continue;
+        if (tags[t + 1] != .identifier) continue;
+        if (std.mem.eql(u8, tree.tokenSlice(t + 1), field_name)) return true;
+    }
+    return false;
 }
 
 /// True iff the method's body contains an `if (X.<field>) |...cap...| { ... }`
