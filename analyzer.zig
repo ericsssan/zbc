@@ -233,13 +233,14 @@ test "escape — return slice borrowed from a function-local arena" {
     var problems = try analyze(gpa,
         \\const std = @import("std");
         \\const Arena = struct {
-        \\    /// @returns borrowed_from(self)
+        \\    inner: std.heap.ArenaAllocator,
+        \\    bytes: []const u8 = "",
         \\    pub fn text(self: *const Arena) []const u8 {
-        \\        _ = self; return "";
+        \\        return self.bytes;
         \\    }
         \\};
         \\pub fn foo() []const u8 {
-        \\    var arena = std.heap.ArenaAllocator.init(undefined);
+        \\    var arena = Arena{ .inner = std.heap.ArenaAllocator.init(undefined) };
         \\    return arena.text();
         \\}
         \\
@@ -285,14 +286,15 @@ test "defer arena.deinit() catches return-of-borrowed-from-dying-arena" {
     var problems = try analyze(gpa,
         \\const std = @import("std");
         \\const Arena = struct {
-        \\    /// @returns borrowed_from(self)
+        \\    inner: std.heap.ArenaAllocator,
+        \\    bytes: []const u8 = "",
         \\    pub fn slice(self: *const Arena) []const u8 {
-        \\        _ = self; return "";
+        \\        return self.bytes;
         \\    }
         \\};
         \\pub fn foo() []const u8 {
-        \\    var arena = std.heap.ArenaAllocator.init(undefined);
-        \\    defer arena.deinit();
+        \\    var arena = Arena{ .inner = std.heap.ArenaAllocator.init(undefined) };
+        \\    defer arena.inner.deinit();
         \\    return arena.slice();
         \\}
         \\
@@ -387,8 +389,8 @@ test "R7 inference: multi-stmt delegator `var x = c.text(); return x;` fires" {
         \\const std = @import("std");
         \\const Ctx = struct {
         \\    inner: std.heap.ArenaAllocator,
-        \\    /// @returns borrowed_from(self)
-        \\    pub fn text(self: *const Ctx) []const u8 { _ = self; return ""; }
+        \\    bytes: []const u8 = "",
+        \\    pub fn text(self: *const Ctx) []const u8 { return self.bytes; }
         \\};
         \\pub fn wrap_multi(c: *const Ctx) []const u8 {
         \\    const x = c.text();
@@ -445,8 +447,8 @@ test "R7 inference: namespace-style delegator wrap fires escape" {
         \\const std = @import("std");
         \\const Ctx = struct {
         \\    inner: std.heap.ArenaAllocator,
-        \\    /// @returns borrowed_from(self)
-        \\    pub fn text(self: *const Ctx) []const u8 { _ = self; return ""; }
+        \\    bytes: []const u8 = "",
+        \\    pub fn text(self: *const Ctx) []const u8 { return self.bytes; }
         \\};
         \\// Namespace-style call: Ctx.text(c) instead of c.text().
         \\pub fn wrap_ns(c: *const Ctx) []const u8 {
@@ -526,8 +528,8 @@ test "arena_escape: struct-wrapping `var ma = W{ .inner = arena };` propagates" 
         \\const std = @import("std");
         \\const MyArena = struct {
         \\    inner: std.heap.ArenaAllocator,
-        \\    /// @returns borrowed_from(self)
-        \\    pub fn text(self: *const MyArena) []const u8 { _ = self; return ""; }
+        \\    bytes: []const u8 = "",
+        \\    pub fn text(self: *const MyArena) []const u8 { return self.bytes; }
         \\};
         \\pub fn foo() []const u8 {
         \\    var arena = std.heap.ArenaAllocator.init(undefined);
@@ -1363,14 +1365,15 @@ test "arena_use_after_kill: read after deinit in call arg is flagged" {
     var problems = try analyze(gpa,
         \\const std = @import("std");
         \\const Arena = struct {
-        \\    /// @returns borrowed_from(self)
-        \\    pub fn text(self: *const Arena) []const u8 { _ = self; return ""; }
+        \\    inner: std.heap.ArenaAllocator,
+        \\    bytes: []const u8 = "",
+        \\    pub fn text(self: *const Arena) []const u8 { return self.bytes; }
         \\};
         \\pub fn consume(s: []const u8) void { _ = s; }
         \\pub fn foo() void {
-        \\    var arena = std.heap.ArenaAllocator.init(undefined);
+        \\    var arena = Arena{ .inner = std.heap.ArenaAllocator.init(undefined) };
         \\    const s = arena.text();
-        \\    arena.deinit();
+        \\    arena.inner.deinit();
         \\    consume(s);
         \\}
         \\

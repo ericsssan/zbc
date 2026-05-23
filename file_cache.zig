@@ -233,7 +233,13 @@ pub const FileCache = struct {
                 break :blk try self.summaryByMethod(deepest_path.type_name, ff.method);
             };
             const cs = callee_summary orelse continue;
-            if (cs.takes_ownership_of == null) continue;
+            // When the inner method is cleanup-named (deinit/close/etc.)
+            // and we lack a contradicting signal, presume it consumes
+            // its receiver — matches annotations.zig's implicit
+            // assumption and recovers external-stdlib deinit cases
+            // (e.g. HashMap.deinit) that pure-inference can't see.
+            if (cs.takes_ownership_of == null and
+                !fn_summary.isReceiverCleanupMethodName(ff.method)) continue;
             try out.append(arena, ff);
         }
         return out.toOwnedSlice(arena);
@@ -454,6 +460,12 @@ pub const FileCache = struct {
 
         const method_name = tree.tokenSlice(method_tok);
         var target_idx = try self.lookupBorrowedFromSameFile(method_name);
+        // Typed same-file lookup: if param has a known local type,
+        // search method on that type.  Catches methods that aren't
+        // top-level fns (lookupBorrowedFromSameFile only sees those).
+        if (target_idx == null) {
+            target_idx = try self.lookupBorrowedFromParamTypeSameFile(proto, param_idx, method_name);
+        }
         if (target_idx == null) {
             target_idx = try self.lookupBorrowedFromParamType(proto, param_idx, method_name);
         }
@@ -479,6 +491,22 @@ pub const FileCache = struct {
         const method_name = tree.tokenSlice(method_tok);
         var target_idx = try self.lookupBorrowedFromSameFile(method_name);
         if (target_idx == null) {
+            // Namespace-style: `Foo.method(arg)` where Foo is a local
+            // type — look up Foo.method via summaryByMethod.
+            if (tree.nodeTag(callee) == .field_access) {
+                const recv = tree.nodeData(callee).node_and_token[0];
+                if (tree.nodeTag(recv) == .identifier) {
+                    const type_name = tree.tokenSlice(tree.nodeMainToken(recv));
+                    if ((try self.summaryByMethod(type_name, method_name))) |s| {
+                        target_idx = switch (s.returns) {
+                            .borrowed_from => |i| i,
+                            else => null,
+                        };
+                    }
+                }
+            }
+        }
+        if (target_idx == null) {
             // Cross-file: when callee is `Foo.method(...)` and Foo is
             // an imap namespace, look up `method` in Foo's FileCache.
             if (tree.nodeTag(callee) == .field_access) {
@@ -503,6 +531,26 @@ pub const FileCache = struct {
     /// target index when the summary's returns is that variant.
     fn lookupBorrowedFromSameFile(self: *FileCache, method_name: []const u8) !?u32 {
         const s = (try self.summaryByName(method_name)) orelse return null;
+        return switch (s.returns) {
+            .borrowed_from => |idx| idx,
+            else => null,
+        };
+    }
+
+    /// Same-file typed lookup: look up `method_name` on the type of
+    /// the named param.  Catches methods on locally-declared types
+    /// that lookupBorrowedFromSameFile (top-level fns only) misses.
+    fn lookupBorrowedFromParamTypeSameFile(
+        self: *FileCache,
+        proto: Ast.full.FnProto,
+        param_idx: u32,
+        method_name: []const u8,
+    ) !?u32 {
+        const path = paramTypePath(self.tree, proto, param_idx) orelse return null;
+        // Only handle bare-name param types here — `<ns>.<Type>` is
+        // routed to lookupBorrowedFromParamType (cross-file).
+        if (path.ns != null) return null;
+        const s = (try self.summaryByMethod(path.type_name, method_name)) orelse return null;
         return switch (s.returns) {
             .borrowed_from => |idx| idx,
             else => null,

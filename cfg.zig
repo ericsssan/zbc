@@ -1275,18 +1275,10 @@ const Builder = struct {
         if (!creator_found) return null;
 
         // The destructor must NOT have @takes(self) — that would
-        // mean it does free self, no leak.  Check cache first
-        // (body-only summary), then db (R8b/R10 inference).
+        // mean it does free self, no leak.
         if (self.cache) |c| {
             if (c.summaryByMethod(ct, fn_name) catch null) |s| {
                 if (s.takes_ownership_of) |idx| if (idx == 0) return null;
-            }
-        }
-        if (self.db) |db| {
-            if (db.lookupTyped(ct, fn_name)) |entry| {
-                if (entry.takes) |t| switch (t) {
-                    .ownership => |idx| if (idx == 0) return null,
-                };
             }
         }
         return ct;
@@ -2425,14 +2417,9 @@ const Builder = struct {
         if (tree.nodeTag(init_node) != .identifier) return null;
         const name = tree.tokenSlice(tree.nodeMainToken(init_node));
         // Existence check — does the file declare a fn with this name?
-        // Cache (top-level fns only) OR db (covers methods that db
-        // tracked via containing_types) — accept either.
         if (self.cache) |c| {
             const model = c.fileModel() catch null;
             if (model) |m| if (m.findFn(name) != null) return name;
-        }
-        if (self.db) |db| {
-            if (db.lookup(name) != null) return name;
         }
         return null;
     }
@@ -2495,9 +2482,7 @@ const Builder = struct {
         const callee_name = tree.tokenSlice(method_tok);
 
         // Resolve type-aware first when the receiver is a known
-        // namespace (e.g. `Utf8.init(...)`), then bare-name.  Cache
-        // (FnSummary) and db consulted in order — cache catches the
-        // syntactic pattern, db catches anything cache misses.
+        // namespace (e.g. `Utf8.init(...)`), then bare-name.
         const heap_fields: []const []const u8 = blk: {
             if (tree.nodeTag(callee) == .field_access) {
                 const recv = tree.nodeData(callee).node_and_token[0];
@@ -2508,21 +2493,11 @@ const Builder = struct {
                             if (s.result_heap_fields.len > 0) break :blk s.result_heap_fields;
                         }
                     }
-                    if (self.db) |db| {
-                        if (db.lookupTyped(recv_name, callee_name)) |entry| {
-                            if (entry.result_heap_fields.len > 0) break :blk entry.result_heap_fields;
-                        }
-                    }
                 }
             }
             if (self.cache) |c| {
                 if (c.summaryByName(callee_name) catch null) |s| {
                     if (s.result_heap_fields.len > 0) break :blk s.result_heap_fields;
-                }
-            }
-            if (self.db) |db| {
-                if (db.lookup(callee_name)) |entry| {
-                    break :blk entry.result_heap_fields;
                 }
             }
             break :blk &[_][]const u8{};
@@ -2810,14 +2785,9 @@ const Builder = struct {
         if (self.cache) |c| {
             if (c.summaryByName(name) catch null) |s| if (s.is_noreturn) return true;
         }
-        if (self.db) |db| {
-            if (db.lookup(name)) |entry| if (entry.is_noreturn) return true;
-        }
         if (tree.nodeTag(callee) == .field_access) {
             const recv = tree.nodeData(callee).node_and_token[0];
-            // Cross-file FnSummary first, then db fallback.
             if (self.lookupRemoteSummary(recv, name)) |s| if (s.is_noreturn) return true;
-            if (self.lookupRemoteEntry(recv, name)) |entry| if (entry.is_noreturn) return true;
         }
         // Aliased noreturn local: `const exit = std.process.exit;`
         // then `exit(1)`.  Bare-identifier callee referencing a
@@ -2938,30 +2908,20 @@ const Builder = struct {
                         if (s.takes_ownership_of) |i| break :blk i;
                     }
                 }
-            }
-            // Then db (annotations + R8b/R10 transitive inference) —
-            // db catches chained ownership-transfer patterns that
-            // body-only summary inference doesn't yet model.
-            if (self.db) |db| {
-                if (db.lookupTyped(recv_ty, callee_name)) |entry| {
-                    if (entry.takes) |t| break :blk switch (t) { .ownership => |i| i };
+                if (!receiver_is_arg0) {
+                    if (c.summaryByName(callee_name) catch null) |s| {
+                        if (s.takes_ownership_of) |i| break :blk i;
+                    }
                 }
             }
-            // Cross-file: FnSummary first, db fallback.
             if (recv_ty) |ty| {
                 if (self.lookupCrossFileSummary(ty, callee_name)) |s| {
                     if (s.takes_ownership_of) |i| break :blk i;
-                }
-                if (self.lookupCrossFileMethod(ty, callee_name)) |entry| {
-                    if (entry.takes) |t| break :blk switch (t) { .ownership => |i| i };
                 }
             }
             if (receiver_is_arg0) {
                 if (self.lookupRemoteSummary(recv_node.?, callee_name)) |s| {
                     if (s.takes_ownership_of) |i| break :blk i;
-                }
-                if (self.lookupRemoteTakes(recv_node.?, callee_name)) |t| {
-                    break :blk switch (t) { .ownership => |i| i };
                 }
             }
             return null;
@@ -3034,28 +2994,14 @@ const Builder = struct {
         // See takesOwnershipFreedLocal for why bare-name fallback is
         // excluded.
         const takes_idx: u32 = blk: {
-            if (self.cache) |c| {
-                if (recv_ty) |ty| {
+            if (recv_ty) |ty| {
+                if (self.cache) |c| {
                     if (c.summaryByMethod(ty, method_name) catch null) |s| {
                         if (s.takes_ownership_of) |i| break :blk i;
                     }
                 }
-            }
-            if (self.db) |db| {
-                if (db.lookupTyped(recv_ty, method_name)) |entry| {
-                    if (entry.takes) |t| break :blk switch (t) { .ownership => |i| i };
-                }
-            }
-            // Cross-file: FnSummary first, db fallback.  Field's
-            // type may be defined in an imported file (e.g.
-            // `r.foo: *RemoteType; r.foo.method()` where RemoteType
-            // lives in lib.zig).
-            if (recv_ty) |ty| {
                 if (self.lookupCrossFileSummary(ty, method_name)) |s| {
                     if (s.takes_ownership_of) |i| break :blk i;
-                }
-                if (self.lookupCrossFileMethod(ty, method_name)) |entry| {
-                    if (entry.takes) |t| break :blk switch (t) { .ownership => |i| i };
                 }
             }
             return null;
@@ -3161,22 +3107,11 @@ const Builder = struct {
                     }
                 }
             }
-            if (self.db) |db| {
-                if (db.lookupTyped(recv_ty, callee_name)) |e| {
-                    if (e.may_free_fields.len > 0) {
-                        const n = @min(e.may_free_fields.len, free_buf.len);
-                        for (e.may_free_fields[0..n], 0..) |ff, i| {
-                            free_buf[i] = .{ .param = ff.param, .field = ff.field };
-                        }
-                        break :blk free_buf[0..n];
-                    }
-                }
-            }
             if (recv_ty) |ty| {
-                if (self.lookupCrossFileMethod(ty, callee_name)) |e| {
-                    if (e.may_free_fields.len > 0) {
-                        const n = @min(e.may_free_fields.len, free_buf.len);
-                        for (e.may_free_fields[0..n], 0..) |ff, i| {
+                if (self.lookupCrossFileSummary(ty, callee_name)) |s| {
+                    if (s.may_free_fields.len > 0) {
+                        const n = @min(s.may_free_fields.len, free_buf.len);
+                        for (s.may_free_fields[0..n], 0..) |ff, i| {
                             free_buf[i] = .{ .param = ff.param, .field = ff.field };
                         }
                         break :blk free_buf[0..n];
@@ -4220,9 +4155,7 @@ const Builder = struct {
                     break :blk self.name_to_local.contains(recv_name);
                 };
 
-                // 1a. Same-file FnSummary hit — typed lookup only
-                // (bare-name fallback would cross-pollute across
-                // unrelated types; see takesOwnershipFreedLocal).
+                // 1. Same-file FnSummary hit — typed lookup only.
                 if (self.cache) |c| {
                     if (self.receiverTypeOfNode(recv_node)) |ty| {
                         if (c.summaryByMethod(ty, method_name) catch null) |s| {
@@ -4232,45 +4165,20 @@ const Builder = struct {
                         }
                     }
                 }
-                // 1b. Same-file DB hit on bare method name (still
-                // bare-name during the transition — db's R6/R7/R8
-                // path catches @returns annotations cache doesn't
-                // express yet).
-                if (self.db) |db| {
-                    if (db.lookup(method_name)) |entry| {
-                        if (entry.annotation) |a| {
-                            return self.applyAnnotationToCall(a, recv_node, args, recv_is_local);
-                        }
-                    }
-                }
 
                 // 2. Cross-file: receiver is a bare identifier (the
-                //    imported namespace), method lives in that file's DB.
+                //    imported namespace), method lives in that file.
                 if (self.lookupRemoteMethod(recv_node, method_name)) |annotation| {
-                    // For cross-file: there's no `recv` in the explicit
-                    // args list (since the receiver IS the namespace),
-                    // so treat as a non-method-style call.
                     return self.applyAnnotationToCall(annotation, callee_node, args, false);
                 }
                 return .unknown;
             },
             .identifier => {
                 const raw_name = tree.tokenSlice(tree.nodeMainToken(callee_node));
-                // Resolve function-pointer binding: if the callee
-                // identifier names a local that's bound to a fn, use
-                // the bound fn's name for the DB lookup.
                 const fn_name = self.resolveBoundCallee(raw_name);
-                // Same-file FnSummary hit on top-level fn name.
                 if (self.cache) |c| {
                     if (c.summaryByName(fn_name) catch null) |s| {
                         if (summaryToAnnotation(s)) |a| {
-                            return self.applyAnnotationToCall(a, callee_node, args, false);
-                        }
-                    }
-                }
-                if (self.db) |db| {
-                    if (db.lookup(fn_name)) |entry| {
-                        if (entry.annotation) |a| {
                             return self.applyAnnotationToCall(a, callee_node, args, false);
                         }
                     }

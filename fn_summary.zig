@@ -491,7 +491,7 @@ pub fn resolveParamIndex(tree: *const Ast, proto: Ast.full.FnProto, name: []cons
     return paramIndex(tree, proto, name);
 }
 
-fn isReceiverCleanupMethodName(name: []const u8) bool {
+pub fn isReceiverCleanupMethodName(name: []const u8) bool {
     return std.mem.eql(u8, name, "deinit") or
         std.mem.eql(u8, name, "close") or
         std.mem.eql(u8, name, "release") or

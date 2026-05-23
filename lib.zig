@@ -178,11 +178,12 @@ test "lib API: analyzeEscape end-to-end flags arena escape" {
     try tmp.dir.writeFile(tio, .{ .sub_path = "foo.zig", .data =
         \\const std = @import("std");
         \\const Arena = struct {
-        \\    /// @returns borrowed_from(self)
-        \\    pub fn text(self: *const Arena) []const u8 { _ = self; return ""; }
+        \\    inner: std.heap.ArenaAllocator,
+        \\    bytes: []const u8 = "",
+        \\    pub fn text(self: *const Arena) []const u8 { return self.bytes; }
         \\};
         \\pub fn foo() []const u8 {
-        \\    var arena = std.heap.ArenaAllocator.init(undefined);
+        \\    var arena = Arena{ .inner = std.heap.ArenaAllocator.init(undefined) };
         \\    return arena.text();
         \\}
         \\
@@ -534,11 +535,12 @@ test "lib API: analyzeEscape with null cache still works on same-file annotation
     try tmp.dir.writeFile(tio, .{ .sub_path = "bar.zig", .data =
         \\const std = @import("std");
         \\const Arena = struct {
-        \\    /// @returns borrowed_from(self)
-        \\    pub fn text(self: *const Arena) []const u8 { _ = self; return ""; }
+        \\    inner: std.heap.ArenaAllocator,
+        \\    bytes: []const u8 = "",
+        \\    pub fn text(self: *const Arena) []const u8 { return self.bytes; }
         \\};
         \\pub fn foo() []const u8 {
-        \\    var arena = std.heap.ArenaAllocator.init(undefined);
+        \\    var arena = Arena{ .inner = std.heap.ArenaAllocator.init(undefined) };
         \\    return arena.text();
         \\}
         \\
