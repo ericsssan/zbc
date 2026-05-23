@@ -81,6 +81,12 @@ pub fn analyzeEscape(
     var problems: std.ArrayListUnmanaged(Problem) = .empty;
     errdefer freeProblemsArrayList(gpa, &problems);
 
+    // Per-file shared cache, used by both flow analysis (cfg) and
+    // pattern rules.  Amortizes FileModel + LocalBindings + FnSummary
+    // across every consumer.
+    var rule_cache = file_cache_mod.FileCache.init(gpa, &tree);
+    defer rule_cache.deinit();
+
     // Flow analysis — per-fn CFG + worklist fixed-point.
     // Iterate raw fn_decls (incl. type-builders) — lowerFunctionFull
     // decides per-fn whether to lower (returns null to skip).
@@ -96,6 +102,7 @@ pub fn analyzeEscape(
             &db,
             remote_ptr,
             config,
+            &rule_cache,
         )) orelse continue;
         defer cfg.deinit(gpa);
         try analyzer_mod.check(gpa, &cfg, .{ .path = path, .config = config }, &problems);
@@ -103,10 +110,6 @@ pub fn analyzeEscape(
 
     // Pattern detectors — dispatched via the comptime registry so
     // adding a rule is a one-file change (see rule_registry.zig).
-    // The cache amortizes FileModel + per-fn LocalBindings across
-    // rules that consume them.
-    var rule_cache = file_cache_mod.FileCache.init(gpa, &tree);
-    defer rule_cache.deinit();
     try rule_registry.runEscape(gpa, &tree, &db, &rule_cache, config, &problems);
 
     // Apply per-line suppressions parsed from `// zbc-disable-line` /

@@ -33,6 +33,7 @@ const annotations = @import("annotations.zig");
 const imports = @import("imports.zig");
 const remote_resolver = @import("remote_resolver.zig");
 const config_mod = @import("config.zig");
+const file_cache = @import("file_cache.zig");
 
 pub const Config = config_mod.Config;
 
@@ -397,7 +398,7 @@ pub fn lowerFunction(
     fn_decl: Ast.Node.Index,
     db: ?*const annotations.Db,
 ) !?Cfg {
-    return lowerFunctionFull(gpa, tree, fn_decl, db, null, &config_mod.Default);
+    return lowerFunctionFull(gpa, tree, fn_decl, db, null, &config_mod.Default, null);
 }
 
 /// Backwards-compat alias from phase 22.  Forwards to lowerFunctionFull
@@ -409,7 +410,7 @@ pub fn lowerFunctionWithRemote(
     db: ?*const annotations.Db,
     remote: ?*const RemoteCtx,
 ) !?Cfg {
-    return lowerFunctionFull(gpa, tree, fn_decl, db, remote, &config_mod.Default);
+    return lowerFunctionFull(gpa, tree, fn_decl, db, remote, &config_mod.Default, null);
 }
 
 /// Main entry point.  Generalizes the per-project knobs into Config
@@ -417,6 +418,11 @@ pub fn lowerFunctionWithRemote(
 /// `Default`, which matches the historical ez behavior — type name
 /// "Ast", text patterns "Ast.parse" / "ArenaAllocator.init" /
 /// ".deinit(" / ".join(".
+///
+/// `cache` is the per-file FileCache used by the new FnSummary /
+/// FileModel queries.  Optional during the annotations.Db ->
+/// inference migration; when provided, queries prefer cache lookups
+/// over db.  When null, falls back to db (legacy path).
 pub fn lowerFunctionFull(
     gpa: std.mem.Allocator,
     tree: *const Ast,
@@ -424,6 +430,7 @@ pub fn lowerFunctionFull(
     db: ?*const annotations.Db,
     remote: ?*const RemoteCtx,
     config: *const Config,
+    cache: ?*file_cache.FileCache,
 ) !?Cfg {
     var buf: [1]Ast.Node.Index = undefined;
     const fn_proto = (try fnProto(tree, &buf, fn_decl)) orelse return null;
@@ -457,6 +464,7 @@ pub fn lowerFunctionFull(
         .gpa = gpa,
         .tree = tree,
         .db = db,
+        .cache = cache,
         .remote = remote,
         .config = config,
         .is_borrowed_return_type = is_borrowed_ret,
@@ -560,6 +568,10 @@ const Builder = struct {
     gpa: std.mem.Allocator,
     tree: *const Ast,
     db: ?*const annotations.Db = null,
+    /// Per-file FileCache for FnSummary / FileModel queries — the
+    /// new inference-driven path that's replacing db queries.
+    /// Optional during migration; null falls back to db.
+    cache: ?*file_cache.FileCache = null,
     remote: ?*const RemoteCtx = null,
     config: *const Config = &config_mod.Default,
     /// The struct/union/enum that contains the fn being lowered.  Set
@@ -2918,6 +2930,12 @@ const Builder = struct {
         // overload's annotation across types).
         const recv_ty: ?[]const u8 = blk: {
             const parent_ty = self.locals.items[@intFromEnum(parent)].type_name orelse break :blk null;
+            // Prefer the FileCache's FileModel; fall back to db for
+            // callers that haven't wired cache yet (e.g. cfg_tests).
+            if (self.cache) |c| {
+                const model = c.fileModel() catch break :blk null;
+                break :blk model.fieldType(parent_ty, field_name);
+            }
             const db = self.db orelse break :blk null;
             break :blk db.fieldType(parent_ty, field_name);
         };
