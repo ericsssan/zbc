@@ -93,6 +93,33 @@ pub const FileCache = struct {
         return gop.value_ptr;
     }
 
+    /// Look up the FnSummary for a top-level fn named `name`.
+    /// Replaces the old `db.lookup(name)` query for the intra-file
+    /// (same-file) path.  Returns null when no top-level fn matches.
+    pub fn summaryByName(
+        self: *FileCache,
+        name: []const u8,
+    ) !?*const fn_summary.FnSummary {
+        const model = try self.fileModel();
+        const fi = model.findFn(name) orelse return null;
+        return try self.summaryOfFn(fi.fn_decl);
+    }
+
+    /// Look up the FnSummary for a method `method_name` on `type_name`.
+    /// Replaces the old `db.lookupTyped(type, name)` query for the
+    /// intra-file path.  Returns null when the type or method isn't
+    /// declared in this file.
+    pub fn summaryByMethod(
+        self: *FileCache,
+        type_name: []const u8,
+        method_name: []const u8,
+    ) !?*const fn_summary.FnSummary {
+        const model = try self.fileModel();
+        const ti = model.findType(type_name) orelse return null;
+        const m = ti.findMethod(method_name) orelse return null;
+        return try self.summaryOfFn(m.fn_decl);
+    }
+
     /// True iff any method on the file's type `type_name` has a
     /// body that allocates a heap instance of the type itself
     /// (`<x>.create(<type_name>)` or `<x>.create(Self)`).

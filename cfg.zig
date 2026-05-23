@@ -1274,14 +1274,20 @@ const Builder = struct {
         if (!creator_found) return null;
 
         // The destructor must NOT have @takes(self) — that would
-        // mean it does free self, no leak.  Look up this fn's own
-        // entry in the db.  (This lookup is still db-based; the
-        // FnSummary.takes_ownership_of migration belongs to CFG-4.)
-        const db = self.db orelse return ct;
-        const this_entry = db.lookupTyped(ct, fn_name) orelse return ct;
-        if (this_entry.takes) |t| switch (t) {
-            .ownership => |idx| if (idx == 0) return null,
-        };
+        // mean it does free self, no leak.  Check cache first
+        // (body-only summary), then db (R8b/R10 inference).
+        if (self.cache) |c| {
+            if (c.summaryByMethod(ct, fn_name) catch null) |s| {
+                if (s.takes_ownership_of) |idx| if (idx == 0) return null;
+            }
+        }
+        if (self.db) |db| {
+            if (db.lookupTyped(ct, fn_name)) |entry| {
+                if (entry.takes) |t| switch (t) {
+                    .ownership => |idx| if (idx == 0) return null,
+                };
+            }
+        }
         return ct;
     }
 
@@ -2417,9 +2423,17 @@ const Builder = struct {
         const tree = self.tree;
         if (tree.nodeTag(init_node) != .identifier) return null;
         const name = tree.tokenSlice(tree.nodeMainToken(init_node));
-        const db = self.db orelse return null;
-        if (db.lookup(name) == null) return null;
-        return name;
+        // Existence check — does the file declare a fn with this name?
+        // Cache (top-level fns only) OR db (covers methods that db
+        // tracked via containing_types) — accept either.
+        if (self.cache) |c| {
+            const model = c.fileModel() catch null;
+            if (model) |m| if (m.findFn(name) != null) return name;
+        }
+        if (self.db) |db| {
+            if (db.lookup(name) != null) return name;
+        }
+        return null;
     }
 
     /// True iff `init_node`'s source text ends with one of the
@@ -2479,21 +2493,36 @@ const Builder = struct {
         };
         const callee_name = tree.tokenSlice(method_tok);
 
-        const db = self.db orelse return;
         // Resolve type-aware first when the receiver is a known
-        // namespace (e.g. `Utf8.init(...)`), then bare-name.
+        // namespace (e.g. `Utf8.init(...)`), then bare-name.  Cache
+        // (FnSummary) and db consulted in order — cache catches the
+        // syntactic pattern, db catches anything cache misses.
         const heap_fields: []const []const u8 = blk: {
             if (tree.nodeTag(callee) == .field_access) {
                 const recv = tree.nodeData(callee).node_and_token[0];
                 if (tree.nodeTag(recv) == .identifier) {
                     const recv_name = tree.tokenSlice(tree.nodeMainToken(recv));
-                    if (db.lookupTyped(recv_name, callee_name)) |entry| {
-                        if (entry.result_heap_fields.len > 0) break :blk entry.result_heap_fields;
+                    if (self.cache) |c| {
+                        if (c.summaryByMethod(recv_name, callee_name) catch null) |s| {
+                            if (s.result_heap_fields.len > 0) break :blk s.result_heap_fields;
+                        }
+                    }
+                    if (self.db) |db| {
+                        if (db.lookupTyped(recv_name, callee_name)) |entry| {
+                            if (entry.result_heap_fields.len > 0) break :blk entry.result_heap_fields;
+                        }
                     }
                 }
             }
-            if (db.lookup(callee_name)) |entry| {
-                break :blk entry.result_heap_fields;
+            if (self.cache) |c| {
+                if (c.summaryByName(callee_name) catch null) |s| {
+                    if (s.result_heap_fields.len > 0) break :blk s.result_heap_fields;
+                }
+            }
+            if (self.db) |db| {
+                if (db.lookup(callee_name)) |entry| {
+                    break :blk entry.result_heap_fields;
+                }
             }
             break :blk &[_][]const u8{};
         };
@@ -2777,6 +2806,9 @@ const Builder = struct {
             self.resolveBoundCallee(raw_name)
         else
             raw_name;
+        if (self.cache) |c| {
+            if (c.summaryByName(name) catch null) |s| if (s.is_noreturn) return true;
+        }
         if (self.db) |db| {
             if (db.lookup(name)) |entry| if (entry.is_noreturn) return true;
         }
@@ -2865,25 +2897,39 @@ const Builder = struct {
         // cross-file by recv's type (when the type is defined in an
         // imported file); then the remote-namespace path (for
         // `lib.method(...)` where recv IS the namespace).
-        const takes = blk: {
-            if (self.db) |db| {
-                if (db.lookupTyped(recv_ty, callee_name)) |entry| {
-                    if (entry.takes) |t| break :blk t;
+        const target_idx: u32 = blk: {
+            // Try FnSummary (cache) first — covers cases that fit the
+            // body-only inference vocabulary.
+            if (self.cache) |c| {
+                if (recv_ty) |ty| {
+                    if (c.summaryByMethod(ty, callee_name) catch null) |s| {
+                        if (s.takes_ownership_of) |i| break :blk i;
+                    }
+                }
+                if (c.summaryByName(callee_name) catch null) |s| {
+                    if (s.takes_ownership_of) |i| break :blk i;
                 }
             }
+            // Then db (annotations + R8b/R10 transitive inference) —
+            // db catches chained ownership-transfer patterns that
+            // body-only summary inference doesn't yet model.
+            if (self.db) |db| {
+                if (db.lookupTyped(recv_ty, callee_name)) |entry| {
+                    if (entry.takes) |t| break :blk switch (t) { .ownership => |i| i };
+                }
+            }
+            // Cross-file (CFG-5 territory).
             if (recv_ty) |ty| {
                 if (self.lookupCrossFileMethod(ty, callee_name)) |entry| {
-                    if (entry.takes) |t| break :blk t;
+                    if (entry.takes) |t| break :blk switch (t) { .ownership => |i| i };
                 }
             }
             if (receiver_is_arg0) {
-                if (self.lookupRemoteTakes(recv_node.?, callee_name)) |t| break :blk t;
+                if (self.lookupRemoteTakes(recv_node.?, callee_name)) |t| {
+                    break :blk switch (t) { .ownership => |i| i };
+                }
             }
             return null;
-        };
-
-        const target_idx = switch (takes) {
-            .ownership => |i| i,
         };
 
         // For cross-file namespace calls (`lib.dispose(g, buf)`), the
@@ -2949,11 +2995,21 @@ const Builder = struct {
             break :blk db.fieldType(parent_ty, field_name);
         };
 
-        // Resolve method's @takes via same-file or cross-file DB.
-        const takes = blk: {
+        // Resolve method's @takes: cache (FnSummary) -> db -> cross-file.
+        const takes_idx: u32 = blk: {
+            if (self.cache) |c| {
+                if (recv_ty) |ty| {
+                    if (c.summaryByMethod(ty, method_name) catch null) |s| {
+                        if (s.takes_ownership_of) |i| break :blk i;
+                    }
+                }
+                if (c.summaryByName(method_name) catch null) |s| {
+                    if (s.takes_ownership_of) |i| break :blk i;
+                }
+            }
             if (self.db) |db| {
                 if (db.lookupTyped(recv_ty, method_name)) |entry| {
-                    if (entry.takes) |t| break :blk t;
+                    if (entry.takes) |t| break :blk switch (t) { .ownership => |i| i };
                 }
             }
             // Cross-file: the field's type may be defined in an
@@ -2961,14 +3017,12 @@ const Builder = struct {
             // where RemoteType lives in lib.zig).
             if (recv_ty) |ty| {
                 if (self.lookupCrossFileMethod(ty, method_name)) |entry| {
-                    if (entry.takes) |t| break :blk t;
+                    if (entry.takes) |t| break :blk switch (t) { .ownership => |i| i };
                 }
             }
             return null;
         };
-        switch (takes) {
-            .ownership => |idx| if (idx != 0) return null,
-        }
+        if (takes_idx != 0) return null;
         return .{ .parent = parent, .name = field_name };
     }
 
