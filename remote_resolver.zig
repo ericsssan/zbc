@@ -261,6 +261,54 @@ pub const Cache = struct {
     }
 };
 
+/// Adapter providing the `file_cache.RemoteSummaryCtx` interface for
+/// `Cache + imports.Map + base_dir`.  Used by FileCache R7 inference
+/// to chase delegating returns across files without creating an
+/// import cycle (file_cache.zig can't import this file directly).
+///
+/// Lifetime: caller owns the struct; the produced `RemoteSummaryCtx`
+/// borrows the adapter's pointer, so the adapter must outlive any
+/// FileCache pass that uses the ctx.
+pub const RemoteSummaryAdapter = struct {
+    cache: *Cache,
+    imap: *const imports_mod.Map,
+    base_dir: []const u8,
+
+    pub fn ctx(self: *RemoteSummaryAdapter) file_cache_mod.RemoteSummaryCtx {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable: file_cache_mod.RemoteSummaryCtx.VTable = .{
+        .getByNamespace = getByNamespace,
+        .next = next,
+    };
+
+    fn getByNamespace(ptr: *anyopaque, namespace: []const u8) ?*file_cache_mod.FileCache {
+        const self: *RemoteSummaryAdapter = @ptrCast(@alignCast(ptr));
+        const entry = self.imap.lookup(namespace) orelse return null;
+        const remote = (self.cache.loadOrLookup(self.base_dir, entry.path) catch return null) orelse return null;
+        // The `fcache` field is borrowed via *const RemoteFile; cast
+        // away const so the consumer can call mutating queries
+        // (summaryByName allocates on first call).  Safe: the cache
+        // only mutates lazy fields under its own per-file ownership.
+        return @constCast(&remote.fcache);
+    }
+
+    fn next(ptr: *anyopaque, state: *u32) ?*file_cache_mod.FileCache {
+        const self: *RemoteSummaryAdapter = @ptrCast(@alignCast(ptr));
+        var it = self.imap.entries.iterator();
+        var i: u32 = 0;
+        while (it.next()) |kv| : (i += 1) {
+            if (i < state.*) continue;
+            state.* = i + 1;
+            const remote = (self.cache.loadOrLookup(self.base_dir, kv.value_ptr.path) catch continue) orelse continue;
+            return @constCast(&remote.fcache);
+        }
+        state.* = i;
+        return null;
+    }
+};
+
 // ── Tests ──────────────────────────────────────────────────
 
 test "loadOrLookup returns null for std-namespace imports" {

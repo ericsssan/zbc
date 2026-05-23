@@ -86,11 +86,20 @@ pub fn analyzeEscape(
     // across every consumer.
     var rule_cache = file_cache_mod.FileCache.init(gpa, &tree);
     defer rule_cache.deinit();
-    // Resolve R10 Case A transitive `takes_ownership_of` across all
-    // fns before the cfg pass.  Now that cfg's takes lookup uses
-    // typed-only cache queries (no bare-name fallback that could
-    // cross-pollute methods between unrelated types), this is safe.
-    try rule_cache.resolveTransitiveTakes();
+    // Resolve R10 Case A transitive `takes_ownership_of` and R7
+    // delegator-borrow inference across all fns before the cfg pass.
+    // Cross-file R7 (when remote ctx is wired) lets wrappers that
+    // delegate into imported files infer their borrowed_from chain.
+    var remote_adapter: ?remote_resolver_mod.RemoteSummaryAdapter = null;
+    if (imap_storage) |*m| if (cache != null) {
+        remote_adapter = .{
+            .cache = cache.?,
+            .imap = m,
+            .base_dir = base_dir,
+        };
+    };
+    const remote_ctx: ?file_cache_mod.RemoteSummaryCtx = if (remote_adapter) |*a| a.ctx() else null;
+    try rule_cache.resolveTransitiveTakesWithRemote(remote_ctx);
 
     // Flow analysis — per-fn CFG + worklist fixed-point.
     // Iterate raw fn_decls (incl. type-builders) — lowerFunctionFull

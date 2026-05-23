@@ -25,6 +25,39 @@ const fmodel = @import("model.zig");
 const local = @import("local.zig");
 const fn_summary = @import("fn_summary.zig");
 
+/// Opaque interface for resolving cross-file FileCaches.  Lives here
+/// (rather than importing remote_resolver.zig) so FileCache can be
+/// queried for cross-file summaries without creating an import cycle
+/// — remote_resolver.zig already imports file_cache.zig.
+///
+/// Implementations: see `remote_resolver.RemoteSummaryAdapter` for the
+/// production wrapper around `Cache + imports.Map`.
+pub const RemoteSummaryCtx = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        /// Resolve namespace name (e.g. "lib" from `const lib =
+        /// @import("lib.zig");`) to a remote FileCache.  Returns null
+        /// when the namespace isn't in the imap or the file can't be
+        /// loaded.
+        getByNamespace: *const fn (ptr: *anyopaque, namespace: []const u8) ?*FileCache,
+        /// Iterate every loaded remote FileCache.  Caller initializes
+        /// `state` to 0; each call returns the next cache (or null when
+        /// exhausted).  Used for "anonymous param type" scans where
+        /// the wrapper has no namespace to target.
+        next: *const fn (ptr: *anyopaque, state: *u32) ?*FileCache,
+    };
+
+    pub fn getByNamespace(self: RemoteSummaryCtx, namespace: []const u8) ?*FileCache {
+        return self.vtable.getByNamespace(self.ptr, namespace);
+    }
+
+    pub fn next(self: RemoteSummaryCtx, state: *u32) ?*FileCache {
+        return self.vtable.next(self.ptr, state);
+    }
+};
+
 pub const FileCache = struct {
     gpa: std.mem.Allocator,
     tree: *const Ast,
@@ -35,6 +68,12 @@ pub const FileCache = struct {
     file_model: ?fmodel.FileModel = null,
     bindings: std.AutoHashMapUnmanaged(u32, local.LocalBindings) = .empty,
     summaries: std.AutoHashMapUnmanaged(u32, fn_summary.FnSummary) = .empty,
+    /// Transient cross-file resolution ctx — set by
+    /// `resolveTransitiveTakes` for the duration of its pass so R7
+    /// inference can chase delegating returns into imported files,
+    /// cleared on return.  Not persisted: the cross-file query
+    /// helpers in cfg.zig do their own resolution.
+    remote: ?RemoteSummaryCtx = null,
 
     pub fn init(gpa: std.mem.Allocator, tree: *const Ast) FileCache {
         return .{ .gpa = gpa, .tree = tree };
@@ -190,6 +229,19 @@ pub const FileCache = struct {
     /// before any consumer reads summaries that depend on
     /// transitive ownership.
     pub fn resolveTransitiveTakes(self: *FileCache) !void {
+        return self.resolveTransitiveTakesWithRemote(null);
+    }
+
+    /// Variant that consults `remote` for cross-file R7 inference.
+    /// When non-null, the R7 pass (Phase 4) can chase delegating
+    /// returns into imported files via the RemoteSummaryCtx vtable.
+    pub fn resolveTransitiveTakesWithRemote(
+        self: *FileCache,
+        remote: ?RemoteSummaryCtx,
+    ) !void {
+        self.remote = remote;
+        defer self.remote = null;
+
         const model = try self.fileModel();
         const lexer = @import("lexer.zig");
 
@@ -362,14 +414,17 @@ pub const FileCache = struct {
         if (k > last or tags[k] != .l_paren) return null;
 
         const method_name = tree.tokenSlice(method_tok);
-        const target_idx = try self.lookupBorrowedFromSameFile(method_name);
+        var target_idx = try self.lookupBorrowedFromSameFile(method_name);
+        if (target_idx == null) {
+            target_idx = try self.lookupBorrowedFromParamType(proto, param_idx, method_name);
+        }
         if ((target_idx orelse return null) == 0) return param_idx;
         return null;
     }
 
     /// `return <Path>.<method>(arg0, arg1, ...);` shape.  Fires when
     /// `<method>` is `borrowed_from(N)` and arg N resolves to one of
-    /// our params.  Same-file lookup only (cross-file deferred).
+    /// our params.  Same-file first; then cross-file via namespace.
     fn inferNamespaceStyle(
         self: *FileCache,
         proto: Ast.full.FnProto,
@@ -383,10 +438,22 @@ pub const FileCache = struct {
             else => return null,
         };
         const method_name = tree.tokenSlice(method_tok);
-        const target_idx = (try self.lookupBorrowedFromSameFile(method_name)) orelse return null;
+        var target_idx = try self.lookupBorrowedFromSameFile(method_name);
+        if (target_idx == null) {
+            // Cross-file: when callee is `Foo.method(...)` and Foo is
+            // an imap namespace, look up `method` in Foo's FileCache.
+            if (tree.nodeTag(callee) == .field_access) {
+                const recv = tree.nodeData(callee).node_and_token[0];
+                if (tree.nodeTag(recv) == .identifier) {
+                    const ns = tree.tokenSlice(tree.nodeMainToken(recv));
+                    target_idx = try self.lookupBorrowedFromImport(ns, method_name);
+                }
+            }
+        }
+        const idx_resolved = target_idx orelse return null;
         const args = call_full.ast.params;
-        if (target_idx >= args.len) return null;
-        const arg = args[target_idx];
+        if (idx_resolved >= args.len) return null;
+        const arg = args[idx_resolved];
         if (tree.nodeTag(arg) != .identifier) return null;
         const arg_name = tree.tokenSlice(tree.nodeMainToken(arg));
         return fn_summary.resolveParamIndex(tree, proto, arg_name);
@@ -401,6 +468,67 @@ pub const FileCache = struct {
             .borrowed_from => |idx| idx,
             else => null,
         };
+    }
+
+    /// Cross-file equivalent: look up `method_name` in the FileCache
+    /// of the imported namespace `ns`.  No-ops when remote ctx is
+    /// absent or the namespace isn't in the imap.
+    fn lookupBorrowedFromImport(self: *FileCache, ns: []const u8, method_name: []const u8) !?u32 {
+        const remote = self.remote orelse return null;
+        const remote_cache = remote.getByNamespace(ns) orelse return null;
+        const s = (try remote_cache.summaryByName(method_name)) orelse return null;
+        return switch (s.returns) {
+            .borrowed_from => |idx| idx,
+            else => null,
+        };
+    }
+
+    /// AST-level param-type resolution: read the named param's type
+    /// annotation, strip wrappers, find the `<ns>.<TypeName>` leaf,
+    /// and look up `method_name` in `<ns>`.  For genuinely anonymous
+    /// param types (`anytype`, inline struct), scan every loaded
+    /// remote file for a unique match.
+    fn lookupBorrowedFromParamType(
+        self: *FileCache,
+        proto: Ast.full.FnProto,
+        param_idx: u32,
+        method_name: []const u8,
+    ) !?u32 {
+        const remote = self.remote orelse return null;
+        const tree = self.tree;
+
+        var idx: u32 = 0;
+        var it = proto.iterate(tree);
+        const param = while (it.next()) |p| : (idx += 1) {
+            if (idx == param_idx) break p;
+        } else return null;
+        const type_node = param.type_expr orelse {
+            if (param.anytype_ellipsis3 != null) {
+                return try scanRemoteForBorrowedFrom(remote, method_name);
+            }
+            return null;
+        };
+
+        // Walk type tokens for the first `<id>.<id>` pair as the
+        // namespace.Type leaf.
+        const first = tree.firstToken(type_node);
+        const last = tree.lastToken(type_node);
+        const tags = tree.tokens.items(.tag);
+        var t: Ast.TokenIndex = first;
+        while (t < last) : (t += 1) {
+            if (tags[t] != .identifier) continue;
+            if (t > first and tags[t - 1] == .period) continue;
+            if (t + 2 > last) break;
+            if (tags[t + 1] != .period) continue;
+            if (tags[t + 2] != .identifier) continue;
+            const ns = tree.tokenSlice(t);
+            return try self.lookupBorrowedFromImport(ns, method_name);
+        }
+
+        if (isAnonymousParamType(tree, type_node)) {
+            return try scanRemoteForBorrowedFrom(remote, method_name);
+        }
+        return null;
     }
 
     /// Multi-return-stmt variant: walk every `return EXPR;` whose
@@ -636,6 +764,47 @@ pub const FileCache = struct {
         return gop.value_ptr;
     }
 };
+
+/// True iff the param's type-expr is `anytype` or an inline
+/// `struct { ... }` — both lack a name we can resolve through imap.
+fn isAnonymousParamType(tree: *const Ast, type_node: Ast.Node.Index) bool {
+    const first = tree.firstToken(type_node);
+    const last = tree.lastToken(type_node);
+    const tags = tree.tokens.items(.tag);
+    var t: Ast.TokenIndex = first;
+    while (t <= last) : (t += 1) {
+        switch (tags[t]) {
+            .asterisk, .question_mark, .l_bracket, .r_bracket => continue,
+            .keyword_const => continue,
+            .identifier => {
+                const s = tree.tokenSlice(t);
+                if (std.mem.eql(u8, s, "anytype")) return true;
+                return false;
+            },
+            .keyword_struct, .keyword_union, .keyword_enum, .keyword_opaque => return true,
+            else => return false,
+        }
+    }
+    return false;
+}
+
+/// Scan every loaded remote FileCache for `method_name`.  Returns the
+/// SINGLE target_idx if exactly one remote has it as `borrowed_from`;
+/// null on miss OR ambiguity (two remotes with different indices).
+fn scanRemoteForBorrowedFrom(remote: RemoteSummaryCtx, method_name: []const u8) !?u32 {
+    var state: u32 = 0;
+    var found: ?u32 = null;
+    while (remote.next(&state)) |remote_cache| {
+        const s = (try remote_cache.summaryByName(method_name)) orelse continue;
+        const idx = switch (s.returns) {
+            .borrowed_from => |i| i,
+            else => continue,
+        };
+        if (found) |existing| if (existing != idx) return null;
+        found = idx;
+    }
+    return found;
+}
 
 // ── Tests ──────────────────────────────────────────────────
 
