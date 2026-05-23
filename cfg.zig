@@ -4560,6 +4560,19 @@ const Builder = struct {
                 if (skip_local) |s| if (id == s) continue;
                 const hint = self.locals.items[@intFromEnum(id)].init_hint;
                 if (hint != .other) continue;
+                // `&id.field` — also clear the FIELD's state (out-param
+                // write through pointer-to-field).  Catches the
+                // canonical `var w = T{.ret = undefined}; fn(&w.ret, ...);
+                // use(w.ret);` shape — without this, w.ret stays .undef
+                // and the use fires use-undefined.
+                if (t + 2 <= last and tags[t + 1] == .period and tags[t + 2] == .identifier) {
+                    const field = tree.tokenSlice(t + 2);
+                    try self.appendStmt(cur, .{
+                        .kind = .{ .field_assign = .{ .parent = id, .name = field, .rhs_kind = .unknown } },
+                        .pos = pos,
+                        .end_pos = end_pos,
+                    });
+                }
                 const gop = try aw.getOrPut(self.gpa, id);
                 if (gop.found_existing) continue;
                 try self.appendStmt(cur, .{
