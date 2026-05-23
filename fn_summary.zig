@@ -331,6 +331,116 @@ pub fn inferDirectTakes(
 /// (`<X>.deinit()` / `<X>.close()` etc.).  Excludes .free / .destroy
 /// because those take their ARG, not their receiver — e.g.
 /// `self.allocator.free(self.slices)` does NOT consume self.allocator.
+// ── R7 helpers (delegating-return inference) ──────────────
+//
+// Pure-syntactic helpers used by FileCache's R7 pass.  Mirror
+// annotations.zig's R7 helpers but live here so FileCache can run
+// delegator-borrow inference without consulting the legacy db.
+// Cache-dependent steps (callee summary lookup, cross-file
+// resolution) live in FileCache.
+
+/// Returns the inner expression of the body's "return value" if the
+/// body has a R7-recognizable shape:
+///
+///   { return EXPR; }                       → EXPR
+///   { var/const X = EXPR; return X; }      → EXPR  (X must match)
+///
+/// Anything else returns null.
+pub fn singleReturnExpr(tree: *const Ast, body_node: Ast.Node.Index) ?Ast.Node.Index {
+    const tag = tree.nodeTag(body_node);
+    var stmt0: Ast.Node.Index = undefined;
+    var stmt1_opt: ?Ast.Node.Index = null;
+    switch (tag) {
+        .block_two, .block_two_semicolon => {
+            const d = tree.nodeData(body_node).opt_node_and_opt_node;
+            stmt0 = d[0].unwrap() orelse return null;
+            stmt1_opt = d[1].unwrap();
+        },
+        .block, .block_semicolon => {
+            const d = tree.nodeData(body_node).extra_range;
+            const start: u32 = @intFromEnum(d.start);
+            const end: u32 = @intFromEnum(d.end);
+            if (end - start == 1) {
+                stmt0 = @enumFromInt(tree.extra_data[start]);
+            } else if (end - start == 2) {
+                stmt0 = @enumFromInt(tree.extra_data[start]);
+                stmt1_opt = @as(Ast.Node.Index, @enumFromInt(tree.extra_data[start + 1]));
+            } else return null;
+        },
+        else => return null,
+    }
+
+    if (stmt1_opt == null) {
+        if (tree.nodeTag(stmt0) != .@"return") return null;
+        return tree.nodeData(stmt0).opt_node.unwrap();
+    }
+
+    const stmt1 = stmt1_opt.?;
+    if (tree.nodeTag(stmt1) != .@"return") return null;
+    const ret_val = tree.nodeData(stmt1).opt_node.unwrap() orelse return null;
+    if (tree.nodeTag(ret_val) != .identifier) return null;
+    const ret_name = tree.tokenSlice(tree.nodeMainToken(ret_val));
+
+    const var_decl = tree.fullVarDecl(stmt0) orelse return null;
+    const name_tok = var_decl.ast.mut_token + 1;
+    if (tree.tokens.items(.tag)[name_tok] != .identifier) return null;
+    const decl_name = tree.tokenSlice(name_tok);
+    if (!std.mem.eql(u8, decl_name, ret_name)) return null;
+
+    return var_decl.ast.init_node.unwrap();
+}
+
+/// True iff `expr` is a return-value shape that doesn't borrow
+/// from any local/param — string literal, integer, null, undefined,
+/// `&.{}` (empty tuple-to-slice coercion).
+pub fn isNonBorrowReturnValue(tree: *const Ast, expr: Ast.Node.Index) bool {
+    switch (tree.nodeTag(expr)) {
+        .string_literal,
+        .multiline_string_literal,
+        .number_literal,
+        .char_literal,
+        => return true,
+        .identifier => {
+            const name = tree.tokenSlice(tree.nodeMainToken(expr));
+            return std.mem.eql(u8, name, "null") or
+                std.mem.eql(u8, name, "undefined") or
+                std.mem.eql(u8, name, "true") or
+                std.mem.eql(u8, name, "false");
+        },
+        .address_of => {
+            const inner = tree.nodeData(expr).node;
+            return switch (tree.nodeTag(inner)) {
+                .struct_init_dot_two, .struct_init_dot_two_comma => true,
+                else => false,
+            };
+        },
+        else => return false,
+    }
+}
+
+/// When the return is a struct literal and any field initializer is
+/// exactly a fn-param identifier, infer `borrowed_from(<that param>)`.
+/// Picks the first match.
+pub fn inferReturnStructLiteralBorrowsParam(
+    tree: *const Ast,
+    proto: Ast.full.FnProto,
+    return_expr: Ast.Node.Index,
+) ?u32 {
+    var buf: [2]Ast.Node.Index = undefined;
+    const si = tree.fullStructInit(&buf, return_expr) orelse return null;
+    for (si.ast.fields) |field_value| {
+        if (tree.nodeTag(field_value) != .identifier) continue;
+        const name = tree.tokenSlice(tree.nodeMainToken(field_value));
+        if (resolveParamIndex(tree, proto, name)) |idx| return idx;
+    }
+    return null;
+}
+
+/// Public alias for paramIndex — used by R7 helpers in FileCache.
+pub fn resolveParamIndex(tree: *const Ast, proto: Ast.full.FnProto, name: []const u8) ?u32 {
+    return paramIndex(tree, proto, name);
+}
+
 fn isReceiverCleanupMethodName(name: []const u8) bool {
     return std.mem.eql(u8, name, "deinit") or
         std.mem.eql(u8, name, "close") or

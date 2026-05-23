@@ -11,6 +11,7 @@ const annotations = @import("annotations.zig");
 const imports_mod = @import("imports.zig");
 const remote_resolver_mod = @import("remote_resolver.zig");
 const config_mod = @import("config.zig");
+const file_cache_mod = @import("file_cache.zig");
 
 const Cfg = cfg_mod.Cfg;
 const BlockId = cfg_mod.BlockId;
@@ -182,13 +183,25 @@ fn analyze(gpa: std.mem.Allocator, src: []const u8) !std.ArrayListUnmanaged(Prob
     var db = try annotations.build(gpa, &tree);
     defer db.deinit(gpa);
 
+    var rule_cache = file_cache_mod.FileCache.init(gpa, &tree);
+    defer rule_cache.deinit();
+    try rule_cache.resolveTransitiveTakes();
+
     var problems: std.ArrayListUnmanaged(Problem) = .empty;
 
     var node_idx: u32 = 1;
     while (node_idx < tree.nodes.len) : (node_idx += 1) {
         const node: Ast.Node.Index = @enumFromInt(node_idx);
         if (tree.nodeTag(node) != .fn_decl) continue;
-        var cfg = (try cfg_mod.lowerFunction(gpa, &tree, node, &db)) orelse continue;
+        var cfg = (try cfg_mod.lowerFunctionFull(
+            gpa,
+            &tree,
+            node,
+            &db,
+            null,
+            &config_mod.Default,
+            &rule_cache,
+        )) orelse continue;
         defer cfg.deinit(gpa);
         try check(gpa, &cfg, .{ .path = "<test>" }, &problems);
     }

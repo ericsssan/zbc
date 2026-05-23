@@ -250,6 +250,194 @@ pub const FileCache = struct {
         for (model.types) |ti| {
             for (ti.methods) |m| try self.filterMayFreeFieldsOne(m.fn_decl);
         }
+
+        // Phase 4: fixed-point R7 inference — propagate
+        // `returns = .borrowed_from(N)` across delegating wrappers.
+        // Mirrors annotations.zig's R7 pass: a fn whose body returns a
+        // delegating call to another fn that's annotated/inferred
+        // borrowed_from inherits the borrowed_from with the local
+        // param index.  Skipped when the fn's returns is already known
+        // (preserves .heap / .owned / explicit borrowed_from).
+        iters = 0;
+        while (iters < 16) : (iters += 1) {
+            var changed = false;
+            for (model.fns) |fi| {
+                if (try self.inferDelegatorBorrowOne(fi.fn_decl)) changed = true;
+            }
+            for (model.types) |ti| {
+                for (ti.methods) |m| {
+                    if (try self.inferDelegatorBorrowOne(m.fn_decl)) changed = true;
+                }
+            }
+            if (!changed) break;
+        }
+    }
+
+    /// Apply R7 delegator-borrow inference to one fn.  Returns true
+    /// iff this call set/updated the fn's `returns` field.
+    fn inferDelegatorBorrowOne(self: *FileCache, fn_decl: Ast.Node.Index) !bool {
+        const lexer = @import("lexer.zig");
+        var buf: [1]Ast.Node.Index = undefined;
+        const proto = lexer.fnProto(self.tree, &buf, fn_decl) orelse return false;
+        const body = lexer.bodyOf(self.tree, fn_decl) orelse return false;
+
+        const s_ptr = try self.summaryOfFn(fn_decl);
+        // Only fill when returns hasn't been determined yet.  Matches
+        // annotations.zig R7's "only fills missing annotation" rule.
+        switch (s_ptr.returns) {
+            .unknown => {},
+            else => return false,
+        }
+
+        const idx = try self.inferDelegatorBorrow(proto, body) orelse return false;
+        const key = @intFromEnum(body);
+        if (self.summaries.getPtr(key)) |entry| {
+            entry.returns = .{ .borrowed_from = idx };
+            return true;
+        }
+        return false;
+    }
+
+    /// Mirror annotations.inferDelegatorBorrow.  Tries the single-return
+    /// shape first; falls back to multi-return.  Returns the borrowed
+    /// param index when inference fires.
+    fn inferDelegatorBorrow(
+        self: *FileCache,
+        proto: Ast.full.FnProto,
+        body: Ast.Node.Index,
+    ) !?u32 {
+        if (fn_summary.singleReturnExpr(self.tree, body)) |re| {
+            if (try self.tryInferFromReturnExpr(proto, re)) |idx| return idx;
+        }
+        return try self.inferDelegatorBorrowMultiReturn(proto, body);
+    }
+
+    /// Try every R7 shape on a single return expression.
+    fn tryInferFromReturnExpr(
+        self: *FileCache,
+        proto: Ast.full.FnProto,
+        return_expr: Ast.Node.Index,
+    ) !?u32 {
+        // Extends-storage form (struct literal carrying a param).
+        if (fn_summary.inferReturnStructLiteralBorrowsParam(self.tree, proto, return_expr)) |idx| {
+            return idx;
+        }
+        var buf: [1]Ast.Node.Index = undefined;
+        const call_full = self.tree.fullCall(&buf, return_expr) orelse return null;
+        if (try self.inferMethodStyle(proto, return_expr)) |idx| return idx;
+        return try self.inferNamespaceStyle(proto, call_full);
+    }
+
+    /// `return <param>.<chain>.<method>(args);` shape.  Fires when
+    /// `<method>` is `borrowed_from(self)` (target_idx 0).
+    fn inferMethodStyle(
+        self: *FileCache,
+        proto: Ast.full.FnProto,
+        return_expr: Ast.Node.Index,
+    ) !?u32 {
+        const tree = self.tree;
+        const first = tree.firstToken(return_expr);
+        const last = tree.lastToken(return_expr);
+        const tags = tree.tokens.items(.tag);
+
+        if (tags[first] != .identifier) return null;
+        if (first + 1 > last or tags[first + 1] != .period) return null;
+
+        const head_name = tree.tokenSlice(first);
+        const param_idx = fn_summary.resolveParamIndex(tree, proto, head_name) orelse return null;
+
+        var k: Ast.TokenIndex = first + 1;
+        var method_tok: Ast.TokenIndex = 0;
+        while (k + 1 <= last and tags[k] == .period and tags[k + 1] == .identifier) {
+            method_tok = k + 1;
+            k += 2;
+            if (k > last) break;
+            if (tags[k] == .l_paren) break;
+            if (tags[k] != .period) {
+                method_tok = 0;
+                break;
+            }
+        }
+        if (method_tok == 0) return null;
+        if (k > last or tags[k] != .l_paren) return null;
+
+        const method_name = tree.tokenSlice(method_tok);
+        const target_idx = try self.lookupBorrowedFromSameFile(method_name);
+        if ((target_idx orelse return null) == 0) return param_idx;
+        return null;
+    }
+
+    /// `return <Path>.<method>(arg0, arg1, ...);` shape.  Fires when
+    /// `<method>` is `borrowed_from(N)` and arg N resolves to one of
+    /// our params.  Same-file lookup only (cross-file deferred).
+    fn inferNamespaceStyle(
+        self: *FileCache,
+        proto: Ast.full.FnProto,
+        call_full: Ast.full.Call,
+    ) !?u32 {
+        const tree = self.tree;
+        const callee = call_full.ast.fn_expr;
+        const method_tok = switch (tree.nodeTag(callee)) {
+            .identifier => tree.nodeMainToken(callee),
+            .field_access => tree.nodeData(callee).node_and_token[1],
+            else => return null,
+        };
+        const method_name = tree.tokenSlice(method_tok);
+        const target_idx = (try self.lookupBorrowedFromSameFile(method_name)) orelse return null;
+        const args = call_full.ast.params;
+        if (target_idx >= args.len) return null;
+        const arg = args[target_idx];
+        if (tree.nodeTag(arg) != .identifier) return null;
+        const arg_name = tree.tokenSlice(tree.nodeMainToken(arg));
+        return fn_summary.resolveParamIndex(tree, proto, arg_name);
+    }
+
+    /// Same-file equivalent of annotations.lookupBorrowedFromSameFile.
+    /// Looks up a top-level fn by name and returns its `borrowed_from`
+    /// target index when the summary's returns is that variant.
+    fn lookupBorrowedFromSameFile(self: *FileCache, method_name: []const u8) !?u32 {
+        const s = (try self.summaryByName(method_name)) orelse return null;
+        return switch (s.returns) {
+            .borrowed_from => |idx| idx,
+            else => null,
+        };
+    }
+
+    /// Multi-return-stmt variant: walk every `return EXPR;` whose
+    /// token range lies within `body`, infer per-return, and return
+    /// `borrowed_from(N)` only when at least one return matched AND
+    /// every matched return agreed on the same N.  Non-borrow shapes
+    /// (literals / null / undefined / `&.{}`) are skipped.
+    fn inferDelegatorBorrowMultiReturn(
+        self: *FileCache,
+        proto: Ast.full.FnProto,
+        body: Ast.Node.Index,
+    ) !?u32 {
+        const tree = self.tree;
+        const body_first = tree.firstToken(body);
+        const body_last = tree.lastToken(body);
+
+        var found: ?u32 = null;
+        var any_match = false;
+
+        var node_idx: u32 = 1;
+        while (node_idx < tree.nodes.len) : (node_idx += 1) {
+            const node: Ast.Node.Index = @enumFromInt(node_idx);
+            if (tree.nodeTag(node) != .@"return") continue;
+            const ft = tree.firstToken(node);
+            const lt = tree.lastToken(node);
+            if (ft < body_first or lt > body_last) continue;
+
+            const value = tree.nodeData(node).opt_node.unwrap() orelse continue;
+            if (fn_summary.isNonBorrowReturnValue(tree, value)) continue;
+
+            const idx = try self.tryInferFromReturnExpr(proto, value) orelse return null;
+            if (found) |existing| if (existing != idx) return null;
+            found = idx;
+            any_match = true;
+        }
+        if (!any_match) return null;
+        return found.?;
     }
 
     /// Apply filterMayFreeFields to one fn's summary in-place.
