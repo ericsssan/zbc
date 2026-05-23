@@ -117,11 +117,15 @@ fn checkFn(
     }
     if (pointer_params.items.len == 0) return;
 
-    // Deferred names registered for cleanup.  Single pass over
-    // `defer` keywords; classify each.  Skips nested fn bodies so
-    // a `defer` inside `const f = struct { fn g() void { defer ... } }`
+    // Deferred names registered for cleanup, with their lexical
+    // scope.  A `defer X.deinit()` in `else { ... }` does NOT
+    // register when control passes through the sibling `if` branch
+    // — pairing it with a write in that branch is a false alarm.
+    // Track each defer's enclosing scope so writes outside that
+    // scope are excluded.  Skips nested fn bodies so a `defer`
+    // inside `const f = struct { fn g() void { defer ... } }`
     // doesn't pollute the outer fn's deferred-name set.
-    var deferred: std.ArrayListUnmanaged([]const u8) = .empty;
+    var deferred: std.ArrayListUnmanaged(DeferredItem) = .empty;
     defer deferred.deinit(gpa);
     var t: Ast.TokenIndex = first;
     while (t <= last) {
@@ -135,12 +139,22 @@ fn checkFn(
             continue;
         }
         if (query.matchAt(tree, defer_cleanup, t, last, null)) |m| {
-            try deferred.append(gpa, m.captureText(tree, 0).?);
+            const range = enclosingScope(tags, t, first, last);
+            try deferred.append(gpa, .{
+                .name = m.captureText(tree, 0).?,
+                .scope_open = range.open,
+                .scope_close = range.close,
+            });
             t = m.end + 1;
             continue;
         }
         if (query.matchAt(tree, defer_free, t, last, null)) |m| {
-            try deferred.append(gpa, m.captureText(tree, 0).?);
+            const range = enclosingScope(tags, t, first, last);
+            try deferred.append(gpa, .{
+                .name = m.captureText(tree, 0).?,
+                .scope_open = range.open,
+                .scope_close = range.close,
+            });
             t = m.end + 1;
             continue;
         }
@@ -160,7 +174,7 @@ fn scanWrites(
     last: Ast.TokenIndex,
     model: *const fmodel.FileModel,
     pointer_params: []const PointerParam,
-    deferred: []const []const u8,
+    deferred: []const DeferredItem,
     problems: *std.ArrayListUnmanaged(Problem),
 ) !void {
     const tags = tree.tokens.items(.tag);
@@ -199,6 +213,63 @@ fn scanWrites(
 }
 
 const PointerParam = struct { name: []const u8, type_name: ?[]const u8 };
+
+/// A `defer X.deinit()` / `defer alloc.free(X)` paired with the
+/// lexical `{ ... }` it was declared inside.  Writes outside that
+/// scope cannot see the registered cleanup — the defer hasn't
+/// executed when control passes a sibling branch.
+const DeferredItem = struct {
+    name: []const u8,
+    scope_open: Ast.TokenIndex,
+    scope_close: Ast.TokenIndex,
+};
+
+const ScopeRange = struct { open: Ast.TokenIndex, close: Ast.TokenIndex };
+
+/// Walk braces around `tok` to find the immediate enclosing
+/// `{ ... }` pair.  Fall back to the fn body range when the defer
+/// sits at the function-top scope.
+fn enclosingScope(
+    tags: []const std.zig.Token.Tag,
+    tok: Ast.TokenIndex,
+    fn_first: Ast.TokenIndex,
+    fn_last: Ast.TokenIndex,
+) ScopeRange {
+    var open: Ast.TokenIndex = fn_first;
+    var depth: i32 = 0;
+    var t: Ast.TokenIndex = tok;
+    while (t > fn_first) {
+        t -= 1;
+        switch (tags[t]) {
+            .r_brace => depth += 1,
+            .l_brace => {
+                if (depth == 0) {
+                    open = t;
+                    break;
+                }
+                depth -= 1;
+            },
+            else => {},
+        }
+    }
+    var close: Ast.TokenIndex = fn_last;
+    depth = 1;
+    t = open + 1;
+    while (t <= fn_last) : (t += 1) {
+        switch (tags[t]) {
+            .l_brace => depth += 1,
+            .r_brace => {
+                depth -= 1;
+                if (depth == 0) {
+                    close = t;
+                    break;
+                }
+            },
+            else => {},
+        }
+    }
+    return .{ .open = open, .close = close };
+}
 
 fn findPointerParam(name: []const u8, params: []const PointerParam) ?PointerParam {
     for (params) |p| if (std.mem.eql(u8, p.name, name)) return p;
@@ -331,7 +402,7 @@ fn rhsMentionsDeferred(
     tree: *const Ast,
     start: Ast.TokenIndex,
     end: Ast.TokenIndex,
-    deferred: []const []const u8,
+    deferred: []const DeferredItem,
 ) ?[]const u8 {
     const tags = tree.tokens.items(.tag);
     if (start > end) return null;
@@ -342,7 +413,15 @@ fn rhsMentionsDeferred(
         // necessarily retain the borrow.
         if (t > 0 and tags[t - 1] == .ampersand) continue;
         const name = tree.tokenSlice(t);
-        for (deferred) |d| if (std.mem.eql(u8, d, name)) return d;
+        for (deferred) |d| {
+            if (!std.mem.eql(u8, d.name, name)) continue;
+            // A defer in a sibling branch (or any block that doesn't
+            // contain the write) hasn't executed when the write
+            // runs — it can't have registered cleanup.  Only count
+            // defers whose enclosing scope encloses this write.
+            if (t < d.scope_open or t > d.scope_close) continue;
+            return d.name;
+        }
     }
     return null;
 }
