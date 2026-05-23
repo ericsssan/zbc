@@ -146,6 +146,17 @@ fn checkBody(
             t = sc;
             continue;
         }
+        // Save-then-deinit (imperative variant of defer-restore):
+        //     var prev = this.field;
+        //     this.field = new;
+        //     prev.deinit();
+        // The prior value was saved to a local; the cleanup happens
+        // AFTER the overwrite on that local.  Scan backward for the
+        // save binding, forward for `<saved>.<cleanup>(`.
+        if (savedAndCleanedUp(tree, first, last, t, sc, this_name, field_name)) {
+            t = sc;
+            continue;
+        }
         // Scan backward up to K tokens looking for prior cleanup
         // of <this>.<field>.
         if (priorCleanupExists(tree, first, t, this_name, field_name)) {
@@ -155,6 +166,90 @@ fn checkBody(
         try report(gpa, problems, tree, t, this_name, field_name, ct);
         t = sc;
     }
+}
+
+/// True iff there's a backward `var <X> = <this>.<field>;` binding
+/// BEFORE the assignment AND a forward `<X>.<cleanup>(` call AFTER
+/// the assignment, both within the same enclosing block.  Catches
+/// the imperative save-then-deinit pattern:
+///     var prev = this.field;
+///     this.field = new;
+///     prev.deinit();
+fn savedAndCleanedUp(
+    tree: *const Ast,
+    body_first: Ast.TokenIndex,
+    body_last: Ast.TokenIndex,
+    assign_tok: Ast.TokenIndex,
+    sc: Ast.TokenIndex,
+    this_name: []const u8,
+    field_name: []const u8,
+) bool {
+    const tags = tree.tokens.items(.tag);
+    // Backward scan for `<keyword_var|const> <X> = <this>.<field>;`
+    // — bounded to K=30 tokens or the enclosing block start.
+    const K: u32 = 30;
+    var saved_name: ?[]const u8 = null;
+    var depth: i32 = 0;
+    var i: u32 = 0;
+    var t: Ast.TokenIndex = assign_tok;
+    while (t > body_first and i < K) : (i += 1) {
+        t -= 1;
+        switch (tags[t]) {
+            .r_brace => depth += 1,
+            .l_brace => {
+                if (depth == 0) break;
+                depth -= 1;
+            },
+            else => {},
+        }
+        if (depth != 0) continue;
+        // Match `keyword_var <ident> = <this_name> . <field_name>`.
+        if (tags[t] != .keyword_var and tags[t] != .keyword_const) continue;
+        if (t + 5 > body_last) continue;
+        if (tags[t + 1] != .identifier) continue;
+        if (tags[t + 2] != .equal) continue;
+        if (tags[t + 3] != .identifier) continue;
+        if (!std.mem.eql(u8, tree.tokenSlice(t + 3), this_name)) continue;
+        if (tags[t + 4] != .period) continue;
+        if (tags[t + 5] != .identifier) continue;
+        if (!std.mem.eql(u8, tree.tokenSlice(t + 5), field_name)) continue;
+        saved_name = tree.tokenSlice(t + 1);
+        break;
+    }
+    const name = saved_name orelse return false;
+    // Forward scan from after the `;` for `<name>.<cleanup>(`.
+    var k: Ast.TokenIndex = sc + 1;
+    depth = 0;
+    i = 0;
+    while (k <= body_last and i < K) : ({
+        k += 1;
+        i += 1;
+    }) {
+        switch (tags[k]) {
+            .l_brace => depth += 1,
+            .r_brace => {
+                if (depth == 0) return false;
+                depth -= 1;
+            },
+            else => {},
+        }
+        if (depth != 0) continue;
+        if (tags[k] != .identifier) continue;
+        if (!std.mem.eql(u8, tree.tokenSlice(k), name)) continue;
+        if (k + 3 > body_last) continue;
+        if (tags[k + 1] != .period) continue;
+        if (tags[k + 2] != .identifier) continue;
+        if (tags[k + 3] != .l_paren) continue;
+        const m = tree.tokenSlice(k + 2);
+        if (std.mem.eql(u8, m, "deinit") or std.mem.eql(u8, m, "deref") or
+            std.mem.eql(u8, m, "destroy") or std.mem.eql(u8, m, "close") or
+            std.mem.eql(u8, m, "free") or std.mem.eql(u8, m, "finalize") or
+            std.mem.eql(u8, m, "dispose"))
+        {
+            return true;
+        }
+    }
+    return false;
 }
 
 /// True iff `ti` has a `deinit` method with a non-trivial body —
