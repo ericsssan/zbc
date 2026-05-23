@@ -47,21 +47,78 @@ pub fn check(
     defer gpa.free(outers);
 
     for (outers) |outer| {
-        // Find the first value-typed field whose type has a cleanup
-        // method.  Only one fire per outer (the design gap is the
-        // missing method, not the field count).
+        // Find the first value-typed field whose type has a NON-TRIVIAL
+        // cleanup method.  If the inner type's `deinit` (or whichever
+        // cleanup method) has an empty / discard-only body, it does
+        // nothing on drop — skipping the outer is harmless.  Common
+        // for CSS/value-type uniform-API conformance: `pub fn deinit
+        // (_: *@This(), _: Allocator) void {}`.
         const fields = try mq.findFields(gpa, model, tree, outer, .{
             .value_typed = true,
             .type_matches = .{ .has_method = .{ .name_pred = isCleanupName } },
         });
         defer gpa.free(fields);
 
-        if (fields.len == 0) continue;
-        const field = fields[0];
+        var hit: ?usize = null;
+        for (fields, 0..) |f, i| {
+            const inner_ti = mq.resolveFieldType(tree, model, f) orelse continue;
+            if (anyNonTrivialCleanup(tree, inner_ti)) {
+                hit = i;
+                break;
+            }
+        }
+        const idx = hit orelse continue;
+        const field = fields[idx];
         const inner = mq.resolveFieldType(tree, model, field).?;
         trace.match(R, tree, field.name_token, "owned field with no outer cleanup");
         try report(gpa, problems, tree, outer.name, field.name_token, field.name, inner.name);
     }
+}
+
+/// True iff `ti` has at least one cleanup-named method whose body is
+/// non-trivial — i.e. contains something other than `_ = <expr>;`
+/// discards.  An empty `{}` or all-discards body means the method
+/// does nothing on drop, so a missing outer cleanup is harmless.
+fn anyNonTrivialCleanup(tree: *const Ast, ti: *const fmodel.TypeInfo) bool {
+    for (ti.methods) |m| {
+        if (!isCleanupName(m.name)) continue;
+        if (!isTrivialBody(tree, m.body_first, m.body_last)) return true;
+    }
+    return false;
+}
+
+/// True iff the body `[body_first..body_last]` (inclusive `{` ... `}`)
+/// is empty or contains only `_ = <expr>;` discard statements.
+fn isTrivialBody(tree: *const Ast, body_first: Ast.TokenIndex, body_last: Ast.TokenIndex) bool {
+    const tags = tree.tokens.items(.tag);
+    if (body_first >= body_last) return true;
+    // body_first is `{`, body_last is `}`.  Empty body: nothing between.
+    if (body_first + 1 == body_last) return true;
+    // Walk statements; require each to be a discard.
+    var t: Ast.TokenIndex = body_first + 1;
+    while (t < body_last) {
+        // Allowed start: `_` identifier followed by `=`.
+        if (tags[t] != .identifier) return false;
+        if (!std.mem.eql(u8, tree.tokenSlice(t), "_")) return false;
+        if (t + 1 >= body_last or tags[t + 1] != .equal) return false;
+        // Skip to the statement-terminating `;` at depth 0.
+        var depth: u32 = 0;
+        var k = t + 2;
+        while (k < body_last) : (k += 1) {
+            switch (tags[k]) {
+                .l_paren, .l_brace, .l_bracket => depth += 1,
+                .r_paren, .r_brace, .r_bracket => {
+                    if (depth == 0) return false;
+                    depth -= 1;
+                },
+                .semicolon => if (depth == 0) break,
+                else => {},
+            }
+        }
+        if (k >= body_last or tags[k] != .semicolon) return false;
+        t = k + 1;
+    }
+    return true;
 }
 
 fn isCleanupName(name: []const u8) bool {
@@ -104,7 +161,8 @@ fn report(
 test "outer has no deinit + owned field fires" {
     try testing.expectFires(check, R,
         \\const Inner = struct {
-        \\    pub fn deinit(self: *Inner) void { _ = self; }
+        \\    fd: i32 = 0,
+        \\    pub fn deinit(self: *Inner) void { self.fd = -1; }
         \\};
         \\const Outer = struct {
         \\    inner: Inner,
@@ -159,7 +217,8 @@ test "pointer field (likely borrow) — no fire" {
 test "optional value field (?Inner) fires" {
     try testing.expectFires(check, R,
         \\const Inner = struct {
-        \\    pub fn deinit(self: *Inner) void { _ = self; }
+        \\    fd: i32 = 0,
+        \\    pub fn deinit(self: *Inner) void { self.fd = -1; }
         \\};
         \\const Outer = struct {
         \\    inner: ?Inner,
@@ -170,7 +229,8 @@ test "optional value field (?Inner) fires" {
 test "multiple owned fields fires once (not per-field)" {
     try testing.expectFires(check, R,
         \\const Inner = struct {
-        \\    pub fn deinit(self: *Inner) void { _ = self; }
+        \\    fd: i32 = 0,
+        \\    pub fn deinit(self: *Inner) void { self.fd = -1; }
         \\};
         \\const Outer = struct {
         \\    a: Inner,
@@ -183,7 +243,36 @@ test "multiple owned fields fires once (not per-field)" {
 test "Inner with finalize/dispose also counts as cleanup" {
     try testing.expectFires(check, R,
         \\const Inner = struct {
-        \\    pub fn dispose(self: *Inner) void { _ = self; }
+        \\    fd: i32 = 0,
+        \\    pub fn dispose(self: *Inner) void { self.fd = -1; }
+        \\};
+        \\const Outer = struct {
+        \\    inner: Inner,
+        \\};
+    );
+}
+
+test "Inner with empty deinit body (no-op trait conformance) — no fire" {
+    // Common for CSS/value-type uniform-API conformance: deinit
+    // exists for trait-method-call uniformity but does nothing.
+    // Missing outer deinit doesn't leak anything.
+    try testing.expectNoFire(check,
+        \\const Inner = struct {
+        \\    pub fn deinit(_: *Inner, _: Allocator) void {}
+        \\};
+        \\const Allocator = struct {};
+        \\const Outer = struct {
+        \\    inner: Inner,
+        \\};
+    );
+}
+
+test "Inner with discard-only deinit body — no fire" {
+    // `pub fn deinit(self: *T) void { _ = self; }` — placeholder
+    // pattern.  Same as empty body: does nothing on drop.
+    try testing.expectNoFire(check,
+        \\const Inner = struct {
+        \\    pub fn deinit(self: *Inner) void { _ = self; }
         \\};
         \\const Outer = struct {
         \\    inner: Inner,
