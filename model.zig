@@ -230,6 +230,8 @@ pub const FileModel = struct {
         return baseTypeName(self.tree, f.type_first, f.type_last);
     }
 
+    pub const FieldTypePath = struct { ns: ?[]const u8, type_name: []const u8 };
+
     /// Like `fieldType` but returns the `<ns>.<Type>` split when the
     /// field's type references an imported namespace.  Used by R10
     /// Case B cross-file filtering: `inner: *lib.Item` needs to look
@@ -238,7 +240,7 @@ pub const FileModel = struct {
         self: *const FileModel,
         struct_name: []const u8,
         field_name: []const u8,
-    ) ?struct { ns: ?[]const u8, type_name: []const u8 } {
+    ) ?FieldTypePath {
         const ti = self.findType(struct_name) orelse return null;
         const f = ti.findField(field_name) orelse return null;
         const tags = self.tree.tokens.items(.tag);

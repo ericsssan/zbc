@@ -518,27 +518,57 @@ pub fn inferMayFreeFields(
             t = lexer.skipNestedFn(tags, t, last);
             continue;
         }
-        // Match `<id>.<id>.<id>(` shape.
+        // Match `<id>(.<id>)+(` — receiver, one or more field
+        // segments, method name, then `(`.  Reject mid-chain matches
+        // (where token before t is `.`, meaning we're in the middle
+        // of a larger chain).
         if (tags[t] != .identifier) continue;
+        if (t > first and tags[t - 1] == .period) continue;
         if (tags[t + 1] != .period) continue;
         if (tags[t + 2] != .identifier) continue;
-        if (tags[t + 3] != .period) continue;
-        if (tags[t + 4] != .identifier) continue;
-        if (tags[t + 5] != .l_paren) continue;
+        // Walk the dotted chain forward as long as we see `.<id>`,
+        // tracking the FIRST and LAST field identifiers.  The chain
+        // ends at the trailing `(` — the ident right before `(` is
+        // the method name; everything between t+2 and that ident
+        // forms the field path.
         const recv = tree.tokenSlice(t);
-        const idx = paramIndex(tree, proto, recv) orelse continue;
-        const method = tree.tokenSlice(t + 4);
-        // The chain shape <param>.<field>.<method>() means <param>.<field>
-        // is the call's RECEIVER.  Only methods that consume their
-        // receiver (deinit/close/release/...) count — `.free` /
-        // `.destroy` take their ARG instead, so e.g.
-        // `self.allocator.free(self.slices)` does NOT free self.allocator.
+        const param_idx = paramIndex(tree, proto, recv) orelse continue;
+        const first_field_tok: lexer.TokenIndex = t + 2;
+        var last_field_tok: lexer.TokenIndex = t + 2;
+        var k: lexer.TokenIndex = t + 3;
+        var method_tok: ?lexer.TokenIndex = null;
+        while (k + 1 <= last) {
+            if (tags[k] == .period and tags[k + 1] == .identifier) {
+                // The trailing ident might be the method (followed by
+                // `(`) or another field segment (followed by `.`).
+                if (k + 2 <= last and tags[k + 2] == .l_paren) {
+                    method_tok = k + 1;
+                    break;
+                }
+                last_field_tok = k + 1;
+                k += 2;
+                continue;
+            }
+            break;
+        }
+        const mtok = method_tok orelse continue;
+        const method = tree.tokenSlice(mtok);
+        // Only methods that consume their RECEIVER (deinit/close/etc.)
+        // count — `.free` / `.destroy` take their ARG instead.
         if (!isReceiverCleanupMethodName(method)) continue;
+        // Field path: source-slice from first field's start to last
+        // field's end.  Same shape annotations.zig's R10 Case B uses.
+        const start_byte = tree.tokens.items(.start)[first_field_tok];
+        const last_start = tree.tokens.items(.start)[last_field_tok];
+        const last_len = tree.tokenSlice(last_field_tok).len;
+        const field_path = tree.source[start_byte..(last_start + last_len)];
         try out.append(arena, .{
-            .param = idx,
-            .field = tree.tokenSlice(t + 2),
+            .param = param_idx,
+            .field = field_path,
             .method = method,
         });
+        // Advance past the method to avoid re-matching the same chain.
+        t = mtok;
     }
     return out.toOwnedSlice(arena);
 }

@@ -3147,6 +3147,19 @@ const Builder = struct {
                         }
                     }
                 }
+                // Identifier-style call (e.g. `cleanup(x, y)`): no
+                // receiver type, look up the top-level fn by name.
+                if (!receiver_is_arg0) {
+                    if (c.summaryByName(callee_name) catch null) |s| {
+                        if (s.may_free_fields.len > 0) {
+                            const n = @min(s.may_free_fields.len, free_buf.len);
+                            for (s.may_free_fields[0..n], 0..) |ff, i| {
+                                free_buf[i] = .{ .param = ff.param, .field = ff.field };
+                            }
+                            break :blk free_buf[0..n];
+                        }
+                    }
+                }
             }
             if (self.db) |db| {
                 if (db.lookupTyped(recv_ty, callee_name)) |e| {

@@ -211,25 +211,26 @@ pub const FileCache = struct {
         for (raw) |ff| {
             const param_ty = paramTypeName(tree, proto, ff.param) orelse continue;
             if (!model.hasType(param_ty)) continue;
-            const path = model.fieldTypePath(param_ty, ff.field) orelse continue;
-            // Resolve the callee summary on the field's TYPE — same-
-            // file when the field type is local, else cross-file via
-            // imported namespace.  Either lookup checks that the
-            // method exists and (for non-cleanup-named methods) has a
-            // takes_ownership_of signal.
+            // Walk the field path one segment at a time so multi-
+            // segment chains like "inner.handle" resolve to the
+            // deepest type before looking up the method.
+            const deepest_path = walkFieldPath(model, param_ty, ff.field) orelse continue;
+            // Resolve the callee summary on the deepest field's TYPE
+            // — same-file when the field type is local, else cross-
+            // file via imported namespace.
             const callee_summary: ?*const fn_summary.FnSummary = blk: {
-                if (path.ns) |ns| {
+                if (deepest_path.ns) |ns| {
                     if (self.remote) |r| {
                         if (r.getByNamespace(ns)) |remote_cache| {
-                            break :blk try remote_cache.summaryByMethod(path.type_name, ff.method);
+                            break :blk try remote_cache.summaryByMethod(deepest_path.type_name, ff.method);
                         }
                     }
                     break :blk null;
                 }
-                if (!model.hasType(path.type_name)) break :blk null;
-                const ti = model.findType(path.type_name) orelse break :blk null;
+                if (!model.hasType(deepest_path.type_name)) break :blk null;
+                const ti = model.findType(deepest_path.type_name) orelse break :blk null;
                 if (!ti.hasMethod(ff.method)) break :blk null;
-                break :blk try self.summaryByMethod(path.type_name, ff.method);
+                break :blk try self.summaryByMethod(deepest_path.type_name, ff.method);
             };
             const cs = callee_summary orelse continue;
             if (cs.takes_ownership_of == null) continue;
@@ -815,6 +816,39 @@ pub const FileCache = struct {
         return gop.value_ptr;
     }
 };
+
+/// Walk a dotted field path (e.g. "inner.handle") through a struct
+/// type chain, returning the DEEPEST field's type as a path split.
+/// For a single-segment path "f", returns `<outer>.f`'s type.  For
+/// multi-segment "f.g.h", walks outer.f -> field-type-of-f, then
+/// that.g, then that.h, returning the leaf type.
+///
+/// Stops + returns null when any intermediate field's type isn't
+/// resolvable in the local model (cross-file intermediates that
+/// aren't loaded yet — uncommon, and the conservative answer is to
+/// drop the entry).
+fn walkFieldPath(
+    model: *const fmodel.FileModel,
+    outer_type: []const u8,
+    path: []const u8,
+) ?fmodel.FileModel.FieldTypePath {
+    var it = std.mem.splitScalar(u8, path, '.');
+    var cur_outer: []const u8 = outer_type;
+    var last_result: ?fmodel.FileModel.FieldTypePath = null;
+    while (it.next()) |segment| {
+        const ftp = model.fieldTypePath(cur_outer, segment) orelse return null;
+        last_result = ftp;
+        // For the next iteration we need a bare type name — if this
+        // segment's type was `<ns>.<Type>` we'd need to load the
+        // remote file to walk further.  We don't have a remote
+        // pointer here; conservative: stop and return null if there
+        // are more segments to walk.
+        if (it.peek() == null) break;
+        if (ftp.ns != null) return null;
+        cur_outer = ftp.type_name;
+    }
+    return last_result;
+}
 
 /// True iff the param's type-expr is `anytype` or an inline
 /// `struct { ... }` — both lack a name we can resolve through imap.
