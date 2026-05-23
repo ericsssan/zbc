@@ -86,6 +86,13 @@ pub fn analyzeEscape(
     // across every consumer.
     var rule_cache = file_cache_mod.FileCache.init(gpa, &tree);
     defer rule_cache.deinit();
+    // NOTE: resolveTransitiveTakes (R10 Case A propagation) is built
+    // but not enabled here — bun-corpus sweep with R10 on produced
+    // ~14 net new findings, several of which are FPs caused by
+    // chain propagation through receiver names that aren't reliably
+    // type-resolved (e.g., `.deinit` chained through unrelated
+    // types).  The infrastructure is ready; enable it once R10 is
+    // type-aware enough to match annotations.zig's precision.
 
     // Flow analysis — per-fn CFG + worklist fixed-point.
     // Iterate raw fn_decls (incl. type-builders) — lowerFunctionFull

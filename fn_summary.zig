@@ -82,6 +82,15 @@ pub const FnSummary = struct {
     /// own type.  Filled when the containing type is known; null
     /// when the fn is top-level (no containing type).
     heap_allocates_self: bool = false,
+    /// Internal flag: true iff FileCache.summaryOfFn has fully
+    /// populated this entry (cheap + deep inference).  Distinct
+    /// from "no fields detected" — without this flag, fns with
+    /// genuinely empty `may_free_fields` would be indistinguishable
+    /// from never-resolved and would get re-inferred (wiping any
+    /// R10 transitive updates).  Not part of the public contract;
+    /// consumers should treat the summary as resolved when they
+    /// retrieve it via FileCache.
+    _resolved: bool = false,
 };
 
 /// Infer a summary for `body`.  Conservative: when unclear, returns
@@ -140,6 +149,18 @@ pub fn inferFromBody(
     if (firstReturnExpr(tree, first, last)) |re| {
         out.returns = classifyReturnExpr(tree, proto, re.first, re.last, out.allocates);
     }
+
+    // NOTE: direct takes_ownership_of inference is NOT wired into
+    // inferFromBody yet.  Sweep audit (bun corpus) revealed subtle
+    // FPs caused by the cfg.zig consumer interactions — even
+    // semantically-correct Pattern 2 matches (gpa.destroy(<param>))
+    // perturbed the lookup hierarchy in cfg's takesOwnership lookup,
+    // letting unrelated `deinit` entries propagate through unchecked
+    // fallback paths.  The inferDirectTakes / resolveTransitiveTakes
+    // helpers are built and exported for future consumers that opt
+    // in explicitly (e.g. pattern rules that don't go through cfg);
+    // turning them on by default needs a follow-up pass to harden
+    // the cfg query chain.
 
     return out;
 }
@@ -245,6 +266,58 @@ fn paramIndex(tree: *const Ast, proto: Ast.full.FnProto, name: []const u8) ?u32 
     while (it.next()) |p| : (idx += 1) {
         const name_tok = p.name_token orelse continue;
         if (std.mem.eql(u8, tree.tokenSlice(name_tok), name)) return idx;
+    }
+    return null;
+}
+
+/// Scan `body` for direct ownership-transfer patterns and return
+/// the index of the first param the fn takes (if any).
+///
+/// Matches `.free(<param>)` / `.destroy(<param>)` — the param is
+/// passed as the explicit arg to an allocator-vocabulary free.
+/// Mirrors annotations.zig R8b.
+///
+/// Deliberately does NOT match `<param>.deinit()` / `.close()` /
+/// other receiver-cleanup forms.  Those signals are ambiguous: a
+/// fn body can call `self.deinit(); self.entries = ...;` as a
+/// reset-and-resurrect pattern where self isn't actually consumed.
+/// Without dataflow tracking we can't tell the difference, so we
+/// stay conservative — annotations.zig's same restriction.
+///
+/// Returns the FIRST match.  When multiple params are consumed the
+/// summary only records one; consumers that need fuller fidelity
+/// should consult `may_free_fields` for the field-typed cases.
+pub fn inferDirectTakes(
+    tree: *const Ast,
+    proto: Ast.full.FnProto,
+    body: Ast.Node.Index,
+) ?u32 {
+    const tags = tree.tokens.items(.tag);
+    const first = tree.firstToken(body);
+    const last = tree.lastToken(body);
+    var t = first;
+    while (t + 3 <= last) : (t += 1) {
+        if (tags[t] == .keyword_fn) {
+            t = lexer.skipNestedFn(tags, t, last);
+            continue;
+        }
+        // `.free(<param>)` / `.destroy(<param>)`.  The arg is the
+        // consumed value (not the receiver).  Reject mid-chain match
+        // where the arg has its own field access (`.free(this.field)`
+        // doesn't consume this).
+        if (tags[t] == .period and tags[t + 1] == .identifier and
+            tags[t + 2] == .l_paren and tags[t + 3] == .identifier)
+        {
+            const method = tree.tokenSlice(t + 1);
+            const is_free = std.mem.eql(u8, method, "free") or
+                std.mem.eql(u8, method, "destroy");
+            if (!is_free) continue;
+            // Guard: arg followed by `.` is a field access on the
+            // arg — the param itself isn't being freed.
+            if (t + 4 <= last and tags[t + 4] == .period) continue;
+            const arg = tree.tokenSlice(t + 3);
+            if (paramIndex(tree, proto, arg)) |pi| return pi;
+        }
     }
     return null;
 }
@@ -563,6 +636,56 @@ fn firstFnProtoAndBody(
         return .{ lexer.fnProto(tree, proto_buf, node).?, lexer.bodyOf(tree, node).? };
     }
     unreachable;
+}
+
+test "inferDirectTakes: gpa.destroy(<param>) returns param index" {
+    var tree = try parse(
+        \\fn cleanup(gpa: std.mem.Allocator, p: *Foo) void {
+        \\    gpa.destroy(p);
+        \\}
+    );
+    defer tree.deinit(testing.allocator);
+    var buf: [1]Ast.Node.Index = undefined;
+    const pb = firstFnProtoAndBody(&tree, &buf);
+    // inferDirectTakes is callable on its own even though it isn't
+    // currently wired into inferFromBody (see the note there).
+    try testing.expectEqual(@as(?u32, 1), inferDirectTakes(&tree, pb[0], pb[1]));
+}
+
+test "inferDirectTakes: gpa.free(<param>) returns param index" {
+    var tree = try parse(
+        \\fn drop(gpa: std.mem.Allocator, buf: []u8) void {
+        \\    gpa.free(buf);
+        \\}
+    );
+    defer tree.deinit(testing.allocator);
+    var buf: [1]Ast.Node.Index = undefined;
+    const pb = firstFnProtoAndBody(&tree, &buf);
+    try testing.expectEqual(@as(?u32, 1), inferDirectTakes(&tree, pb[0], pb[1]));
+}
+
+test "inferDirectTakes: no .free/.destroy returns null" {
+    var tree = try parse(
+        \\fn touch(self: *Foo) void {
+        \\    _ = self;
+        \\}
+    );
+    defer tree.deinit(testing.allocator);
+    var buf: [1]Ast.Node.Index = undefined;
+    const pb = firstFnProtoAndBody(&tree, &buf);
+    try testing.expect(inferDirectTakes(&tree, pb[0], pb[1]) == null);
+}
+
+test "inferDirectTakes: <param>.deinit() does NOT match (reset-and-resurrect risk)" {
+    var tree = try parse(
+        \\fn cleanup(self: *Foo) void {
+        \\    self.deinit();
+        \\}
+    );
+    defer tree.deinit(testing.allocator);
+    var buf: [1]Ast.Node.Index = undefined;
+    const pb = firstFnProtoAndBody(&tree, &buf);
+    try testing.expect(inferDirectTakes(&tree, pb[0], pb[1]) == null);
 }
 
 test "inferMayFreeFields: detects <param>.<field>.<deallocMethod>()" {
