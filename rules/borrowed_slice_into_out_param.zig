@@ -19,6 +19,7 @@ const Ast = std.zig.Ast;
 const lexer = @import("../lexer.zig");
 const local = @import("../local.zig");
 const query = @import("../query.zig");
+const fmodel = @import("../model.zig");
 const problem_mod = @import("../problem.zig");
 const testing = @import("../testing.zig");
 const config_mod = @import("../config.zig");
@@ -67,13 +68,18 @@ pub fn check(
     problems: *std.ArrayListUnmanaged(Problem),
 ) !void {
     if (!config_mod.isEnabled(config, .borrowed_slice_into_out_param)) return;
-    try lexer.forEachFnCached(gpa, tree, cache, problems, checkFn);
+    var proto_buf: [1]Ast.Node.Index = undefined;
+    var fns = lexer.iterFnDecls(tree);
+    while (fns.next(&proto_buf)) |fn_entry| {
+        try checkFn(gpa, tree, cache, fn_entry.node, fn_entry.proto, fn_entry.body, problems);
+    }
 }
 
 fn checkFn(
     gpa: std.mem.Allocator,
     tree: *const Ast,
     cache: *file_cache_mod.FileCache,
+    fn_decl: Ast.Node.Index,
     proto: Ast.full.FnProto,
     body: Ast.Node.Index,
     problems: *std.ArrayListUnmanaged(Problem),
@@ -89,13 +95,25 @@ fn checkFn(
     const bindings = try cache.localBindings(proto, body);
 
     // Pointer params — bindings with .param origin whose declared
-    // type starts with `*` or `?*`.
-    var pointer_params: std.ArrayListUnmanaged([]const u8) = .empty;
+    // type starts with `*` or `?*`.  We also record each pointer
+    // param's CONTAINER TYPE NAME (e.g. "PackageInstall" for
+    // `this: *PackageInstall`) so writes through it can be
+    // type-checked against the file model — a write to a primitive
+    // field (`this.file_count: usize = ...`) can't carry a borrowed
+    // slice and must not fire.
+    const model = try cache.fileModel();
+    // Containing type for `*@This()` / `*Self` resolution.
+    const self_type: ?[]const u8 = if (model.containingTypeOf(fn_decl)) |ti| ti.name else null;
+
+    var pointer_params: std.ArrayListUnmanaged(PointerParam) = .empty;
     defer pointer_params.deinit(gpa);
     for (bindings.items) |b| {
         if (b.origin != .param) continue;
         if (!isPointerType(tags, b.rhs_first, b.rhs_last)) continue;
-        try pointer_params.append(gpa, b.name);
+        try pointer_params.append(gpa, .{
+            .name = b.name,
+            .type_name = extractTypeName(tree, tags, b.rhs_first, b.rhs_last, self_type),
+        });
     }
     if (pointer_params.items.len == 0) return;
 
@@ -131,7 +149,7 @@ fn checkFn(
     if (deferred.items.len == 0) return;
 
     // Find writes through pointer params; check RHS for any deferred name.
-    try scanWrites(gpa, tree, write_via_out, first, last, pointer_params.items, deferred.items, problems);
+    try scanWrites(gpa, tree, write_via_out, first, last, model, pointer_params.items, deferred.items, problems);
 }
 
 fn scanWrites(
@@ -140,7 +158,8 @@ fn scanWrites(
     atoms: []const Atom,
     first: Ast.TokenIndex,
     last: Ast.TokenIndex,
-    pointer_params: []const []const u8,
+    model: *const fmodel.FileModel,
+    pointer_params: []const PointerParam,
     deferred: []const []const u8,
     problems: *std.ArrayListUnmanaged(Problem),
 ) !void {
@@ -149,12 +168,137 @@ fn scanWrites(
     defer gpa.free(writes);
     for (writes) |w| {
         const out_name = w.captureText(tree, 0).?;
-        if (!isPointerParam(out_name, pointer_params)) continue;
+        const pp = findPointerParam(out_name, pointer_params) orelse continue;
+        // Type-aware LHS check: when the write is `<out>.<field> = ...`
+        // and we can resolve <field>'s declared type via the FileModel,
+        // skip primitive-typed fields (`usize` / `u32` / `bool` /
+        // etc.) — those can't hold a borrowed slice.  The audit
+        // showed many FPs of the form `this.file_count =
+        // FileCopier.copy(subdir, ...);` where the RHS just mentions
+        // a deferred name as a CALL ARG (the call returns a primitive).
+        if (w.start + 2 <= last and tags[w.start + 1] == .period and tags[w.start + 2] == .identifier) {
+            const field_name = tree.tokenSlice(w.start + 2);
+            if (pp.type_name) |ty| {
+                if (model.fieldType(ty, field_name)) |ft| {
+                    if (isPrimitiveTypeName(ft)) continue;
+                }
+            }
+        }
+        // RHS-shape check: when the assigned value comes from a
+        // `*.toOwnedSlice(*)` / `*.dupe(*)` / `*.clone(*)` call, the
+        // value is OWNED (newly-allocated by the call's allocator
+        // arg), not a borrow of the deferred local.  The deferred
+        // cleanup happens AFTER the copy is made; out-param holds
+        // a valid allocation.
         const sc = lexer.findStmtSemicolon(tags, w.end + 1, last) orelse continue;
         if (sc <= w.end + 1) continue;
+        if (rhsContainsCopyingCall(tree, w.end + 1, sc - 1)) continue;
         const dn = rhsMentionsDeferred(tree, w.end + 1, sc - 1, deferred) orelse continue;
         try report(gpa, problems, tree, w.start, out_name, dn);
     }
+}
+
+const PointerParam = struct { name: []const u8, type_name: ?[]const u8 };
+
+fn findPointerParam(name: []const u8, params: []const PointerParam) ?PointerParam {
+    for (params) |p| if (std.mem.eql(u8, p.name, name)) return p;
+    return null;
+}
+
+
+/// Walk type tokens for `(?)?*(const)?<id>(.<id>)?` and return the
+/// last identifier — the container type's name.  Handles `*T`,
+/// `?*T`, `*const T`, `*ns.T`, and `*@This()` / `*Self` (resolved
+/// to `self_type` when provided).  Returns null on shapes we can't
+/// confidently classify (slice/array/anytype/inline-struct).
+fn extractTypeName(
+    tree: *const Ast,
+    tags: []const std.zig.Token.Tag,
+    first: Ast.TokenIndex,
+    last: Ast.TokenIndex,
+    self_type: ?[]const u8,
+) ?[]const u8 {
+    if (first > last) return null;
+    var t = first;
+    while (t <= last) : (t += 1) {
+        switch (tags[t]) {
+            .question_mark, .asterisk, .keyword_const => continue,
+            .l_bracket => return null,
+            .identifier, .builtin => break,
+            else => return null,
+        }
+    }
+    if (t > last) return null;
+    // `@This()` → self_type.
+    if (tags[t] == .builtin) {
+        if (std.mem.eql(u8, tree.tokenSlice(t), "@This")) return self_type;
+        return null;
+    }
+    if (tags[t] != .identifier) return null;
+    var last_id = tree.tokenSlice(t);
+    // `Self` → self_type.
+    if (std.mem.eql(u8, last_id, "Self")) {
+        if (self_type) |st| return st;
+        return null;
+    }
+    while (t + 2 <= last and tags[t + 1] == .period and tags[t + 2] == .identifier) : (t += 2) {
+        last_id = tree.tokenSlice(t + 2);
+    }
+    return last_id;
+}
+
+fn isPrimitiveTypeName(name: []const u8) bool {
+    // Zig primitives that can't hold a slice / borrow.  Slices and
+    // pointers are excluded — those CAN hold borrowed memory.  Bool
+    // and ints are sufficient to cover the common FP shape
+    // (`this.count: usize = fn(deferred, ...)`).
+    if (name.len == 0) return false;
+    // Numeric types: bool, void, type, anyerror, anyopaque, comptime_*,
+    // u<N>, i<N>, f<N>, c_*, usize, isize.
+    if (std.mem.eql(u8, name, "bool")) return true;
+    if (std.mem.eql(u8, name, "void")) return true;
+    if (std.mem.eql(u8, name, "type")) return true;
+    if (std.mem.eql(u8, name, "anyerror")) return true;
+    if (std.mem.eql(u8, name, "anyopaque")) return true;
+    if (std.mem.eql(u8, name, "usize")) return true;
+    if (std.mem.eql(u8, name, "isize")) return true;
+    if (std.mem.startsWith(u8, name, "comptime_")) return true;
+    if (std.mem.startsWith(u8, name, "c_")) return true;
+    // u<digits> / i<digits> / f<digits>.
+    if ((name[0] == 'u' or name[0] == 'i' or name[0] == 'f') and name.len >= 2) {
+        for (name[1..]) |c| if (c < '0' or c > '9') return false;
+        return true;
+    }
+    return false;
+}
+
+/// True iff `[start, end]` contains a `.<copy_method>(` shape where
+/// `<copy_method>` is a known copying call (returns owned, doesn't
+/// borrow from args).
+fn rhsContainsCopyingCall(tree: *const Ast, start: Ast.TokenIndex, end: Ast.TokenIndex) bool {
+    const tags = tree.tokens.items(.tag);
+    if (start + 2 > end) return false;
+    var t: Ast.TokenIndex = start;
+    while (t + 2 <= end) : (t += 1) {
+        if (tags[t] != .period) continue;
+        if (tags[t + 1] != .identifier) continue;
+        if (tags[t + 2] != .l_paren) continue;
+        const m = tree.tokenSlice(t + 1);
+        if (isCopyingMethodName(m)) return true;
+    }
+    return false;
+}
+
+fn isCopyingMethodName(name: []const u8) bool {
+    return std.mem.eql(u8, name, "toOwnedSlice") or
+        std.mem.eql(u8, name, "toOwnedSliceSentinel") or
+        std.mem.eql(u8, name, "dupe") or
+        std.mem.eql(u8, name, "dupeZ") or
+        std.mem.eql(u8, name, "clone") or
+        std.mem.eql(u8, name, "cloneZ") or
+        std.mem.eql(u8, name, "copyFrom") or
+        std.mem.eql(u8, name, "copyForwards") or
+        std.mem.eql(u8, name, "copyBackwards");
 }
 
 /// True iff the type expression at `[first, last]` starts with `*`
@@ -167,11 +311,6 @@ fn isPointerType(tags: []const std.zig.Token.Tag, first: Ast.TokenIndex, last: A
         t += 1;
     }
     return tags[t] == .asterisk;
-}
-
-fn isPointerParam(name: []const u8, params: []const []const u8) bool {
-    for (params) |p| if (std.mem.eql(u8, p, name)) return true;
-    return false;
 }
 
 fn isDeinitOrClose(name: []const u8) bool {
@@ -265,5 +404,60 @@ test "no defer doesn't fire" {
         \\pub fn parse(out: *[]const u8, src: []const u8) !void {
         \\    out.* = src;
         \\}
+    );
+}
+
+test "primitive-typed out field doesn't fire" {
+    // `this.count = fn(deferred, ...)` — count is usize, can't hold
+    // a borrowed slice.  The deferred name appears in args only.
+    try testing.expectNoFire(check,
+        \\const std = @import("std");
+        \\const Outer = struct {
+        \\    count: u32 = 0,
+        \\    pub fn doIt(this: *Outer, alloc: std.mem.Allocator) !void {
+        \\        const buf = try alloc.alloc(u8, 4);
+        \\        defer alloc.free(buf);
+        \\        this.count = doWork(buf);
+        \\    }
+        \\};
+        \\fn doWork(_: []u8) u32 { return 0; }
+    );
+}
+
+test "RHS with toOwnedSlice copy doesn't fire" {
+    // `out.* = blk: { ... break :blk try tmp.toOwnedSlice(allocator); };`
+    // The break value is OWNED via toOwnedSlice using the caller's
+    // allocator.  defer tmp.deref() doesn't invalidate the copy.
+    try testing.expectNoFire(check,
+        \\const std = @import("std");
+        \\const Wrapper = struct {
+        \\    pub fn deref(_: Wrapper) void {}
+        \\    pub fn toOwnedSlice(_: Wrapper, _: std.mem.Allocator) ![]const u8 {
+        \\        return "";
+        \\    }
+        \\};
+        \\fn makeTmp() Wrapper { return .{}; }
+        \\pub fn parse(out: *[]const u8, allocator: std.mem.Allocator) !void {
+        \\    const tmp = makeTmp();
+        \\    defer tmp.deref();
+        \\    out.* = try tmp.toOwnedSlice(allocator);
+        \\}
+    );
+}
+
+test "*@This() pointer param resolves field type via containing struct" {
+    // Param uses `*@This()` — extractTypeName must resolve to the
+    // containing type so the FileModel lookup hits.
+    try testing.expectNoFire(check,
+        \\const std = @import("std");
+        \\const PI = struct {
+        \\    file_count: u32 = 0,
+        \\    pub fn install(this: *@This(), alloc: std.mem.Allocator) !void {
+        \\        var subdir: std.fs.Dir = undefined;
+        \\        defer subdir.close();
+        \\        this.file_count = copyFiles(subdir, alloc);
+        \\    }
+        \\};
+        \\fn copyFiles(_: std.fs.Dir, _: std.mem.Allocator) u32 { return 0; }
     );
 }
