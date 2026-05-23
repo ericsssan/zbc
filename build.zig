@@ -24,9 +24,17 @@ pub fn build(b: *std.Build) void {
     // Powers cross-module type resolution in zls_resolver.zig.
     // ZLS targets Zig master; the version in build.zig.zon is
     // pinned by hash.
+    //
+    // `version-string` is forwarded explicitly because ZLS's
+    // build.zig runs `git describe` on its source tree to embed a
+    // version — but the extracted dependency tarball isn't a git
+    // repo, so the describe fails and ZLS prints a warning.
+    // Hard-coding silences it; the value matches the version in
+    // build.zig.zon.
     const zls_dep = b.dependency("zls", .{
         .target = target,
         .optimize = optimize,
+        .@"version-string" = @as([]const u8, "0.17.0-dev"),
     });
     const zls_mod = zls_dep.module("zls");
 

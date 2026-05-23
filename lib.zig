@@ -4,7 +4,6 @@ const std = @import("std");
 const Ast = std.zig.Ast;
 
 const cfg_mod = @import("cfg.zig");
-const annotations_mod = @import("annotations.zig");
 const analyzer_mod = @import("analyzer.zig");
 const config_mod = @import("config.zig");
 const problem_mod = @import("problem.zig");
@@ -50,9 +49,6 @@ pub fn analyzeEscape(
     var tree = try Ast.parse(gpa, src, .zig);
     defer tree.deinit(gpa);
 
-    var db = try annotations_mod.buildFull(gpa, &tree, config);
-    defer db.deinit(gpa);
-
     var problems: std.ArrayListUnmanaged(Problem) = .empty;
     errdefer freeProblemsArrayList(gpa, &problems);
 
@@ -94,7 +90,6 @@ pub fn analyzeEscape(
             gpa,
             &tree,
             node,
-            &db,
             config,
             &rule_cache,
             zls_ptr,
@@ -196,7 +191,6 @@ test "lib API: analyzeEscape end-to-end flags arena escape" {
 
 test {
     _ = cfg_mod;
-    _ = annotations_mod;
     _ = analyzer_mod;
     _ = config_mod;
     _ = problem_mod;

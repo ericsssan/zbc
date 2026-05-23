@@ -92,16 +92,18 @@ Each rule was extracted from real bug-fix PRs in Bun, TigerBeetle,
 Ghostty, Mach, or ziglang/zig's standard library.  The fixture
 in `test/fixtures/` documents the PR each rule was mined from.
 
-## Annotations
+## Analysis is pure-inference
 
-Most analysis is inference-driven.  Annotations fill the gaps
-where source shape is ambiguous:
+No annotations are read.  Every signal — heap-vs-arena origin,
+ownership transfer, borrow-from-parameter, allocator identity — is
+derived from body shape via the flow analyzer and the per-file
+FnSummary inference (`fn_summary.zig`).  Cross-module type
+questions go through ZLS (`zls_resolver.zig`).
 
-```zig
-/// @returns owned | borrowed_from(<param>) | owns_locals | heap
-/// @takes ownership(<param>)
-/// @borrowed                              (on a struct field)
-```
+The older `/// @returns`/`/// @takes`/`/// @borrowed` doc-comment
+annotation system is retired — zbc no longer parses these
+comments.  They are inert decoration; existing code that carries
+them works unchanged.
 
 ## Library use
 

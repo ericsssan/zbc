@@ -8,7 +8,6 @@ const std = @import("std");
 const Ast = std.zig.Ast;
 
 const cfg_mod = @import("cfg.zig");
-const annotations = @import("annotations.zig");
 
 const Cfg = cfg_mod.Cfg;
 const BlockId = cfg_mod.BlockId;
@@ -38,38 +37,16 @@ const TestBundle = struct {
 };
 
 fn parseAndLower(gpa: std.mem.Allocator, src: []const u8) !TestBundle {
-    return parseAndLowerCommon(gpa, src, false);
-}
-
-/// Same as parseAndLower but builds the same-file annotation DB and
-/// threads it through lowerFunction.  Use when tests exercise the
-/// annotated-call classification paths.  Db is intentionally leaked
-/// — its keys/values point into tree.source which the bundle owns.
-fn parseAndLowerWithDb(gpa: std.mem.Allocator, src: []const u8) !TestBundle {
-    return parseAndLowerCommon(gpa, src, true);
-}
-
-fn parseAndLowerCommon(gpa: std.mem.Allocator, src: []const u8, build_db: bool) !TestBundle {
     const src_z = try gpa.dupeSentinel(u8, src, 0);
     errdefer gpa.free(src_z);
     var tree = try Ast.parse(gpa, src_z, .zig);
     errdefer tree.deinit(gpa);
 
-    var db_storage: ?annotations.Db = if (build_db) try annotations.build(gpa, &tree) else null;
-    // Db owns only its map; deinit'd at bundle.deinit via leak-into-cfg
-    // pattern is wrong — we need to deinit it manually.  Easiest: free
-    // here on the success path too, since cfg only borrows annotation
-    // VALUES (which are small union types), not slice keys.  Wait — db
-    // is consulted DURING lowerFunction, then no longer needed once
-    // CFG emit completes.  Free immediately after lowerFunction returns.
-    defer if (db_storage) |*d| d.deinit(gpa);
-
     var node_idx: u32 = 1;
     while (node_idx < tree.nodes.len) : (node_idx += 1) {
         const node: Ast.Node.Index = @enumFromInt(node_idx);
         if (tree.nodeTag(node) == .fn_decl) {
-            const db_ptr: ?*const annotations.Db = if (db_storage) |*d| d else null;
-            const cfg = try lowerFunction(gpa, &tree, node, db_ptr);
+            const cfg = try lowerFunction(gpa, &tree, node);
             return .{ .src_z = src_z, .tree = tree, .cfg = cfg };
         }
     }

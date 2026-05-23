@@ -7,7 +7,6 @@ const cfg_mod = @import("cfg.zig");
 const state_mod = @import("abstract_state.zig");
 const transfer = @import("transfer.zig");
 const problem_mod = @import("problem.zig");
-const annotations = @import("annotations.zig");
 const config_mod = @import("config.zig");
 const file_cache_mod = @import("file_cache.zig");
 
@@ -178,9 +177,6 @@ fn analyze(gpa: std.mem.Allocator, src: []const u8) !std.ArrayListUnmanaged(Prob
     var tree = try Ast.parse(gpa, src_z, .zig);
     defer tree.deinit(gpa);
 
-    var db = try annotations.build(gpa, &tree);
-    defer db.deinit(gpa);
-
     var rule_cache = file_cache_mod.FileCache.init(gpa, &tree);
     defer rule_cache.deinit();
     try rule_cache.resolveTransitiveTakes();
@@ -195,7 +191,6 @@ fn analyze(gpa: std.mem.Allocator, src: []const u8) !std.ArrayListUnmanaged(Prob
             gpa,
             &tree,
             node,
-            &db,
             &config_mod.Default,
             &rule_cache,
         )) orelse continue;
@@ -547,11 +542,14 @@ test "arena_escape: composite via direct arena_local.method() is flagged" {
     const gpa = std.testing.allocator;
     var problems = try analyze(gpa,
         \\const std = @import("std");
+        \\const Arena = struct {
+        \\    inner: std.heap.ArenaAllocator,
+        \\    bytes: []const u8 = "",
+        \\    pub fn arenaText(self: *const Arena) []const u8 { return self.bytes; }
+        \\};
         \\const Wrapper = struct { s: []const u8 };
-        \\/// @returns borrowed_from(self)
-        \\pub fn arenaText(self: *std.heap.ArenaAllocator) []const u8 { _ = self; return ""; }
         \\pub fn foo() Wrapper {
-        \\    var arena = std.heap.ArenaAllocator.init(undefined);
+        \\    var arena = Arena{ .inner = std.heap.ArenaAllocator.init(undefined) };
         \\    return Wrapper{ .s = arena.arenaText() };
         \\}
         \\
@@ -559,7 +557,7 @@ test "arena_escape: composite via direct arena_local.method() is flagged" {
     defer freeProblems(gpa, &problems);
     var found = false;
     for (problems.items) |p| {
-        if (std.mem.indexOf(u8, p.message, "borrow from function-local arena") != null) found = true;
+        if (std.mem.indexOf(u8, p.message, "function-local arena") != null) found = true;
     }
     try std.testing.expect(found);
 }
@@ -569,8 +567,8 @@ test "arena_escape: composite via chained field-access then method is flagged" {
     var problems = try analyze(gpa,
         \\const std = @import("std");
         \\const Arena = struct {
-        \\    /// @returns borrowed_from(self)
-        \\    pub fn text(self: *const Arena) []const u8 { _ = self; return ""; }
+        \\    bytes: []const u8 = "",
+        \\    pub fn text(self: *const Arena) []const u8 { return self.bytes; }
         \\};
         \\const Wrapper = struct { s: []const u8 };
         \\const Outer = struct { inner: std.heap.ArenaAllocator, a: Arena };
@@ -581,9 +579,6 @@ test "arena_escape: composite via chained field-access then method is flagged" {
         \\
     );
     defer freeProblems(gpa, &problems);
-    // Walker matches `<local> ( . <id> )* . <method> (` — so
-    // `o.a.text()` fires once we recognize the field chain before
-    // the method call.
     var fired = false;
     for (problems.items) |p| {
         if (std.mem.indexOf(u8, p.message, "function-local arena") != null) fired = true;

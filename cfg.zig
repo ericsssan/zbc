@@ -29,7 +29,6 @@
 const std = @import("std");
 const Ast = std.zig.Ast;
 const abstract_state = @import("abstract_state.zig");
-const annotations = @import("annotations.zig");
 const config_mod = @import("config.zig");
 const file_cache = @import("file_cache.zig");
 const fn_summary = @import("fn_summary.zig");
@@ -387,30 +386,22 @@ pub fn lowerFunction(
     gpa: std.mem.Allocator,
     tree: *const Ast,
     fn_decl: Ast.Node.Index,
-    db: ?*const annotations.Db,
 ) !?Cfg {
-    return lowerFunctionFull(gpa, tree, fn_decl, db, &config_mod.Default, null);
+    return lowerFunctionFull(gpa, tree, fn_decl, &config_mod.Default, null);
 }
 
 /// Main entry point.  Generalizes the per-project knobs into Config
-/// (phase 42).  Existing callers that don't pass a Config get
-/// `Default`, which matches the historical ez behavior — type name
-/// "Ast", text patterns "Ast.parse" / "ArenaAllocator.init" /
-/// ".deinit(" / ".join(".
-///
-/// `cache` is the per-file FileCache used by the new FnSummary /
-/// FileModel queries.  Optional during the annotations.Db ->
-/// inference migration; when provided, queries prefer cache lookups
-/// over db.  When null, falls back to db (legacy path).
+/// (phase 42).  `cache` is the per-file FileCache for FnSummary /
+/// FileModel queries — required for cross-fn inference; pass null only
+/// in narrow test helpers that exercise single-fn flow analysis.
 pub fn lowerFunctionFull(
     gpa: std.mem.Allocator,
     tree: *const Ast,
     fn_decl: Ast.Node.Index,
-    db: ?*const annotations.Db,
     config: *const Config,
     cache: ?*file_cache.FileCache,
 ) !?Cfg {
-    return lowerFunctionFullWithZls(gpa, tree, fn_decl, db, config, cache, null);
+    return lowerFunctionFullWithZls(gpa, tree, fn_decl, config, cache, null);
 }
 
 /// Variant that also accepts a ZLS-backed type resolver.  When
@@ -421,7 +412,6 @@ pub fn lowerFunctionFullWithZls(
     gpa: std.mem.Allocator,
     tree: *const Ast,
     fn_decl: Ast.Node.Index,
-    db: ?*const annotations.Db,
     config: *const Config,
     cache: ?*file_cache.FileCache,
     zls: ?*zls_resolver_mod.ZlsResolver,
@@ -438,26 +428,24 @@ pub fn lowerFunctionFullWithZls(
     else
         false;
 
-    // Check whether THIS fn carries `@returns owns_locals` — if so,
-    // suppress composite-borrow detection inside its body.
-    const suppress_cb = blk: {
-        const d = db orelse break :blk false;
-        const name_tok = fn_proto.name_token orelse break :blk false;
-        const name = tree.tokenSlice(name_tok);
-        const entry = d.lookup(name) orelse break :blk false;
-        const a = entry.annotation orelse break :blk false;
-        break :blk a == .owns_locals;
-    };
+    // `owns_locals` was an annotation-comment opt-out that suppressed
+    // composite-borrow detection inside a fn body.  With annotation
+    // parsing retired, no fn opts out — inference always runs.
+    const suppress_cb = false;
 
-    // Pull the containing type for this fn_decl from the DB's
-    // pre-pass map so Self / @This() resolve inside param types and
-    // receiver-type lookups have a starting scope.
-    const self_type: ?[]const u8 = if (db) |d| d.containingType(fn_decl) else null;
+    // Pull the containing type via the FileCache's FileModel so
+    // Self / @This() resolve inside param types and receiver-type
+    // lookups have a starting scope.
+    const self_type: ?[]const u8 = blk: {
+        const c = cache orelse break :blk null;
+        const model = c.fileModel() catch break :blk null;
+        const ti = model.containingTypeOf(fn_decl) orelse break :blk null;
+        break :blk ti.name;
+    };
 
     var builder: Builder = .{
         .gpa = gpa,
         .tree = tree,
-        .db = db,
         .cache = cache,
         .zls = zls,
         .config = config,
@@ -561,10 +549,8 @@ const DeferEntry = struct { kind: DeferKind, body: Ast.Node.Index };
 const Builder = struct {
     gpa: std.mem.Allocator,
     tree: *const Ast,
-    db: ?*const annotations.Db = null,
     /// Per-file FileCache for FnSummary / FileModel queries — the
-    /// new inference-driven path that's replacing db queries.
-    /// Optional during migration; null falls back to db.
+    /// per-file shared model + inference cache.
     cache: ?*file_cache.FileCache = null,
     /// Optional ZLS-backed type resolver.  When set, `receiverTypeOfNode`
     /// falls back to ZLS when zbc's own type-name tracking can't
@@ -1246,29 +1232,8 @@ const Builder = struct {
 
         // Find any method on type `ct` whose body allocates a heap
         // instance of the type (`<x>.create(<ct>)` / `.create(Self)`).
-        // Prefer the FileCache's FnSummary inference; fall back to db
-        // for callers that haven't wired cache yet.
-        const creator_found = if (self.cache) |c|
-            (c.anyMethodAllocatesSelf(ct) catch false)
-        else blk: {
-            const db = self.db orelse return null;
-            var found = false;
-            var it = db.fns.valueIterator();
-            while (it.next()) |list| {
-                for (list.items) |e| {
-                    if (e.heap_allocates_self) {
-                        if (e.containing_type) |ect| {
-                            if (std.mem.eql(u8, ect, ct)) {
-                                found = true;
-                                break;
-                            }
-                        }
-                    }
-                }
-                if (found) break;
-            }
-            break :blk found;
-        };
+        const cache = self.cache orelse return null;
+        const creator_found = cache.anyMethodAllocatesSelf(ct) catch false;
         if (!creator_found) return null;
 
         // The destructor must NOT have @takes(self) — that would
@@ -2782,10 +2747,6 @@ const Builder = struct {
         if (self.cache) |c| {
             if (c.summaryByName(name) catch null) |s| if (s.is_noreturn) return true;
         }
-        if (tree.nodeTag(callee) == .field_access) {
-            const recv = tree.nodeData(callee).node_and_token[0];
-            if (self.lookupRemoteSummary(recv, name)) |s| if (s.is_noreturn) return true;
-        }
         // Aliased noreturn local: `const exit = std.process.exit;`
         // then `exit(1)`.  Bare-identifier callee referencing a
         // local whose init was a known noreturn chain.
@@ -2811,33 +2772,6 @@ const Builder = struct {
             if (std.mem.endsWith(u8, callee_text, pat)) return true;
         }
         return false;
-    }
-
-    /// Cross-file FnEntry lookup — retired with remote_resolver.  ZLS
-    /// handles cross-file type resolution now; annotation propagation
-    /// across files is no longer supported.  Always null.
-    fn lookupRemoteEntry(
-        self: *Builder,
-        recv_node: Ast.Node.Index,
-        method_name: []const u8,
-    ) ?annotations.FnEntry {
-        _ = self;
-        _ = recv_node;
-        _ = method_name;
-        return null;
-    }
-
-    /// FnSummary-equivalent of lookupRemoteEntry — retired with
-    /// remote_resolver.  Always null.
-    fn lookupRemoteSummary(
-        self: *Builder,
-        recv_node: Ast.Node.Index,
-        method_name: []const u8,
-    ) ?*const fn_summary.FnSummary {
-        _ = self;
-        _ = recv_node;
-        _ = method_name;
-        return null;
     }
 
     /// If the callee has `@takes ownership(p)`, return the LocalId
@@ -2900,16 +2834,6 @@ const Builder = struct {
                     }
                 }
             }
-            if (recv_ty) |ty| {
-                if (self.lookupCrossFileSummary(ty, callee_name)) |s| {
-                    if (s.takes_ownership_of) |i| break :blk i;
-                }
-            }
-            if (receiver_is_arg0) {
-                if (self.lookupRemoteSummary(recv_node.?, callee_name)) |s| {
-                    if (s.takes_ownership_of) |i| break :blk i;
-                }
-            }
             return null;
         };
 
@@ -2917,7 +2841,9 @@ const Builder = struct {
         // receiver IS the imported namespace — not part of the
         // callee's logical arg list.  ast.params already holds the
         // full explicit-arg list; don't subtract for the namespace.
-        const effective_recv_is_arg0 = receiver_is_arg0 and !self.calleeIsImportedNamespace(recv_node.?);
+        // Cross-file detection retired with remote_resolver; receiver
+        // is now always treated as arg 0 for field-access callees.
+        const effective_recv_is_arg0 = receiver_is_arg0;
 
         const candidate = if (effective_recv_is_arg0 and target_idx == 0)
             recv_node.?
@@ -2966,14 +2892,9 @@ const Builder = struct {
         // overload's annotation across types).
         const recv_ty: ?[]const u8 = blk: {
             const parent_ty = self.locals.items[@intFromEnum(parent)].type_name orelse break :blk null;
-            // Prefer the FileCache's FileModel; fall back to db for
-            // callers that haven't wired cache yet (e.g. cfg_tests).
-            if (self.cache) |c| {
-                const model = c.fileModel() catch break :blk null;
-                break :blk model.fieldType(parent_ty, field_name);
-            }
-            const db = self.db orelse break :blk null;
-            break :blk db.fieldType(parent_ty, field_name);
+            const cache = self.cache orelse break :blk null;
+            const model = cache.fileModel() catch break :blk null;
+            break :blk model.fieldType(parent_ty, field_name);
         };
 
         // Resolve method's @takes: cache (typed only) -> db -> cross-file.
@@ -2985,9 +2906,6 @@ const Builder = struct {
                     if (c.summaryByMethod(ty, method_name) catch null) |s| {
                         if (s.takes_ownership_of) |i| break :blk i;
                     }
-                }
-                if (self.lookupCrossFileSummary(ty, method_name)) |s| {
-                    if (s.takes_ownership_of) |i| break :blk i;
                 }
             }
             return null;
@@ -3105,27 +3023,12 @@ const Builder = struct {
                     }
                 }
             }
-            if (recv_ty) |ty| {
-                if (self.lookupCrossFileSummary(ty, callee_name)) |s| {
-                    if (s.may_free_fields.len > 0) {
-                        const n = @min(s.may_free_fields.len, free_buf.len);
-                        for (s.may_free_fields[0..n], 0..) |ff, i| {
-                            free_buf[i] = .{ .param = ff.param, .field = ff.field };
-                        }
-                        break :blk free_buf[0..n];
-                    }
-                }
-            }
             return;
         };
 
-        // For method-call shape, param 0 is the receiver; subsequent
-        // params come from explicit args.  Imported namespaces
-        // (`bun.method(p)`) are NOT a logical arg — strip from the
-        // receiver-is-arg0 calculation so param indices map to
-        // explicit args directly.
-        const effective_recv_is_arg0 = receiver_is_arg0 and recv_node != null and
-            !self.calleeIsImportedNamespace(recv_node.?);
+        // Receiver is param 0 for field-access callees.  Cross-file
+        // namespace detection retired with remote_resolver.
+        const effective_recv_is_arg0 = receiver_is_arg0 and recv_node != null;
 
         for (frees) |ff| {
             // Map the callee's param index to the caller's arg node.
@@ -3144,64 +3047,6 @@ const Builder = struct {
             const parent = self.name_to_local.get(arg_name) orelse continue;
             try out.append(gpa, .{ .parent = parent, .field = ff.field });
         }
-    }
-
-    /// Cross-file method lookup by (containing_type, method_name).
-    /// Walks every imap entry, loads the file, checks if that file
-    /// declares `type_name` (via Db.hasType), and if so does the
-    /// typed lookup there.  Returns the first matching entry.
-    ///
-    /// Used when a local has a type name that isn't defined in the
-    /// caller's file — e.g. `var loader: *lib.HTMLRewriterLoader =
-    /// ...; loader.finalize();` where HTMLRewriterLoader lives in
-    /// lib.zig.  The local db can't find HTMLRewriterLoader; this
-    /// helper walks imports and tries each remote db.
-    ///
-    /// Cross-file typed method lookup — retired with remote_resolver.
-    /// Always null.
-    fn lookupCrossFileMethod(
-        self: *Builder,
-        type_name: []const u8,
-        method_name: []const u8,
-    ) ?annotations.FnEntry {
-        _ = self;
-        _ = type_name;
-        _ = method_name;
-        return null;
-    }
-
-    /// FnSummary cross-file typed lookup — retired with remote_resolver.
-    /// Always null.
-    fn lookupCrossFileSummary(
-        self: *Builder,
-        type_name: []const u8,
-        method_name: []const u8,
-    ) ?*const fn_summary.FnSummary {
-        _ = self;
-        _ = type_name;
-        _ = method_name;
-        return null;
-    }
-
-    /// Cross-file `@takes` lookup — retired with remote_resolver.
-    /// Always null.
-    fn lookupRemoteTakes(
-        self: *Builder,
-        recv_node: Ast.Node.Index,
-        method_name: []const u8,
-    ) ?annotations.TakesAnnotation {
-        _ = self;
-        _ = recv_node;
-        _ = method_name;
-        return null;
-    }
-
-    /// Was: identifier resolves to an imported namespace in our imap.
-    /// Retired with remote_resolver — always false.
-    fn calleeIsImportedNamespace(self: *Builder, node: Ast.Node.Index) bool {
-        _ = self;
-        _ = node;
-        return false;
     }
 
     /// For `<allocator>.free(p)` / `<allocator>.destroy(p)`, return the
@@ -3291,8 +3136,6 @@ const Builder = struct {
                 // and our pattern matched only because the *arg* also
                 // looked allocator-ish (rare, but possible).
                 if (looksLikeAllocatorName(name)) return null;
-                // Skip imported namespaces (`bun.destroy(...)`).
-                if (self.calleeIsImportedNamespace(recv)) return null;
                 const id = self.name_to_local.get(name) orelse return null;
                 return .{ .local = id };
             },
@@ -3747,7 +3590,7 @@ const Builder = struct {
     /// escape checks even on value-shape returns.
     fn firstResourceMethodBorrow(self: *Builder, expr_node: Ast.Node.Index) ?LocalId {
         const tree = self.tree;
-        const db = self.db orelse return null;
+        const cache = self.cache orelse return null;
         const first = tree.firstToken(expr_node);
         const last = tree.lastToken(expr_node);
         const tags = tree.tokens.items(.tag);
@@ -3755,9 +3598,7 @@ const Builder = struct {
         var t: Ast.TokenIndex = first;
         while (t + 3 <= last) : (t += 1) {
             if (tags[t] != .identifier) continue;
-            // Receiver token must not itself be a field (preceded by `.`).
             if (t > 0 and tags[t - 1] == .period) continue;
-            // Must be followed by at least one `.`
             if (tags[t + 1] != .period) continue;
 
             const recv_name = tree.tokenSlice(t);
@@ -3765,18 +3606,28 @@ const Builder = struct {
             const hint = self.locals.items[@intFromEnum(local)].init_hint;
             if (hint == .other) continue;
 
-            // Walk the dot-chain: every step must be `. <id>`.  The
-            // last `<id>` before `(` is the method we look up.
-            var k: Ast.TokenIndex = t + 1; // current `.`
+            // Walk the dot-chain.  Track each intermediate identifier
+            // as a field segment so we can walk `local.f1.f2.method()`
+            // through the model.fieldType chain to find the type that
+            // owns `method`.  Last ident before `(` is the method.
+            var k: Ast.TokenIndex = t + 1;
             var method_tok: Ast.TokenIndex = 0;
+            var field_first: Ast.TokenIndex = 0;
+            var field_last: Ast.TokenIndex = 0;
             while (k + 1 <= last and tags[k] == .period and tags[k + 1] == .identifier) {
+                // The ident at k+1 might be a field or the method.  We
+                // can't tell yet — record it provisionally as method;
+                // if a following `.` shows up, demote to field segment.
+                if (method_tok != 0) {
+                    if (field_first == 0) field_first = method_tok;
+                    field_last = method_tok;
+                }
                 method_tok = k + 1;
                 k += 2;
                 if (k > last) break;
                 if (tags[k] == .l_paren) break;
-                // Otherwise expect another `.` for next chain step.
                 if (tags[k] != .period) {
-                    method_tok = 0; // not a method-call chain
+                    method_tok = 0;
                     break;
                 }
             }
@@ -3784,11 +3635,29 @@ const Builder = struct {
             if (k > last or tags[k] != .l_paren) continue;
 
             const method_name = tree.tokenSlice(method_tok);
-            const entry = db.lookup(method_name) orelse continue;
-            if (entry.annotation) |a| switch (a) {
+            const recv_ty = self.locals.items[@intFromEnum(local)].type_name orelse continue;
+
+            // Walk the field path through the model to find the type
+            // that owns `method`.  No field segments → method is on
+            // local's own type.  With segments, each step asks the
+            // model for the next field's type.
+            const final_ty: ?[]const u8 = blk: {
+                if (field_first == 0) break :blk recv_ty;
+                const model = cache.fileModel() catch break :blk null;
+                var cur_ty: []const u8 = recv_ty;
+                var ft: Ast.TokenIndex = field_first;
+                while (ft <= field_last) : (ft += 2) {
+                    const fname = tree.tokenSlice(ft);
+                    cur_ty = model.fieldType(cur_ty, fname) orelse break :blk null;
+                }
+                break :blk cur_ty;
+            };
+            const ty = final_ty orelse continue;
+            const summary = (cache.summaryByMethod(ty, method_name) catch null) orelse continue;
+            switch (summary.returns) {
                 .borrowed_from => |idx| if (idx == 0) return local,
                 else => {},
-            };
+            }
         }
         return null;
     }
@@ -4154,18 +4023,11 @@ const Builder = struct {
                 if (self.cache) |c| {
                     if (self.receiverTypeOfNode(recv_node)) |ty| {
                         if (c.summaryByMethod(ty, method_name) catch null) |s| {
-                            if (summaryToAnnotation(s)) |a| {
-                                return self.applyAnnotationToCall(a, recv_node, args, recv_is_local);
-                            }
+                            if (self.applySummaryReturnsToCall(s.returns, recv_node, args, recv_is_local)) |k| return k;
                         }
                     }
                 }
 
-                // 2. Cross-file: receiver is a bare identifier (the
-                //    imported namespace), method lives in that file.
-                if (self.lookupRemoteMethod(recv_node, method_name)) |annotation| {
-                    return self.applyAnnotationToCall(annotation, callee_node, args, false);
-                }
                 return .unknown;
             },
             .identifier => {
@@ -4173,9 +4035,7 @@ const Builder = struct {
                 const fn_name = self.resolveBoundCallee(raw_name);
                 if (self.cache) |c| {
                     if (c.summaryByName(fn_name) catch null) |s| {
-                        if (summaryToAnnotation(s)) |a| {
-                            return self.applyAnnotationToCall(a, callee_node, args, false);
-                        }
+                        if (self.applySummaryReturnsToCall(s.returns, callee_node, args, false)) |k| return k;
                     }
                 }
                 return .unknown;
@@ -4691,46 +4551,19 @@ const Builder = struct {
         }
     }
 
-    /// Cross-file annotation lookup — retired with remote_resolver.
-    /// Always null.
-    fn lookupRemoteMethod(
+    /// Map a FnSummary's inferred return shape to the ExprKind we
+    /// emit at the call site.  Mirrors what annotations.zig used to
+    /// do via the parsed `/// @returns ...` doc-comment, but driven
+    /// purely from body-shape inference.  `.unknown` and `.plain`
+    /// produce null (caller's existing ExprKind stands).
+    fn applySummaryReturnsToCall(
         self: *Builder,
-        recv_node: Ast.Node.Index,
-        method_name: []const u8,
-    ) ?annotations.ReturnsAnnotation {
-        _ = self;
-        _ = recv_node;
-        _ = method_name;
-        return null;
-    }
-
-    /// Conservatively translate a body-only FnSummary.Returns into
-    /// the same-meaning annotations.ReturnsAnnotation, or null when
-    /// the summary doesn't carry an actionable signal.  Used by the
-    /// cfg consumers that previously read `entry.annotation`.
-    ///
-    /// `.heap` collapses to `.owned` rather than `.heap` to preserve
-    /// the OLD R6-inferred semantics — annotations.zig's R6 path
-    /// produced `.owned` for slice-returning + alloc-body fns, NOT
-    /// `.heap` (which would mint a HeapId at every call site and
-    /// strengthen UAF tracking).  Migrating to .heap is a separate
-    /// decision that needs sweep verification on real corpora.
-    fn summaryToAnnotation(s: *const fn_summary.FnSummary) ?annotations.ReturnsAnnotation {
-        return switch (s.returns) {
-            .heap, .owned => .owned,
-            .borrowed_from => |p| .{ .borrowed_from = p },
-            .plain, .unknown => null,
-        };
-    }
-
-    fn applyAnnotationToCall(
-        self: *Builder,
-        anno: annotations.ReturnsAnnotation,
+        ret: fn_summary.Returns,
         receiver_or_callee: Ast.Node.Index,
         args: []const Ast.Node.Index,
         receiver_is_arg0: bool,
-    ) ExprKind {
-        switch (anno) {
+    ) ?ExprKind {
+        switch (ret) {
             .owned => return .owned,
             .borrowed_from => |target_idx| {
                 if (receiver_is_arg0 and target_idx == 0) {
@@ -4740,22 +4573,15 @@ const Builder = struct {
                 if (explicit_idx >= args.len) return .unknown;
                 return self.identifierToCopyOrUnknown(args[explicit_idx]);
             },
-            // owns_locals only affects the CALLEE's own analysis (it
-            // suppresses composite-borrow detection inside that fn's
-            // body).  At call sites it tells us nothing about the
-            // returned value's lifetime beyond "the callee took
-            // responsibility for whatever it embedded."  Treat as
-            // .owned — caller has no remaining liability.
-            .owns_locals => return .owned,
-            // `@returns heap` — mint a HeapId at THIS call site so
-            // downstream free/use tracking fires.  Same shape as a
-            // direct `.heap_alloc` from the heap_alloc_patterns text
-            // match.
+            // `.heap` — mint a HeapId at THIS call site so downstream
+            // free/use tracking fires.  Same shape as a direct
+            // `.heap_alloc` from the heap_alloc_patterns text match.
             .heap => {
                 const hid: abstract_state.HeapId = @enumFromInt(self.next_heap);
                 self.next_heap += 1;
                 return .{ .heap_alloc = .{ .id = hid } };
             },
+            .plain, .unknown => return null,
         }
     }
 
