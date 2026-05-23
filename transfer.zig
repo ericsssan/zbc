@@ -629,6 +629,16 @@ fn transferOutParamWrite(
             if (!config_mod.isEnabled(ctx.config, .arena_escape)) return;
             const st = state.arenas.get(aid) orelse return;
             if (st.is_heap_allocated) return;
+            // Installation, not escape: `this.<field> = ArenaAllocator.init(...)`
+            // moves the freshly-created arena INTO the caller-visible
+            // storage.  The arena's lifetime extends to the storage's
+            // lifetime — `this` lives at least as long as the fn, so
+            // installing an arena into `this.<field>` is the canonical
+            // setup-time pattern, not an escape.  The bug shape is
+            // `arena.allocator().alloc(...)` written through — a BORROW
+            // FROM the arena leaving the frame — which arrives here
+            // with value_kind != .arena_init.
+            if (w.value_kind == .arena_init) return;
             try report(ctx, "arena-escape", pos, end_pos, .@"error",
                 "writing a value borrowed from a function-local arena through `{s}` (escapes its lifetime)",
                 .{out_name});
