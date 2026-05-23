@@ -1246,29 +1246,38 @@ const Builder = struct {
         // by Builder.self_type at fn lowering setup).
         const ct = self.self_type orelse return null;
 
-        const db = self.db orelse return null;
-        // Find any entry on type T that has heap_allocates_self.
-        // db.fns is a multi-map; iterate all entries.
-        var creator_found = false;
-        var it = db.fns.valueIterator();
-        while (it.next()) |list| {
-            for (list.items) |e| {
-                if (e.heap_allocates_self) {
-                    if (e.containing_type) |ect| {
-                        if (std.mem.eql(u8, ect, ct)) {
-                            creator_found = true;
-                            break;
+        // Find any method on type `ct` whose body allocates a heap
+        // instance of the type (`<x>.create(<ct>)` / `.create(Self)`).
+        // Prefer the FileCache's FnSummary inference; fall back to db
+        // for callers that haven't wired cache yet.
+        const creator_found = if (self.cache) |c|
+            (c.anyMethodAllocatesSelf(ct) catch false)
+        else blk: {
+            const db = self.db orelse return null;
+            var found = false;
+            var it = db.fns.valueIterator();
+            while (it.next()) |list| {
+                for (list.items) |e| {
+                    if (e.heap_allocates_self) {
+                        if (e.containing_type) |ect| {
+                            if (std.mem.eql(u8, ect, ct)) {
+                                found = true;
+                                break;
+                            }
                         }
                     }
                 }
+                if (found) break;
             }
-            if (creator_found) break;
-        }
+            break :blk found;
+        };
         if (!creator_found) return null;
 
         // The destructor must NOT have @takes(self) — that would
         // mean it does free self, no leak.  Look up this fn's own
-        // entry in the db.
+        // entry in the db.  (This lookup is still db-based; the
+        // FnSummary.takes_ownership_of migration belongs to CFG-4.)
+        const db = self.db orelse return ct;
         const this_entry = db.lookupTyped(ct, fn_name) orelse return ct;
         if (this_entry.takes) |t| switch (t) {
             .ownership => |idx| if (idx == 0) return null,

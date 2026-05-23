@@ -93,6 +93,27 @@ pub const FileCache = struct {
         return gop.value_ptr;
     }
 
+    /// True iff any method on the file's type `type_name` has a
+    /// body that allocates a heap instance of the type itself
+    /// (`<x>.create(<type_name>)` or `<x>.create(Self)`).
+    ///
+    /// Composes FileModel + summaryOfFn — runs FnSummary inference
+    /// across the type's methods, short-circuits on first hit.
+    /// Replaces the old `db.fns.iter()` heap_allocates_self scan
+    /// from annotations.Db.
+    pub fn anyMethodAllocatesSelf(
+        self: *FileCache,
+        type_name: []const u8,
+    ) !bool {
+        const model = try self.fileModel();
+        const ti = model.findType(type_name) orelse return false;
+        for (ti.methods) |m| {
+            const s = try self.summaryOfFn(m.fn_decl);
+            if (s.heap_allocates_self) return true;
+        }
+        return false;
+    }
+
     /// Like summaryOf but also fills the deep inference fields that
     /// require allocation (`may_free_fields`, `result_heap_fields`)
     /// and the contextual field (`heap_allocates_self`).  Slice
@@ -191,6 +212,30 @@ test "FileCache: localBindings caches per body" {
     const b1 = try cache.localBindings(bar.proto, bar.body);
     try std.testing.expect(a1 == a2);
     try std.testing.expect(a1 != b1);
+}
+
+test "FileCache: anyMethodAllocatesSelf detects type with heap factory method" {
+    const gpa = std.testing.allocator;
+    const src: [:0]const u8 =
+        \\const Foo = struct {
+        \\    x: u32,
+        \\    pub fn create(alloc: std.mem.Allocator) !*Foo {
+        \\        return try alloc.create(Foo);
+        \\    }
+        \\    pub fn deinit(self: *Foo) void { _ = self; }
+        \\};
+        \\const Bar = struct {
+        \\    pub fn deinit(self: *Bar) void { _ = self; }
+        \\};
+    ;
+    var tree = try Ast.parse(gpa, src, .zig);
+    defer tree.deinit(gpa);
+    var cache = FileCache.init(gpa, &tree);
+    defer cache.deinit();
+
+    try std.testing.expect(try cache.anyMethodAllocatesSelf("Foo"));
+    try std.testing.expect(!try cache.anyMethodAllocatesSelf("Bar"));
+    try std.testing.expect(!try cache.anyMethodAllocatesSelf("Missing"));
 }
 
 test "FileCache: summaryOfFn fills deep fields (heap_allocates_self + result_heap_fields)" {
