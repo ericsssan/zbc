@@ -136,6 +136,15 @@ fn checkBody(
             t = sc;
             continue;
         }
+        // Skip when the assignment is inside `if (!<X>) { ... }` —
+        // the negation guard means the write runs on the FALSE
+        // path, i.e. when the prior state was empty/uninitialized
+        // (canonical lazy-init shape).  Common for `if
+        // (!this.loaded) { this.X = ... }`.
+        if (insideNegationGuard(tree, first, t)) {
+            t = sc;
+            continue;
+        }
         // Skip inline `defer <this>.<field> = saved;` and
         // `errdefer <this>.<field> = saved;` — the save/restore
         // pattern where the prior value was captured to a local and
@@ -395,6 +404,56 @@ fn rhsIsNullOrUndefined(tree: *const Ast, start: Ast.TokenIndex, end: Ast.TokenI
 /// tokens before that `orelse` are the same `<this>.<field>` chain.
 /// Inside such a block the prior value is guaranteed null, so the
 /// assignment isn't an overwrite.
+/// True iff the assignment sits inside `if (!<expr>) { ... }` —
+/// the negation-guarded init pattern.  Walk back to the enclosing
+/// `{`, check that the matching token sequence reading back is
+/// `(` ... `!` ... `)` ... `{`.  Conservative: only the very
+/// outermost expression's first non-paren token after the `(` is
+/// inspected; nested `!` isn't required.
+fn insideNegationGuard(
+    tree: *const Ast,
+    start: Ast.TokenIndex,
+    assign_tok: Ast.TokenIndex,
+) bool {
+    const tags = tree.tokens.items(.tag);
+    var depth: i32 = 0;
+    var t: Ast.TokenIndex = assign_tok;
+    while (t > start) {
+        t -= 1;
+        switch (tags[t]) {
+            .r_brace => depth += 1,
+            .l_brace => {
+                if (depth == 0) {
+                    // Found the opening brace of our enclosing block.
+                    // Must be preceded by `)` (the if-condition's close).
+                    if (t < 3) return false;
+                    if (tags[t - 1] != .r_paren) return false;
+                    // Walk back paren-balanced to the `(`.
+                    var p_depth: i32 = 1;
+                    var p: Ast.TokenIndex = t - 1;
+                    while (p > start and p_depth > 0) {
+                        p -= 1;
+                        switch (tags[p]) {
+                            .r_paren => p_depth += 1,
+                            .l_paren => p_depth -= 1,
+                            else => {},
+                        }
+                    }
+                    if (p_depth != 0) return false;
+                    // Token before `(` should be `if`.
+                    if (p == 0 or tags[p - 1] != .keyword_if) return false;
+                    // First token inside `(` must be `!`.
+                    if (p + 1 >= t - 1) return false;
+                    return tags[p + 1] == .bang;
+                }
+                depth -= 1;
+            },
+            else => {},
+        }
+    }
+    return false;
+}
+
 fn insideOrelseGuard(
     tree: *const Ast,
     start: Ast.TokenIndex,
