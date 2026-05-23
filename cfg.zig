@@ -1716,7 +1716,7 @@ const Builder = struct {
             self.typeIsStackArray(tn)
         else
             false;
-        const is_pointer = if (var_decl.ast.type_node.unwrap()) |tn|
+        var is_pointer = if (var_decl.ast.type_node.unwrap()) |tn|
             self.typeIsPointer(tn)
         else
             false;
@@ -1736,6 +1736,24 @@ const Builder = struct {
             self.classifyExpr(init)
         else
             .plain;
+
+        // Infer is_pointer from the init expression when there's no
+        // explicit type annotation.  Catches the common shapes:
+        //   - `const p = &x.field;` — literal address-of
+        //   - `const p = gpa.create(T);` — heap-alloc returns *T
+        //   - `const p = &x;` aliasing a known pointer local (copy_of)
+        // Prevents stack-escape FPs on `&p.subfield` later, since p
+        // is itself a pointer into caller-owned (or heap) storage.
+        if (!is_pointer) {
+            if (init_opt) |init| {
+                if (tree.nodeTag(init) == .address_of) is_pointer = true;
+            }
+            if (init_kind == .heap_alloc) is_pointer = true;
+            if (init_kind == .copy_of) {
+                const src = init_kind.copy_of;
+                if (self.locals.items[@intFromEnum(src)].is_pointer) is_pointer = true;
+            }
+        }
 
         // Derive init_hint from the classification — avoids a second
         // classifyExpr call (which would double-mint Arena/Heap ids).
@@ -3346,7 +3364,16 @@ const Builder = struct {
                     // caller, not this fn's stack frame.  `&self.field`
                     // where `self: *Self` is a borrow from caller-owned
                     // storage — not a stack escape candidate.
-                    if (self.locals.items[@intFromEnum(fref.parent)].is_pointer) {
+                    const parent_info = self.locals.items[@intFromEnum(fref.parent)];
+                    if (parent_info.is_pointer) {
+                        return .unknown;
+                    }
+                    // Heap-allocated parent: same logic.  `&prealloc.f`
+                    // where `prealloc = gpa.create(T)` is a heap-field
+                    // pointer, not a stack ref.  init_hint covers
+                    // implicit-typed locals that weren't caught by
+                    // is_pointer (no explicit type annotation).
+                    if (parent_info.init_hint == .heap_local) {
                         return .unknown;
                     }
                     return .{ .stack_ref = fref.parent };
