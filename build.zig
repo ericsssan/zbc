@@ -20,6 +20,16 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // ── ZLS dependency ──────────────────────────────────────
+    // Powers cross-module type resolution in zls_resolver.zig.
+    // ZLS targets Zig master; the version in build.zig.zon is
+    // pinned by hash.
+    const zls_dep = b.dependency("zls", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const zls_mod = zls_dep.module("zls");
+
     // ── Public library module ───────────────────────────────
     // Importable by downstream consumers as `@import("zbc")`.
     const lib_mod = b.addModule("zbc", .{
@@ -27,17 +37,20 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    lib_mod.addImport("zls", zls_mod);
 
     // ── CLI executable ──────────────────────────────────────
     // Standalone binary; useful for one-off sweeps without
     // integrating into a host build.zig.
+    const exe_mod = b.createModule(.{
+        .root_source_file = b.path("main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    exe_mod.addImport("zls", zls_mod);
     const exe = b.addExecutable(.{
         .name = "zbc",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("main.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
+        .root_module = exe_mod,
     });
     b.installArtifact(exe);
 
@@ -59,6 +72,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    cli_test_mod.addImport("zls", zls_mod);
     const cli_tests = b.addTest(.{ .root_module = cli_test_mod });
     test_step.dependOn(&b.addRunArtifact(cli_tests).step);
 }
