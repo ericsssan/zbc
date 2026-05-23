@@ -858,6 +858,21 @@ fn reportWithNote(
             .label = label,
         };
     }
+    // Dedupe by (rule_id, start.byte).  The cfg builder inlines
+    // defer/errdefer bodies at every exit point, so a diagnostic
+    // emitted from inside a defer body fires once per exit — one
+    // logical bug, N reports.  Linear scan is fine here: per-fn
+    // problem counts are small (rarely >50).
+    for (ctx.problems.items) |p| {
+        if (p.start.byte == pos.byte and std.mem.eql(u8, p.rule_id, rule_id)) {
+            ctx.gpa.free(msg);
+            if (notes.len > 0) {
+                for (notes) |*n| ctx.gpa.free(n.label);
+                ctx.gpa.free(notes);
+            }
+            return;
+        }
+    }
     try ctx.problems.append(ctx.gpa, .{
         .rule_id = rule_id,
         .severity = severity,
