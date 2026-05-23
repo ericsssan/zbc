@@ -25,6 +25,26 @@
 const std = @import("std");
 const lib = @import("lib.zig");
 
+/// Silence ZLS's std.log info/debug output — zbc uses ZLS as a type
+/// oracle, not as a language server, so its informational messages
+/// ("Loaded build file ...", etc.) are pure noise on stderr that
+/// pollutes grep-friendly sweeps.  Only ZLS warnings and errors
+/// surface; zbc's own logs are unaffected (they use the default
+/// scope).
+pub const std_options: std.Options = .{
+    .log_scope_levels = &.{
+        .{ .scope = .analysis, .level = .warn },
+        .{ .scope = .completions, .level = .warn },
+        .{ .scope = .config, .level = .warn },
+        .{ .scope = .diag, .level = .warn },
+        .{ .scope = .goto, .level = .warn },
+        .{ .scope = .inlay_hint, .level = .warn },
+        .{ .scope = .main, .level = .warn },
+        .{ .scope = .server, .level = .warn },
+        .{ .scope = .store, .level = .warn },
+    },
+};
+
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     const io = init.io;
