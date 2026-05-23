@@ -122,6 +122,23 @@ fn checkBody(
             t = sc;
             continue;
         }
+        // Skip inline `defer <this>.<field> = saved;` and
+        // `errdefer <this>.<field> = saved;` — the save/restore
+        // pattern where the prior value was captured to a local and
+        // the defer restores it.  Not an overwrite, no leak.
+        if (insideInlineDefer(tags, t)) {
+            t = sc;
+            continue;
+        }
+        // Skip when the immediately-preceding statement is an assert
+        // that mentions `<this>.<field>` — the author is asserting
+        // the prior state is known/empty/default ("first set" guard,
+        // common with lazy init).  K=30 tokens is enough to span an
+        // `assert(condition);` statement of any reasonable shape.
+        if (priorAssertOnField(tree, first, t, this_name, field_name)) {
+            t = sc;
+            continue;
+        }
         // Scan backward up to K tokens looking for prior cleanup
         // of <this>.<field>.
         if (priorCleanupExists(tree, first, t, this_name, field_name)) {
@@ -131,6 +148,67 @@ fn checkBody(
         try report(gpa, problems, tree, t, this_name, field_name, ct);
         t = sc;
     }
+}
+
+/// True iff `assign_tok` (the `<this>` ident in `<this>.<field> = …`)
+/// is the body of an inline `defer` / `errdefer` statement.  Matches:
+///   `defer <this>.<field> = saved;`
+///   `errdefer <this>.<field> = saved;`
+///   `errdefer |err| <this>.<field> = saved;`
+///   `defer { <this>.<field> = saved; ... }` (first stmt in block)
+fn insideInlineDefer(tags: []const std.zig.Token.Tag, assign_tok: Ast.TokenIndex) bool {
+    if (assign_tok == 0) return false;
+    const t = assign_tok - 1;
+    // Bare `defer` / `errdefer` immediately before.
+    if (tags[t] == .keyword_defer or tags[t] == .keyword_errdefer) return true;
+    // `errdefer |err|` — peel `|err|`.
+    if (tags[t] == .pipe and t >= 3) {
+        if (tags[t - 1] == .identifier and tags[t - 2] == .pipe) {
+            if (t >= 4 and tags[t - 3] == .keyword_errdefer) return true;
+        }
+    }
+    // Block form: `defer { <stmt>; … }` — first stmt has `{` then
+    // `defer`/`errdefer` directly before it.
+    if (tags[t] == .l_brace and t >= 1) {
+        if (tags[t - 1] == .keyword_defer or tags[t - 1] == .keyword_errdefer) return true;
+    }
+    return false;
+}
+
+/// True iff a recent `assert(<expr involving this.field>)` /
+/// `bun.assert(...)` / `std.debug.assert(...)` precedes `assign_tok`.
+/// Bounded to a 30-token lookback so we don't pick up unrelated
+/// asserts earlier in the fn.
+fn priorAssertOnField(
+    tree: *const Ast,
+    start: Ast.TokenIndex,
+    assign_tok: Ast.TokenIndex,
+    this_name: []const u8,
+    field_name: []const u8,
+) bool {
+    const tags = tree.tokens.items(.tag);
+    const K: u32 = 64;
+    var i: u32 = 0;
+    var t: Ast.TokenIndex = assign_tok;
+    var saw_field = false;
+    while (t > start and i < K) : (i += 1) {
+        t -= 1;
+        if (tags[t] == .identifier) {
+            const s = tree.tokenSlice(t);
+            // Look for the field-name ident followed (going forward)
+            // by the this name — i.e. `<this>.<field>` shape.
+            if (std.mem.eql(u8, s, field_name) and t >= 2 and
+                tags[t - 1] == .period and tags[t - 2] == .identifier and
+                std.mem.eql(u8, tree.tokenSlice(t - 2), this_name))
+            {
+                saw_field = true;
+            }
+            // The assert identifier.  Recognize `assert` and the
+            // last-segment of `bun.assert` / `std.debug.assert` etc.
+            if (saw_field and std.mem.eql(u8, s, "assert")) return true;
+        }
+    }
+    return false;
 }
 
 /// True iff the RHS at `[start, end)` is exactly `null`, `undefined`,
@@ -463,6 +541,46 @@ test "overwrite-without-deinit: `if (this.field) |…|` guard counts as cleanup"
         \\        this.inner = new_inner;
         \\    }
         \\};
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
+test "overwrite-without-deinit: inline `defer this.field = saved;` (save/restore) doesn't fire" {
+    const gpa = std.testing.allocator;
+    var problems = try runOn(gpa,
+        \\const Inner = struct { pub fn deinit(_: *Inner) void {} };
+        \\const Owner = struct {
+        \\    inner: Inner,
+        \\    pub fn withTemp(this: *Owner, new_inner: Inner) void {
+        \\        const prev = this.inner;
+        \\        defer this.inner = prev;
+        \\        this.inner = new_inner;
+        \\        _ = new_inner;
+        \\    }
+        \\};
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    // The `defer this.inner = prev;` line is a restore — no FP there.
+    // The unguarded `this.inner = new_inner` IS a real overwrite
+    // without prior cleanup → should fire exactly once.
+    try std.testing.expectEqual(@as(usize, 1), problems.items.len);
+}
+
+test "overwrite-without-deinit: assert(this.field == default) gates the write — no fire" {
+    const gpa = std.testing.allocator;
+    var problems = try runOn(gpa,
+        \\const Inner = struct { pub fn deinit(_: *Inner) void {} };
+        \\const Owner = struct {
+        \\    inner: Inner,
+        \\    pub fn lazyInit(this: *Owner, new_inner: Inner) void {
+        \\        bun.assert(this.inner == .empty);
+        \\        this.inner = new_inner;
+        \\    }
+        \\};
+        \\const bun = struct { pub fn assert(_: bool) void {} };
         \\
     );
     defer freeProblems(gpa, &problems);
