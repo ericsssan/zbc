@@ -4371,6 +4371,15 @@ const Builder = struct {
         var paren_depth: u32 = 0;
         var comptime_skip_active: bool = false;
         var comptime_skip_until: u32 = 0;
+        // Track the destination-arg region of write-through builtins
+        // (`@memcpy(dest, src)`, `@memset(dest, val)`).  The first
+        // argument is WRITTEN, not READ — emitting a .use / .field_use
+        // for tokens in that region would fire spurious use-undefined
+        // on the common `var buf: [N]u8 = undefined; @memcpy(buf, …)`
+        // shape.  Active from the `(` after `@memcpy`/`@memset` until
+        // the comma that separates the first arg from the rest.
+        var write_dest_skip_active: bool = false;
+        var write_dest_skip_depth: u32 = 0;
 
         var t: Ast.TokenIndex = first;
         while (t <= last) : (t += 1) {
@@ -4383,6 +4392,12 @@ const Builder = struct {
                     comptime_skip_active = true;
                     comptime_skip_until = paren_depth - 1;
                 }
+                if (!write_dest_skip_active and t > 0 and tags[t - 1] == .builtin and
+                    isWriteFirstArgBuiltin(tree.tokenSlice(t - 1)))
+                {
+                    write_dest_skip_active = true;
+                    write_dest_skip_depth = paren_depth;
+                }
                 continue;
             }
             if (tag == .r_paren) {
@@ -4390,9 +4405,19 @@ const Builder = struct {
                 if (comptime_skip_active and paren_depth == comptime_skip_until) {
                     comptime_skip_active = false;
                 }
+                if (write_dest_skip_active and paren_depth < write_dest_skip_depth) {
+                    write_dest_skip_active = false;
+                }
+                continue;
+            }
+            if (tag == .comma and write_dest_skip_active and paren_depth == write_dest_skip_depth) {
+                // Comma at the same depth as the builtin's args ends
+                // the destination region; subsequent args are sources.
+                write_dest_skip_active = false;
                 continue;
             }
             if (comptime_skip_active) continue;
+            if (write_dest_skip_active) continue;
             if (tag != .identifier) continue;
             // LHS of a plain `=` assignment inside a sub-expression
             // (e.g. a switch arm body or labeled block being used as
@@ -4652,6 +4677,17 @@ const Builder = struct {
         };
         for (candidates) |c| if (std.mem.eql(u8, name, c)) return true;
         return false;
+    }
+
+    /// True for builtins whose FIRST argument is the destination (a
+    /// write-through pointer or slice).  Used by `emitUsesInExpr` to
+    /// suppress spurious .use / .field_use emission on the dest in
+    /// the canonical `var buf: [N]u8 = undefined; @memcpy(buf, src);`
+    /// shape — the dest is written, not read.
+    fn isWriteFirstArgBuiltin(name: []const u8) bool {
+        // `name` includes the leading `@`.
+        return std.mem.eql(u8, name, "@memcpy") or
+            std.mem.eql(u8, name, "@memset");
     }
 
     /// Emit a `.field_use` for every PREFIX of the dotted chain
