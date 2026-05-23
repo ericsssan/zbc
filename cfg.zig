@@ -462,6 +462,7 @@ pub fn lowerFunctionFullWithZls(
         .suppress_composite_borrow = suppress_cb,
         .fn_proto = fn_proto,
         .fn_body_last = tree.lastToken(body_node),
+        .fn_body_first = tree.firstToken(body_node),
         .self_type = self_type,
     };
     defer builder.tempDeinit();
@@ -630,6 +631,10 @@ const Builder = struct {
     /// construction; used by lowerVarDecl's body-use-signal scan
     /// for is_pointer inference (`var p = call(); p.* = …;`).
     fn_body_last: Ast.TokenIndex = 0,
+    /// First token of the fn body (the opening `{`).  Set at
+    /// construction; paired with `fn_body_last` for whole-body
+    /// token scans (e.g. save-restore-via-defer detection).
+    fn_body_first: Ast.TokenIndex = 0,
     /// name → LocalId for current scope.  v1 doesn't handle nested scopes;
     /// names are flat per-function.
     name_to_local: std.StringHashMapUnmanaged(LocalId) = .empty,
@@ -2090,15 +2095,25 @@ const Builder = struct {
             // stack reference, that lifetime now reaches the caller
             // — fire the same escape diagnostics as a borrowed-shape
             // return.
+            //
+            // Save-restore-via-defer skip: when the fn body has a
+            // `defer <recv>.<path> = ...` that targets the SAME
+            // field, the temporary stack borrow is bounded by the
+            // defer — by the time the fn returns the prior value
+            // has been restored.  Don't emit the escape stmt for
+            // that case.
             if (self.locals.items[@intFromEnum(fref.parent)].is_pointer) {
-                try self.appendStmt(cur.*, .{
-                    .kind = .{ .out_param_write = .{
-                        .out = fref.parent,
-                        .value_kind = self.classifyExpr(rhs),
-                    } },
-                    .pos = self.posOf(assign_node),
-                    .end_pos = self.endPosOf(assign_node),
-                });
+                const recv_name = self.locals.items[@intFromEnum(fref.parent)].name;
+                if (!self.fieldPathRestoredByDefer(recv_name, fref.name)) {
+                    try self.appendStmt(cur.*, .{
+                        .kind = .{ .out_param_write = .{
+                            .out = fref.parent,
+                            .value_kind = self.classifyExpr(rhs),
+                        } },
+                        .pos = self.posOf(assign_node),
+                        .end_pos = self.endPosOf(assign_node),
+                    });
+                }
             }
         } else if (self.derefOfPointerLocal(lhs)) |out_local| {
             // `<local>.* = RHS` — when local is pointer-typed, this
@@ -4248,6 +4263,47 @@ const Builder = struct {
         const id = self.name_to_local.get(name) orelse return null;
         if (!self.locals.items[@intFromEnum(id)].is_pointer) return null;
         return id;
+    }
+
+    /// Save-restore-via-defer guard: the fn body has a defer that
+    /// restores the same field path that this out-param write is
+    /// touching.  Canonical pattern in Bun's parser:
+    ///     const prev = p.field;
+    ///     defer p.field = prev;
+    ///     p.field = &stack_local;
+    /// The stack borrow is bounded by the defer — by the time the
+    /// fn returns the field has been restored to `prev`, so the
+    /// stack-local pointer never escapes the frame.  Tokens after
+    /// the matched `defer` are compared byte-for-byte against the
+    /// source slice for `<recv>.<path>` to honour multi-segment
+    /// paths (`p.fn_only_data_visit.class_name_ref`).
+    fn fieldPathRestoredByDefer(
+        self: *const Builder,
+        recv_name: []const u8,
+        path: []const u8,
+    ) bool {
+        const tree = self.tree;
+        const tags = tree.tokens.items(.tag);
+        const starts = tree.tokens.items(.start);
+        if (self.fn_body_last == 0) return false;
+        var t: Ast.TokenIndex = self.fn_body_first;
+        while (t <= self.fn_body_last) : (t += 1) {
+            if (tags[t] != .keyword_defer) continue;
+            if (t + 1 > self.fn_body_last) continue;
+            const after = starts[t + 1];
+            const expected_len = recv_name.len + 1 + path.len;
+            if (after + expected_len > tree.source.len) continue;
+            const got = tree.source[after .. after + expected_len];
+            if (!std.mem.startsWith(u8, got, recv_name)) continue;
+            if (got[recv_name.len] != '.') continue;
+            if (!std.mem.eql(u8, got[recv_name.len + 1 ..], path)) continue;
+            var b: usize = after + expected_len;
+            while (b < tree.source.len and (tree.source[b] == ' ' or tree.source[b] == '\t')) : (b += 1) {}
+            if (b >= tree.source.len) continue;
+            if (tree.source[b] != '=') continue;
+            return true;
+        }
+        return false;
     }
 
     /// `.field_name = <value>` field initializer in a struct literal:
