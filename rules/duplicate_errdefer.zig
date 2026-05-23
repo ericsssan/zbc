@@ -65,6 +65,12 @@ const Cleanup = struct {
     /// Last token (inclusive) of the full call expression — the
     /// closing `)`.
     call_last: Ast.TokenIndex,
+    /// Token index of the IMMEDIATE enclosing `{` — the open-brace
+    /// of the block this errdefer lives in.  Two errdefers in
+    /// DIFFERENT enclosing braces are typically in mutually
+    /// exclusive branches (`if {...} else if {...}`); both can't
+    /// register at runtime so there's no double-free risk.
+    enclosing_lbrace: Ast.TokenIndex,
 };
 
 fn checkBody(
@@ -89,7 +95,8 @@ fn checkBody(
         }
         if (tags[t] != .keyword_errdefer) continue;
         // Inline form: `errdefer <recv-chain>.<method>(...);`.
-        const e = parseInlineErrdefer(tree, t, last) orelse continue;
+        var e = parseInlineErrdefer(tree, t, last) orelse continue;
+        e.enclosing_lbrace = findEnclosingLBrace(tags, t, first);
         try entries.append(gpa, e);
     }
 
@@ -101,6 +108,12 @@ fn checkBody(
     for (entries.items, 0..) |a, i| {
         for (entries.items[0..i]) |b| {
             if (!callsEqual(tree, a, b)) continue;
+            // Branch-disjoint guard: two errdefers in different
+            // immediate scopes (different `{`s) are typically in
+            // mutually exclusive arms of an `if/else if/else`
+            // chain — only one ever registers, so no double-free.
+            // Same-scope duplicates are the real bug.
+            if (a.enclosing_lbrace != b.enclosing_lbrace) continue;
             try report(gpa, problems, tree, a, b);
             break;
         }
@@ -159,7 +172,33 @@ fn parseInlineErrdefer(tree: *const Ast, ed_tok: Ast.TokenIndex, last: Ast.Token
         .errdefer_tok = ed_tok,
         .call_first = ed_tok + 1,
         .call_last = call_end,
+        .enclosing_lbrace = 0,
     };
+}
+
+/// Walk back from the `errdefer` token through the fn body, tracking
+/// brace depth.  The first `{` at depth -1 is the immediate enclosing
+/// open-brace.  Bounded by `lo` (fn body's first token) so we never
+/// stray outside.
+fn findEnclosingLBrace(
+    tags: []const std.zig.Token.Tag,
+    ed_tok: Ast.TokenIndex,
+    lo: Ast.TokenIndex,
+) Ast.TokenIndex {
+    var depth: i32 = 0;
+    var t: Ast.TokenIndex = ed_tok;
+    while (t > lo) {
+        t -= 1;
+        switch (tags[t]) {
+            .r_brace => depth += 1,
+            .l_brace => {
+                if (depth == 0) return t;
+                depth -= 1;
+            },
+            else => {},
+        }
+    }
+    return lo;
 }
 
 fn callsEqual(tree: *const Ast, a: Cleanup, b: Cleanup) bool {
@@ -316,6 +355,27 @@ test "duplicate-errdefer: bare local receiver fires" {
     );
     defer freeProblems(gpa, &problems);
     try std.testing.expectEqual(@as(usize, 1), problems.items.len);
+}
+
+test "duplicate-errdefer: mutually exclusive if/else if branches don't fire" {
+    const gpa = std.testing.allocator;
+    var problems = try runOn(gpa,
+        \\const T = struct { pub fn deinit(_: *T, _: anytype) void {} };
+        \\pub fn parse(allocator: anytype, a: ?u32, b: ?u32) !void {
+        \\    if (a) |_| {
+        \\        var x: T = .{};
+        \\        errdefer x.deinit(allocator);
+        \\        _ = x;
+        \\    } else if (b) |_| {
+        \\        var x: T = .{};
+        \\        errdefer x.deinit(allocator);
+        \\        _ = x;
+        \\    }
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
 }
 
 test "duplicate-errdefer: nested fn errdefers don't bleed into outer scan" {
