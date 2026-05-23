@@ -97,6 +97,16 @@ pub fn check(
             // One level of delegation only (no transitive chains).
             if (bodyHandlesFieldViaHelper(tree, model, deinit, outer, field.name, cleanup_call)) continue;
 
+            // Partial sub-field cleanup: the deinit body mentions
+            // `<self>.<field>.<subfield>...` somewhere.  Even without
+            // a direct `<self>.<field>.deinit()`, partial cleanup
+            // of inner resources is evidence the field is being
+            // handled intentionally (rather than forgotten) — common
+            // when the composed type's deinit signature requires
+            // arguments the outer doesn't have, so the outer reaches
+            // into specific owned sub-fields.
+            if (methodBodyMentionsField(tree, deinit, field.name)) continue;
+
             try report(gpa, problems, tree, field.name_token, field.name, inner_ti.name);
         }
     }
