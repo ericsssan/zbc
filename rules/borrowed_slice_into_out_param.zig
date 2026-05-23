@@ -317,8 +317,16 @@ fn isDeinitOrClose(name: []const u8) bool {
     return std.mem.eql(u8, name, "deinit") or std.mem.eql(u8, name, "close");
 }
 
-/// True iff `[start, end]` mentions one of the deferred names.
+/// True iff `[start, end]` mentions one of the deferred names as
+/// a VALUE — i.e. NOT preceded by `&` (by-reference pass).
 /// Returns the matched name on hit.
+///
+/// Rationale: `out.* = ZigString.init(arena)` passes `arena` by
+/// value; ZigString stores a borrow into arena's memory.  But
+/// `this.scripts = createList(buf, &top_level_dir, ...)` passes
+/// `&top_level_dir` by reference; createList typically reads from
+/// the pointer transiently rather than retaining it.  Skipping
+/// `&deferred` references trades a few FNs for many fewer FPs.
 fn rhsMentionsDeferred(
     tree: *const Ast,
     start: Ast.TokenIndex,
@@ -330,6 +338,9 @@ fn rhsMentionsDeferred(
     var t: Ast.TokenIndex = start;
     while (t <= end) : (t += 1) {
         if (tags[t] != .identifier) continue;
+        // Skip `&deferred` — by-reference pass; the fn doesn't
+        // necessarily retain the borrow.
+        if (t > 0 and tags[t - 1] == .ampersand) continue;
         const name = tree.tokenSlice(t);
         for (deferred) |d| if (std.mem.eql(u8, d, name)) return d;
     }
