@@ -3885,14 +3885,25 @@ const Builder = struct {
         const recv_local = self.name_to_local.get(recv_name) orelse return null;
         const container = self.locals.items[@intFromEnum(recv_local)].from_container orelse return null;
 
-        // Receiver IS interior — check the method actually frees
-        // `self` via takesOwnershipFreedLocal (which consults
-        // db.lookupTyped's @takes annotation, including inferred
-        // ones).  Returns the receiver only when the callee
-        // promises to free arg 0.
-        const freed = self.takesOwnershipFreedLocal(call_node) orelse return null;
-        if (freed != recv_local) return null;
-        return .{ .receiver = recv_local, .container = container };
+        // Receiver IS an interior pointer (for-loop capture into a
+        // container).  Fire on EITHER of:
+        //   - The method provably frees its receiver
+        //     (`takesOwnershipFreedLocal`), OR
+        //   - The method NAME is cleanup-style (deinit/close/dispose/
+        //     etc.) — a strong convention that "this releases the
+        //     receiver's owned resources."  Even when the body
+        //     doesn't literally call `.free(self)` / `.destroy(self)`
+        //     (it usually frees the receiver's FIELDS instead, leaving
+        //     the storage logically dead), invoking it on an interior
+        //     pointer is the suspect pattern the rule warns about.
+        if (self.takesOwnershipFreedLocal(call_node)) |freed| {
+            if (freed == recv_local) return .{ .receiver = recv_local, .container = container };
+        }
+        const method_name = tree.tokenSlice(fa[1]);
+        if (fn_summary.isReceiverCleanupMethodName(method_name)) {
+            return .{ .receiver = recv_local, .container = container };
+        }
+        return null;
     }
 
     /// For a call like `<recv>.alloc(...)`, `<recv>.free(...)`,
