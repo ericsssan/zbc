@@ -117,37 +117,48 @@ fn parseInlineErrdefer(tree: *const Ast, ed_tok: Ast.TokenIndex, last: Ast.Token
     const tags = tree.tokens.items(.tag);
     if (ed_tok + 1 > last) return null;
     if (tags[ed_tok + 1] != .identifier) return null;
-    // Walk forward through `<ident>(.<ident>)*` until we reach `(`.
     var t: Ast.TokenIndex = ed_tok + 1;
     var ident_count: u32 = 0;
+    var last_paren_end: ?Ast.TokenIndex = null;
+    // Walk a chain of `<ident>(.<ident>)*` with optional `()` after
+    // each segment (e.g. `dev.allocator().free(arg)`).  After each
+    // `()` group, keep extending if the next token is `.`.  The
+    // FINAL call's closing paren is what call_last must point to —
+    // otherwise two errdefers that share only the first segment
+    // (`dev.allocator()`) get matched as duplicates even when the
+    // tail differs (`free(specifier_cloned)` vs `free(dir_name)`).
     while (t <= last) : (t += 1) {
         switch (tags[t]) {
             .identifier => ident_count += 1,
             .period => {},
-            .l_paren => break,
+            .l_paren => {
+                var depth: u32 = 1;
+                var u: Ast.TokenIndex = t + 1;
+                while (u <= last and depth > 0) : (u += 1) {
+                    switch (tags[u]) {
+                        .l_paren => depth += 1,
+                        .r_paren => depth -= 1,
+                        else => {},
+                    }
+                }
+                if (depth != 0) return null;
+                last_paren_end = u - 1;
+                // Continue if a chained method follows: `.<ident>...`.
+                if (u <= last and tags[u] == .period) {
+                    t = u; // advance to `.`; outer loop will continue
+                    continue;
+                }
+                break;
+            },
             else => return null,
         }
     }
-    if (t > last or tags[t] != .l_paren) return null;
-    // Require at least 2 identifiers — receiver.method.  Bare-fn
-    // calls (`errdefer cleanup();`) don't have the receiver/method
-    // structure this rule targets.
+    const call_end = last_paren_end orelse return null;
     if (ident_count < 2) return null;
-    // Match the call's closing `)`.
-    var depth: u32 = 1;
-    var u: Ast.TokenIndex = t + 1;
-    while (u <= last and depth > 0) : (u += 1) {
-        switch (tags[u]) {
-            .l_paren => depth += 1,
-            .r_paren => depth -= 1,
-            else => {},
-        }
-    }
-    if (depth != 0) return null;
     return .{
         .errdefer_tok = ed_tok,
         .call_first = ed_tok + 1,
-        .call_last = u - 1,
+        .call_last = call_end,
     };
 }
 
