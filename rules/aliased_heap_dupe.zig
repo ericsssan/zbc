@@ -132,7 +132,7 @@ fn checkBody(
     // appears immediately after a `return` keyword in the body, with
     // an optional `.<...>` field chain accepted — `return dup;` and
     // `return dup;` only for v1, no `return wrap(dup);` style).
-    var returned_buf: [8]bool = .{false} ** 8;
+    var returned_buf: [8]bool = @splat(false);
     var t: Ast.TokenIndex = first;
     while (t <= last) : (t += 1) {
         if (tags[t] != .keyword_return) continue;

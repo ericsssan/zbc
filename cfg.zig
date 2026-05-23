@@ -1044,7 +1044,7 @@ const Builder = struct {
                 try self.pushDefer(body);
             },
             .@"errdefer" => {
-                const body = tree.nodeData(stmt_node).opt_token_and_node[1];
+                const body = tree.nodeData(stmt_node).node;
                 try self.pushErrdefer(body);
             },
             .if_simple, .@"if" => try self.lowerIf(stmt_node, cur),

@@ -610,7 +610,7 @@ fn renderSpan(
     // Find the byte range of `start.line` in src.
     const line_text = sliceLine(src, start.byte);
     // Print the source line:  NNN | <text>
-    const line_str_buf: [16]u8 = [_]u8{0} ** 16;
+    const line_str_buf: [16]u8 = @splat(0);
     var buf = line_str_buf;
     const ln_str = std.fmt.bufPrint(&buf, "{}", .{start.line}) catch "?";
     const lead = if (gutter_width > ln_str.len) gutter_width - ln_str.len else 0;

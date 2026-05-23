@@ -125,10 +125,10 @@ pub const Match = struct {
     end: TokenIndex,
     /// captures[slot] is the token index of an identifier captured
     /// by `.capture = slot`; null if that slot wasn't filled.
-    captures: [MAX_CAPTURES]?TokenIndex = .{null} ** MAX_CAPTURES,
+    captures: [MAX_CAPTURES]?TokenIndex = @splat(null),
     /// range_captures[slot] is the token range captured by
     /// `.capture_until = .{ .slot = slot, ... }`; null if unfilled.
-    range_captures: [MAX_RANGE_CAPTURES]?TokenRange = .{null} ** MAX_RANGE_CAPTURES,
+    range_captures: [MAX_RANGE_CAPTURES]?TokenRange = @splat(null),
 
     /// Convenience: text of capture slot N.
     pub fn captureText(self: Match, tree: *const Ast, slot: u8) ?[]const u8 {
