@@ -452,6 +452,7 @@ pub fn lowerFunctionFullWithZls(
         .is_borrowed_return_type = is_borrowed_ret,
         .suppress_composite_borrow = suppress_cb,
         .fn_proto = fn_proto,
+        .fn_body_last = tree.lastToken(body_node),
         .self_type = self_type,
     };
     defer builder.tempDeinit();
@@ -523,6 +524,50 @@ fn bodyOf(tree: *const Ast, node: Ast.Node.Index) ?Ast.Node.Index {
     return tree.nodeData(node).node_and_node[1];
 }
 
+/// True iff `path` (a dotted field chain like "value_ptr.field" or
+/// just "ptr") starts with a segment whose name ends in `_ptr` (or
+/// is exactly `ptr`).  Pointer-name convention — stdlib's
+/// `GetOrPutResult.value_ptr: *V` / `.key_ptr: *K`, ArrayList's
+/// `.ptr`, etc.  A field chain whose head is such a name guarantees
+/// the borrow lifts out of any auto-deref, so `&local.<ptr_name>.X`
+/// is a borrow into caller- or heap-owned storage rather than a
+/// stack ref.
+fn fieldPathHasPointerName(path: []const u8) bool {
+    // Take the first dotted segment.
+    var end: usize = 0;
+    while (end < path.len and path[end] != '.') : (end += 1) {}
+    const seg = path[0..end];
+    if (std.mem.eql(u8, seg, "ptr")) return true;
+    if (std.mem.endsWith(u8, seg, "_ptr")) return true;
+    return false;
+}
+
+/// True iff the body tokens `[name_tok+1 .. last]` contain `<name>.*`
+/// somewhere — i.e. the local declared at `name_tok` is dereferenced
+/// later in the body.  Used by `lowerVarDecl` to infer `is_pointer`
+/// for opaque-init locals (`var p = pool.get(); p.* = …;`) so
+/// `&p.field` later doesn't fire stack-escape.
+fn localIsDereferencedAfter(
+    tree: *const Ast,
+    name: []const u8,
+    name_tok: Ast.TokenIndex,
+    last: Ast.TokenIndex,
+) bool {
+    const tags = tree.tokens.items(.tag);
+    if (name_tok + 1 > last) return false;
+    var t: Ast.TokenIndex = name_tok + 1;
+    while (t + 1 <= last) : (t += 1) {
+        if (tags[t] != .identifier) continue;
+        // Must NOT be a field access (`x.name.*` — `name` here is a
+        // field, not the local).  The preceding token is `.` in
+        // that case.
+        if (t > 0 and tags[t - 1] == .period) continue;
+        if (!std.mem.eql(u8, tree.tokenSlice(t), name)) continue;
+        if (tags[t + 1] == .period_asterisk) return true;
+    }
+    return false;
+}
+
 // ── Builder ────────────────────────────────────────────────
 
 const LoopCtx = struct {
@@ -572,6 +617,10 @@ const Builder = struct {
     /// registerFnParams.  Optional only for cfg-builder constructs
     /// outside of normal fn lowering (currently none).
     fn_proto: ?Ast.full.FnProto = null,
+    /// Last token of the fn body (the closing `}`).  Set at
+    /// construction; used by lowerVarDecl's body-use-signal scan
+    /// for is_pointer inference (`var p = call(); p.* = …;`).
+    fn_body_last: Ast.TokenIndex = 0,
     /// name → LocalId for current scope.  v1 doesn't handle nested scopes;
     /// names are flat per-function.
     name_to_local: std.StringHashMapUnmanaged(LocalId) = .empty,
@@ -1742,6 +1791,8 @@ const Builder = struct {
         //   - `const p = &x.field;` — literal address-of
         //   - `const p = gpa.create(T);` — heap-alloc returns *T
         //   - `const p = &x;` aliasing a known pointer local (copy_of)
+        //   - `var p = pool.get(); p.* = …;` — `p.*` use proves
+        //     pointer-ness when the call's return type is opaque
         // Prevents stack-escape FPs on `&p.subfield` later, since p
         // is itself a pointer into caller-owned (or heap) storage.
         if (!is_pointer) {
@@ -1752,6 +1803,17 @@ const Builder = struct {
             if (init_kind == .copy_of) {
                 const src = init_kind.copy_of;
                 if (self.locals.items[@intFromEnum(src)].is_pointer) is_pointer = true;
+            }
+            // Body-use signal: scan forward from the var_decl for
+            // `<name>.*` — if the local is ever dereferenced, it must
+            // be a pointer.  Cheap: O(remaining_tokens) per opaque-
+            // init decl; many decls get short-circuited by the
+            // cheaper checks above.  Scan bounded to the fn body's
+            // last token (the closing `}` of the fn).
+            if (!is_pointer and init_kind == .unknown) {
+                if (localIsDereferencedAfter(self.tree, name, name_tok, self.fn_body_last)) {
+                    is_pointer = true;
+                }
             }
         }
 
@@ -3374,6 +3436,15 @@ const Builder = struct {
                     // implicit-typed locals that weren't caught by
                     // is_pointer (no explicit type annotation).
                     if (parent_info.init_hint == .heap_local) {
+                        return .unknown;
+                    }
+                    // Pointer-named field in the chain: e.g.
+                    // `&entry.value_ptr.field` where `value_ptr` is a
+                    // `*V` (stdlib HashMap GetOrPutResult convention).
+                    // The address-of borrows V's interior — not a
+                    // stack ref.  Same for `*.key_ptr.*` / `*.ptr.*`
+                    // and any field name ending in `_ptr`.
+                    if (fieldPathHasPointerName(fref.name)) {
                         return .unknown;
                     }
                     return .{ .stack_ref = fref.parent };
