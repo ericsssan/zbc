@@ -13,7 +13,6 @@
 const std = @import("std");
 const Ast = std.zig.Ast;
 
-const annotations_mod = @import("../annotations.zig");
 const problem_mod = @import("../problem.zig");
 const config_mod = @import("../config.zig");
 const file_cache_mod = @import("../file_cache.zig");
@@ -24,20 +23,19 @@ const returnsType = lexer.returnsType;
 const fnProto = lexer.fnProto;
 const bodyOf = lexer.bodyOf;
 
-const Db = annotations_mod.Db;
 const Problem = problem_mod.Problem;
 const Pos = problem_mod.Pos;
 
 pub fn check(
     gpa: std.mem.Allocator,
     tree: *const Ast,
-    db: *const Db,
     cache: *file_cache_mod.FileCache,
     config: *const config_mod.Config,
     problems: *std.ArrayListUnmanaged(Problem),
 ) !void {
     if (!config_mod.isEnabled(config, .clobbered_by_struct_reset)) return;
-    _ = cache;
+
+    const model = try cache.fileModel();
 
     var node_idx: u32 = 1;
     while (node_idx < tree.nodes.len) : (node_idx += 1) {
@@ -51,8 +49,8 @@ pub fn check(
         // own fn_decl nodes in this loop.
         if (returnsType(tree, node)) continue;
         const body = bodyOf(tree, node) orelse continue;
-        const self_type = db.containingType(node);
-        try checkBody(gpa, tree, db, self_type, body, problems);
+        const self_type: ?[]const u8 = if (model.containingTypeOf(node)) |ti| ti.name else null;
+        try checkBody(gpa, tree, self_type, body, problems);
     }
 }
 
@@ -74,7 +72,6 @@ const Assign = struct {
 fn checkBody(
     gpa: std.mem.Allocator,
     tree: *const Ast,
-    db: *const Db,
     self_type: ?[]const u8,
     body: Ast.Node.Index,
     problems: *std.ArrayListUnmanaged(Problem),
@@ -200,7 +197,6 @@ fn checkBody(
     // Phase 3: pair each assignment with the FIRST subsequent reset
     // on the same `<obj>`.  If the reset's literal does not contain
     // `.<field> =`, fire at the assignment site.
-    _ = db;
     _ = self_type;
     for (assigns_buf[0..assign_count]) |a| {
         if (!rhsLooksMeaningful(tree, a.rhs_first, a.rhs_last)) continue;
@@ -349,17 +345,7 @@ fn report(
 // ── Tests ──────────────────────────────────────────────────
 
 fn runOn(gpa: std.mem.Allocator, src: []const u8) !std.ArrayListUnmanaged(Problem) {
-    const src_z = try gpa.dupeSentinel(u8, src, 0);
-    defer gpa.free(src_z);
-    var tree = try Ast.parse(gpa, src_z, .zig);
-    defer tree.deinit(gpa);
-    var db = try annotations_mod.buildFull(gpa, &tree, null, null);
-    defer db.deinit(gpa);
-    var problems: std.ArrayListUnmanaged(Problem) = .empty;
-    var cache = file_cache_mod.FileCache.init(gpa, &tree);
-    defer cache.deinit();
-    try check(gpa, &tree, &db, &cache, &config_mod.Default, &problems);
-    return problems;
+    return testing.runRule(gpa, check, src);
 }
 
 const freeProblems = testing.freeProblems;

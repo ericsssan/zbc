@@ -19,13 +19,12 @@ const Ast = std.zig.Ast;
 
 const lexer = @import("../lexer.zig");
 const local = @import("../local.zig");
-const annotations_mod = @import("../annotations.zig");
+const fmodel = @import("../model.zig");
 const problem_mod = @import("../problem.zig");
 const testing = @import("../testing.zig");
 const config_mod = @import("../config.zig");
 const file_cache_mod = @import("../file_cache.zig");
 
-const Db = annotations_mod.Db;
 const Problem = problem_mod.Problem;
 const Pos = problem_mod.Pos;
 const R = "missing-errdefer-between-tries";
@@ -33,17 +32,17 @@ const R = "missing-errdefer-between-tries";
 pub fn check(
     gpa: std.mem.Allocator,
     tree: *const Ast,
-    db: *const Db,
     cache: *file_cache_mod.FileCache,
     config: *const config_mod.Config,
     problems: *std.ArrayListUnmanaged(Problem),
 ) !void {
     if (!config_mod.isEnabled(config, .missing_errdefer_between_tries)) return;
 
+    const model = try cache.fileModel();
     var proto_buf: [1]Ast.Node.Index = undefined;
     var fns = lexer.iterFnDecls(tree);
     while (fns.next(&proto_buf)) |fn_entry| {
-        try checkFn(gpa, tree, cache, db, fn_entry.proto, fn_entry.body, problems);
+        try checkFn(gpa, tree, cache, model, fn_entry.proto, fn_entry.body, problems);
     }
 }
 
@@ -60,7 +59,7 @@ fn checkFn(
     gpa: std.mem.Allocator,
     tree: *const Ast,
     cache: *file_cache_mod.FileCache,
-    db: *const Db,
+    model: *const fmodel.FileModel,
     proto: Ast.full.FnProto,
     body: Ast.Node.Index,
     problems: *std.ArrayListUnmanaged(Problem),
@@ -106,7 +105,7 @@ fn checkFn(
         var is_fd_open = false;
         if (isOwnershipTransferMethod(meth)) {
             if (parsed.type_name.len == 0 or parsed.type_name[0] < 'A' or parsed.type_name[0] > 'Z') continue;
-            if (!typeHasDeinit(db, parsed.type_name)) continue;
+            if (!typeHasDeinit(model, parsed.type_name)) continue;
         } else if (isFileHandleOpenerMethod(meth)) {
             is_fd_open = true;
         } else continue;
@@ -197,13 +196,13 @@ fn isFileHandleOpenerMethod(name: []const u8) bool {
         std.mem.eql(u8, name, "accept");
 }
 
-/// True iff `Type` has a `deinit` method discoverable in the Db.
-/// Conservative: cross-file / unknown types pass through (true) so
-/// we don't miss real bugs whose types are declared in another
-/// file.  Returns false only when the type IS in the local file
-/// AND demonstrably has no `deinit`.
-fn typeHasDeinit(db: *const Db, type_name: []const u8) bool {
-    if (db.hasType(type_name) and db.lookupTyped(type_name, "deinit") == null) {
+/// True iff `Type` has a `deinit` method discoverable in the
+/// FileModel.  Conservative: cross-file / unknown types pass through
+/// (true) so we don't miss real bugs whose types are declared in
+/// another file.  Returns false only when the type IS in the local
+/// file AND demonstrably has no `deinit`.
+fn typeHasDeinit(model: *const fmodel.FileModel, type_name: []const u8) bool {
+    if (model.hasType(type_name) and !model.typeHasMethod(type_name, "deinit")) {
         return false;
     }
     return true;
@@ -284,17 +283,7 @@ fn report(
 // ── Tests ──────────────────────────────────────────────────
 
 fn runOn(gpa: std.mem.Allocator, src: []const u8) !std.ArrayListUnmanaged(Problem) {
-    const src_z = try gpa.dupeSentinel(u8, src, 0);
-    defer gpa.free(src_z);
-    var tree = try Ast.parse(gpa, src_z, .zig);
-    defer tree.deinit(gpa);
-    var db = try annotations_mod.buildFull(gpa, &tree, null, null);
-    defer db.deinit(gpa);
-    var problems: std.ArrayListUnmanaged(Problem) = .empty;
-    var cache = file_cache_mod.FileCache.init(gpa, &tree);
-    defer cache.deinit();
-    try check(gpa, &tree, &db, &cache, &config_mod.Default, &problems);
-    return problems;
+    return testing.runRule(gpa, check, src);
 }
 
 const freeProblems = testing.freeProblems;

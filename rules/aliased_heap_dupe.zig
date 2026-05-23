@@ -20,7 +20,7 @@
 const std = @import("std");
 const Ast = std.zig.Ast;
 
-const annotations_mod = @import("../annotations.zig");
+const fmodel = @import("../model.zig");
 const problem_mod = @import("../problem.zig");
 const config_mod = @import("../config.zig");
 const file_cache_mod = @import("../file_cache.zig");
@@ -31,7 +31,6 @@ const testing = @import("../testing.zig");
 const fnProto = lexer.fnProto;
 const bodyOf = lexer.bodyOf;
 
-const Db = annotations_mod.Db;
 const Problem = problem_mod.Problem;
 const Severity = problem_mod.Severity;
 const Pos = problem_mod.Pos;
@@ -42,18 +41,18 @@ const Pos = problem_mod.Pos;
 pub fn check(
     gpa: std.mem.Allocator,
     tree: *const Ast,
-    db: *const Db,
     cache: *file_cache_mod.FileCache,
     config: *const config_mod.Config,
     problems: *std.ArrayListUnmanaged(Problem),
 ) !void {
     if (!config_mod.isEnabled(config, .aliased_heap_dupe)) return;
 
+    const model = try cache.fileModel();
     var node_idx: u32 = 1;
     while (node_idx < tree.nodes.len) : (node_idx += 1) {
         const node: Ast.Node.Index = @enumFromInt(node_idx);
         if (tree.nodeTag(node) != .fn_decl) continue;
-        try checkFn(gpa, tree, cache, db, node, problems);
+        try checkFn(gpa, tree, cache, model, node, problems);
     }
 }
 
@@ -61,29 +60,23 @@ fn checkFn(
     gpa: std.mem.Allocator,
     tree: *const Ast,
     cache: *file_cache_mod.FileCache,
-    db: *const Db,
+    model: *const fmodel.FileModel,
     fn_decl: Ast.Node.Index,
     problems: *std.ArrayListUnmanaged(Problem),
 ) !void {
     var buf: [1]Ast.Node.Index = undefined;
     const fn_proto = fnProto(tree, &buf, fn_decl) orelse return;
     const return_type = fn_proto.ast.return_type.unwrap() orelse return;
-    const self_type = db.containingType(fn_decl);
+    const self_type: ?[]const u8 = if (model.containingTypeOf(fn_decl)) |ti| ti.name else null;
     const T = stripReturnType(tree, return_type, self_type) orelse return;
 
-    // Collect flag-owned field names on T.  No entries → nothing to
-    // check; the dupe pattern isn't hazardous for plain value types.
-    var fields_buf: [16][]const u8 = undefined;
-    var field_count: usize = 0;
-    var it = db.flag_owned_fields.iterator();
-    while (it.next()) |entry| {
-        if (!std.mem.eql(u8, entry.key_ptr.containing_type, T)) continue;
-        if (field_count >= fields_buf.len) break;
-        fields_buf[field_count] = entry.key_ptr.name;
-        field_count += 1;
-    }
-    if (field_count == 0) return;
-    const flag_fields = fields_buf[0..field_count];
+    // Collect flag-owned field names on T via inference (any field
+    // `X` with a sibling `X_allocated: bool`).  No entries → nothing
+    // to check; the dupe pattern isn't hazardous for plain value
+    // types.
+    const flag_fields = try model.flagOwnedFields(gpa, T);
+    defer gpa.free(flag_fields);
+    if (flag_fields.len == 0) return;
 
     const body = bodyOf(tree, fn_decl) orelse return;
     try checkBody(gpa, tree, cache, fn_proto, T, flag_fields, body, problems);
@@ -330,17 +323,7 @@ fn report(
 // ── Tests ──────────────────────────────────────────────────
 
 fn runOn(gpa: std.mem.Allocator, src: []const u8) !std.ArrayListUnmanaged(Problem) {
-    const src_z = try gpa.dupeSentinel(u8, src, 0);
-    defer gpa.free(src_z);
-    var tree = try Ast.parse(gpa, src_z, .zig);
-    defer tree.deinit(gpa);
-    var db = try annotations_mod.buildFull(gpa, &tree, null, null);
-    defer db.deinit(gpa);
-    var problems: std.ArrayListUnmanaged(Problem) = .empty;
-    var cache = file_cache_mod.FileCache.init(gpa, &tree);
-    defer cache.deinit();
-    try check(gpa, &tree, &db, &cache, &config_mod.Default, &problems);
-    return problems;
+    return testing.runRule(gpa, check, src);
 }
 
 const freeProblems = testing.freeProblems;

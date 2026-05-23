@@ -21,7 +21,7 @@
 const std = @import("std");
 const Ast = std.zig.Ast;
 
-const annotations_mod = @import("../annotations.zig");
+const fmodel = @import("../model.zig");
 const problem_mod = @import("../problem.zig");
 const config_mod = @import("../config.zig");
 const file_cache_mod = @import("../file_cache.zig");
@@ -31,20 +31,19 @@ const testing = @import("../testing.zig");
 const fnProto = lexer.fnProto;
 const bodyOf = lexer.bodyOf;
 
-const Db = annotations_mod.Db;
 const Problem = problem_mod.Problem;
 const Pos = problem_mod.Pos;
 
 pub fn check(
     gpa: std.mem.Allocator,
     tree: *const Ast,
-    db: *const Db,
     cache: *file_cache_mod.FileCache,
     config: *const config_mod.Config,
     problems: *std.ArrayListUnmanaged(Problem),
 ) !void {
     if (!config_mod.isEnabled(config, .asymmetric_field_free)) return;
-    _ = cache;
+
+    const model = try cache.fileModel();
 
     // Build sibling groups per containing type.
     var groups: std.StringHashMapUnmanaged(TypeGroups) = .empty;
@@ -60,7 +59,7 @@ pub fn check(
     while (node_idx < tree.nodes.len) : (node_idx += 1) {
         const node: Ast.Node.Index = @enumFromInt(node_idx);
         if (tree.nodeTag(node) != .fn_decl) continue;
-        try checkFn(gpa, tree, db, root_self_type, &groups, node, problems);
+        try checkFn(gpa, tree, model, root_self_type, &groups, node, problems);
     }
 }
 
@@ -313,7 +312,7 @@ fn findRootSelfTypeName(tree: *const Ast) ?[]const u8 {
 fn checkFn(
     gpa: std.mem.Allocator,
     tree: *const Ast,
-    db: *const Db,
+    model: *const fmodel.FileModel,
     root_self_type: ?[]const u8,
     groups: *const std.StringHashMapUnmanaged(TypeGroups),
     fn_decl: Ast.Node.Index,
@@ -325,7 +324,10 @@ fn checkFn(
     const fn_name = tree.tokenSlice(name_tok);
     if (!isDestructorName(fn_name)) return;
 
-    const ct = db.containingType(fn_decl) orelse root_self_type orelse return;
+    const ct: []const u8 = if (model.containingTypeOf(fn_decl)) |ti|
+        ti.name
+    else
+        root_self_type orelse return;
     const tg = groups.getPtr(ct) orelse return;
 
     // First param name — typically "this" or "self".  Used as the
@@ -341,18 +343,20 @@ fn checkFn(
     try collectMentionedFields(tree, body, first_param_name, &mentioned, gpa);
 
     // For each sibling group, check coverage.  Two filters:
-    //   - Skip borrowed fields (annotated `/// @borrowed` or
-    //     inferred) — legitimately not freed.
+    //   - Skip pointer-typed fields — heuristic for "this is a
+    //     borrow, not an owned value."  Replaces the older
+    //     `db.isBorrowedField` query that read `/// @borrowed`
+    //     annotations; pure inference uses the type shape.
     //   - Skip the entire group when the inner named type doesn't
     //     have a discoverable `deinit` method — those `?<X>` shapes
     //     are almost always borrowed pointers / string IDs that
     //     happen to share a type alias, not heap-owned values.
     for (tg.groups.items) |group| {
-        if (!innerTypeHasDeinit(db, group.type_text)) continue;
+        if (!innerTypeHasDeinit(model, group.type_text)) continue;
         var owned: std.ArrayListUnmanaged(FieldEntry) = .empty;
         defer owned.deinit(gpa);
         for (group.fields.items) |f| {
-            if (db.isBorrowedField(ct, f.name)) continue;
+            if (model.fieldIsPointer(ct, f.name)) continue;
             try owned.append(gpa, f);
         }
         if (owned.items.len < 2) continue;
@@ -371,11 +375,12 @@ fn checkFn(
 
 /// True iff the inner type name of `?<X>` (or `?*<X>`) corresponds
 /// to a type that defines a `deinit` method discoverable in the
-/// Db.  Skips groups where the inner is a slice / sentinel-array
-/// shape (those have no inherent deinit), and groups where the
-/// named type isn't known to the Db (cross-file types that haven't
-/// been resolved — conservative skip rather than potential FP).
-fn innerTypeHasDeinit(db: *const Db, tt: []const u8) bool {
+/// FileModel.  Skips groups where the inner is a slice / sentinel-
+/// array shape (those have no inherent deinit), and groups where
+/// the named type isn't known locally (cross-file types that
+/// haven't been resolved — conservative skip rather than potential
+/// FP).
+fn innerTypeHasDeinit(model: *const fmodel.FileModel, tt: []const u8) bool {
     if (tt.len < 2 or tt[0] != '?') return false;
     var inner = std.mem.trim(u8, tt[1..], " \t");
     // Strip pointer prefixes (`*`, `*const`) to get the pointee
@@ -404,12 +409,12 @@ fn innerTypeHasDeinit(db: *const Db, tt: []const u8) bool {
         if (c == '.') last_segment_start = i + 1;
     }
     const last_segment = inner[last_segment_start..];
-    // Heuristic: if the type IS defined in this file (db.hasType)
-    // AND has no deinit method, it's a value type — skip.  If the
-    // type isn't local (cross-file import, generic instantiation,
-    // or unknown), keep — the sibling-asymmetry signal alone is
-    // worth surfacing rather than missing.
-    if (db.hasType(last_segment) and db.lookupTyped(last_segment, "deinit") == null) {
+    // Heuristic: if the type IS defined in this file AND has no
+    // deinit method, it's a value type — skip.  If the type isn't
+    // local (cross-file import, generic instantiation, or unknown),
+    // keep — the sibling-asymmetry signal alone is worth surfacing
+    // rather than missing.
+    if (model.hasType(last_segment) and !model.typeHasMethod(last_segment, "deinit")) {
         return false;
     }
     return true;
@@ -469,17 +474,7 @@ fn report(
 // ── Tests ──────────────────────────────────────────────────
 
 fn runOn(gpa: std.mem.Allocator, src: []const u8) !std.ArrayListUnmanaged(Problem) {
-    const src_z = try gpa.dupeSentinel(u8, src, 0);
-    defer gpa.free(src_z);
-    var tree = try Ast.parse(gpa, src_z, .zig);
-    defer tree.deinit(gpa);
-    var db = try annotations_mod.buildFull(gpa, &tree, null, null);
-    defer db.deinit(gpa);
-    var problems: std.ArrayListUnmanaged(Problem) = .empty;
-    var cache = file_cache_mod.FileCache.init(gpa, &tree);
-    defer cache.deinit();
-    try check(gpa, &tree, &db, &cache, &config_mod.Default, &problems);
-    return problems;
+    return testing.runRule(gpa, check, src);
 }
 
 const freeProblems = testing.freeProblems;

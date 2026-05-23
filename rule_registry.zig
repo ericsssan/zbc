@@ -92,16 +92,16 @@ const unreleased_refs_on_error_mod = @import("rules/unreleased_refs_on_error.zig
 // Rules that need Db run after CFG analysis populates it.
 
 pub const escape_rules = [_]Rule{
-    .{ .id = "aliased-heap-dupe",                          .check = .{ .with_db = aliased_heap_dupe_mod.check } },
-    .{ .id = "clobbered-by-struct-reset",                  .check = .{ .with_db = clobbered_by_struct_reset_mod.check } },
+    .{ .id = "aliased-heap-dupe",                          .check = .{ .plain = aliased_heap_dupe_mod.check } },
+    .{ .id = "clobbered-by-struct-reset",                  .check = .{ .plain = clobbered_by_struct_reset_mod.check } },
     .{ .id = "realloc-byte-count",                         .check = .{ .plain = realloc_byte_count_mod.check } },
-    .{ .id = "asymmetric-field-free",                      .check = .{ .with_db = asymmetric_field_free_mod.check } },
-    .{ .id = "missing-errdefer-between-tries",             .check = .{ .with_db = missing_errdefer_between_tries_mod.check } },
+    .{ .id = "asymmetric-field-free",                      .check = .{ .plain = asymmetric_field_free_mod.check } },
+    .{ .id = "missing-errdefer-between-tries",             .check = .{ .plain = missing_errdefer_between_tries_mod.check } },
     .{ .id = "free-then-try-realloc",                      .check = .{ .plain = free_then_try_realloc_mod.check } },
     .{ .id = "destroy-after-deinit-in-loop",               .check = .{ .plain = destroy_after_deinit_in_loop_mod.check } },
     .{ .id = "dead-errdefer-in-result-fn",                 .check = .{ .plain = dead_errdefer_in_result_fn_mod.check } },
     .{ .id = "duplicate-errdefer",                         .check = .{ .plain = duplicate_errdefer_mod.check } },
-    .{ .id = "overwrite-without-deinit",                   .check = .{ .with_db = overwrite_without_deinit_mod.check } },
+    .{ .id = "overwrite-without-deinit",                   .check = .{ .plain = overwrite_without_deinit_mod.check } },
     .{ .id = "stack-fallback-escape",                      .check = .{ .plain = stack_fallback_escape_mod.check } },
     .{ .id = "unreleased-refs-on-error",                   .check = .{ .plain = unreleased_refs_on_error_mod.check } },
     .{ .id = "hashmap-getptr-rehash",                      .check = .{ .plain = hashmap_getptr_rehash_mod.check } },

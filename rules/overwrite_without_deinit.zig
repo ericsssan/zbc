@@ -26,7 +26,7 @@
 const std = @import("std");
 const Ast = std.zig.Ast;
 
-const annotations_mod = @import("../annotations.zig");
+const fmodel = @import("../model.zig");
 const problem_mod = @import("../problem.zig");
 const config_mod = @import("../config.zig");
 const file_cache_mod = @import("../file_cache.zig");
@@ -37,21 +37,19 @@ const findStmtSemicolon = lexer.findStmtSemicolon;
 const fnProto = lexer.fnProto;
 const bodyOf = lexer.bodyOf;
 
-const Db = annotations_mod.Db;
 const Problem = problem_mod.Problem;
 const Pos = problem_mod.Pos;
 
 pub fn check(
     gpa: std.mem.Allocator,
     tree: *const Ast,
-    db: *const Db,
     cache: *file_cache_mod.FileCache,
     config: *const config_mod.Config,
     problems: *std.ArrayListUnmanaged(Problem),
 ) !void {
     if (!config_mod.isEnabled(config, .overwrite_without_deinit)) return;
-    _ = cache;
 
+    const model = try cache.fileModel();
     var node_idx: u32 = 1;
     while (node_idx < tree.nodes.len) : (node_idx += 1) {
         const node: Ast.Node.Index = @enumFromInt(node_idx);
@@ -61,17 +59,17 @@ pub fn check(
         if (returnsType(tree, fp)) continue;
         const name_tok = fp.name_token orelse continue;
         if (isConstructorName(tree.tokenSlice(name_tok))) continue;
-        const ct = db.containingType(node) orelse continue;
+        const ct_ti = model.containingTypeOf(node) orelse continue;
         const this_name = lexer.firstParamName(tree, fp) orelse continue;
         const body = bodyOf(tree, node) orelse continue;
-        try checkBody(gpa, tree, db, ct, this_name, body, problems);
+        try checkBody(gpa, tree, model, ct_ti.name, this_name, body, problems);
     }
 }
 
 fn checkBody(
     gpa: std.mem.Allocator,
     tree: *const Ast,
-    db: *const Db,
+    model: *const fmodel.FileModel,
     ct: []const u8,
     this_name: []const u8,
     body: Ast.Node.Index,
@@ -98,12 +96,12 @@ fn checkBody(
         const sc = findStmtSemicolon(tags, t + 4, last) orelse continue;
         const field_name = tree.tokenSlice(t + 2);
         // Field-type lookup: must have a known type whose `deinit` is
-        // in the Db.  Skip otherwise.
-        const field_type = db.fieldType(ct, field_name) orelse {
+        // declared in this file.  Skip otherwise.
+        const field_type = model.fieldType(ct, field_name) orelse {
             t = sc;
             continue;
         };
-        if (db.lookupTyped(field_type, "deinit") == null) {
+        if (!model.typeHasMethod(field_type, "deinit")) {
             t = sc;
             continue;
         }
@@ -349,17 +347,7 @@ fn report(
 // ── Tests ──────────────────────────────────────────────────
 
 fn runOn(gpa: std.mem.Allocator, src: []const u8) !std.ArrayListUnmanaged(Problem) {
-    const src_z = try gpa.dupeSentinel(u8, src, 0);
-    defer gpa.free(src_z);
-    var tree = try Ast.parse(gpa, src_z, .zig);
-    defer tree.deinit(gpa);
-    var db = try annotations_mod.buildFull(gpa, &tree, null, null);
-    defer db.deinit(gpa);
-    var problems: std.ArrayListUnmanaged(Problem) = .empty;
-    var cache = file_cache_mod.FileCache.init(gpa, &tree);
-    defer cache.deinit();
-    try check(gpa, &tree, &db, &cache, &config_mod.Default, &problems);
-    return problems;
+    return testing.runRule(gpa, check, src);
 }
 
 const freeProblems = testing.freeProblems;

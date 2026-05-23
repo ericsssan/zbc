@@ -192,7 +192,122 @@ pub const FileModel = struct {
         }
         return null;
     }
+
+    /// True iff the file declares a type with this name.
+    pub fn hasType(self: *const FileModel, name: []const u8) bool {
+        return self.findType(name) != null;
+    }
+
+    /// Find the type whose body contains `fn_decl`.  Returns null
+    /// for top-level fns.  When `fn_decl` is inside a nested type,
+    /// returns the INNERMOST enclosing type (smallest body range),
+    /// not the outer — methods on nested types should associate
+    /// with their declaring type, not its container.
+    pub fn containingTypeOf(self: *const FileModel, fn_decl: Ast.Node.Index) ?*const TypeInfo {
+        const fn_tok = self.tree.firstToken(fn_decl);
+        var best: ?*const TypeInfo = null;
+        var best_span: u32 = std.math.maxInt(u32);
+        for (self.types) |*ti| {
+            if (fn_tok > ti.body_first and fn_tok < ti.body_last) {
+                const span = ti.body_last - ti.body_first;
+                if (span < best_span) {
+                    best = ti;
+                    best_span = span;
+                }
+            }
+        }
+        return best;
+    }
+
+    /// (struct_name, field_name) -> the field's declared base type
+    /// name with `*` / `?` / `const` / `[]` wrappers stripped.
+    /// Returns null when the struct or field isn't known, or when the
+    /// type has no resolvable base name (slice/array/fn-pointer
+    /// shapes).  Matches the old `Db.fieldType` query shape.
+    pub fn fieldType(self: *const FileModel, struct_name: []const u8, field_name: []const u8) ?[]const u8 {
+        const ti = self.findType(struct_name) orelse return null;
+        const f = ti.findField(field_name) orelse return null;
+        return baseTypeName(self.tree, f.type_first, f.type_last);
+    }
+
+    /// True iff the field's declared type starts with `*` (after
+    /// stripping `?` / `const`).  Heuristic for "this field is a
+    /// borrow, not an owned value" — pointer-typed struct fields
+    /// almost always alias storage that lives elsewhere.  Inference
+    /// replacement for the old `Db.isBorrowedField` query that
+    /// previously relied on `/// @borrowed` doc-comment annotations.
+    pub fn fieldIsPointer(self: *const FileModel, struct_name: []const u8, field_name: []const u8) bool {
+        const ti = self.findType(struct_name) orelse return false;
+        const f = ti.findField(field_name) orelse return false;
+        const tags = self.tree.tokens.items(.tag);
+        var t: TokenIndex = f.type_first;
+        while (t <= f.type_last) : (t += 1) {
+            switch (tags[t]) {
+                .question_mark, .keyword_const => {},
+                .asterisk => return true,
+                else => return false,
+            }
+        }
+        return false;
+    }
+
+    /// True iff `struct_name`.`field_name` is the heap-owning half of
+    /// a flag-paired ownership pattern: a sibling field
+    /// `<field_name>_allocated: bool` exists on the same struct.
+    /// Inference-equivalent of the old `Db.flag_owned_fields` set —
+    /// pure syntactic pairing, no annotation needed.
+    pub fn isFlagOwnedField(self: *const FileModel, struct_name: []const u8, field_name: []const u8) bool {
+        const ti = self.findType(struct_name) orelse return false;
+        if (ti.findField(field_name) == null) return false;
+        // Look for the sibling `<field>_allocated: bool` field.
+        var buf: [128]u8 = undefined;
+        const suffix = "_allocated";
+        if (field_name.len + suffix.len > buf.len) return false;
+        @memcpy(buf[0..field_name.len], field_name);
+        @memcpy(buf[field_name.len..][0..suffix.len], suffix);
+        const sibling_name = buf[0 .. field_name.len + suffix.len];
+        const sibling = ti.findField(sibling_name) orelse return false;
+        // Sibling type must be exactly `bool`.
+        if (sibling.type_first != sibling.type_last) return false;
+        return std.mem.eql(u8, self.tree.tokenSlice(sibling.type_first), "bool");
+    }
+
+    /// Iterate over `(field_name)` pairs of every flag-owned field
+    /// on `struct_name`.  Caller-owned slice; freed by `gpa.free`.
+    pub fn flagOwnedFields(
+        self: *const FileModel,
+        gpa: std.mem.Allocator,
+        struct_name: []const u8,
+    ) ![]const []const u8 {
+        const ti = self.findType(struct_name) orelse return &.{};
+        var out: std.ArrayListUnmanaged([]const u8) = .empty;
+        for (ti.fields) |f| {
+            if (self.isFlagOwnedField(struct_name, f.name)) {
+                try out.append(gpa, f.name);
+            }
+        }
+        return out.toOwnedSlice(gpa);
+    }
 };
+
+/// Strip pointer / optional / const / slice wrappers from a type
+/// expression token range and return the base identifier.  Returns
+/// null when the base isn't a single identifier (fn-pointer, anon
+/// struct, etc.).
+fn baseTypeName(tree: *const Ast, first: TokenIndex, last: TokenIndex) ?[]const u8 {
+    const tags = tree.tokens.items(.tag);
+    var t: TokenIndex = first;
+    while (t <= last) : (t += 1) {
+        switch (tags[t]) {
+            // Strip leading wrappers and keep scanning.
+            .asterisk, .question_mark, .keyword_const, .keyword_var, .l_bracket, .r_bracket => {},
+            .identifier => return tree.tokenSlice(t),
+            // Anything else (paren, dot, etc.) — give up.
+            else => return null,
+        }
+    }
+    return null;
+}
 
 /// Build a FileModel for the given Ast.  `tree` must outlive the model.
 pub fn build(gpa: std.mem.Allocator, tree: *const Ast) !FileModel {
@@ -762,6 +877,127 @@ test "build: nested type decls collected with parent link" {
     try testing.expect(outer.hasMethod("deinit"));
     try testing.expect(inner.hasMethod("close"));
     try testing.expect(inner.hasCleanupMethod());
+}
+
+test "fieldIsPointer: detects *T / ?*T / *const T" {
+    const src: [:0]const u8 =
+        \\const Foo = struct {
+        \\    val: Inner,
+        \\    ptr: *Inner,
+        \\    opt_ptr: ?*Inner,
+        \\    const_ptr: *const Inner,
+        \\    opt_val: ?Inner,
+        \\    sl: []u8,
+        \\};
+        \\const Inner = struct {};
+    ;
+    var tree = try Ast.parse(testing.allocator, src, .zig);
+    defer tree.deinit(testing.allocator);
+    var model = try build(testing.allocator, &tree);
+    defer model.deinit();
+
+    try testing.expect(!model.fieldIsPointer("Foo", "val"));
+    try testing.expect(model.fieldIsPointer("Foo", "ptr"));
+    try testing.expect(model.fieldIsPointer("Foo", "opt_ptr"));
+    try testing.expect(model.fieldIsPointer("Foo", "const_ptr"));
+    try testing.expect(!model.fieldIsPointer("Foo", "opt_val"));
+    try testing.expect(!model.fieldIsPointer("Foo", "sl"));
+}
+
+test "containingTypeOf: method's fn_decl resolves to its struct" {
+    const src: [:0]const u8 =
+        \\const Foo = struct {
+        \\    x: u32,
+        \\    pub fn deinit(self: *Foo) void { _ = self; }
+        \\};
+        \\pub fn top_level() void {}
+    ;
+    var tree = try Ast.parse(testing.allocator, src, .zig);
+    defer tree.deinit(testing.allocator);
+    var model = try build(testing.allocator, &tree);
+    defer model.deinit();
+
+    // Find the deinit fn_decl + the top_level fn_decl.
+    var idx: u32 = 1;
+    var deinit_node: ?Ast.Node.Index = null;
+    var top_node: ?Ast.Node.Index = null;
+    while (idx < tree.nodes.len) : (idx += 1) {
+        const n: Ast.Node.Index = @enumFromInt(idx);
+        if (tree.nodeTag(n) != .fn_decl) continue;
+        var buf: [1]Ast.Node.Index = undefined;
+        const fp = @import("lexer.zig").fnProto(&tree, &buf, n).?;
+        const name_tok = fp.name_token.?;
+        if (std.mem.eql(u8, tree.tokenSlice(name_tok), "deinit")) deinit_node = n;
+        if (std.mem.eql(u8, tree.tokenSlice(name_tok), "top_level")) top_node = n;
+    }
+    const dt = model.containingTypeOf(deinit_node.?);
+    try testing.expect(dt != null);
+    try testing.expectEqualStrings("Foo", dt.?.name);
+    try testing.expect(model.containingTypeOf(top_node.?) == null);
+}
+
+test "fieldType: strips pointer/optional/const/slice wrappers" {
+    const src: [:0]const u8 =
+        \\const Bar = struct {
+        \\    a: Inner,
+        \\    b: *Inner,
+        \\    c: ?*const Inner,
+        \\    d: []const u8,
+        \\    e: ?Inner,
+        \\};
+        \\const Inner = struct {};
+    ;
+    var tree = try Ast.parse(testing.allocator, src, .zig);
+    defer tree.deinit(testing.allocator);
+    var model = try build(testing.allocator, &tree);
+    defer model.deinit();
+
+    try testing.expectEqualStrings("Inner", model.fieldType("Bar", "a").?);
+    try testing.expectEqualStrings("Inner", model.fieldType("Bar", "b").?);
+    try testing.expectEqualStrings("Inner", model.fieldType("Bar", "c").?);
+    try testing.expectEqualStrings("u8", model.fieldType("Bar", "d").?);
+    try testing.expectEqualStrings("Inner", model.fieldType("Bar", "e").?);
+}
+
+test "isFlagOwnedField: detects X + X_allocated pair" {
+    const src: [:0]const u8 =
+        \\const Owner = struct {
+        \\    data: []u8,
+        \\    data_allocated: bool,
+        \\    other: u32,
+        \\};
+    ;
+    var tree = try Ast.parse(testing.allocator, src, .zig);
+    defer tree.deinit(testing.allocator);
+    var model = try build(testing.allocator, &tree);
+    defer model.deinit();
+
+    try testing.expect(model.isFlagOwnedField("Owner", "data"));
+    try testing.expect(!model.isFlagOwnedField("Owner", "other"));
+    try testing.expect(!model.isFlagOwnedField("Owner", "data_allocated"));
+    try testing.expect(!model.isFlagOwnedField("Missing", "data"));
+}
+
+test "flagOwnedFields: returns the field-name set" {
+    const src: [:0]const u8 =
+        \\const Owner = struct {
+        \\    one: []u8,
+        \\    one_allocated: bool,
+        \\    two: []u8,
+        \\    two_allocated: bool,
+        \\    three: u32,
+        \\};
+    ;
+    var tree = try Ast.parse(testing.allocator, src, .zig);
+    defer tree.deinit(testing.allocator);
+    var model = try build(testing.allocator, &tree);
+    defer model.deinit();
+
+    const flagged = try model.flagOwnedFields(testing.allocator, "Owner");
+    defer testing.allocator.free(flagged);
+    try testing.expectEqual(@as(usize, 2), flagged.len);
+    try testing.expectEqualStrings("one", flagged[0]);
+    try testing.expectEqualStrings("two", flagged[1]);
 }
 
 test "build: doubly-nested type chains parent links" {
