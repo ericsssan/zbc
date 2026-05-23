@@ -1278,6 +1278,30 @@ const Builder = struct {
     /// doesn't claim it frees self, return the type's name.  Used
     /// by `lowerFunctionBody` to emit a leak_warning stmt at body
     /// start.  Returns null in all other cases.
+    /// True iff the destructor's own body releases an `arena`-named
+    /// field via `<self|this>.arena.deinit(...)`.  Heuristic for
+    /// "self is housed in the arena it manages" — the arena's
+    /// release transitively frees `self`, so the leak rule's
+    /// `allocator.destroy(self)` requirement is moot.
+    fn destructorReleasesOwnArena(self: *const Builder) bool {
+        if (self.fn_body_first == 0) return false;
+        const tags = self.tree.tokens.items(.tag);
+        var t: Ast.TokenIndex = self.fn_body_first;
+        while (t + 4 <= self.fn_body_last) : (t += 1) {
+            if (tags[t] != .identifier) continue;
+            const s = self.tree.tokenSlice(t);
+            if (!std.mem.eql(u8, s, "self") and !std.mem.eql(u8, s, "this")) continue;
+            if (tags[t + 1] != .period) continue;
+            if (tags[t + 2] != .identifier) continue;
+            if (!std.mem.eql(u8, self.tree.tokenSlice(t + 2), "arena")) continue;
+            if (tags[t + 3] != .period) continue;
+            if (tags[t + 4] != .identifier) continue;
+            if (!std.mem.eql(u8, self.tree.tokenSlice(t + 4), "deinit")) continue;
+            return true;
+        }
+        return false;
+    }
+
     /// True iff `type_name`'s body declares a bun refcount mixin
     /// — `RefCount(...)` or `ThreadSafeRefCount(...)`.  Used by
     /// `leakyDestructorTypeName` to suppress the leak fire on
@@ -1340,6 +1364,13 @@ const Builder = struct {
         // declared as `pub const ref = RefCount.ref;` aliases —
         // not `fn` decls — so `hasMethod` misses them.
         if (self.typeBodyHasRefCountMixin(ct)) return null;
+        // Self-housed-in-arena: when the destructor body calls
+        // `<self>.arena.deinit()`, the type instance very likely
+        // lives inside that arena (a Bun-wide pattern: parser, FS
+        // router, number renamer).  Arena.deinit releases the
+        // entire arena pool, so `self` is freed transitively —
+        // no explicit `allocator.destroy(self)` needed.
+        if (self.destructorReleasesOwnArena()) return null;
 
         // The destructor must NOT have @takes(self) — that would
         // mean it does free self, no leak.
