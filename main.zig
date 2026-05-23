@@ -163,9 +163,6 @@ pub fn main(init: std.process.Init) !void {
         .enabled = enabled.items,
     };
 
-    var shared_cache: lib.Cache = lib.Cache.init(gpa, io);
-    defer shared_cache.deinit();
-
     const tasks = try gpa.alloc(Task, expanded.items.len);
     defer gpa.free(tasks);
     for (expanded.items, tasks) |path, *t| {
@@ -174,7 +171,6 @@ pub fn main(init: std.process.Init) !void {
             .io = io,
             .path = path,
             .config = &config,
-            .cache = &shared_cache,
             .problems = &.{},
             .err = null,
         };
@@ -375,7 +371,6 @@ const Task = struct {
     io: std.Io,
     path: []const u8,
     config: *const lib.Config,
-    cache: *lib.Cache,
     problems: []lib.Problem,
     err: ?anyerror,
 };
@@ -407,7 +402,7 @@ fn workerLoop(ctx: WorkerCtx) void {
 }
 
 fn runOne(t: *Task) std.Io.Cancelable!void {
-    const problems = lib.analyzeEscape(t.gpa, t.io, t.path, t.cache, t.config) catch |err| {
+    const problems = lib.analyzeEscape(t.gpa, t.io, t.path, t.config) catch |err| {
         t.err = err;
         return;
     };

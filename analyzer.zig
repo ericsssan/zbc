@@ -8,8 +8,6 @@ const state_mod = @import("abstract_state.zig");
 const transfer = @import("transfer.zig");
 const problem_mod = @import("problem.zig");
 const annotations = @import("annotations.zig");
-const imports_mod = @import("imports.zig");
-const remote_resolver_mod = @import("remote_resolver.zig");
 const config_mod = @import("config.zig");
 const file_cache_mod = @import("file_cache.zig");
 
@@ -198,7 +196,6 @@ fn analyze(gpa: std.mem.Allocator, src: []const u8) !std.ArrayListUnmanaged(Prob
             &tree,
             node,
             &db,
-            null,
             &config_mod.Default,
             &rule_cache,
         )) orelse continue;
@@ -1937,7 +1934,3 @@ test "return error.X without prior explicit free — clean (errdefer is the SOLE
     try std.testing.expectEqual(@as(usize, 0), problems.items.len);
 }
 
-test {
-    _ = imports_mod;
-    _ = remote_resolver_mod;
-}

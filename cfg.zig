@@ -30,23 +30,12 @@ const std = @import("std");
 const Ast = std.zig.Ast;
 const abstract_state = @import("abstract_state.zig");
 const annotations = @import("annotations.zig");
-const imports = @import("imports.zig");
-const remote_resolver = @import("remote_resolver.zig");
 const config_mod = @import("config.zig");
 const file_cache = @import("file_cache.zig");
 const fn_summary = @import("fn_summary.zig");
 const zls_resolver_mod = @import("zls_resolver.zig");
 
 pub const Config = config_mod.Config;
-
-/// Cross-file resolution context passed into lowerFunction.  When
-/// present, classifyCall resolves `imported.method(...)` callees by
-/// looking up the method's annotation in the imported file's DB.
-pub const RemoteCtx = struct {
-    imap: *const imports.Map,
-    base_dir: []const u8,
-    cache: *remote_resolver.Cache,
-};
 
 pub const BlockId = abstract_state.BlockId;
 pub const LocalId = abstract_state.LocalId;
@@ -400,19 +389,7 @@ pub fn lowerFunction(
     fn_decl: Ast.Node.Index,
     db: ?*const annotations.Db,
 ) !?Cfg {
-    return lowerFunctionFull(gpa, tree, fn_decl, db, null, &config_mod.Default, null);
-}
-
-/// Backwards-compat alias from phase 22.  Forwards to lowerFunctionFull
-/// with the Default config — preserves the previous 5-arg signature.
-pub fn lowerFunctionWithRemote(
-    gpa: std.mem.Allocator,
-    tree: *const Ast,
-    fn_decl: Ast.Node.Index,
-    db: ?*const annotations.Db,
-    remote: ?*const RemoteCtx,
-) !?Cfg {
-    return lowerFunctionFull(gpa, tree, fn_decl, db, remote, &config_mod.Default, null);
+    return lowerFunctionFull(gpa, tree, fn_decl, db, &config_mod.Default, null);
 }
 
 /// Main entry point.  Generalizes the per-project knobs into Config
@@ -430,11 +407,10 @@ pub fn lowerFunctionFull(
     tree: *const Ast,
     fn_decl: Ast.Node.Index,
     db: ?*const annotations.Db,
-    remote: ?*const RemoteCtx,
     config: *const Config,
     cache: ?*file_cache.FileCache,
 ) !?Cfg {
-    return lowerFunctionFullWithZls(gpa, tree, fn_decl, db, remote, config, cache, null);
+    return lowerFunctionFullWithZls(gpa, tree, fn_decl, db, config, cache, null);
 }
 
 /// Variant that also accepts a ZLS-backed type resolver.  When
@@ -446,7 +422,6 @@ pub fn lowerFunctionFullWithZls(
     tree: *const Ast,
     fn_decl: Ast.Node.Index,
     db: ?*const annotations.Db,
-    remote: ?*const RemoteCtx,
     config: *const Config,
     cache: ?*file_cache.FileCache,
     zls: ?*zls_resolver_mod.ZlsResolver,
@@ -485,7 +460,6 @@ pub fn lowerFunctionFullWithZls(
         .db = db,
         .cache = cache,
         .zls = zls,
-        .remote = remote,
         .config = config,
         .is_borrowed_return_type = is_borrowed_ret,
         .suppress_composite_borrow = suppress_cb,
@@ -597,7 +571,6 @@ const Builder = struct {
     /// resolve a local (cross-module types, generic instantiations,
     /// inferred-from-method-call locals).  null = legacy AST-only path.
     zls: ?*zls_resolver_mod.ZlsResolver = null,
-    remote: ?*const RemoteCtx = null,
     config: *const Config = &config_mod.Default,
     /// The struct/union/enum that contains the fn being lowered.  Set
     /// by the caller of `build` per fn (via `lib.zig`'s walker).
@@ -2840,42 +2813,31 @@ const Builder = struct {
         return false;
     }
 
-    /// Cross-file FnEntry lookup — shared by callers that need
-    /// multiple fields off the remote entry.
+    /// Cross-file FnEntry lookup — retired with remote_resolver.  ZLS
+    /// handles cross-file type resolution now; annotation propagation
+    /// across files is no longer supported.  Always null.
     fn lookupRemoteEntry(
         self: *Builder,
         recv_node: Ast.Node.Index,
         method_name: []const u8,
     ) ?annotations.FnEntry {
-        const remote = self.remote orelse return null;
-        const tree = self.tree;
-        if (tree.nodeTag(recv_node) != .identifier) return null;
-        const recv_name = tree.tokenSlice(tree.nodeMainToken(recv_node));
-        const imap_entry = remote.imap.lookup(recv_name) orelse return null;
-        const remote_file = (remote.cache.loadOrLookup(remote.base_dir, imap_entry.path) catch return null) orelse return null;
-        return remote_file.db.lookup(method_name);
+        _ = self;
+        _ = recv_node;
+        _ = method_name;
+        return null;
     }
 
-    /// FnSummary-equivalent of lookupRemoteEntry — queries the
-    /// imported file's FileCache (FnSummary inference, post-R10
-    /// transitive resolution) instead of its annotation Db.  Used
-    /// by callers that prefer the cache-first / db-fallback chain.
+    /// FnSummary-equivalent of lookupRemoteEntry — retired with
+    /// remote_resolver.  Always null.
     fn lookupRemoteSummary(
         self: *Builder,
         recv_node: Ast.Node.Index,
         method_name: []const u8,
     ) ?*const fn_summary.FnSummary {
-        const remote = self.remote orelse return null;
-        const tree = self.tree;
-        if (tree.nodeTag(recv_node) != .identifier) return null;
-        const recv_name = tree.tokenSlice(tree.nodeMainToken(recv_node));
-        const imap_entry = remote.imap.lookup(recv_name) orelse return null;
-        const remote_file = (remote.cache.loadOrLookup(remote.base_dir, imap_entry.path) catch return null) orelse return null;
-        // remote_file.fcache.tree is &remote_file.tree (stable).
-        // Cast away const so the cache's mutable lazy-init paths work;
-        // the outer caller treats the result as borrowed.
-        const cache: *file_cache.FileCache = @constCast(&remote_file.fcache);
-        return cache.summaryByName(method_name) catch null;
+        _ = self;
+        _ = recv_node;
+        _ = method_name;
+        return null;
     }
 
     /// If the callee has `@takes ownership(p)`, return the LocalId
@@ -3195,74 +3157,51 @@ const Builder = struct {
     /// lib.zig.  The local db can't find HTMLRewriterLoader; this
     /// helper walks imports and tries each remote db.
     ///
-    /// Ambiguity: if MULTIPLE imported files define a type with the
-    /// same name, only the FIRST match is returned.  Bun's codebase
-    /// shouldn't hit this in practice (struct names are unique
-    /// per-file by convention), but the alternative — return null
-    /// on multi-match — would silently drop catches.  First-match
-    /// is the pragmatic choice.
+    /// Cross-file typed method lookup — retired with remote_resolver.
+    /// Always null.
     fn lookupCrossFileMethod(
         self: *Builder,
         type_name: []const u8,
         method_name: []const u8,
     ) ?annotations.FnEntry {
-        const remote = self.remote orelse return null;
-        var it = remote.imap.entries.iterator();
-        while (it.next()) |kv| {
-            const remote_file = (remote.cache.loadOrLookup(remote.base_dir, kv.value_ptr.path) catch continue) orelse continue;
-            if (!remote_file.db.hasType(type_name)) continue;
-            if (remote_file.db.lookupTyped(type_name, method_name)) |e| return e;
-        }
+        _ = self;
+        _ = type_name;
+        _ = method_name;
         return null;
     }
 
-    /// FnSummary-equivalent of lookupCrossFileMethod — walks imap to
-    /// find a remote file declaring `type_name`, then queries its
-    /// FileCache (typed lookup, since `<recv>.<method>` is the
-    /// shape this helper resolves).
+    /// FnSummary cross-file typed lookup — retired with remote_resolver.
+    /// Always null.
     fn lookupCrossFileSummary(
         self: *Builder,
         type_name: []const u8,
         method_name: []const u8,
     ) ?*const fn_summary.FnSummary {
-        const remote = self.remote orelse return null;
-        var it = remote.imap.entries.iterator();
-        while (it.next()) |kv| {
-            const remote_file = (remote.cache.loadOrLookup(remote.base_dir, kv.value_ptr.path) catch continue) orelse continue;
-            const cache: *file_cache.FileCache = @constCast(&remote_file.fcache);
-            const model = cache.fileModel() catch continue;
-            if (!model.hasType(type_name)) continue;
-            if (cache.summaryByMethod(type_name, method_name) catch null) |s| return s;
-        }
+        _ = self;
+        _ = type_name;
+        _ = method_name;
         return null;
     }
 
-    /// Cross-file `@takes` lookup — see lookupRemoteMethod for the
-    /// resolution mechanics.
+    /// Cross-file `@takes` lookup — retired with remote_resolver.
+    /// Always null.
     fn lookupRemoteTakes(
         self: *Builder,
         recv_node: Ast.Node.Index,
         method_name: []const u8,
     ) ?annotations.TakesAnnotation {
-        const remote = self.remote orelse return null;
-        const tree = self.tree;
-        if (tree.nodeTag(recv_node) != .identifier) return null;
-        const recv_name = tree.tokenSlice(tree.nodeMainToken(recv_node));
-        const imap_entry = remote.imap.lookup(recv_name) orelse return null;
-        const remote_file = (remote.cache.loadOrLookup(remote.base_dir, imap_entry.path) catch return null) orelse return null;
-        const entry = remote_file.db.lookup(method_name) orelse return null;
-        return entry.takes;
+        _ = self;
+        _ = recv_node;
+        _ = method_name;
+        return null;
     }
 
-    /// True iff `node` is a bare identifier that resolves to an
-    /// imported namespace in our imap (e.g. `lib` in `lib.foo(...)`).
-    /// Used to disambiguate method-style calls from namespace calls.
+    /// Was: identifier resolves to an imported namespace in our imap.
+    /// Retired with remote_resolver — always false.
     fn calleeIsImportedNamespace(self: *Builder, node: Ast.Node.Index) bool {
-        const remote = self.remote orelse return false;
-        const tree = self.tree;
-        if (tree.nodeTag(node) != .identifier) return false;
-        const name = tree.tokenSlice(tree.nodeMainToken(node));
-        return remote.imap.lookup(name) != null;
+        _ = self;
+        _ = node;
+        return false;
     }
 
     /// For `<allocator>.free(p)` / `<allocator>.destroy(p)`, return the
@@ -4743,33 +4682,17 @@ const Builder = struct {
         }
     }
 
-    /// Cross-file annotation lookup.  When the call shape is
-    /// `<imported>.<method>(...)`, resolve `imported` through the
-    /// local imap to a path, load that file's annotation DB through
-    /// the sweep-wide remote cache, and return `method`'s annotation
-    /// (if any).  Returns null on any miss — never errors; callers
-    /// must treat missing remote info as "no annotation."
+    /// Cross-file annotation lookup — retired with remote_resolver.
+    /// Always null.
     fn lookupRemoteMethod(
         self: *Builder,
         recv_node: Ast.Node.Index,
         method_name: []const u8,
     ) ?annotations.ReturnsAnnotation {
-        // Cache-first: consult the remote file's FnSummary inference
-        // (via lookupRemoteSummary), translate to ReturnsAnnotation
-        // with the same conservative collapse as the intra-file path.
-        if (self.lookupRemoteSummary(recv_node, method_name)) |s| {
-            if (summaryToAnnotation(s)) |a| return a;
-        }
-        // Db fallback for cases cache doesn't express
-        // (explicit /// @returns owns_locals / R6-only inferences).
-        const remote = self.remote orelse return null;
-        const tree = self.tree;
-        if (tree.nodeTag(recv_node) != .identifier) return null;
-        const recv_name = tree.tokenSlice(tree.nodeMainToken(recv_node));
-        const imap_entry = remote.imap.lookup(recv_name) orelse return null;
-        const remote_file = (remote.cache.loadOrLookup(remote.base_dir, imap_entry.path) catch return null) orelse return null;
-        const entry = remote_file.db.lookup(method_name) orelse return null;
-        return entry.annotation;
+        _ = self;
+        _ = recv_node;
+        _ = method_name;
+        return null;
     }
 
     /// Conservatively translate a body-only FnSummary.Returns into

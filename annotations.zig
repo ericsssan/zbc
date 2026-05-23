@@ -15,8 +15,6 @@
 const std = @import("std");
 const Ast = std.zig.Ast;
 const config_mod = @import("config.zig");
-const imports_mod = @import("imports.zig");
-const remote_resolver_mod = @import("remote_resolver.zig");
 
 /// R8 inference uses these to recognize alloc/free wrappers.
 /// Default to the canonical std allocator surface so callers that
@@ -406,28 +404,18 @@ pub fn build(gpa: std.mem.Allocator, tree: *const Ast) !Db {
     return buildWithConfig(gpa, tree, null);
 }
 
-/// Optional remote ctx for R7 cross-file inference.  When provided,
-/// inferDelegatorBorrow can look up callees defined in imported
-/// files and infer wrappers that delegate across module boundaries.
-pub const RemoteCtx = struct {
-    imap: *const imports_mod.Map,
-    base_dir: []const u8,
-    cache: *remote_resolver_mod.Cache,
-};
-
 pub fn buildWithConfig(
     gpa: std.mem.Allocator,
     tree: *const Ast,
     config: ?*const config_mod.Config,
 ) !Db {
-    return buildFull(gpa, tree, config, null);
+    return buildFull(gpa, tree, config);
 }
 
 pub fn buildFull(
     gpa: std.mem.Allocator,
     tree: *const Ast,
     config: ?*const config_mod.Config,
-    remote: ?RemoteCtx,
 ) !Db {
     const alloc_patterns = if (config) |c| c.heap_alloc_patterns else default_heap_alloc_patterns;
     const free_patterns = if (config) |c| c.heap_free_patterns else default_heap_free_patterns;
@@ -532,7 +520,7 @@ pub fn buildFull(
             if (existing != null and existing.?.annotation != null) continue;
 
             const body = tree.nodeData(node).node_and_node[1];
-            const inferred = inferDelegatorBorrow(tree, fn_proto, body, &db, remote) orelse continue;
+            const inferred = inferDelegatorBorrow(tree, fn_proto, body, &db) orelse continue;
             const ep = try putOrUpdate(&db, gpa, name, ct, .{
                 .name = name,
                 .containing_type = ct,
@@ -621,7 +609,7 @@ pub fn buildFull(
             if (had_takes and had_fields) continue;
 
             const body = tree.nodeData(node).node_and_node[1];
-            const inferred = try inferTakesViaReceiverCall(gpa, tree, fn_proto, body, &db, ct, remote);
+            const inferred = try inferTakesViaReceiverCall(gpa, tree, fn_proto, body, &db, ct);
 
             // Decide what's NEW.  Don't overwrite existing data —
             // R8b's direct-free inference + explicit @takes are
@@ -837,7 +825,6 @@ fn inferTakesViaReceiverCall(
     body_node: Ast.Node.Index,
     db: *const Db,
     self_type: ?[]const u8,
-    remote: ?RemoteCtx,
 ) !InferReceiverResult {
     const first = tree.firstToken(body_node);
     const last = tree.lastToken(body_node);
@@ -883,7 +870,7 @@ fn inferTakesViaReceiverCall(
             // the classic `<param>.<method>()` shape — propagates
             // ownership of the param itself.
             if (result.takes != null) continue; // first match wins
-            const callee = resolveMethod(db, parent_ty, method_name, remote) orelse continue;
+            const callee = resolveMethod(db, parent_ty, method_name) orelse continue;
             const callee_takes = callee.takes orelse continue;
             switch (callee_takes) {
                 .ownership => |i| if (i == 0) {
@@ -909,7 +896,7 @@ fn inferTakesViaReceiverCall(
         }
         if (!resolution_ok) continue;
 
-        const callee = resolveMethod(db, cur_ty, method_name, remote) orelse continue;
+        const callee = resolveMethod(db, cur_ty, method_name) orelse continue;
         const callee_takes = callee.takes orelse continue;
         switch (callee_takes) {
             .ownership => |i| if (i == 0) {
@@ -1043,19 +1030,14 @@ fn inferFreesArgField(
     }
 }
 
-/// Resolve a method by (containing_type, name) — local DB first,
-/// then cross-file when remote is available.  Used by R10 inference.
+/// Resolve a method by (containing_type, name) — local DB only.
+/// Cross-file lookup retired with remote_resolver.  Used by R10 inference.
 fn resolveMethod(
     db: *const Db,
     ty: ?[]const u8,
     method_name: []const u8,
-    remote: ?RemoteCtx,
 ) ?FnEntry {
-    if (db.lookupTyped(ty, method_name)) |e| return e;
-    if (ty != null and remote != null) {
-        if (lookupCrossFile(remote.?, ty.?, method_name)) |e| return e;
-    }
-    return null;
+    return db.lookupTyped(ty, method_name);
 }
 
 /// Parsed shape of a `<param>(.<field>)*.<method>(` token chain.
@@ -1106,24 +1088,6 @@ fn scanFieldChain(
         // Chain ends without a `(` — not a method-call shape we
         // care about for R10 inference.
         return null;
-    }
-    return null;
-}
-
-/// Cross-file equivalent of `Db.lookupTyped` — walks remote's imap
-/// for a file that declares `type_name`, then looks up
-/// `(type_name, method_name)` there.  Used by R10's inference and
-/// by callers needing pre-build cross-file resolution.
-fn lookupCrossFile(
-    remote: RemoteCtx,
-    type_name: []const u8,
-    method_name: []const u8,
-) ?FnEntry {
-    var it = remote.imap.entries.iterator();
-    while (it.next()) |kv| {
-        const file = (remote.cache.loadOrLookup(remote.base_dir, kv.value_ptr.path) catch continue) orelse continue;
-        if (!file.db.hasType(type_name)) continue;
-        if (file.db.lookupTyped(type_name, method_name)) |e| return e;
     }
     return null;
 }
@@ -1369,16 +1333,15 @@ fn inferDelegatorBorrow(
     fn_proto: Ast.full.FnProto,
     body_node: Ast.Node.Index,
     db: *const Db,
-    remote: ?RemoteCtx,
 ) ?ReturnsAnnotation {
     // Single-stmt or var+return shape: classify the lone return.
     if (singleReturnExpr(tree, body_node)) |return_expr| {
-        if (tryInferFromReturnExpr(tree, fn_proto, return_expr, db, remote)) |a| return a;
+        if (tryInferFromReturnExpr(tree, fn_proto, return_expr, db)) |a| return a;
     }
     // Multi-return body (e.g. `if (cond) return c.text(); return "";`):
     // infer if EVERY return stmt either delegates to the same param
     // or returns a non-borrow value (literal / null / &.{} / etc.).
-    return inferDelegatorBorrowMultiReturn(tree, fn_proto, body_node, db, remote);
+    return inferDelegatorBorrowMultiReturn(tree, fn_proto, body_node, db);
 }
 
 fn tryInferFromReturnExpr(
@@ -1386,7 +1349,6 @@ fn tryInferFromReturnExpr(
     fn_proto: Ast.full.FnProto,
     return_expr: Ast.Node.Index,
     db: *const Db,
-    remote: ?RemoteCtx,
 ) ?ReturnsAnnotation {
     // Extends-storage form: `return .{ .field = <param> }` or
     // `return T{ .field = <param> }` — the returned value carries
@@ -1397,8 +1359,8 @@ fn tryInferFromReturnExpr(
 
     var buf: [1]Ast.Node.Index = undefined;
     const call_full = tree.fullCall(&buf, return_expr) orelse return null;
-    if (inferMethodStyle(tree, fn_proto, return_expr, db, remote)) |a| return a;
-    return inferNamespaceStyle(tree, fn_proto, call_full, db, remote);
+    if (inferMethodStyle(tree, fn_proto, return_expr, db)) |a| return a;
+    return inferNamespaceStyle(tree, fn_proto, call_full, db);
 }
 
 /// Inference for the canonical wrapper-constructor shape:
@@ -1456,7 +1418,6 @@ fn inferDelegatorBorrowMultiReturn(
     fn_proto: Ast.full.FnProto,
     body_node: Ast.Node.Index,
     db: *const Db,
-    remote: ?RemoteCtx,
 ) ?ReturnsAnnotation {
     const body_first = tree.firstToken(body_node);
     const body_last = tree.lastToken(body_node);
@@ -1476,7 +1437,7 @@ fn inferDelegatorBorrowMultiReturn(
         const value = value_opt orelse continue; // `return;` — void
         if (isNonBorrowReturnValue(tree, value)) continue;
 
-        const inferred = tryInferFromReturnExpr(tree, fn_proto, value, db, remote) orelse {
+        const inferred = tryInferFromReturnExpr(tree, fn_proto, value, db) orelse {
             // Recognized neither a borrow delegation nor a known
             // non-borrow — can't safely infer.
             return null;
@@ -1538,158 +1499,11 @@ fn lookupBorrowedFromSameFile(
     };
 }
 
-/// Look up `method_name` in one specific imported file (by imap
-/// entry name).  Used for namespace-style R7 (`Foo.method(...)`)
-/// where the receiver IS the import namespace — avoids the cost
-/// of scanning every imap entry on every method lookup.
-fn lookupBorrowedFromImport(
-    remote: RemoteCtx,
-    namespace: []const u8,
-    method_name: []const u8,
-) ?u32 {
-    const imap_entry = remote.imap.lookup(namespace) orelse return null;
-    const file = (remote.cache.loadOrLookup(remote.base_dir, imap_entry.path) catch return null) orelse return null;
-    const entry = file.db.lookup(method_name) orelse return null;
-    const a = entry.annotation orelse return null;
-    return switch (a) {
-        .borrowed_from => |idx| idx,
-        else => null,
-    };
-}
-
-/// AST-level type-name resolution.  Read the named param's type
-/// annotation tokens, strip leading `*`/`?`/`const`/`[]`/whitespace,
-/// and if the leaf form is `<ns>.<Type>` where `<ns>` is in the
-/// caller's imap, look up `method_name` in `<ns>.zig`'s DB.
-///
-/// Why this works without semantic types: every step uses AST text
-/// and imap entries we already build.  Limited shape (single-hop
-/// `ns.Type` with at most a wrapping pointer chain), but covers
-/// the common `pub fn wrap(c: *const ns.Type) RetT { return c.method(); }`
-/// shape that real wrappers use.
-///
-/// For genuinely anonymous param types (`anytype`, inline
-/// `struct { ... }`) — where there's no namespace to target — we
-/// fall back to scanning every imap entry's DB for the method.
-/// Cost is bounded because anonymous param types are rare and the
-/// scan only triggers when the targeted lookup misses.  Returns
-/// null on ambiguity (two imports each define the method
-/// differently) so we err toward no inference rather than wrong.
-fn lookupBorrowedFromParamType(
-    tree: *const Ast,
-    fn_proto: Ast.full.FnProto,
-    param_idx: u32,
-    method_name: []const u8,
-    remote: ?RemoteCtx,
-) ?u32 {
-    const r = remote orelse return null;
-
-    var idx: u32 = 0;
-    var it = fn_proto.iterate(tree);
-    const param = while (it.next()) |p| : (idx += 1) {
-        if (idx == param_idx) break p;
-    } else return null;
-    // `anytype` params have type_expr == null (anytype_ellipsis3
-    // is set instead).  No named type to resolve — fall straight
-    // to the imap scan.
-    const type_node = param.type_expr orelse {
-        if (param.anytype_ellipsis3 != null) return scanImapForBorrowedFrom(r, method_name);
-        return null;
-    };
-
-    // Walk the type's tokens.  Skip pointer/const/optional/slice
-    // qualifiers; look for the first `<id>.<id>` pair as the leaf
-    // namespace.Type form.
-    const first = tree.firstToken(type_node);
-    const last = tree.lastToken(type_node);
-    const tags = tree.tokens.items(.tag);
-    var t: Ast.TokenIndex = first;
-    while (t < last) : (t += 1) {
-        if (tags[t] != .identifier) continue;
-        // `<id> . <id>` — `id` must NOT be preceded by `.` itself.
-        if (t > first and tags[t - 1] == .period) continue;
-        if (t + 2 > last) break;
-        if (tags[t + 1] != .period) continue;
-        if (tags[t + 2] != .identifier) continue;
-        const ns = tree.tokenSlice(t);
-        // We don't actually need the type name — only the namespace
-        // tells us which remote file to consult.  The method lookup
-        // is by name in that file's full annotation DB.
-        return lookupBorrowedFromImport(r, ns, method_name);
-    }
-    // Bare-identifier leaf type (`const Foo = struct {...};` in the
-    // SAME file).  Same-file path would have already caught the
-    // method via lookupBorrowedFromSameFile; nothing more to do.
-    //
-    // For `anytype` or inline `struct { ... }` param types we have
-    // no namespace to target.  Fall back to scanning every imap
-    // entry for the method — bounded cost (only fires when the
-    // param type is genuinely anonymous, which is rare; one scan
-    // per such call site).  Returns the target_idx if EXACTLY ONE
-    // import has the method annotated borrowed_from(idx); ambiguous
-    // matches bail.
-    if (isAnonymousParamType(tree, type_node)) {
-        return scanImapForBorrowedFrom(r, method_name);
-    }
-    return null;
-}
-
-/// True iff the param's type-expr is `anytype` or an inline
-/// `struct { ... }` — both lack a name we can resolve through imap.
-fn isAnonymousParamType(tree: *const Ast, type_node: Ast.Node.Index) bool {
-    const first = tree.firstToken(type_node);
-    const last = tree.lastToken(type_node);
-    const tags = tree.tokens.items(.tag);
-
-    // Skip leading qualifiers (`*`, `const`, `?`, `[`, `]`, identifiers
-    // that are qualifiers like `const`).  Then check the first
-    // significant token.
-    var t: Ast.TokenIndex = first;
-    while (t <= last) : (t += 1) {
-        switch (tags[t]) {
-            .asterisk, .question_mark, .l_bracket, .r_bracket => continue,
-            .keyword_const => continue,
-            .identifier => {
-                const s = tree.tokenSlice(t);
-                if (std.mem.eql(u8, s, "anytype")) return true;
-                return false; // any other identifier is a named type
-            },
-            .keyword_struct, .keyword_union, .keyword_enum, .keyword_opaque => return true,
-            else => return false,
-        }
-    }
-    return false;
-}
-
-/// Scan every imap entry's remote DB for `method_name`.  Returns the
-/// SINGLE target_idx if exactly one import has it as `borrowed_from`;
-/// null on miss or on ambiguity (two imports each define the method
-/// with different target indices).
-fn scanImapForBorrowedFrom(remote: RemoteCtx, method_name: []const u8) ?u32 {
-    var found: ?u32 = null;
-    var it = remote.imap.entries.iterator();
-    while (it.next()) |kv| {
-        const path = kv.value_ptr.path;
-        const file = (remote.cache.loadOrLookup(remote.base_dir, path) catch continue) orelse continue;
-        const entry = file.db.lookup(method_name) orelse continue;
-        const a = entry.annotation orelse continue;
-        switch (a) {
-            .borrowed_from => |idx| {
-                if (found) |existing| if (existing != idx) return null;
-                found = idx;
-            },
-            else => {},
-        }
-    }
-    return found;
-}
-
 fn inferMethodStyle(
     tree: *const Ast,
     fn_proto: Ast.full.FnProto,
     return_expr: Ast.Node.Index,
     db: *const Db,
-    remote: ?RemoteCtx,
 ) ?ReturnsAnnotation {
     const first = tree.firstToken(return_expr);
     const last = tree.lastToken(return_expr);
@@ -1717,21 +1531,11 @@ fn inferMethodStyle(
     if (k > last or tags[k] != .l_paren) return null;
 
     const method_name = tree.tokenSlice(method_tok);
-    // Same-file first.  Then AST-level type resolution: read the
-    // param's declared type, strip pointer/const, and if the leaf
-    // is `<namespace>.<TypeName>` where namespace is in our imap,
-    // try to find the method on TypeName in that file.
-    var target_idx = lookupBorrowedFromSameFile(db, method_name);
-    if (target_idx == null) {
-        target_idx = lookupBorrowedFromParamType(
-            tree,
-            fn_proto,
-            param_idx,
-            method_name,
-            remote,
-        );
-    }
-    if ((target_idx orelse return null) == 0) return .{ .borrowed_from = param_idx };
+    // Same-file lookup only — cross-file R7 inference retired with
+    // remote_resolver; ZLS handles cross-file type resolution at
+    // the cfg-builder level (cfg.receiverTypeOfNode).
+    const target_idx = lookupBorrowedFromSameFile(db, method_name) orelse return null;
+    if (target_idx == 0) return .{ .borrowed_from = param_idx };
     return null;
 }
 
@@ -1740,7 +1544,6 @@ fn inferNamespaceStyle(
     fn_proto: Ast.full.FnProto,
     call_full: Ast.full.Call,
     db: *const Db,
-    remote: ?RemoteCtx,
 ) ?ReturnsAnnotation {
     const callee = call_full.ast.fn_expr;
     const method_tok = switch (tree.nodeTag(callee)) {
@@ -1749,20 +1552,9 @@ fn inferNamespaceStyle(
         else => return null,
     };
     const method_name = tree.tokenSlice(method_tok);
-    // Same-file first.  For namespace-style `Foo.method(...)` where
-    // Foo is in our imap, also try Foo's own DB — bounded to one
-    // remote lookup per call site (no broad scanning).
-    var target_idx = lookupBorrowedFromSameFile(db, method_name);
-    if (target_idx == null) {
-        if (tree.nodeTag(callee) == .field_access and remote != null) {
-            const recv = tree.nodeData(callee).node_and_token[0];
-            if (tree.nodeTag(recv) == .identifier) {
-                const ns = tree.tokenSlice(tree.nodeMainToken(recv));
-                target_idx = lookupBorrowedFromImport(remote.?, ns, method_name);
-            }
-        }
-    }
-    const idx_resolved = target_idx orelse return null;
+    // Same-file lookup only — cross-file R7 inference retired with
+    // remote_resolver.
+    const idx_resolved = lookupBorrowedFromSameFile(db, method_name) orelse return null;
     const args = call_full.ast.params;
     if (idx_resolved >= args.len) return null;
     const arg = args[idx_resolved];
