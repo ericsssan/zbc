@@ -133,28 +133,53 @@ pub const FileCache = struct {
     }
 
     /// Return the param's type-name (with */?/const wrappers stripped)
-    /// by walking the proto's param iterator.  Used by the
-    /// may_free_fields filter to look up `(param_type, field)` in the
-    /// FileModel.
+    /// by walking the proto's param iterator.  Returns the FIRST
+    /// identifier — for `*lib.T` returns "lib", not "T".  Used by
+    /// the may_free_fields filter where we need to look up against
+    /// `(local_type, field)` and prefix-as-namespace cases would miss
+    /// anyway.  Use `paramTypePath` for cross-file resolution.
     fn paramTypeName(tree: *const Ast, proto: Ast.full.FnProto, idx: u32) ?[]const u8 {
+        const path = paramTypePath(tree, proto, idx) orelse return null;
+        return path.ns orelse path.type_name;
+    }
+
+    /// Like `paramTypeName` but distinguishes `<ns>.<Type>` from a
+    /// bare `<Type>` leaf:
+    ///   `*T`        → { ns = null,  type_name = "T" }
+    ///   `*lib.T`    → { ns = "lib", type_name = "T" }
+    ///   `anytype`   → null
+    /// Cross-file R10 / R7 inference uses `ns` to look up via remote
+    /// imap; `type_name` is the actual type whose methods we query.
+    fn paramTypePath(
+        tree: *const Ast,
+        proto: Ast.full.FnProto,
+        idx: u32,
+    ) ?struct { ns: ?[]const u8, type_name: []const u8 } {
         var i: u32 = 0;
         var it = proto.iterate(tree);
         while (it.next()) |p| : (i += 1) {
             if (i != idx) continue;
             const type_node = p.type_expr orelse return null;
-            // Strip wrappers — same logic as model.baseTypeName but
-            // inline here so we don't add a public dependency.
             const tags = tree.tokens.items(.tag);
-            var t = tree.firstToken(type_node);
             const last = tree.lastToken(type_node);
+            var t = tree.firstToken(type_node);
+            // Skip wrapper tokens; stop at the first identifier (the
+            // namespace OR the type name itself).
             while (t <= last) : (t += 1) {
                 switch (tags[t]) {
                     .asterisk, .question_mark, .keyword_const, .keyword_var, .l_bracket, .r_bracket => {},
-                    .identifier => return tree.tokenSlice(t),
+                    .identifier => break,
                     else => return null,
                 }
             }
-            return null;
+            if (t > last or tags[t] != .identifier) return null;
+            const first_id = tree.tokenSlice(t);
+            // Is this followed by `.<identifier>`?  If so it's a
+            // `<ns>.<Type>` leaf.
+            if (t + 2 <= last and tags[t + 1] == .period and tags[t + 2] == .identifier) {
+                return .{ .ns = first_id, .type_name = tree.tokenSlice(t + 2) };
+            }
+            return .{ .ns = null, .type_name = first_id };
         }
         return null;
     }
@@ -186,14 +211,28 @@ pub const FileCache = struct {
         for (raw) |ff| {
             const param_ty = paramTypeName(tree, proto, ff.param) orelse continue;
             if (!model.hasType(param_ty)) continue;
-            const field_ty = model.fieldType(param_ty, ff.field) orelse continue;
-            if (!model.hasType(field_ty)) continue;
-            const ti = model.findType(field_ty) orelse continue;
-            if (!ti.hasMethod(ff.method)) continue;
-            // Check the field-type's method actually consumes its
-            // receiver per FnSummary's transitive analysis.
-            const callee_summary = (try self.summaryByMethod(field_ty, ff.method)) orelse continue;
-            if (callee_summary.takes_ownership_of == null) continue;
+            const path = model.fieldTypePath(param_ty, ff.field) orelse continue;
+            // Resolve the callee summary on the field's TYPE — same-
+            // file when the field type is local, else cross-file via
+            // imported namespace.  Either lookup checks that the
+            // method exists and (for non-cleanup-named methods) has a
+            // takes_ownership_of signal.
+            const callee_summary: ?*const fn_summary.FnSummary = blk: {
+                if (path.ns) |ns| {
+                    if (self.remote) |r| {
+                        if (r.getByNamespace(ns)) |remote_cache| {
+                            break :blk try remote_cache.summaryByMethod(path.type_name, ff.method);
+                        }
+                    }
+                    break :blk null;
+                }
+                if (!model.hasType(path.type_name)) break :blk null;
+                const ti = model.findType(path.type_name) orelse break :blk null;
+                if (!ti.hasMethod(ff.method)) break :blk null;
+                break :blk try self.summaryByMethod(path.type_name, ff.method);
+            };
+            const cs = callee_summary orelse continue;
+            if (cs.takes_ownership_of == null) continue;
             try out.append(arena, ff);
         }
         return out.toOwnedSlice(arena);
@@ -624,14 +663,27 @@ pub const FileCache = struct {
             const pi = paramIndexFor(tree, proto, param_name) orelse continue;
             const method = tree.tokenSlice(t + 2);
 
-            // Look up callee summary: method on receiver_type when
-            // available, else by bare name.  Both queries hit the
-            // cache (pre-warmed above), so this is O(1) per call site.
-            // Try looking up the callee on the param's type (when
-            // we know it from receiver_type).  Otherwise fall back
-            // to the bare-name lookup — catches top-level fns and
-            // methods that don't disambiguate by type.
+            // Look up callee summary on PARAM's declared type — that's
+            // the receiver of `<param>.<method>(`.  Tries same-file,
+            // then cross-file (when type is `<ns>.<Type>` and remote
+            // is wired).  Falls back to the outer fn's containing type
+            // and bare-name lookup for legacy patterns.
             const callee_summary: ?*const fn_summary.FnSummary = blk: {
+                if (paramTypePath(tree, proto, pi)) |path| {
+                    if (path.ns) |ns| {
+                        // Cross-file: resolve <ns> → remote FileCache,
+                        // look up <type_name>.<method> there.
+                        if (self.remote) |r| {
+                            if (r.getByNamespace(ns)) |remote_cache| {
+                                if (try remote_cache.summaryByMethod(path.type_name, method)) |s| {
+                                    break :blk s;
+                                }
+                            }
+                        }
+                    } else {
+                        if (try self.summaryByMethod(path.type_name, method)) |s| break :blk s;
+                    }
+                }
                 if (receiver_type) |rt| {
                     if (try self.summaryByMethod(rt, method)) |s| break :blk s;
                 }

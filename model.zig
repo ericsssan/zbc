@@ -230,6 +230,34 @@ pub const FileModel = struct {
         return baseTypeName(self.tree, f.type_first, f.type_last);
     }
 
+    /// Like `fieldType` but returns the `<ns>.<Type>` split when the
+    /// field's type references an imported namespace.  Used by R10
+    /// Case B cross-file filtering: `inner: *lib.Item` needs to look
+    /// up `Item` in `lib`'s FileCache, not in this file.
+    pub fn fieldTypePath(
+        self: *const FileModel,
+        struct_name: []const u8,
+        field_name: []const u8,
+    ) ?struct { ns: ?[]const u8, type_name: []const u8 } {
+        const ti = self.findType(struct_name) orelse return null;
+        const f = ti.findField(field_name) orelse return null;
+        const tags = self.tree.tokens.items(.tag);
+        var t: TokenIndex = f.type_first;
+        while (t <= f.type_last) : (t += 1) {
+            switch (tags[t]) {
+                .asterisk, .question_mark, .keyword_const, .keyword_var, .l_bracket, .r_bracket => {},
+                .identifier => break,
+                else => return null,
+            }
+        }
+        if (t > f.type_last or tags[t] != .identifier) return null;
+        const first_id = self.tree.tokenSlice(t);
+        if (t + 2 <= f.type_last and tags[t + 1] == .period and tags[t + 2] == .identifier) {
+            return .{ .ns = first_id, .type_name = self.tree.tokenSlice(t + 2) };
+        }
+        return .{ .ns = null, .type_name = first_id };
+    }
+
     /// True iff the field's declared type starts with `*` (after
     /// stripping `?` / `const`).  Heuristic for "this field is a
     /// borrow, not an owned value" — pointer-typed struct fields
