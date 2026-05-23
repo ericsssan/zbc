@@ -71,13 +71,19 @@ pub fn check(
         });
         defer gpa.free(fields);
 
+        // Outer has no allocator/arena field?  Then it can't pass
+        // one to an inner cleanup that requires it — the inner type
+        // is meant to be cleaned by a CALLER that holds the
+        // allocator, not by the outer struct.  Common in Bun's CSS
+        // value types (`deinit(self, allocator: Allocator)`).
+        const outer_has_allocator = outerHasAllocatorField(tree, outer);
         var hit: ?usize = null;
         for (fields, 0..) |f, i| {
             const inner_ti = mq.resolveFieldType(tree, model, f) orelse continue;
-            if (anyNonTrivialCleanup(tree, inner_ti)) {
-                hit = i;
-                break;
-            }
+            if (!anyNonTrivialCleanup(tree, inner_ti)) continue;
+            if (!outer_has_allocator and allCleanupMethodsNeedExtraArg(tree, inner_ti)) continue;
+            hit = i;
+            break;
         }
         const idx = hit orelse continue;
         const field = fields[idx];
@@ -137,6 +143,64 @@ fn hasNewFactoryDecl(tree: *const Ast, ti: *const fmodel.TypeInfo) bool {
         if (r < ti.body_last and tags[r] == .l_paren) return true;
     }
     return false;
+}
+
+/// True iff the outer struct has a field whose type/name looks
+/// like an allocator handle the outer could pass to inner cleanup
+/// methods.  Heuristic via name (`allocator` / `alloc`) — the
+/// CSS-value-type cluster names theirs differently, so we miss a
+/// few, but the false-negative direction is preferred over
+/// false-firing.
+fn outerHasAllocatorField(tree: *const Ast, ti: *const fmodel.TypeInfo) bool {
+    for (ti.fields) |f| {
+        if (std.mem.eql(u8, f.name, "allocator") or
+            std.mem.eql(u8, f.name, "alloc") or
+            std.mem.eql(u8, f.name, "gpa") or
+            std.mem.eql(u8, f.name, "arena")) return true;
+        // Or by type name: field type ends with `Allocator` /
+        // `ArenaAllocator`.
+        const tags = tree.tokens.items(.tag);
+        var t = f.type_first;
+        var last_id: ?[]const u8 = null;
+        while (t <= f.type_last) : (t += 1) {
+            if (tags[t] == .identifier) last_id = tree.tokenSlice(t);
+        }
+        if (last_id) |n| {
+            if (std.mem.endsWith(u8, n, "Allocator") or
+                std.mem.endsWith(u8, n, "Arena")) return true;
+        }
+    }
+    return false;
+}
+
+/// True iff EVERY cleanup-named method on `ti` requires more
+/// parameters than just the receiver — i.e. there's no inline
+/// `deinit(self)` shape, only `deinit(self, allocator)` /
+/// `deinit(self, ctx)` / etc.  The outer struct can't pass that
+/// extra arg without holding it — so a missing inline cleanup on
+/// the outer is consistent with the cleanup being a caller's
+/// responsibility, not the outer's.
+fn allCleanupMethodsNeedExtraArg(tree: *const Ast, ti: *const fmodel.TypeInfo) bool {
+    if (ti.methods.len == 0) return false;
+    var saw_cleanup = false;
+    for (ti.methods) |m| {
+        if (!isCleanupName(m.name)) continue;
+        saw_cleanup = true;
+        if (cleanupTakesOnlySelf(tree, m)) return false;
+    }
+    return saw_cleanup;
+}
+
+/// True iff the method's prototype has exactly one parameter (the
+/// receiver).  Used to detect `pub fn deinit(self: *T) void` vs
+/// `pub fn deinit(self: *T, alloc: Allocator) void`.
+fn cleanupTakesOnlySelf(tree: *const Ast, m: fmodel.MethodInfo) bool {
+    var buf: [1]Ast.Node.Index = undefined;
+    const proto = tree.fullFnProto(&buf, m.fn_decl) orelse return false;
+    var it = proto.iterate(tree);
+    var count: u32 = 0;
+    while (it.next()) |_| count += 1;
+    return count == 1;
 }
 
 /// True iff `ti` has at least one cleanup-named method whose body is
