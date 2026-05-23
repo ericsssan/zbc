@@ -14,6 +14,7 @@ const rule_registry = @import("rule_registry.zig");
 const rule_catalog_mod = @import("rule_catalog.zig");
 const file_cache_mod = @import("file_cache.zig");
 const suppressions_mod = @import("suppressions.zig");
+const zls_resolver_mod = @import("zls_resolver.zig");
 
 pub const Config = config_mod.Config;
 pub const DefaultConfig = config_mod.Default;
@@ -101,6 +102,22 @@ pub fn analyzeEscape(
     const remote_ctx: ?file_cache_mod.RemoteSummaryCtx = if (remote_adapter) |*a| a.ctx() else null;
     try rule_cache.resolveTransitiveTakesWithRemote(remote_ctx);
 
+    // ZLS-backed type resolver — cross-module type queries that
+    // zbc's own AST-only tracking can't answer (for-loop captures,
+    // generic instantiations, multi-hop @import aliases).  Optional;
+    // when init fails (e.g. ZLS can't open the path) we silently
+    // fall through to the legacy AST-only path.
+    var zls_resolver: zls_resolver_mod.ZlsResolver = undefined;
+    const zls_ok = blk: {
+        zls_resolver.init(gpa, io, path, src) catch |err| {
+            std.log.debug("zls_resolver init failed for {s}: {}", .{ path, err });
+            break :blk false;
+        };
+        break :blk true;
+    };
+    defer if (zls_ok) zls_resolver.deinit();
+    const zls_ptr: ?*zls_resolver_mod.ZlsResolver = if (zls_ok) &zls_resolver else null;
+
     // Flow analysis — per-fn CFG + worklist fixed-point.
     // Iterate raw fn_decls (incl. type-builders) — lowerFunctionFull
     // decides per-fn whether to lower (returns null to skip).
@@ -109,7 +126,7 @@ pub fn analyzeEscape(
         const node: Ast.Node.Index = @enumFromInt(node_idx);
         if (tree.nodeTag(node) != .fn_decl) continue;
         const remote_ptr: ?*const cfg_mod.RemoteCtx = if (remote_ctx_storage) |*r| r else null;
-        var cfg = (try cfg_mod.lowerFunctionFull(
+        var cfg = (try cfg_mod.lowerFunctionFullWithZls(
             gpa,
             &tree,
             node,
@@ -117,6 +134,7 @@ pub fn analyzeEscape(
             remote_ptr,
             config,
             &rule_cache,
+            zls_ptr,
         )) orelse continue;
         defer cfg.deinit(gpa);
         try analyzer_mod.check(gpa, &cfg, .{ .path = path, .config = config }, &problems);

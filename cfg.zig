@@ -35,6 +35,7 @@ const remote_resolver = @import("remote_resolver.zig");
 const config_mod = @import("config.zig");
 const file_cache = @import("file_cache.zig");
 const fn_summary = @import("fn_summary.zig");
+const zls_resolver_mod = @import("zls_resolver.zig");
 
 pub const Config = config_mod.Config;
 
@@ -433,6 +434,23 @@ pub fn lowerFunctionFull(
     config: *const Config,
     cache: ?*file_cache.FileCache,
 ) !?Cfg {
+    return lowerFunctionFullWithZls(gpa, tree, fn_decl, db, remote, config, cache, null);
+}
+
+/// Variant that also accepts a ZLS-backed type resolver.  When
+/// provided, `receiverTypeOfNode` / `inferTypeNameFromInit` fall back
+/// to ZLS for cross-module + generic-instantiation type queries that
+/// zbc's own AST-only tracking can't answer.
+pub fn lowerFunctionFullWithZls(
+    gpa: std.mem.Allocator,
+    tree: *const Ast,
+    fn_decl: Ast.Node.Index,
+    db: ?*const annotations.Db,
+    remote: ?*const RemoteCtx,
+    config: *const Config,
+    cache: ?*file_cache.FileCache,
+    zls: ?*zls_resolver_mod.ZlsResolver,
+) !?Cfg {
     var buf: [1]Ast.Node.Index = undefined;
     const fn_proto = (try fnProto(tree, &buf, fn_decl)) orelse return null;
     const body_node = bodyOf(tree, fn_decl) orelse return null;
@@ -466,6 +484,7 @@ pub fn lowerFunctionFull(
         .tree = tree,
         .db = db,
         .cache = cache,
+        .zls = zls,
         .remote = remote,
         .config = config,
         .is_borrowed_return_type = is_borrowed_ret,
@@ -573,6 +592,11 @@ const Builder = struct {
     /// new inference-driven path that's replacing db queries.
     /// Optional during migration; null falls back to db.
     cache: ?*file_cache.FileCache = null,
+    /// Optional ZLS-backed type resolver.  When set, `receiverTypeOfNode`
+    /// falls back to ZLS when zbc's own type-name tracking can't
+    /// resolve a local (cross-module types, generic instantiations,
+    /// inferred-from-method-call locals).  null = legacy AST-only path.
+    zls: ?*zls_resolver_mod.ZlsResolver = null,
     remote: ?*const RemoteCtx = null,
     config: *const Config = &config_mod.Default,
     /// The struct/union/enum that contains the fn being lowered.  Set
@@ -3017,10 +3041,22 @@ const Builder = struct {
     /// — callers fall back to bare-name lookup.
     fn receiverTypeOfNode(self: *Builder, node: Ast.Node.Index) ?[]const u8 {
         const tree = self.tree;
-        if (tree.nodeTag(node) != .identifier) return null;
-        const name = tree.tokenSlice(tree.nodeMainToken(node));
-        const lid = self.name_to_local.get(name) orelse return null;
-        return self.locals.items[@intFromEnum(lid)].type_name;
+        // Fast path: bare-identifier locals with a known declared type.
+        if (tree.nodeTag(node) == .identifier) {
+            const name = tree.tokenSlice(tree.nodeMainToken(node));
+            if (self.name_to_local.get(name)) |lid| {
+                if (self.locals.items[@intFromEnum(lid)].type_name) |t| return t;
+            }
+        }
+        // Fallback: ask ZLS to resolve the node's type.  Catches
+        // for-loop captures (`for (xs) |*x| x.method(...)`), locals
+        // init'd from method-call returns (`var w = makeWalker()`),
+        // and cross-module aliases (`const W = ns.factory.Type`)
+        // where zbc's AST-only tracking can't see the type.
+        if (self.zls) |z| {
+            return z.typeNameOfNode(node) catch null;
+        }
+        return null;
     }
 
     /// A single (parent_local, field) emission triggered by a
