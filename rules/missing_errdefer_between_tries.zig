@@ -89,6 +89,15 @@ fn checkFn(
         // (`if (try Loader.fromJS(...)) |x|`) AND const bindings
         // (`const X = try ...`).
         if (!b.wasTryWrapped(tags)) continue;
+        // Arena-allocated bindings: if the RHS passes
+        // `<arena>.allocator()` and the fn body has a `defer
+        // <arena>.deinit();` in scope, the binding's storage is
+        // already cleaned up unconditionally on any return path —
+        // no errdefer needed.  Canonical Bun shape:
+        //     var arena = ArenaAllocator.init(...);
+        //     defer arena.deinit();
+        //     const x = try foo(arena.allocator(), ...);
+        if (rhsArenaIsDeferDeinited(tree, b.rhs_first, b.rhs_last, first, last)) continue;
 
         // Extract the FIRST call's (type, method) — the OLD walker
         // semantics.  Works for any rhs shape including chains and
@@ -181,6 +190,61 @@ const ParsedCall = struct {
 /// LAST identifier before the first `(`, and `type_name` is the
 /// one immediately before it.  Returns null when the chain isn't
 /// at least `<Type>.<method>(`.
+/// Detect `<arena>.allocator()` in the binding's RHS where `<arena>`
+/// has a `defer <arena>.deinit(...)` in the fn body.  Used to skip
+/// the rule on arena-rooted bindings — the arena's defer handles
+/// cleanup on every return (success or error), so an errdefer for
+/// the binding itself is redundant.
+fn rhsArenaIsDeferDeinited(
+    tree: *const Ast,
+    rhs_first: Ast.TokenIndex,
+    rhs_last: Ast.TokenIndex,
+    body_first: Ast.TokenIndex,
+    body_last: Ast.TokenIndex,
+) bool {
+    const tags = tree.tokens.items(.tag);
+    // Scan the RHS for `<ident> . allocator (` patterns and collect
+    // the receiver names.
+    var t: Ast.TokenIndex = rhs_first;
+    while (t + 3 <= rhs_last) : (t += 1) {
+        if (tags[t] != .identifier) continue;
+        if (tags[t + 1] != .period) continue;
+        if (tags[t + 2] != .identifier) continue;
+        if (!std.mem.eql(u8, tree.tokenSlice(t + 2), "allocator")) continue;
+        if (tags[t + 3] != .l_paren) continue;
+        // Walking back to ensure this isn't `something.<ident>.allocator()` —
+        // we want the bare `<arena_name>.allocator()` receiver.  An
+        // immediately-preceding `.` means it's a chained access; the
+        // arena name is whatever the chain root is, but the canonical
+        // pattern uses a plain local, so be conservative.
+        if (t > rhs_first and tags[t - 1] == .period) continue;
+        const arena_name = tree.tokenSlice(t);
+        if (deferDeinitOf(tree, arena_name, body_first, body_last)) return true;
+    }
+    return false;
+}
+
+/// True iff the fn body contains `defer <arena_name>.deinit(` anywhere.
+fn deferDeinitOf(
+    tree: *const Ast,
+    arena_name: []const u8,
+    body_first: Ast.TokenIndex,
+    body_last: Ast.TokenIndex,
+) bool {
+    const tags = tree.tokens.items(.tag);
+    var u: Ast.TokenIndex = body_first;
+    while (u + 4 <= body_last) : (u += 1) {
+        if (tags[u] != .keyword_defer) continue;
+        if (tags[u + 1] != .identifier) continue;
+        if (!std.mem.eql(u8, tree.tokenSlice(u + 1), arena_name)) continue;
+        if (tags[u + 2] != .period) continue;
+        if (tags[u + 3] != .identifier) continue;
+        if (!std.mem.eql(u8, tree.tokenSlice(u + 3), "deinit")) continue;
+        if (u + 4 <= body_last and tags[u + 4] == .l_paren) return true;
+    }
+    return false;
+}
+
 fn parseTypeMethodAfter(tree: *const Ast, start: Ast.TokenIndex, last: Ast.TokenIndex) ?ParsedCall {
     const tags = tree.tokens.items(.tag);
     var t: Ast.TokenIndex = start;
