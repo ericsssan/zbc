@@ -627,6 +627,20 @@ pub const FileCache = struct {
     ///
     /// Composes FileModel + summaryOfFn — runs FnSummary inference
     /// across the type's methods, short-circuits on first hit.
+    /// True iff `type_name`'s body declares a method named
+    /// `method_name`.  Thin wrapper over FileModel.findType +
+    /// TypeInfo.hasMethod for callers that only hold a FileCache
+    /// (no direct model).
+    pub fn typeHasMethod(
+        self: *FileCache,
+        type_name: []const u8,
+        method_name: []const u8,
+    ) !bool {
+        const model = try self.fileModel();
+        const ti = model.findType(type_name) orelse return false;
+        return ti.hasMethod(method_name);
+    }
+
     pub fn anyMethodAllocatesSelf(
         self: *FileCache,
         type_name: []const u8,

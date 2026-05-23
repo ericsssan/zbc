@@ -1298,6 +1298,17 @@ const Builder = struct {
         const creator_found = cache.anyMethodAllocatesSelf(ct) catch false;
         if (!creator_found) return null;
 
+        // Two-stage cleanup pattern: when fn is `deinit` / `finalize`
+        // AND the type ALSO defines a separate `destroy` method,
+        // the convention is `destroy()` does `deinit(); alloc.destroy(self);`.
+        // Don't fire on the inner `deinit` — it's deliberately
+        // partial.  The leak check naturally targets `destroy` (if
+        // even there) instead.
+        if (!std.mem.eql(u8, fn_name, "destroy")) {
+            const has_destroy = cache.typeHasMethod(ct, "destroy") catch false;
+            if (has_destroy) return null;
+        }
+
         // The destructor must NOT have @takes(self) — that would
         // mean it does free self, no leak.
         if (self.cache) |c| {
