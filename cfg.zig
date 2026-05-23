@@ -2898,16 +2898,20 @@ const Builder = struct {
         // imported file); then the remote-namespace path (for
         // `lib.method(...)` where recv IS the namespace).
         const target_idx: u32 = blk: {
-            // Try FnSummary (cache) first — covers cases that fit the
-            // body-only inference vocabulary.
+            // Try FnSummary (cache) — TYPED lookup only.  Bare-name
+            // fallback (summaryByName) would cross-pollute methods
+            // between unrelated types when the receiver's type isn't
+            // declared in this file (e.g. external PathOrFileDescriptor.
+            // deinit getting matched against local Blob.deinit's
+            // inferred takes).  When recv_ty is null or external,
+            // fall through to db's typed lookup (which correctly
+            // returns null for cross-file types) and then to the
+            // cross-file paths.
             if (self.cache) |c| {
                 if (recv_ty) |ty| {
                     if (c.summaryByMethod(ty, callee_name) catch null) |s| {
                         if (s.takes_ownership_of) |i| break :blk i;
                     }
-                }
-                if (c.summaryByName(callee_name) catch null) |s| {
-                    if (s.takes_ownership_of) |i| break :blk i;
                 }
             }
             // Then db (annotations + R8b/R10 transitive inference) —
@@ -2995,16 +2999,15 @@ const Builder = struct {
             break :blk db.fieldType(parent_ty, field_name);
         };
 
-        // Resolve method's @takes: cache (FnSummary) -> db -> cross-file.
+        // Resolve method's @takes: cache (typed only) -> db -> cross-file.
+        // See takesOwnershipFreedLocal for why bare-name fallback is
+        // excluded.
         const takes_idx: u32 = blk: {
             if (self.cache) |c| {
                 if (recv_ty) |ty| {
                     if (c.summaryByMethod(ty, method_name) catch null) |s| {
                         if (s.takes_ownership_of) |i| break :blk i;
                     }
-                }
-                if (c.summaryByName(method_name) catch null) |s| {
-                    if (s.takes_ownership_of) |i| break :blk i;
                 }
             }
             if (self.db) |db| {

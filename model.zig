@@ -290,6 +290,80 @@ pub const FileModel = struct {
     }
 };
 
+/// True iff `name_tok` is nested inside ANY `fn ... { ... }` body
+/// in the source — even one enclosing nested struct/union/enum
+/// decls.  Walks backward through every unmatched `{`; at each one,
+/// looks back for the keyword that opens the brace (`fn` -> fn body,
+/// `struct`/`union`/`enum` -> type body).  Returns true on the
+/// first `fn` brace found, false if we reach the file top without
+/// hitting one.
+///
+/// Used to filter out methods of structs returned from generic fns
+/// (e.g. `fn Wrap(T) type { return struct { fn deinit(...) {} }; }`)
+/// from model.fns — those bodies live inside a fn's source range
+/// and would otherwise look top-level by syntactic walk.
+fn isInsideFnBody(tree: *const Ast, name_tok: TokenIndex) bool {
+    const tags = tree.tokens.items(.tag);
+    if (name_tok == 0) return false;
+    var t: i64 = @as(i64, @intCast(name_tok)) - 1;
+    var depth: i32 = 0;
+    while (t >= 0) : (t -= 1) {
+        const tok: TokenIndex = @intCast(t);
+        switch (tags[tok]) {
+            .r_brace => depth += 1,
+            .l_brace => {
+                if (depth == 0) {
+                    // Unmatched `{`.  Identify what opened it.
+                    switch (braceOpenerKind(tags, tok)) {
+                        .fn_body => return true,
+                        .type_body => {
+                            // Struct/union/enum body — continue
+                            // walking outward past it.  depth stays
+                            // 0 (we're now in the enclosing scope).
+                        },
+                        .unknown => return false,
+                    }
+                } else {
+                    depth -= 1;
+                }
+            },
+            else => {},
+        }
+    }
+    return false;
+}
+
+const BraceOpener = enum { fn_body, type_body, unknown };
+
+/// Classify what kind of construct opens the `{` at `brace_tok`.
+/// Looks back past parens/type-expressions for the introducing
+/// keyword.  Conservative: returns `.unknown` rather than guessing
+/// when the lookback hits a terminator or runs out of budget.
+fn braceOpenerKind(tags: []const std.zig.Token.Tag, brace_tok: TokenIndex) BraceOpener {
+    if (brace_tok == 0) return .unknown;
+    var u: i64 = @as(i64, @intCast(brace_tok)) - 1;
+    var paren: i32 = 0;
+    var hops: u32 = 0;
+    while (u >= 0 and hops < 128) : ({
+        u -= 1;
+        hops += 1;
+    }) {
+        const ut: TokenIndex = @intCast(u);
+        switch (tags[ut]) {
+            .r_paren => paren += 1,
+            .l_paren => paren -= 1,
+            .keyword_fn => if (paren == 0) return .fn_body,
+            .keyword_struct, .keyword_union, .keyword_enum, .keyword_opaque => {
+                if (paren == 0) return .type_body;
+            },
+            // Block / stmt terminators break the lookback.
+            .l_brace, .r_brace, .semicolon => if (paren == 0) return .unknown,
+            else => {},
+        }
+    }
+    return .unknown;
+}
+
 /// Strip pointer / optional / const / slice wrappers from a type
 /// expression token range and return the base identifier.  Returns
 /// null when the base isn't a single identifier (fn-pointer, anon
@@ -361,6 +435,14 @@ pub fn build(gpa: std.mem.Allocator, tree: *const Ast) !FileModel {
             }
         }
         if (inside_type) continue;
+
+        // Skip if inside ANY fn's body (i.e., this is a nested fn /
+        // a method on a struct declared inside `fn X() type { return
+        // struct { ... }; }`).  Without this filter, methods of
+        // generic-fn-returned structs leak into model.fns as
+        // pseudo-top-level entries — summaryByName then finds them
+        // and applies their inferred takes to unrelated call sites.
+        if (isInsideFnBody(tree, name_tok)) continue;
 
         try fns.append(a, .{
             .name = tree.tokenSlice(name_tok),

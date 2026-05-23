@@ -150,17 +150,10 @@ pub fn inferFromBody(
         out.returns = classifyReturnExpr(tree, proto, re.first, re.last, out.allocates);
     }
 
-    // NOTE: direct takes_ownership_of inference is NOT wired into
-    // inferFromBody yet.  Sweep audit (bun corpus) revealed subtle
-    // FPs caused by the cfg.zig consumer interactions — even
-    // semantically-correct Pattern 2 matches (gpa.destroy(<param>))
-    // perturbed the lookup hierarchy in cfg's takesOwnership lookup,
-    // letting unrelated `deinit` entries propagate through unchecked
-    // fallback paths.  The inferDirectTakes / resolveTransitiveTakes
-    // helpers are built and exported for future consumers that opt
-    // in explicitly (e.g. pattern rules that don't go through cfg);
-    // turning them on by default needs a follow-up pass to harden
-    // the cfg query chain.
+    // Direct takes_ownership_of inference (R8b-style: .free(<param>)
+    // / .destroy(<param>) only).  See inferDirectTakes for the
+    // conservative rationale around <param>.deinit() being excluded.
+    out.takes_ownership_of = inferDirectTakes(tree, proto, body);
 
     return out;
 }
