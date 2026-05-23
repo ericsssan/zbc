@@ -56,18 +56,14 @@ pub fn analyzeEscape(
     var problems: std.ArrayListUnmanaged(Problem) = .empty;
     errdefer freeProblemsArrayList(gpa, &problems);
 
-    // Per-file shared cache, used by both flow analysis (cfg) and
-    // pattern rules.  Amortizes FileModel + LocalBindings + FnSummary
-    // across every consumer.
-    var rule_cache = file_cache_mod.FileCache.init(gpa, &tree);
-    defer rule_cache.deinit();
-    try rule_cache.resolveTransitiveTakes();
-
     // ZLS-backed type resolver — cross-module type queries that
     // zbc's own AST-only tracking can't answer (for-loop captures,
     // generic instantiations, multi-hop @import aliases, cross-file
     // method resolution).  Optional; when init fails (e.g. ZLS can't
     // open the path) we silently fall through to the AST-only path.
+    // Built BEFORE the FileCache so the cache can consult it during
+    // transitive-takes resolution (param-type lookups via ZLS handle
+    // `*lib.T` cross-module params that token-walks can't see).
     var zls_resolver: zls_resolver_mod.ZlsResolver = undefined;
     const zls_ok = blk: {
         zls_resolver.init(gpa, io, path, src) catch |err| {
@@ -78,6 +74,14 @@ pub fn analyzeEscape(
     };
     defer if (zls_ok) zls_resolver.deinit();
     const zls_ptr: ?*zls_resolver_mod.ZlsResolver = if (zls_ok) &zls_resolver else null;
+
+    // Per-file shared cache, used by both flow analysis (cfg) and
+    // pattern rules.  Amortizes FileModel + LocalBindings + FnSummary
+    // across every consumer.
+    var rule_cache = file_cache_mod.FileCache.init(gpa, &tree);
+    defer rule_cache.deinit();
+    rule_cache.setZls(zls_ptr);
+    try rule_cache.resolveTransitiveTakes();
 
     // Flow analysis — per-fn CFG + worklist fixed-point.
     // Iterate raw fn_decls (incl. type-builders) — lowerFunctionFull

@@ -24,6 +24,7 @@ const Ast = std.zig.Ast;
 const fmodel = @import("model.zig");
 const local = @import("local.zig");
 const fn_summary = @import("fn_summary.zig");
+const zls_resolver_mod = @import("zls_resolver.zig");
 
 pub const FileCache = struct {
     gpa: std.mem.Allocator,
@@ -35,9 +36,19 @@ pub const FileCache = struct {
     file_model: ?fmodel.FileModel = null,
     bindings: std.AutoHashMapUnmanaged(u32, local.LocalBindings) = .empty,
     summaries: std.AutoHashMapUnmanaged(u32, fn_summary.FnSummary) = .empty,
+    /// Optional ZLS-backed type resolver.  When set, type-shaped
+    /// questions (param container name, field type) prefer ZLS over
+    /// the token-walk fallback — handles cross-module types, generic
+    /// instantiations, and pointer/optional chains uniformly instead
+    /// of via fragile token-pattern proxies.
+    zls: ?*zls_resolver_mod.ZlsResolver = null,
 
     pub fn init(gpa: std.mem.Allocator, tree: *const Ast) FileCache {
         return .{ .gpa = gpa, .tree = tree };
+    }
+
+    pub fn setZls(self: *FileCache, zls: ?*zls_resolver_mod.ZlsResolver) void {
+        self.zls = zls;
     }
 
     pub fn deinit(self: *FileCache) void {
@@ -93,54 +104,25 @@ pub const FileCache = struct {
         return gop.value_ptr;
     }
 
-    /// Return the param's type-name (with */?/const wrappers stripped)
-    /// by walking the proto's param iterator.  Returns the FIRST
-    /// identifier — for `*lib.T` returns "lib", not "T".  Used by
-    /// the may_free_fields filter where we need to look up against
-    /// `(local_type, field)` and prefix-as-namespace cases would miss
-    /// anyway.  Use `paramTypePath` for cross-file resolution.
-    fn paramTypeName(tree: *const Ast, proto: Ast.full.FnProto, idx: u32) ?[]const u8 {
-        const path = paramTypePath(tree, proto, idx) orelse return null;
-        return path.ns orelse path.type_name;
-    }
-
-    /// Like `paramTypeName` but distinguishes `<ns>.<Type>` from a
-    /// bare `<Type>` leaf:
-    ///   `*T`        → { ns = null,  type_name = "T" }
-    ///   `*lib.T`    → { ns = "lib", type_name = "T" }
-    ///   `anytype`   → null
-    /// Cross-file R10 / R7 inference uses `ns` to look up via remote
-    /// imap; `type_name` is the actual type whose methods we query.
-    fn paramTypePath(
-        tree: *const Ast,
+    /// Return the param's resolved container name (e.g. "T" for any
+    /// of `T`, `*T`, `*const T`, `?*T`, `*lib.T`, `Generic(K, V)`).
+    /// Prefers ZLS (handles cross-module + generics) and falls back
+    /// to a token-walk that strips `*`/`?`/`const`/`[]` wrappers and
+    /// returns the LAST identifier in a dotted chain.
+    fn paramContainerName(
+        self: *FileCache,
         proto: Ast.full.FnProto,
         idx: u32,
-    ) ?struct { ns: ?[]const u8, type_name: []const u8 } {
+    ) !?[]const u8 {
         var i: u32 = 0;
-        var it = proto.iterate(tree);
+        var it = proto.iterate(self.tree);
         while (it.next()) |p| : (i += 1) {
             if (i != idx) continue;
             const type_node = p.type_expr orelse return null;
-            const tags = tree.tokens.items(.tag);
-            const last = tree.lastToken(type_node);
-            var t = tree.firstToken(type_node);
-            // Skip wrapper tokens; stop at the first identifier (the
-            // namespace OR the type name itself).
-            while (t <= last) : (t += 1) {
-                switch (tags[t]) {
-                    .asterisk, .question_mark, .keyword_const, .keyword_var, .l_bracket, .r_bracket => {},
-                    .identifier => break,
-                    else => return null,
-                }
+            if (self.zls) |z| {
+                if (z.typeNameOfNode(type_node) catch null) |name| return name;
             }
-            if (t > last or tags[t] != .identifier) return null;
-            const first_id = tree.tokenSlice(t);
-            // Is this followed by `.<identifier>`?  If so it's a
-            // `<ns>.<Type>` leaf.
-            if (t + 2 <= last and tags[t + 1] == .period and tags[t + 2] == .identifier) {
-                return .{ .ns = first_id, .type_name = tree.tokenSlice(t + 2) };
-            }
-            return .{ .ns = null, .type_name = first_id };
+            return paramContainerNameFallback(self.tree, type_node);
         }
         return null;
     }
@@ -167,10 +149,11 @@ pub const FileCache = struct {
         proto: Ast.full.FnProto,
         raw: []const fn_summary.FieldFree,
     ) ![]const fn_summary.FieldFree {
+        _ = tree;
         if (raw.len == 0) return &.{};
         var out: std.ArrayListUnmanaged(fn_summary.FieldFree) = .empty;
         for (raw) |ff| {
-            const param_ty = paramTypeName(tree, proto, ff.param) orelse continue;
+            const param_ty = (try self.paramContainerName(proto, ff.param)) orelse continue;
             if (!model.hasType(param_ty)) continue;
             // Walk the field path one segment at a time so multi-
             // segment chains like "inner.handle" resolve to the
@@ -477,11 +460,8 @@ pub const FileCache = struct {
         param_idx: u32,
         method_name: []const u8,
     ) !?u32 {
-        const path = paramTypePath(self.tree, proto, param_idx) orelse return null;
-        // Only handle bare-name param types here — `<ns>.<Type>` is
-        // routed to lookupBorrowedFromParamType (cross-file).
-        if (path.ns != null) return null;
-        const s = (try self.summaryByMethod(path.type_name, method_name)) orelse return null;
+        const type_name = (try self.paramContainerName(proto, param_idx)) orelse return null;
+        const s = (try self.summaryByMethod(type_name, method_name)) orelse return null;
         return switch (s.returns) {
             .borrowed_from => |idx| idx,
             else => null,
@@ -599,16 +579,12 @@ pub const FileCache = struct {
             const method = tree.tokenSlice(t + 2);
 
             // Look up callee summary on PARAM's declared type — that's
-            // the receiver of `<param>.<method>(`.  Tries same-file,
-            // then cross-file (when type is `<ns>.<Type>` and remote
-            // is wired).  Falls back to the outer fn's containing type
-            // and bare-name lookup for legacy patterns.
+            // the receiver of `<param>.<method>(`.  Tries the
+            // ZLS-resolved container name first, then falls back to
+            // the outer fn's containing type and bare-name lookup.
             const callee_summary: ?*const fn_summary.FnSummary = blk: {
-                if (paramTypePath(tree, proto, pi)) |path| {
-                    if (path.ns == null) {
-                        // Same-file: cross-file lookup retired.
-                        if (try self.summaryByMethod(path.type_name, method)) |s| break :blk s;
-                    }
+                if (try self.paramContainerName(proto, pi)) |type_name| {
+                    if (try self.summaryByMethod(type_name, method)) |s| break :blk s;
                 }
                 if (receiver_type) |rt| {
                     if (try self.summaryByMethod(rt, method)) |s| break :blk s;
@@ -752,6 +728,30 @@ pub const FileCache = struct {
 /// resolvable in the local model (cross-file intermediates that
 /// aren't loaded yet — uncommon, and the conservative answer is to
 /// drop the entry).
+/// Token-walk fallback for `paramContainerName` when ZLS is unavailable.
+/// Strips `*`/`?`/`const`/`[`/`]` wrappers, then returns the LAST
+/// identifier in a dotted chain — `*lib.T` → "T", `?[]u8` → null.
+fn paramContainerNameFallback(tree: *const Ast, type_node: Ast.Node.Index) ?[]const u8 {
+    const tags = tree.tokens.items(.tag);
+    const last = tree.lastToken(type_node);
+    var t = tree.firstToken(type_node);
+    while (t <= last) : (t += 1) {
+        switch (tags[t]) {
+            .asterisk, .question_mark, .keyword_const, .keyword_var => continue,
+            .l_bracket, .r_bracket => return null,
+            .identifier => break,
+            else => return null,
+        }
+    }
+    if (t > last or tags[t] != .identifier) return null;
+    // Walk the dotted chain; return the last identifier (so `*lib.T` → "T").
+    var last_id = tree.tokenSlice(t);
+    while (t + 2 <= last and tags[t + 1] == .period and tags[t + 2] == .identifier) : (t += 2) {
+        last_id = tree.tokenSlice(t + 2);
+    }
+    return last_id;
+}
+
 fn walkFieldPath(
     model: *const fmodel.FileModel,
     outer_type: []const u8,
