@@ -376,6 +376,14 @@ const known_noreturn_chains = [_][]const u8{
     "posix.exit",
     "os.abort",
     "process.abort",
+    // Bun's process-exit wrapper.  Used after fatal-script teardown:
+    //   this.deinit();
+    //   Global.exit(exit.code);
+    // — anything textually after this call is unreachable.  Without
+    // the noreturn signal, the analyzer joins the post-deinit state
+    // into the next basic block and fires heap-use-after-free on
+    // sibling branches that read `this`.
+    "Global.exit",
 };
 
 // ── Lowering ───────────────────────────────────────────────
