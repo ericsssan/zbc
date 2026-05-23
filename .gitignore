@@ -1,6 +1,10 @@
 .zig-cache/
 zig-out/
+# Zig dependency cache (populated by `zig build`).  Never tracked.
+zig-pkg/
 
 # Local-only working notes — handoff context between sessions.
 # Lives on disk for the agent to read, but never tracked.
 HANDOFF.md
+# Dated session transcripts.
+20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]-*.txt

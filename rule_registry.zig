@@ -1,39 +1,24 @@
 //! Comptime rule registry — the canonical list of escape-analysis
-//! pattern rules with their call signature classification.
+//! pattern rules.
 //!
 //! Adding a rule: import its module here, append one entry to
 //! `escape_rules`, and add the invariant to `config.zig`.  lib.zig
 //! iterates this list — no manual dispatch site to edit.
-//!
-//! Two signature shapes exist; the union discriminates dispatch:
-//!   .plain   — check(gpa, tree, config, problems)
-//!   .with_db — check(gpa, tree, db,     config, problems)
 
 const std = @import("std");
 const Ast = std.zig.Ast;
 
 const config_mod = @import("config.zig");
 const problem_mod = @import("problem.zig");
-const annotations_mod = @import("annotations.zig");
 const file_cache = @import("file_cache.zig");
 
 const Problem = problem_mod.Problem;
 const Config = config_mod.Config;
-const Db = annotations_mod.Db;
 const FileCache = file_cache.FileCache;
 
-pub const CheckPlain = *const fn (
+pub const Check = *const fn (
     std.mem.Allocator,
     *const Ast,
-    *FileCache,
-    *const Config,
-    *std.ArrayListUnmanaged(Problem),
-) anyerror!void;
-
-pub const CheckWithDb = *const fn (
-    std.mem.Allocator,
-    *const Ast,
-    *const Db,
     *FileCache,
     *const Config,
     *std.ArrayListUnmanaged(Problem),
@@ -41,10 +26,7 @@ pub const CheckWithDb = *const fn (
 
 pub const Rule = struct {
     id: []const u8,
-    check: union(enum) {
-        plain: CheckPlain,
-        with_db: CheckWithDb,
-    },
+    check: Check,
 };
 
 // ── Rule imports ─────────────────────────────────────────────
@@ -82,7 +64,6 @@ const slice_of_arena_into_heap_mod = @import("rules/slice_of_arena_into_heap.zig
 const stack_fallback_escape_mod = @import("rules/stack_fallback_escape.zig");
 const tagged_union_retag_with_old_payload_read_mod = @import("rules/tagged_union_retag_with_old_payload_read.zig");
 const union_deinit_without_inert_reset_mod = @import("rules/union_deinit_without_inert_reset.zig");
-const stale_annotation_mod = @import("rules/stale_annotation.zig");
 const unreleased_factory_handle_mod = @import("rules/unreleased_factory_handle.zig");
 const unreleased_refs_on_error_mod = @import("rules/unreleased_refs_on_error.zig");
 
@@ -92,61 +73,55 @@ const unreleased_refs_on_error_mod = @import("rules/unreleased_refs_on_error.zig
 // Rules that need Db run after CFG analysis populates it.
 
 pub const escape_rules = [_]Rule{
-    .{ .id = "aliased-heap-dupe",                          .check = .{ .plain = aliased_heap_dupe_mod.check } },
-    .{ .id = "clobbered-by-struct-reset",                  .check = .{ .plain = clobbered_by_struct_reset_mod.check } },
-    .{ .id = "realloc-byte-count",                         .check = .{ .plain = realloc_byte_count_mod.check } },
-    .{ .id = "asymmetric-field-free",                      .check = .{ .plain = asymmetric_field_free_mod.check } },
-    .{ .id = "missing-errdefer-between-tries",             .check = .{ .plain = missing_errdefer_between_tries_mod.check } },
-    .{ .id = "free-then-try-realloc",                      .check = .{ .plain = free_then_try_realloc_mod.check } },
-    .{ .id = "destroy-after-deinit-in-loop",               .check = .{ .plain = destroy_after_deinit_in_loop_mod.check } },
-    .{ .id = "dead-errdefer-in-result-fn",                 .check = .{ .plain = dead_errdefer_in_result_fn_mod.check } },
-    .{ .id = "duplicate-errdefer",                         .check = .{ .plain = duplicate_errdefer_mod.check } },
-    .{ .id = "overwrite-without-deinit",                   .check = .{ .plain = overwrite_without_deinit_mod.check } },
-    .{ .id = "stack-fallback-escape",                      .check = .{ .plain = stack_fallback_escape_mod.check } },
-    .{ .id = "unreleased-refs-on-error",                   .check = .{ .plain = unreleased_refs_on_error_mod.check } },
-    .{ .id = "hashmap-getptr-rehash",                      .check = .{ .plain = hashmap_getptr_rehash_mod.check } },
-    .{ .id = "arraylist-items-slice",                      .check = .{ .plain = arraylist_items_slice_mod.check } },
-    .{ .id = "fd-write-after-close",                       .check = .{ .plain = fd_write_after_close_mod.check } },
-    .{ .id = "slice-of-arena-into-heap",                   .check = .{ .plain = slice_of_arena_into_heap_mod.check } },
-    .{ .id = "free-without-null-then-check",               .check = .{ .plain = free_without_null_then_check_mod.check } },
-    .{ .id = "tagged-union-retag-with-old-payload-read",   .check = .{ .plain = tagged_union_retag_with_old_payload_read_mod.check } },
-    .{ .id = "union-deinit-without-inert-reset",           .check = .{ .plain = union_deinit_without_inert_reset_mod.check } },
-    .{ .id = "self-undefined-after-destroy",               .check = .{ .plain = self_undefined_after_destroy_mod.check } },
-    .{ .id = "missing-errdefer-on-out-param",              .check = .{ .plain = missing_errdefer_on_out_param_mod.check } },
-    .{ .id = "reset-skips-pooled-resource-release",        .check = .{ .plain = reset_skips_pooled_resource_release_mod.check } },
-    .{ .id = "return-borrowed-payload",                    .check = .{ .plain = return_borrowed_payload_mod.check } },
-    .{ .id = "unreleased-factory-handle",                  .check = .{ .plain = unreleased_factory_handle_mod.check } },
-    .{ .id = "memset-undef-after-len-truncation",          .check = .{ .plain = memset_undef_after_len_truncation_mod.check } },
-    .{ .id = "publish-then-touch-self",                    .check = .{ .plain = publish_then_touch_self_mod.check } },
-    .{ .id = "assert-on-untrusted-input",                  .check = .{ .plain = assert_on_untrusted_input_mod.check } },
-    .{ .id = "missing-deinit-on-composed-owner",           .check = .{ .plain = missing_deinit_on_composed_owner_mod.check } },
-    .{ .id = "owned-field-no-outer-cleanup",               .check = .{ .plain = owned_field_no_outer_cleanup_mod.check } },
-    .{ .id = "borrowed-slice-into-out-param",              .check = .{ .plain = borrowed_slice_into_out_param_mod.check } },
-    .{ .id = "defer-and-errdefer-free-overlap",            .check = .{ .plain = defer_and_errdefer_free_overlap_mod.check } },
-    .{ .id = "sentinel-strip-free-size-mismatch",          .check = .{ .plain = sentinel_strip_free_size_mismatch_mod.check } },
-    .{ .id = "move-out-without-restore",                   .check = .{ .plain = move_out_without_restore_mod.check } },
-    .{ .id = "deinit-order-violates-construction-dep",     .check = .{ .plain = deinit_order_violates_construction_dep_mod.check } },
-    .{ .id = "borrowed-slice-into-stack-buffer-returned",  .check = .{ .plain = borrowed_slice_into_stack_buffer_returned_mod.check } },
-    .{ .id = "stale-annotation",                           .check = .{ .plain = stale_annotation_mod.check } },
+    .{ .id = "aliased-heap-dupe",                          .check = aliased_heap_dupe_mod.check },
+    .{ .id = "clobbered-by-struct-reset",                  .check = clobbered_by_struct_reset_mod.check },
+    .{ .id = "realloc-byte-count",                         .check = realloc_byte_count_mod.check },
+    .{ .id = "asymmetric-field-free",                      .check = asymmetric_field_free_mod.check },
+    .{ .id = "missing-errdefer-between-tries",             .check = missing_errdefer_between_tries_mod.check },
+    .{ .id = "free-then-try-realloc",                      .check = free_then_try_realloc_mod.check },
+    .{ .id = "destroy-after-deinit-in-loop",               .check = destroy_after_deinit_in_loop_mod.check },
+    .{ .id = "dead-errdefer-in-result-fn",                 .check = dead_errdefer_in_result_fn_mod.check },
+    .{ .id = "duplicate-errdefer",                         .check = duplicate_errdefer_mod.check },
+    .{ .id = "overwrite-without-deinit",                   .check = overwrite_without_deinit_mod.check },
+    .{ .id = "stack-fallback-escape",                      .check = stack_fallback_escape_mod.check },
+    .{ .id = "unreleased-refs-on-error",                   .check = unreleased_refs_on_error_mod.check },
+    .{ .id = "hashmap-getptr-rehash",                      .check = hashmap_getptr_rehash_mod.check },
+    .{ .id = "arraylist-items-slice",                      .check = arraylist_items_slice_mod.check },
+    .{ .id = "fd-write-after-close",                       .check = fd_write_after_close_mod.check },
+    .{ .id = "slice-of-arena-into-heap",                   .check = slice_of_arena_into_heap_mod.check },
+    .{ .id = "free-without-null-then-check",               .check = free_without_null_then_check_mod.check },
+    .{ .id = "tagged-union-retag-with-old-payload-read",   .check = tagged_union_retag_with_old_payload_read_mod.check },
+    .{ .id = "union-deinit-without-inert-reset",           .check = union_deinit_without_inert_reset_mod.check },
+    .{ .id = "self-undefined-after-destroy",               .check = self_undefined_after_destroy_mod.check },
+    .{ .id = "missing-errdefer-on-out-param",              .check = missing_errdefer_on_out_param_mod.check },
+    .{ .id = "reset-skips-pooled-resource-release",        .check = reset_skips_pooled_resource_release_mod.check },
+    .{ .id = "return-borrowed-payload",                    .check = return_borrowed_payload_mod.check },
+    .{ .id = "unreleased-factory-handle",                  .check = unreleased_factory_handle_mod.check },
+    .{ .id = "memset-undef-after-len-truncation",          .check = memset_undef_after_len_truncation_mod.check },
+    .{ .id = "publish-then-touch-self",                    .check = publish_then_touch_self_mod.check },
+    .{ .id = "assert-on-untrusted-input",                  .check = assert_on_untrusted_input_mod.check },
+    .{ .id = "missing-deinit-on-composed-owner",           .check = missing_deinit_on_composed_owner_mod.check },
+    .{ .id = "owned-field-no-outer-cleanup",               .check = owned_field_no_outer_cleanup_mod.check },
+    .{ .id = "borrowed-slice-into-out-param",              .check = borrowed_slice_into_out_param_mod.check },
+    .{ .id = "defer-and-errdefer-free-overlap",            .check = defer_and_errdefer_free_overlap_mod.check },
+    .{ .id = "sentinel-strip-free-size-mismatch",          .check = sentinel_strip_free_size_mismatch_mod.check },
+    .{ .id = "move-out-without-restore",                   .check = move_out_without_restore_mod.check },
+    .{ .id = "deinit-order-violates-construction-dep",     .check = deinit_order_violates_construction_dep_mod.check },
+    .{ .id = "borrowed-slice-into-stack-buffer-returned",  .check = borrowed_slice_into_stack_buffer_returned_mod.check },
 };
 
-/// Dispatch all registered escape rules against `tree`.
-/// Run after CFG/analyzer populates `db`.  `cache` is amortized
-/// per-file shared state — rules borrow FileModel + LocalBindings
-/// from it instead of building their own copies.
+/// Dispatch all registered escape rules against `tree`.  `cache` is
+/// amortized per-file shared state — rules borrow FileModel +
+/// LocalBindings + FnSummary from it instead of building their own.
 pub fn runEscape(
     gpa: std.mem.Allocator,
     tree: *const Ast,
-    db: *const Db,
     cache: *FileCache,
     config: *const Config,
     problems: *std.ArrayListUnmanaged(Problem),
 ) !void {
     for (escape_rules) |rule| {
-        switch (rule.check) {
-            .plain => |fp| try fp(gpa, tree, cache, config, problems),
-            .with_db => |fp| try fp(gpa, tree, db, cache, config, problems),
-        }
+        try rule.check(gpa, tree, cache, config, problems);
     }
 }
 
@@ -203,7 +178,6 @@ test "registry: pull in every rule module so inline tests run" {
     _ = stack_fallback_escape_mod;
     _ = tagged_union_retag_with_old_payload_read_mod;
     _ = union_deinit_without_inert_reset_mod;
-    _ = stale_annotation_mod;
     _ = unreleased_factory_handle_mod;
     _ = unreleased_refs_on_error_mod;
 }

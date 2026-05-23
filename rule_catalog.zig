@@ -249,11 +249,6 @@ pub const all = [_]Rule{
         .title = "`<T>.parse(&stack_buf)` result returned — sub-slice fields point at the now-dead stack buffer",
         .body = @embedFile("rules/borrowed-slice-into-stack-buffer-returned.md"),
     },
-    .{
-        .id = "stale-annotation",
-        .title = "`/// @returns ...` doc annotation contradicts the body's inferred behavior",
-        .body = @embedFile("rules/stale-annotation.md"),
-    },
 };
 
 /// Look up a rule by id.  Returns null on unknown id so callers can

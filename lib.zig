@@ -105,7 +105,7 @@ pub fn analyzeEscape(
 
     // Pattern detectors — dispatched via the comptime registry so
     // adding a rule is a one-file change (see rule_registry.zig).
-    try rule_registry.runEscape(gpa, &tree, &db, &rule_cache, config, &problems);
+    try rule_registry.runEscape(gpa, &tree, &rule_cache, config, &problems);
 
     // Apply per-line suppressions parsed from `// zbc-disable-line` /
     // `// zbc-disable-next-line` source comments.  Filter happens at
