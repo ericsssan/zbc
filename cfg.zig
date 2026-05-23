@@ -1259,7 +1259,14 @@ const Builder = struct {
         const tree = self.tree;
         const tags = tree.tokens.items(.tag);
         // Walk payload tokens collecting (is_pointer, capture_name)
-        // pairs in input order.
+        // pairs in input order.  Two passes happen here:
+        //   1. for-loop interior-pointer marker (from_container) —
+        //      `for (entries.items) |*r|` records that `r` borrows
+        //      from `entries`.  Used by interior_pointer_destroy.
+        //   2. ZLS-derived capture type — `for (xs) |x|` resolves
+        //      `x`'s container type via ZLS on the input.  Without
+        //      this, captures get type_name=null and method-on-
+        //      capture lookups fall back to bare-name.
         var pt = for_data.payload_token;
         var input_idx: usize = 0;
         var is_ptr = false;
@@ -1275,18 +1282,34 @@ const Builder = struct {
                     const is_underscore = std.mem.eql(u8, name, "_");
                     const was_ptr = is_ptr;
                     is_ptr = false;
-                    if (is_underscore or !was_ptr) continue;
-                    // Resolve <container>.<field> shape on the input.
-                    if (tree.nodeTag(input) != .field_access) continue;
-                    const fa = tree.nodeData(input).node_and_token;
-                    const recv = fa[0];
-                    if (tree.nodeTag(recv) != .identifier) continue;
-                    const recv_name = tree.tokenSlice(tree.nodeMainToken(recv));
-                    const container = self.name_to_local.get(recv_name) orelse continue;
-                    // Find the capture's LocalId (registered just
-                    // above by registerCapturesWith).
+                    if (is_underscore) continue;
                     const capture_local = self.name_to_local.get(name) orelse continue;
-                    self.locals.items[@intFromEnum(capture_local)].from_container = container;
+
+                    // (1) Interior-pointer marker (by-pointer capture
+                    // over `<container>.<field>`).
+                    if (was_ptr and tree.nodeTag(input) == .field_access) {
+                        const fa = tree.nodeData(input).node_and_token;
+                        const recv = fa[0];
+                        if (tree.nodeTag(recv) == .identifier) {
+                            const recv_name = tree.tokenSlice(tree.nodeMainToken(recv));
+                            if (self.name_to_local.get(recv_name)) |container| {
+                                self.locals.items[@intFromEnum(capture_local)].from_container = container;
+                            }
+                        }
+                    }
+
+                    // (2) ZLS-derived capture type.  resolveTypeOfNode
+                    // on the input gives the slice/array; the helper
+                    // strips pointer/optional/array wrappers down to
+                    // the container — for `[]Item` we get "Item",
+                    // which is the right type for both `|x|` and
+                    // `|*x|` captures (the `*` is just a borrow modifier).
+                    if (self.zls) |z| {
+                        if (z.typeNameOfNode(input) catch null) |ty| {
+                            const li = &self.locals.items[@intFromEnum(capture_local)];
+                            if (li.type_name == null) li.type_name = ty;
+                        }
+                    }
                 },
                 .comma => {}, // separator between captures
                 else => {},
