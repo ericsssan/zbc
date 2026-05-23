@@ -34,6 +34,7 @@ const imports = @import("imports.zig");
 const remote_resolver = @import("remote_resolver.zig");
 const config_mod = @import("config.zig");
 const file_cache = @import("file_cache.zig");
+const fn_summary = @import("fn_summary.zig");
 
 pub const Config = config_mod.Config;
 
@@ -4144,7 +4145,22 @@ const Builder = struct {
                     break :blk self.name_to_local.contains(recv_name);
                 };
 
-                // 1. Same-file DB hit on method name.
+                // 1a. Same-file FnSummary hit — typed lookup only
+                // (bare-name fallback would cross-pollute across
+                // unrelated types; see takesOwnershipFreedLocal).
+                if (self.cache) |c| {
+                    if (self.receiverTypeOfNode(recv_node)) |ty| {
+                        if (c.summaryByMethod(ty, method_name) catch null) |s| {
+                            if (summaryToAnnotation(s)) |a| {
+                                return self.applyAnnotationToCall(a, recv_node, args, recv_is_local);
+                            }
+                        }
+                    }
+                }
+                // 1b. Same-file DB hit on bare method name (still
+                // bare-name during the transition — db's R6/R7/R8
+                // path catches @returns annotations cache doesn't
+                // express yet).
                 if (self.db) |db| {
                     if (db.lookup(method_name)) |entry| {
                         if (entry.annotation) |a| {
@@ -4169,6 +4185,14 @@ const Builder = struct {
                 // identifier names a local that's bound to a fn, use
                 // the bound fn's name for the DB lookup.
                 const fn_name = self.resolveBoundCallee(raw_name);
+                // Same-file FnSummary hit on top-level fn name.
+                if (self.cache) |c| {
+                    if (c.summaryByName(fn_name) catch null) |s| {
+                        if (summaryToAnnotation(s)) |a| {
+                            return self.applyAnnotationToCall(a, callee_node, args, false);
+                        }
+                    }
+                }
                 if (self.db) |db| {
                     if (db.lookup(fn_name)) |entry| {
                         if (entry.annotation) |a| {
@@ -4708,6 +4732,25 @@ const Builder = struct {
         const remote_file = (remote.cache.loadOrLookup(remote.base_dir, imap_entry.path) catch return null) orelse return null;
         const entry = remote_file.db.lookup(method_name) orelse return null;
         return entry.annotation;
+    }
+
+    /// Conservatively translate a body-only FnSummary.Returns into
+    /// the same-meaning annotations.ReturnsAnnotation, or null when
+    /// the summary doesn't carry an actionable signal.  Used by the
+    /// cfg consumers that previously read `entry.annotation`.
+    ///
+    /// `.heap` collapses to `.owned` rather than `.heap` to preserve
+    /// the OLD R6-inferred semantics — annotations.zig's R6 path
+    /// produced `.owned` for slice-returning + alloc-body fns, NOT
+    /// `.heap` (which would mint a HeapId at every call site and
+    /// strengthen UAF tracking).  Migrating to .heap is a separate
+    /// decision that needs sweep verification on real corpora.
+    fn summaryToAnnotation(s: *const fn_summary.FnSummary) ?annotations.ReturnsAnnotation {
+        return switch (s.returns) {
+            .heap, .owned => .owned,
+            .borrowed_from => |p| .{ .borrowed_from = p },
+            .plain, .unknown => null,
+        };
     }
 
     fn applyAnnotationToCall(
