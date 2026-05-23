@@ -96,12 +96,19 @@ fn checkBody(
         const sc = findStmtSemicolon(tags, t + 4, last) orelse continue;
         const field_name = tree.tokenSlice(t + 2);
         // Field-type lookup: must have a known type whose `deinit` is
-        // declared in this file.  Skip otherwise.
+        // declared in this file AND non-trivial.  Trivial deinit
+        // bodies (`{}` or `{ _ = self; }`) are common for trait
+        // uniformity (CSS value types in Bun) — overwriting such a
+        // field can't leak anything.
         const field_type = model.fieldType(ct, field_name) orelse {
             t = sc;
             continue;
         };
-        if (!model.typeHasMethod(field_type, "deinit")) {
+        const inner_ti = model.findType(field_type) orelse {
+            t = sc;
+            continue;
+        };
+        if (!hasNonTrivialDeinit(tree, inner_ti)) {
             t = sc;
             continue;
         }
@@ -148,6 +155,47 @@ fn checkBody(
         try report(gpa, problems, tree, t, this_name, field_name, ct);
         t = sc;
     }
+}
+
+/// True iff `ti` has a `deinit` method with a non-trivial body —
+/// any statement that's not a `_ = <expr>;` discard.  Mirrors the
+/// same check in owned-field-no-outer-cleanup.  Returns false for
+/// types whose deinit is `{}` or only discards (CSS uniform-API
+/// conformance); overwriting such a field can't leak anything.
+fn hasNonTrivialDeinit(tree: *const Ast, ti: *const fmodel.TypeInfo) bool {
+    for (ti.methods) |m| {
+        if (!std.mem.eql(u8, m.name, "deinit")) continue;
+        if (!isTrivialBody(tree, m.body_first, m.body_last)) return true;
+    }
+    return false;
+}
+
+fn isTrivialBody(tree: *const Ast, body_first: Ast.TokenIndex, body_last: Ast.TokenIndex) bool {
+    const tags = tree.tokens.items(.tag);
+    if (body_first >= body_last) return true;
+    if (body_first + 1 == body_last) return true;
+    var t: Ast.TokenIndex = body_first + 1;
+    while (t < body_last) {
+        if (tags[t] != .identifier) return false;
+        if (!std.mem.eql(u8, tree.tokenSlice(t), "_")) return false;
+        if (t + 1 >= body_last or tags[t + 1] != .equal) return false;
+        var depth: u32 = 0;
+        var k = t + 2;
+        while (k < body_last) : (k += 1) {
+            switch (tags[k]) {
+                .l_paren, .l_brace, .l_bracket => depth += 1,
+                .r_paren, .r_brace, .r_bracket => {
+                    if (depth == 0) return false;
+                    depth -= 1;
+                },
+                .semicolon => if (depth == 0) break,
+                else => {},
+            }
+        }
+        if (k >= body_last or tags[k] != .semicolon) return false;
+        t = k + 1;
+    }
+    return true;
 }
 
 /// True iff `assign_tok` (the `<this>` ident in `<this>.<field> = …`)
@@ -437,7 +485,7 @@ test "overwrite-without-deinit: reassign deinit-able field without prior cleanup
         \\    name: u32,
         \\    index: u32,
         \\    duplicate,
-        \\    pub fn deinit(_: *NameOrIndex) void {}
+        \\    pub fn deinit(self: *NameOrIndex) void { _ = self; self.* = .duplicate; }
         \\};
         \\const Field = struct {
         \\    name_or_index: NameOrIndex = .duplicate,
@@ -458,7 +506,7 @@ test "overwrite-without-deinit: prior `.deinit()` is OK" {
         \\const NameOrIndex = union(enum) {
         \\    name: u32,
         \\    duplicate,
-        \\    pub fn deinit(_: *NameOrIndex) void {}
+        \\    pub fn deinit(self: *NameOrIndex) void { _ = self; self.* = .duplicate; }
         \\};
         \\const Field = struct {
         \\    name_or_index: NameOrIndex = .duplicate,
@@ -495,7 +543,7 @@ test "overwrite-without-deinit: constructor fn (init/create/from*) is skipped" {
         \\const NameOrIndex = union(enum) {
         \\    name: u32,
         \\    duplicate,
-        \\    pub fn deinit(_: *NameOrIndex) void {}
+        \\    pub fn deinit(self: *NameOrIndex) void { _ = self; self.* = .duplicate; }
         \\};
         \\const Field = struct {
         \\    name_or_index: NameOrIndex = .duplicate,
@@ -516,7 +564,7 @@ test "overwrite-without-deinit: explicit `<allocator>.free(this.field)` cleanup 
     const gpa = std.testing.allocator;
     var problems = try runOn(gpa,
         \\const std = @import("std");
-        \\const Inner = struct { pub fn deinit(_: *Inner) void {} };
+        \\const Inner = struct { pub fn deinit(self: *Inner) void { self.* = undefined; } };
         \\const Owner = struct {
         \\    inner: Inner = .{},
         \\    pub fn replace(this: *Owner, new_inner: Inner, a: std.mem.Allocator) void {
@@ -533,7 +581,7 @@ test "overwrite-without-deinit: explicit `<allocator>.free(this.field)` cleanup 
 test "overwrite-without-deinit: `if (this.field) |…|` guard counts as cleanup" {
     const gpa = std.testing.allocator;
     var problems = try runOn(gpa,
-        \\const Inner = struct { pub fn deinit(_: *Inner) void {} };
+        \\const Inner = struct { pub fn deinit(self: *Inner) void { self.* = undefined; } };
         \\const Owner = struct {
         \\    inner: ?Inner = null,
         \\    pub fn swap(this: *Owner, new_inner: Inner) void {
@@ -550,7 +598,7 @@ test "overwrite-without-deinit: `if (this.field) |…|` guard counts as cleanup"
 test "overwrite-without-deinit: inline `defer this.field = saved;` (save/restore) doesn't fire" {
     const gpa = std.testing.allocator;
     var problems = try runOn(gpa,
-        \\const Inner = struct { pub fn deinit(_: *Inner) void {} };
+        \\const Inner = struct { pub fn deinit(self: *Inner) void { self.* = undefined; } };
         \\const Owner = struct {
         \\    inner: Inner,
         \\    pub fn withTemp(this: *Owner, new_inner: Inner) void {
@@ -572,7 +620,7 @@ test "overwrite-without-deinit: inline `defer this.field = saved;` (save/restore
 test "overwrite-without-deinit: assert(this.field == default) gates the write — no fire" {
     const gpa = std.testing.allocator;
     var problems = try runOn(gpa,
-        \\const Inner = struct { pub fn deinit(_: *Inner) void {} };
+        \\const Inner = struct { pub fn deinit(self: *Inner) void { self.* = undefined; } };
         \\const Owner = struct {
         \\    inner: Inner,
         \\    pub fn lazyInit(this: *Owner, new_inner: Inner) void {
