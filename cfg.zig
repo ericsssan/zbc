@@ -3501,49 +3501,23 @@ const Builder = struct {
                     if (std.mem.eql(u8, fname, "ptr")) {
                         return .{ .copy_of = id };
                     }
-                    // `/// @borrowed` field annotation: the field's
-                    // storage is owned by the containing struct, so a
-                    // read of `local.field` yields a borrow tied to
-                    // `local`'s lifetime.  Surface as .stack_ref(local)
-                    // so it composes with the stack-owner liveness
-                    // check at use sites — `owner.die()` then
-                    // invalidates the borrow.
-                    if (self.db) |db| {
-                        const info = self.locals.items[@intFromEnum(id)];
-                        if (info.type_name) |ty| if (db.isBorrowedField(ty, fname)) {
-                            if (!info.is_pointer) return .{ .stack_ref = id };
-                        };
-                    }
+                    // NOTE: pre-inference-migration this site also
+                    // looked up `/// @borrowed` field annotations via
+                    // db.isBorrowedField and treated the read as a
+                    // borrow of the parent local.  Zero real-world
+                    // usage of `/// @borrowed` was found across 5
+                    // corpora (bun, tigerbeetle, ghostty, mach, Ez),
+                    // so the special case was dead.  Removed
+                    // alongside the broader annotation -> inference
+                    // migration; if pointer-typed-field borrows ever
+                    // need re-tracking, do it via a model.fieldKind
+                    // inference, not annotation lookup.
                     return .{ .field_copy_of = .{ .parent = id, .name = fname } };
                 }
             }
-            // Deep chain (`<local>.<f1>.<f2>...`): walk down via
-            // `fieldLhsFor` to find the root local and the
-            // dotted-path it builds, then look up `(root_type,
-            // dotted_path)` in `borrowed_fields`.  Closes the gap
-            // where nested-literal inference marks dotted paths
-            // borrowed but the single-level classifier above only
-            // catches `<local>.<field>`.
-            //
-            // Two-tier lookup: first try the literal dotted-path
-            // (set by nested-literal inference) for a direct match,
-            // then fall through to a per-step walk via
-            // `isBorrowedDeepChain` which threads through
-            // `db.field_types`, stops at any pointer-typed
-            // intermediate field, and reports any `@borrowed`
-            // step along the way.  The per-step path catches the
-            // explicit-leaf-annotation case
-            // (`Inner.buf @borrowed`, read via `o.outer.buf`).
-            if (self.db) |db| {
-                if (self.fieldLhsFor(expr_node)) |fref| {
-                    const info = self.locals.items[@intFromEnum(fref.parent)];
-                    if (info.type_name) |ty| {
-                        const borrowed = db.isBorrowedField(ty, fref.name) or
-                            db.isBorrowedDeepChain(ty, fref.name);
-                        if (borrowed and !info.is_pointer) return .{ .stack_ref = fref.parent };
-                    }
-                }
-            }
+            // Deep-chain `/// @borrowed` lookup removed alongside
+            // the single-level check above (same rationale — zero
+            // real-world usage across the test corpora).
         }
 
         // Identifier reference → .undef / .copy_of(local) if known
@@ -4786,6 +4760,14 @@ const Builder = struct {
         recv_node: Ast.Node.Index,
         method_name: []const u8,
     ) ?annotations.ReturnsAnnotation {
+        // Cache-first: consult the remote file's FnSummary inference
+        // (via lookupRemoteSummary), translate to ReturnsAnnotation
+        // with the same conservative collapse as the intra-file path.
+        if (self.lookupRemoteSummary(recv_node, method_name)) |s| {
+            if (summaryToAnnotation(s)) |a| return a;
+        }
+        // Db fallback for cases cache doesn't express
+        // (explicit /// @returns owns_locals / R6-only inferences).
         const remote = self.remote orelse return null;
         const tree = self.tree;
         if (tree.nodeTag(recv_node) != .identifier) return null;
