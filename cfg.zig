@@ -3128,24 +3128,50 @@ const Builder = struct {
         else
             null;
 
-        // may_free_fields resolution stays on the db path.  Cache's
-        // filter narrowed inferMayFreeFields to (local-field-type,
-        // non-pointer, has-cleanup-method) but still over-fires vs
-        // annotations.zig R10 (which checks the SPECIFIC method
-        // name's takes, not just that some cleanup method exists).
-        // Recording the matched method name in FieldFree + checking
-        // the field-type's specific method's takes would close the
-        // gap; left for a follow-up.
-        const entry: annotations.FnEntry = blk: {
+        // Resolve callee's may_free_fields.  Cache filter now matches
+        // annotations.zig R10 Case B precision: only fires when the
+        // field's actual type has the exact matched method declared
+        // locally.  Cache-first → db → cross-file fallback.
+        const Free = struct { param: u32, field: []const u8 };
+        var free_buf: [16]Free = undefined;
+        const frees: []const Free = blk: {
+            if (self.cache) |c| {
+                if (recv_ty) |ty| {
+                    if (c.summaryByMethod(ty, callee_name) catch null) |s| {
+                        if (s.may_free_fields.len > 0) {
+                            const n = @min(s.may_free_fields.len, free_buf.len);
+                            for (s.may_free_fields[0..n], 0..) |ff, i| {
+                                free_buf[i] = .{ .param = ff.param, .field = ff.field };
+                            }
+                            break :blk free_buf[0..n];
+                        }
+                    }
+                }
+            }
             if (self.db) |db| {
-                if (db.lookupTyped(recv_ty, callee_name)) |e| break :blk e;
+                if (db.lookupTyped(recv_ty, callee_name)) |e| {
+                    if (e.may_free_fields.len > 0) {
+                        const n = @min(e.may_free_fields.len, free_buf.len);
+                        for (e.may_free_fields[0..n], 0..) |ff, i| {
+                            free_buf[i] = .{ .param = ff.param, .field = ff.field };
+                        }
+                        break :blk free_buf[0..n];
+                    }
+                }
             }
             if (recv_ty) |ty| {
-                if (self.lookupCrossFileMethod(ty, callee_name)) |e| break :blk e;
+                if (self.lookupCrossFileMethod(ty, callee_name)) |e| {
+                    if (e.may_free_fields.len > 0) {
+                        const n = @min(e.may_free_fields.len, free_buf.len);
+                        for (e.may_free_fields[0..n], 0..) |ff, i| {
+                            free_buf[i] = .{ .param = ff.param, .field = ff.field };
+                        }
+                        break :blk free_buf[0..n];
+                    }
+                }
             }
             return;
         };
-        if (entry.may_free_fields.len == 0) return;
 
         // For method-call shape, param 0 is the receiver; subsequent
         // params come from explicit args.  Imported namespaces
@@ -3155,7 +3181,7 @@ const Builder = struct {
         const effective_recv_is_arg0 = receiver_is_arg0 and recv_node != null and
             !self.calleeIsImportedNamespace(recv_node.?);
 
-        for (entry.may_free_fields) |ff| {
+        for (frees) |ff| {
             // Map the callee's param index to the caller's arg node.
             const arg_node: Ast.Node.Index = if (effective_recv_is_arg0 and ff.param == 0)
                 recv_node.?

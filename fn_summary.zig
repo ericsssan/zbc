@@ -44,12 +44,19 @@ pub const Returns = union(enum) {
 
 /// A `<param>.<field>` chain that a fn's body destroys.  Multiple
 /// entries per fn possible — `fn deinit(self) { self.x.free(); self.y.close(); }`
-/// emits two.  Same shape as the old `annotations.FieldFree`.
+/// emits two.  Same shape as the old `annotations.FieldFree` plus
+/// a `method` slot so post-inference filters can check the SPECIFIC
+/// method's existence on the field's type (rather than just "any
+/// cleanup method").
 pub const FieldFree = struct {
     /// 0-indexed param whose `.<field>` is freed (0 = receiver).
     param: u32,
     /// Field name (slice into source — caller keeps tree alive).
     field: []const u8,
+    /// Method name that matched (e.g. "deinit" / "close").  Slice
+    /// into source.  Used by FileCache.filterMayFreeFields to verify
+    /// the field's TYPE actually has this method before propagating.
+    method: []const u8,
 };
 
 pub const FnSummary = struct {
@@ -370,6 +377,7 @@ pub fn inferMayFreeFields(
         try out.append(arena, .{
             .param = idx,
             .field = tree.tokenSlice(t + 2),
+            .method = method,
         });
     }
     return out.toOwnedSlice(arena);

@@ -120,15 +120,22 @@ pub const FileCache = struct {
         return null;
     }
 
-    /// Filter may_free_fields entries down to those we can verify
-    /// locally: the param's type, the field, and the field's type
-    /// must all be declared in this file, the field must NOT be
-    /// pointer-typed, and the field's type must have a cleanup
-    /// method (deinit/close/release/...).  Mirrors annotations.zig
-    /// R10's conservatism — propagate only when the chain is fully
-    /// resolvable locally.  Returns a freshly-allocated slice in
-    /// `arena`.
+    /// Filter may_free_fields entries to match annotations.zig R10
+    /// Case B's resolveMethod conservatism.  An entry survives only
+    /// when:
+    ///   - param's type is locally declared
+    ///   - field is not pointer-typed
+    ///   - field's declared type is locally declared
+    ///   - the field-type's method (the one recorded in ff.method)
+    ///     exists AND has takes_ownership_of != null (i.e. R10/R8b
+    ///     determined that the method actually consumes its
+    ///     receiver — not just that it exists).  Without this check
+    ///     value-typed fields whose type has a non-consuming deinit
+    ///     (e.g. ManifestLogModel.deinit that just releases
+    ///     subordinate resources) get treated as freed when they
+    ///     shouldn't.
     fn filterMayFreeFields(
+        self: *FileCache,
         arena: std.mem.Allocator,
         model: *const fmodel.FileModel,
         tree: *const Ast,
@@ -139,21 +146,16 @@ pub const FileCache = struct {
         var out: std.ArrayListUnmanaged(fn_summary.FieldFree) = .empty;
         for (raw) |ff| {
             const param_ty = paramTypeName(tree, proto, ff.param) orelse continue;
-            // Param type must be locally declared (we need to look
-            // at its fields).
             if (!model.hasType(param_ty)) continue;
-            // Field can't be pointer-typed (deinit on a pointer field
-            // consumes the pointee, not the parent's field).
             if (model.fieldIsPointer(param_ty, ff.field)) continue;
-            // Field's declared type must be locally declared AND
-            // expose a cleanup method.  Without this, value-typed
-            // fields whose type lives in another file (and may not
-            // actually have a heap-owning deinit) get treated as
-            // freed — false-positive UAF downstream.
             const field_ty = model.fieldType(param_ty, ff.field) orelse continue;
             if (!model.hasType(field_ty)) continue;
             const ti = model.findType(field_ty) orelse continue;
-            if (!ti.hasCleanupMethod()) continue;
+            if (!ti.hasMethod(ff.method)) continue;
+            // Check the field-type's method actually consumes its
+            // receiver per FnSummary's transitive analysis.
+            const callee_summary = (try self.summaryByMethod(field_ty, ff.method)) orelse continue;
+            if (callee_summary.takes_ownership_of == null) continue;
             try out.append(arena, ff);
         }
         return out.toOwnedSlice(arena);
@@ -238,6 +240,33 @@ pub const FileCache = struct {
             }
             if (!changed) break;
         }
+
+        // Phase 3: filter may_free_fields per fn.  Done here (not in
+        // summaryOfFn) because the filter consults OTHER fn summaries
+        // — moving it inside summaryOfFn creates a comptime dep cycle.
+        // Filter requires Phase 2 to be done so the called methods'
+        // takes_ownership_of reflects the transitive analysis.
+        for (model.fns) |fi| try self.filterMayFreeFieldsOne(fi.fn_decl);
+        for (model.types) |ti| {
+            for (ti.methods) |m| try self.filterMayFreeFieldsOne(m.fn_decl);
+        }
+    }
+
+    /// Apply filterMayFreeFields to one fn's summary in-place.
+    fn filterMayFreeFieldsOne(self: *FileCache, fn_decl: Ast.Node.Index) !void {
+        const lexer = @import("lexer.zig");
+        var buf: [1]Ast.Node.Index = undefined;
+        const proto = lexer.fnProto(self.tree, &buf, fn_decl) orelse return;
+        const body = lexer.bodyOf(self.tree, fn_decl) orelse return;
+        const key = @intFromEnum(body);
+        const entry = self.summaries.getPtr(key) orelse return;
+        if (entry.may_free_fields.len == 0) return;
+        const model = try self.fileModel();
+        if (self.summary_arena == null) {
+            self.summary_arena = std.heap.ArenaAllocator.init(self.gpa);
+        }
+        const a = self.summary_arena.?.allocator();
+        entry.may_free_fields = try self.filterMayFreeFields(a, model, self.tree, proto, entry.may_free_fields);
     }
 
     /// Returns true iff the fn's summary's `takes_ownership_of` was
@@ -401,7 +430,7 @@ pub const FileCache = struct {
         }
         const a = self.summary_arena.?.allocator();
 
-        const raw_frees = try fn_summary.inferMayFreeFields(a, self.tree, proto, body);
+        s.may_free_fields = try fn_summary.inferMayFreeFields(a, self.tree, proto, body);
         s.result_heap_fields = try fn_summary.inferResultHeapFields(a, self.tree, body);
 
         // Containing-type lookup → heap_allocates_self.
@@ -409,13 +438,10 @@ pub const FileCache = struct {
         const ct: ?[]const u8 = if (model.containingTypeOf(fn_decl)) |ti| ti.name else null;
         s.heap_allocates_self = fn_summary.inferHeapAllocatesSelf(self.tree, body, ct);
 
-        // Filter may_free_fields by checking each (param, field)'s
-        // type shape via the model.  Drop entries where the field is
-        // pointer-typed — `<param>.<field>.deinit()` on a `<field>: *T`
-        // consumes the pointee, NOT the parent's field.  Without this
-        // filter the body-only inference over-fires on common cases
-        // like `this.stdout.deinit()` where `this.stdout: *Pipe`.
-        s.may_free_fields = try filterMayFreeFields(a, model, self.tree, proto, raw_frees);
+        // NOTE: may_free_fields here is the RAW body-only inference.
+        // resolveTransitiveTakes filters it as a finalization pass,
+        // since the filter needs to consult OTHER summaries (creating
+        // a comptime-dependency cycle if done inside summaryOfFn).
 
         s._resolved = true;
         gop.value_ptr.* = s;
