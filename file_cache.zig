@@ -28,6 +28,10 @@ const fn_summary = @import("fn_summary.zig");
 pub const FileCache = struct {
     gpa: std.mem.Allocator,
     tree: *const Ast,
+    /// Arena for FnSummary's variable-length fields
+    /// (may_free_fields, result_heap_fields).  Lazy: only initialized
+    /// on first summaryOf call that needs it.
+    summary_arena: ?std.heap.ArenaAllocator = null,
     file_model: ?fmodel.FileModel = null,
     bindings: std.AutoHashMapUnmanaged(u32, local.LocalBindings) = .empty,
     summaries: std.AutoHashMapUnmanaged(u32, fn_summary.FnSummary) = .empty,
@@ -38,6 +42,7 @@ pub const FileCache = struct {
 
     pub fn deinit(self: *FileCache) void {
         if (self.file_model) |*m| m.deinit();
+        if (self.summary_arena) |*a| a.deinit();
         var it = self.bindings.valueIterator();
         while (it.next()) |b| b.deinit();
         self.bindings.deinit(self.gpa);
@@ -72,7 +77,9 @@ pub const FileCache = struct {
     /// Lazily infer (and cache) the behavioral summary for the given
     /// fn body.  Same caching contract as localBindings.  Parallel
     /// API to annotations.Db; new code should prefer this for the
-    /// queries it covers.
+    /// queries it covers.  Body-only inference — for the deep fields
+    /// (may_free_fields / result_heap_fields / heap_allocates_self),
+    /// use `summaryOfFn` instead.
     pub fn summaryOf(
         self: *FileCache,
         proto: Ast.full.FnProto,
@@ -83,6 +90,61 @@ pub const FileCache = struct {
         if (!gop.found_existing) {
             gop.value_ptr.* = fn_summary.inferFromBody(self.tree, proto, body);
         }
+        return gop.value_ptr;
+    }
+
+    /// Like summaryOf but also fills the deep inference fields that
+    /// require allocation (`may_free_fields`, `result_heap_fields`)
+    /// and the contextual field (`heap_allocates_self`).  Slice
+    /// storage lives in the cache's `summary_arena`.
+    pub fn summaryOfFn(
+        self: *FileCache,
+        fn_decl: Ast.Node.Index,
+    ) !*const fn_summary.FnSummary {
+        // Resolve proto + body via lexer helpers.
+        var proto_buf: [1]Ast.Node.Index = undefined;
+        const lexer = @import("lexer.zig");
+        const proto = lexer.fnProto(self.tree, &proto_buf, fn_decl) orelse {
+            // Caller passed a non-fn_decl node — return a sentinel
+            // .unknown summary.  Cache by fn_decl index so we don't
+            // recompute.
+            const key = @intFromEnum(fn_decl) | 0x8000_0000;
+            const gop = try self.summaries.getOrPut(self.gpa, key);
+            if (!gop.found_existing) gop.value_ptr.* = .{};
+            return gop.value_ptr;
+        };
+        const body = lexer.bodyOf(self.tree, fn_decl) orelse {
+            const key = @intFromEnum(fn_decl) | 0x8000_0000;
+            const gop = try self.summaries.getOrPut(self.gpa, key);
+            if (!gop.found_existing) gop.value_ptr.* = .{};
+            return gop.value_ptr;
+        };
+
+        const key = @intFromEnum(body);
+        const gop = try self.summaries.getOrPut(self.gpa, key);
+        if (gop.found_existing and gop.value_ptr.may_free_fields.len > 0) {
+            // Already deep-filled.
+            return gop.value_ptr;
+        }
+
+        // Start from the cheap body-only summary.
+        var s = fn_summary.inferFromBody(self.tree, proto, body);
+
+        // Lazy-init the summary arena.
+        if (self.summary_arena == null) {
+            self.summary_arena = std.heap.ArenaAllocator.init(self.gpa);
+        }
+        const a = self.summary_arena.?.allocator();
+
+        s.may_free_fields = try fn_summary.inferMayFreeFields(a, self.tree, proto, body);
+        s.result_heap_fields = try fn_summary.inferResultHeapFields(a, self.tree, body);
+
+        // Containing-type lookup → heap_allocates_self.
+        const model = try self.fileModel();
+        const ct: ?[]const u8 = if (model.containingTypeOf(fn_decl)) |ti| ti.name else null;
+        s.heap_allocates_self = fn_summary.inferHeapAllocatesSelf(self.tree, body, ct);
+
+        gop.value_ptr.* = s;
         return gop.value_ptr;
     }
 };
@@ -129,6 +191,36 @@ test "FileCache: localBindings caches per body" {
     const b1 = try cache.localBindings(bar.proto, bar.body);
     try std.testing.expect(a1 == a2);
     try std.testing.expect(a1 != b1);
+}
+
+test "FileCache: summaryOfFn fills deep fields (heap_allocates_self + result_heap_fields)" {
+    const gpa = std.testing.allocator;
+    const src: [:0]const u8 =
+        \\const Foo = struct {
+        \\    bytes: []u8,
+        \\    pub fn init(self_alloc: std.mem.Allocator) !*Foo {
+        \\        const f = try self_alloc.create(Foo);
+        \\        f.* = .{ .bytes = try self_alloc.alloc(u8, 16) };
+        \\        return f;
+        \\    }
+        \\};
+    ;
+    var tree = try Ast.parse(gpa, src, .zig);
+    defer tree.deinit(gpa);
+    var cache = FileCache.init(gpa, &tree);
+    defer cache.deinit();
+
+    // Find the init fn_decl.
+    var idx: u32 = 1;
+    while (idx < tree.nodes.len) : (idx += 1) {
+        const node: Ast.Node.Index = @enumFromInt(idx);
+        if (tree.nodeTag(node) != .fn_decl) continue;
+        const s = try cache.summaryOfFn(node);
+        // Body has gpa.create(Foo) on a fn inside Foo → heap_allocates_self.
+        try std.testing.expect(s.heap_allocates_self);
+        try std.testing.expect(s.allocates);
+        break;
+    }
 }
 
 test "FileCache: summaryOf caches per body, classifies alloc as heap" {

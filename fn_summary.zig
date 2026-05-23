@@ -42,6 +42,16 @@ pub const Returns = union(enum) {
     unknown,
 };
 
+/// A `<param>.<field>` chain that a fn's body destroys.  Multiple
+/// entries per fn possible — `fn deinit(self) { self.x.free(); self.y.close(); }`
+/// emits two.  Same shape as the old `annotations.FieldFree`.
+pub const FieldFree = struct {
+    /// 0-indexed param whose `.<field>` is freed (0 = receiver).
+    param: u32,
+    /// Field name (slice into source — caller keeps tree alive).
+    field: []const u8,
+};
+
 pub const FnSummary = struct {
     returns: Returns = .unknown,
     /// If non-null, the call site invalidates the value passed at
@@ -57,11 +67,32 @@ pub const FnSummary = struct {
     /// Body invokes a free / destroy / cleanup call.  Coarse — same
     /// caveat as `allocates`.
     deallocates: bool = false,
+    /// `<param>.<field>.<destroy_method>()` chains in the body — one
+    /// entry per chain.  Lets call sites emit a `.field_heap_free`
+    /// per chain.  Slice is owned by the FnSummaryCache arena.
+    may_free_fields: []const FieldFree = &.{},
+    /// Field names that a constructor allocates and stores into the
+    /// returned struct literal — i.e. `return .{ .X = alloc(), ... }`.
+    /// Lets call sites mint synthetic `field_assign(local, X,
+    /// .heap_alloc)` so subsequent `local.X` reads see correct UAF
+    /// state.  Slice is owned by the FnSummaryCache arena.
+    result_heap_fields: []const []const u8 = &.{},
+    /// Body contains `<x>.create(<containing-type>)` or
+    /// `<x>.create(Self)` — i.e. allocates a heap instance of its
+    /// own type.  Filled when the containing type is known; null
+    /// when the fn is top-level (no containing type).
+    heap_allocates_self: bool = false,
 };
 
 /// Infer a summary for `body`.  Conservative: when unclear, returns
 /// `.unknown` / null / false — never guesses.  `proto` carries the
 /// param list so `borrowed_from` can resolve to a param index.
+///
+/// Body-only inference: only fills fields that can be determined
+/// from the proto + body alone.  `heap_allocates_self` requires the
+/// containing type's NAME (a contextual lookup) and `may_free_fields`
+/// / `result_heap_fields` need allocations to land somewhere stable —
+/// caller may want `inferFromBodyAlloc` for those.
 pub fn inferFromBody(
     tree: *const Ast,
     proto: Ast.full.FnProto,
@@ -218,6 +249,186 @@ fn paramIndex(tree: *const Ast, proto: Ast.full.FnProto, name: []const u8) ?u32 
     return null;
 }
 
+// ── Deep inference (allocates) ────────────────────────────
+
+/// Scan `body` for `<param>.<field>.<destroy_method>(...)` chains.
+/// Returns one entry per chain.  Caller owns the returned slice;
+/// pass an arena allocator so per-fn deinit is cheap.
+pub fn inferMayFreeFields(
+    arena: std.mem.Allocator,
+    tree: *const Ast,
+    proto: Ast.full.FnProto,
+    body: Ast.Node.Index,
+) ![]const FieldFree {
+    var out: std.ArrayListUnmanaged(FieldFree) = .empty;
+    const tags = tree.tokens.items(.tag);
+    const first = tree.firstToken(body);
+    const last = tree.lastToken(body);
+    var t = first;
+    while (t + 5 <= last) : (t += 1) {
+        if (tags[t] == .keyword_fn) {
+            t = lexer.skipNestedFn(tags, t, last);
+            continue;
+        }
+        // Match `<id>.<id>.<id>(` shape.
+        if (tags[t] != .identifier) continue;
+        if (tags[t + 1] != .period) continue;
+        if (tags[t + 2] != .identifier) continue;
+        if (tags[t + 3] != .period) continue;
+        if (tags[t + 4] != .identifier) continue;
+        if (tags[t + 5] != .l_paren) continue;
+        const recv = tree.tokenSlice(t);
+        const idx = paramIndex(tree, proto, recv) orelse continue;
+        const method = tree.tokenSlice(t + 4);
+        if (vocabulary.lookupMethod(method)) |vs| {
+            if (!vs.deallocates) continue;
+            try out.append(arena, .{
+                .param = idx,
+                .field = tree.tokenSlice(t + 2),
+            });
+        }
+    }
+    return out.toOwnedSlice(arena);
+}
+
+/// True iff the body contains `<x>.create(<type_name>)` or
+/// `<x>.create(Self)`.  Returns false when `type_name` is null
+/// (top-level fns have no containing type).
+pub fn inferHeapAllocatesSelf(
+    tree: *const Ast,
+    body: Ast.Node.Index,
+    type_name: ?[]const u8,
+) bool {
+    const tn = type_name orelse return false;
+    const tags = tree.tokens.items(.tag);
+    const first = tree.firstToken(body);
+    const last = tree.lastToken(body);
+    var t = first;
+    while (t + 4 <= last) : (t += 1) {
+        if (tags[t] == .keyword_fn) {
+            t = lexer.skipNestedFn(tags, t, last);
+            continue;
+        }
+        if (tags[t] != .period) continue;
+        if (tags[t + 1] != .identifier) continue;
+        if (!std.mem.eql(u8, tree.tokenSlice(t + 1), "create")) continue;
+        if (tags[t + 2] != .l_paren) continue;
+        // Walk the call's arg list (single arg expected, possibly
+        // namespaced like `ns.Type`) and check the LAST identifier
+        // against `tn` / `Self`.
+        var k = t + 3;
+        var last_ident: ?Ast.TokenIndex = null;
+        while (k <= last) : (k += 1) {
+            if (tags[k] == .r_paren or tags[k] == .comma) break;
+            if (tags[k] == .identifier) last_ident = k;
+        }
+        if (last_ident) |li| {
+            const text = tree.tokenSlice(li);
+            if (std.mem.eql(u8, text, tn)) return true;
+            if (std.mem.eql(u8, text, "Self")) return true;
+        }
+    }
+    return false;
+}
+
+/// If `body` is `{ return <struct_literal>; }` and any field's
+/// initializer text contains an alloc call (`.alloc(`, `.create(`,
+/// `.dupe(`, etc.), return the list of those field names.  Empty
+/// for non-constructor bodies.  Caller owns the returned slice.
+pub fn inferResultHeapFields(
+    arena: std.mem.Allocator,
+    tree: *const Ast,
+    body: Ast.Node.Index,
+) ![]const []const u8 {
+    var out: std.ArrayListUnmanaged([]const u8) = .empty;
+    // Text-based approach matching the original annotations.zig
+    // pipeline: find a `return ... { .X = ... }` struct-literal
+    // shape, then text-match each field's RHS against the alloc-call
+    // vocabulary.  Per-token introspection of a struct literal AST
+    // node would be more precise but this is good enough for the
+    // common constructor shape and matches the existing pipeline's
+    // conservatism.
+    const source = tree.source;
+    const tags = tree.tokens.items(.tag);
+    const starts = tree.tokens.items(.start);
+    const first = tree.firstToken(body);
+    const last = tree.lastToken(body);
+
+    // Find `return` at depth 0 of the body, then look for `.{` or
+    // `<Type>{` following it.
+    var t = first;
+    var ret_at: ?Ast.TokenIndex = null;
+    while (t <= last) : (t += 1) {
+        if (tags[t] == .keyword_fn) {
+            t = lexer.skipNestedFn(tags, t, last);
+            continue;
+        }
+        if (tags[t] == .keyword_return) {
+            ret_at = t;
+            break;
+        }
+    }
+    const ra = ret_at orelse return &.{};
+    // Find the `{` after the return that opens a struct literal.
+    var k = ra + 1;
+    while (k <= last and tags[k] != .l_brace and tags[k] != .semicolon) : (k += 1) {}
+    if (k > last or tags[k] != .l_brace) return &.{};
+    const lb = k;
+    const rb = lexer.matchBrace(tags, lb, last) orelse return &.{};
+    // Walk the literal's body looking for `.<name> = <rhs>,` pairs.
+    var i: lexer.TokenIndex = lb + 1;
+    while (i < rb) : (i += 1) {
+        if (tags[i] != .period) continue;
+        if (i + 2 > rb) break;
+        if (tags[i + 1] != .identifier) continue;
+        if (tags[i + 2] != .equal) continue;
+        const fname = tree.tokenSlice(i + 1);
+        // Find end of this field's RHS: the comma at depth 0
+        // (relative to where we are) or `}`.
+        var depth: u32 = 0;
+        var j: lexer.TokenIndex = i + 3;
+        while (j <= rb) : (j += 1) {
+            switch (tags[j]) {
+                .l_paren, .l_brace, .l_bracket => depth += 1,
+                .r_paren, .r_brace, .r_bracket => {
+                    if (depth == 0) break;
+                    depth -= 1;
+                },
+                .comma => if (depth == 0) break,
+                else => {},
+            }
+        }
+        const rhs_first = i + 3;
+        const rhs_last = if (j > rb) rb - 1 else j - 1;
+        if (rhs_first > rhs_last) {
+            i = j;
+            continue;
+        }
+        const rhs_text = source[starts[rhs_first] .. starts[rhs_last] + tree.tokenSlice(rhs_last).len];
+        if (rhsTextLooksAlloc(rhs_text)) {
+            try out.append(arena, fname);
+        }
+        i = j;
+    }
+    return out.toOwnedSlice(arena);
+}
+
+/// True iff `text` contains a substring matching the alloc-pattern
+/// vocabulary.  Conservative text match (same shape the old
+/// annotations.zig pipeline used).
+fn rhsTextLooksAlloc(text: []const u8) bool {
+    const patterns = [_][]const u8{
+        ".alloc(", ".allocSentinel(", ".allocAdvanced(",
+        ".create(", ".dupe(", ".dupeZ(",
+        ".allocPrint(", ".allocPrintZ(",
+        ".toOwnedSlice(",
+    };
+    for (patterns) |p| {
+        if (std.mem.indexOf(u8, text, p) != null) return true;
+    }
+    return false;
+}
+
 // ── Tests ──────────────────────────────────────────────────
 
 const testing = std.testing;
@@ -339,4 +550,116 @@ test "infer: nested fns don't leak effects to outer" {
     const s = inferFirstFn(&tree, &buf);
     try testing.expect(!s.allocates);
     try testing.expect(s.returns == .unknown);
+}
+
+fn firstFnProtoAndBody(
+    tree: *const Ast,
+    proto_buf: *[1]Ast.Node.Index,
+) struct { Ast.full.FnProto, Ast.Node.Index } {
+    var idx: u32 = 1;
+    while (idx < tree.nodes.len) : (idx += 1) {
+        const node: Ast.Node.Index = @enumFromInt(idx);
+        if (tree.nodeTag(node) != .fn_decl) continue;
+        return .{ lexer.fnProto(tree, proto_buf, node).?, lexer.bodyOf(tree, node).? };
+    }
+    unreachable;
+}
+
+test "inferMayFreeFields: detects <param>.<field>.<deallocMethod>()" {
+    var tree = try parse(
+        \\fn cleanup(self: *Foo, other: *Bar) void {
+        \\    self.x.deinit();
+        \\    other.y.close();
+        \\    self.z.deref();
+        \\}
+    );
+    defer tree.deinit(testing.allocator);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var buf: [1]Ast.Node.Index = undefined;
+    const pb = firstFnProtoAndBody(&tree, &buf);
+    const ff = try inferMayFreeFields(arena.allocator(), &tree, pb[0], pb[1]);
+    try testing.expectEqual(@as(usize, 3), ff.len);
+    try testing.expectEqual(@as(u32, 0), ff[0].param);
+    try testing.expectEqualStrings("x", ff[0].field);
+    try testing.expectEqual(@as(u32, 1), ff[1].param);
+    try testing.expectEqualStrings("y", ff[1].field);
+    try testing.expectEqual(@as(u32, 0), ff[2].param);
+    try testing.expectEqualStrings("z", ff[2].field);
+}
+
+test "inferMayFreeFields: ignores non-deallocating methods" {
+    var tree = try parse(
+        \\fn touch(self: *Foo) void {
+        \\    self.x.append(1);
+        \\    self.y.process();
+        \\}
+    );
+    defer tree.deinit(testing.allocator);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var buf: [1]Ast.Node.Index = undefined;
+    const pb = firstFnProtoAndBody(&tree, &buf);
+    const ff = try inferMayFreeFields(arena.allocator(), &tree, pb[0], pb[1]);
+    try testing.expectEqual(@as(usize, 0), ff.len);
+}
+
+test "inferHeapAllocatesSelf: <x>.create(<TypeName>) hits" {
+    var tree = try parse(
+        \\fn factory(gpa: std.mem.Allocator) !*Foo {
+        \\    return try gpa.create(Foo);
+        \\}
+    );
+    defer tree.deinit(testing.allocator);
+    var buf: [1]Ast.Node.Index = undefined;
+    const pb = firstFnProtoAndBody(&tree, &buf);
+    try testing.expect(inferHeapAllocatesSelf(&tree, pb[1], "Foo"));
+    try testing.expect(!inferHeapAllocatesSelf(&tree, pb[1], "Bar"));
+    try testing.expect(!inferHeapAllocatesSelf(&tree, pb[1], null));
+}
+
+test "inferHeapAllocatesSelf: <x>.create(Self) hits" {
+    var tree = try parse(
+        \\fn factory(gpa: std.mem.Allocator) !*Foo {
+        \\    return try gpa.create(Self);
+        \\}
+    );
+    defer tree.deinit(testing.allocator);
+    var buf: [1]Ast.Node.Index = undefined;
+    const pb = firstFnProtoAndBody(&tree, &buf);
+    try testing.expect(inferHeapAllocatesSelf(&tree, pb[1], "AnyType"));
+}
+
+test "inferResultHeapFields: collects alloc-RHS fields from struct-literal return" {
+    var tree = try parse(
+        \\fn init(gpa: std.mem.Allocator, src: []const u8) !Foo {
+        \\    return .{
+        \\        .bytes = try gpa.alloc(u8, 16),
+        \\        .name = try gpa.dupe(u8, src),
+        \\        .count = 0,
+        \\    };
+        \\}
+    );
+    defer tree.deinit(testing.allocator);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var buf: [1]Ast.Node.Index = undefined;
+    const pb = firstFnProtoAndBody(&tree, &buf);
+    const rhf = try inferResultHeapFields(arena.allocator(), &tree, pb[1]);
+    try testing.expectEqual(@as(usize, 2), rhf.len);
+    try testing.expectEqualStrings("bytes", rhf[0]);
+    try testing.expectEqualStrings("name", rhf[1]);
+}
+
+test "inferResultHeapFields: non-constructor body yields empty" {
+    var tree = try parse(
+        \\fn make() Foo { return .{}; }
+    );
+    defer tree.deinit(testing.allocator);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var buf: [1]Ast.Node.Index = undefined;
+    const pb = firstFnProtoAndBody(&tree, &buf);
+    const rhf = try inferResultHeapFields(arena.allocator(), &tree, pb[1]);
+    try testing.expectEqual(@as(usize, 0), rhf.len);
 }
