@@ -3128,14 +3128,14 @@ const Builder = struct {
         else
             null;
 
-        // may_free_fields resolution stays on the db path: cache's
-        // body-only inferMayFreeFields fires on `<param>.<field>.deinit()`
-        // shapes without knowing whether `<field>` is a value or a
-        // pointer.  For pointer-typed fields the deinit consumes the
-        // pointee (not the parent's field), so cache fires false
-        // positives in that case.  db's R10 inference uses field_types
-        // to check this — until cache gets the same type-aware filter,
-        // db remains the source of truth here.
+        // may_free_fields resolution stays on the db path.  Cache's
+        // filter narrowed inferMayFreeFields to (local-field-type,
+        // non-pointer, has-cleanup-method) but still over-fires vs
+        // annotations.zig R10 (which checks the SPECIFIC method
+        // name's takes, not just that some cleanup method exists).
+        // Recording the matched method name in FieldFree + checking
+        // the field-type's specific method's takes would close the
+        // gap; left for a follow-up.
         const entry: annotations.FnEntry = blk: {
             if (self.db) |db| {
                 if (db.lookupTyped(recv_ty, callee_name)) |e| break :blk e;

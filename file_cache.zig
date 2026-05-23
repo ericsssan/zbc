@@ -93,6 +93,72 @@ pub const FileCache = struct {
         return gop.value_ptr;
     }
 
+    /// Return the param's type-name (with */?/const wrappers stripped)
+    /// by walking the proto's param iterator.  Used by the
+    /// may_free_fields filter to look up `(param_type, field)` in the
+    /// FileModel.
+    fn paramTypeName(tree: *const Ast, proto: Ast.full.FnProto, idx: u32) ?[]const u8 {
+        var i: u32 = 0;
+        var it = proto.iterate(tree);
+        while (it.next()) |p| : (i += 1) {
+            if (i != idx) continue;
+            const type_node = p.type_expr orelse return null;
+            // Strip wrappers — same logic as model.baseTypeName but
+            // inline here so we don't add a public dependency.
+            const tags = tree.tokens.items(.tag);
+            var t = tree.firstToken(type_node);
+            const last = tree.lastToken(type_node);
+            while (t <= last) : (t += 1) {
+                switch (tags[t]) {
+                    .asterisk, .question_mark, .keyword_const, .keyword_var, .l_bracket, .r_bracket => {},
+                    .identifier => return tree.tokenSlice(t),
+                    else => return null,
+                }
+            }
+            return null;
+        }
+        return null;
+    }
+
+    /// Filter may_free_fields entries down to those we can verify
+    /// locally: the param's type, the field, and the field's type
+    /// must all be declared in this file, the field must NOT be
+    /// pointer-typed, and the field's type must have a cleanup
+    /// method (deinit/close/release/...).  Mirrors annotations.zig
+    /// R10's conservatism — propagate only when the chain is fully
+    /// resolvable locally.  Returns a freshly-allocated slice in
+    /// `arena`.
+    fn filterMayFreeFields(
+        arena: std.mem.Allocator,
+        model: *const fmodel.FileModel,
+        tree: *const Ast,
+        proto: Ast.full.FnProto,
+        raw: []const fn_summary.FieldFree,
+    ) ![]const fn_summary.FieldFree {
+        if (raw.len == 0) return &.{};
+        var out: std.ArrayListUnmanaged(fn_summary.FieldFree) = .empty;
+        for (raw) |ff| {
+            const param_ty = paramTypeName(tree, proto, ff.param) orelse continue;
+            // Param type must be locally declared (we need to look
+            // at its fields).
+            if (!model.hasType(param_ty)) continue;
+            // Field can't be pointer-typed (deinit on a pointer field
+            // consumes the pointee, not the parent's field).
+            if (model.fieldIsPointer(param_ty, ff.field)) continue;
+            // Field's declared type must be locally declared AND
+            // expose a cleanup method.  Without this, value-typed
+            // fields whose type lives in another file (and may not
+            // actually have a heap-owning deinit) get treated as
+            // freed — false-positive UAF downstream.
+            const field_ty = model.fieldType(param_ty, ff.field) orelse continue;
+            if (!model.hasType(field_ty)) continue;
+            const ti = model.findType(field_ty) orelse continue;
+            if (!ti.hasCleanupMethod()) continue;
+            try out.append(arena, ff);
+        }
+        return out.toOwnedSlice(arena);
+    }
+
     /// Resolve a name in `proto`'s param list to its 0-indexed
     /// position.  Local helper for the R10 transitive pass.
     fn paramIndexFor(tree: *const Ast, proto: Ast.full.FnProto, name: []const u8) ?u32 {
@@ -335,13 +401,21 @@ pub const FileCache = struct {
         }
         const a = self.summary_arena.?.allocator();
 
-        s.may_free_fields = try fn_summary.inferMayFreeFields(a, self.tree, proto, body);
+        const raw_frees = try fn_summary.inferMayFreeFields(a, self.tree, proto, body);
         s.result_heap_fields = try fn_summary.inferResultHeapFields(a, self.tree, body);
 
         // Containing-type lookup → heap_allocates_self.
         const model = try self.fileModel();
         const ct: ?[]const u8 = if (model.containingTypeOf(fn_decl)) |ti| ti.name else null;
         s.heap_allocates_self = fn_summary.inferHeapAllocatesSelf(self.tree, body, ct);
+
+        // Filter may_free_fields by checking each (param, field)'s
+        // type shape via the model.  Drop entries where the field is
+        // pointer-typed — `<param>.<field>.deinit()` on a `<field>: *T`
+        // consumes the pointee, NOT the parent's field.  Without this
+        // filter the body-only inference over-fires on common cases
+        // like `this.stdout.deinit()` where `this.stdout: *Pipe`.
+        s.may_free_fields = try filterMayFreeFields(a, model, self.tree, proto, raw_frees);
 
         s._resolved = true;
         gop.value_ptr.* = s;
