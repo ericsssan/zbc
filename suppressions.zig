@@ -10,10 +10,10 @@
 //!   // zbc-disable-line: rule-id, rule-id2    — comma-separated list
 //!   // zbc-disable-line: *                    — suppresses ALL rules
 //!
-//! Rationale (see "annotations -> inference" design discussion):
-//! suppression replaces the role of `/// @returns owns_locals`-style
-//! assertions.  The tool's belief is purely inferred; the author
-//! overrides only by silencing.
+//! Rationale: zbc's analysis is purely inferred.  The author has no
+//! way to override the inferred belief by asserting alternative
+//! semantics — the only override is to silence a specific finding
+//! via this suppression mechanism.
 //!
 //! Implementation note: Zig's tokenizer DROPS line comments before
 //! producing the token stream, so this scanner walks the raw source

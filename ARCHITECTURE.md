@@ -70,8 +70,8 @@ No umbrella module.  Each module is a clean dependency.
 ## Per-file dispatch + amortized shared state
 
 `lib.zig::analyzeEscape` owns one `FileCache` per file.  After CFG
-analysis populates the annotation `Db`, it calls
-`rule_registry.runEscape(gpa, &tree, &db, &cache, config, &problems)` —
+analysis runs over every fn, it calls
+`rule_registry.runEscape(gpa, &tree, &cache, config, &problems)` —
 ONE call that iterates the comptime `escape_rules` list and dispatches
 each rule.
 
@@ -87,10 +87,8 @@ pub fn check(
 ) !void { ... }
 ```
 
-…with the 5 db-dependent rules taking an extra `db: *const Db`
-parameter between `tree` and `cache`.  `rule_registry.Rule` is a
-union(`plain` | `with_db`) so the dispatcher hands each rule the right
-args.  Rules that don't use `cache` can `_ = cache;` and move on.
+All rules have the same signature.  Rules that don't use `cache` can
+`_ = cache;` and move on.
 
 `FileCache` is lazy:
 
@@ -377,9 +375,6 @@ A clean diff that adds a new rule without trace calls is fine.
        // ... detection logic ...
    }
    ```
-
-   For rules that need annotation data, the signature additionally
-   takes a `db: *const annotations.Db` between `tree` and `cache`.
 
    For rules that walk per-fn AND need LocalBindings, use
    `lexer.forEachFnCached(gpa, tree, cache, problems, checkFn)`

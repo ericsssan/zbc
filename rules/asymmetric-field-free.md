@@ -44,11 +44,10 @@ Fix:
 ## When this might be a false positive
 
 - The omitted field is intentionally an alias / borrow of the
-  handled one (same type, but only one side owns).  Annotate the
-  borrowed side with `/// @borrowed` so reads and copies don't
-  imply ownership, then this rule's caller would still need to
-  ignore the borrowed field (current implementation does not yet
-  consult `borrowed_fields`).
+  handled one (same type, but only one side owns).  Declare the
+  borrowed side as a pointer type (`*T`); the rule skips pointer-
+  typed fields automatically.  Otherwise suppress with
+  `// zbc-disable-line:asymmetric-field-free`.
 - The omitted field is freed via a helper called from inside the
   destructor (`this.cleanupParamMap();`).  zbc doesn't follow the
   helper; inline the free or rename the helper to match the

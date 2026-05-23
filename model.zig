@@ -263,9 +263,7 @@ pub const FileModel = struct {
     /// True iff the field's declared type starts with `*` (after
     /// stripping `?` / `const`).  Heuristic for "this field is a
     /// borrow, not an owned value" — pointer-typed struct fields
-    /// almost always alias storage that lives elsewhere.  Inference
-    /// replacement for the old `Db.isBorrowedField` query that
-    /// previously relied on `/// @borrowed` doc-comment annotations.
+    /// almost always alias storage that lives elsewhere.
     pub fn fieldIsPointer(self: *const FileModel, struct_name: []const u8, field_name: []const u8) bool {
         const ti = self.findType(struct_name) orelse return false;
         const f = ti.findField(field_name) orelse return false;

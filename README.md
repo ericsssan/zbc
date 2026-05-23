@@ -9,18 +9,20 @@ ownership / cleanup bugs.
 
 ```zig
 const Owner = struct {
-    /// @borrowed
-    data: []u8 = &.{},
-
-    /// @takes ownership(self)
-    pub fn die(self: *Owner) void { /* ... */ }
+    data: []u8,
+    pub fn deinit(self: *Owner, gpa: std.mem.Allocator) void {
+        gpa.free(self.data);
+    }
 };
 
-var owner: Owner = .{};
-const x = owner.data;       // borrow of owner
-owner.die();
+var owner = Owner{ .data = try gpa.alloc(u8, 16) };
+const x = owner.data;       // borrow of owner.data
+owner.deinit(gpa);          // gpa.free(self.data) inferred as takes-ownership
 _ = x;                      // → heap-use-after-free
 ```
+
+No annotations, no setup — the body of `deinit` is enough for inference to
+recognize that calling `owner.deinit(gpa)` invalidates `owner.data`.
 
 ## Usage
 
@@ -100,10 +102,10 @@ derived from body shape via the flow analyzer and the per-file
 FnSummary inference (`fn_summary.zig`).  Cross-module type
 questions go through ZLS (`zls_resolver.zig`).
 
-The older `/// @returns`/`/// @takes`/`/// @borrowed` doc-comment
-annotation system is retired — zbc no longer parses these
-comments.  They are inert decoration; existing code that carries
-them works unchanged.
+When a finding is wrong, suppress that line with
+`// zbc-disable-line:<rule-id>` or
+`// zbc-disable-next-line:<rule-id>`.  There is no syntax for
+asserting alternative semantics — the tool's belief is what it is.
 
 ## Library use
 

@@ -101,7 +101,7 @@ pub const ArenaState = struct {
     /// True when this entry was created by the inter-procedural
     /// fallback in transferHeapFree / transferFieldHeapFree (i.e.,
     /// the local had no prior tracked .heap origin but a
-    /// @takes-ownership call took it).  Used by transferFieldUse to
+    /// takes-ownership call took it).  Used by transferFieldUse to
     /// fire parent-liveness ONLY for inter-procedural frees —
     /// regular alloc+free in same fn shouldn't propagate to fields
     /// (the field's own tracking handles that, and back-edge state

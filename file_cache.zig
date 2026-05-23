@@ -86,11 +86,9 @@ pub const FileCache = struct {
     }
 
     /// Lazily infer (and cache) the behavioral summary for the given
-    /// fn body.  Same caching contract as localBindings.  Parallel
-    /// API to annotations.Db; new code should prefer this for the
-    /// queries it covers.  Body-only inference — for the deep fields
-    /// (may_free_fields / result_heap_fields / heap_allocates_self),
-    /// use `summaryOfFn` instead.
+    /// fn body.  Same caching contract as localBindings.  Body-only
+    /// inference — for the deep fields (may_free_fields /
+    /// result_heap_fields / heap_allocates_self), use `summaryOfFn`.
     pub fn summaryOf(
         self: *FileCache,
         proto: Ast.full.FnProto,
@@ -127,19 +125,15 @@ pub const FileCache = struct {
         return null;
     }
 
-    /// Filter may_free_fields entries to match annotations.zig R10
-    /// Case B's resolveMethod conservatism.  An entry survives only
-    /// when:
+    /// Filter may_free_fields entries — an entry survives only when:
     ///   - param's type is locally declared
     ///   - field is not pointer-typed
     ///   - field's declared type is locally declared
     ///   - the field-type's method (the one recorded in ff.method)
-    ///     exists AND has takes_ownership_of != null (i.e. R10/R8b
-    ///     determined that the method actually consumes its
-    ///     receiver — not just that it exists).  Without this check
-    ///     value-typed fields whose type has a non-consuming deinit
-    ///     (e.g. ManifestLogModel.deinit that just releases
-    ///     subordinate resources) get treated as freed when they
+    ///     exists AND has takes_ownership_of != null (the method
+    ///     actually consumes its receiver — not just that it
+    ///     exists).  Without this check value-typed fields whose type
+    ///     has a non-consuming deinit get treated as freed when they
     ///     shouldn't.
     fn filterMayFreeFields(
         self: *FileCache,
@@ -159,11 +153,11 @@ pub const FileCache = struct {
             // segment chains like "inner.handle" resolve to the
             // deepest type before looking up the method.
             const deepest_path = walkFieldPath(model, param_ty, ff.field) orelse continue;
-            // Resolve the callee summary on the deepest field's TYPE
-            // — same-file when the field type is local, else cross-
-            // file via imported namespace.
+            // Resolve the callee summary on the deepest field's TYPE.
+            // Cross-file types (deepest_path.ns != null) are dropped —
+            // we only have summaries for same-file methods.
             const callee_summary: ?*const fn_summary.FnSummary = blk: {
-                if (deepest_path.ns != null) break :blk null; // cross-file retired
+                if (deepest_path.ns != null) break :blk null;
                 if (!model.hasType(deepest_path.type_name)) break :blk null;
                 const ti = model.findType(deepest_path.type_name) orelse break :blk null;
                 if (!ti.hasMethod(ff.method)) break :blk null;
@@ -172,8 +166,7 @@ pub const FileCache = struct {
             const cs = callee_summary orelse continue;
             // When the inner method is cleanup-named (deinit/close/etc.)
             // and we lack a contradicting signal, presume it consumes
-            // its receiver — matches annotations.zig's implicit
-            // assumption and recovers external-stdlib deinit cases
+            // its receiver — recovers external-stdlib deinit cases
             // (e.g. HashMap.deinit) that pure-inference can't see.
             if (cs.takes_ownership_of == null and
                 !fn_summary.isReceiverCleanupMethodName(ff.method)) continue;
@@ -201,15 +194,12 @@ pub const FileCache = struct {
     /// are inferred (bounded by `max_iters` to guard against
     /// pathological cases).
     ///
-    /// Corresponds to annotations.zig R10 Case A (direct chain — no
-    /// intermediate field segments).  Case B (`<param>.<field>.
-    /// <method>()`) is deferred; tracker is `may_free_fields` for
-    /// that case, which this pass already inherits via direct
-    /// inference.
+    /// Direct chain (`<param>.<method>()`) only.  Multi-segment
+    /// `<param>.<field>.<method>()` chains are tracked via
+    /// `may_free_fields` and resolved separately.
     ///
-    /// Idempotent.  Call once per file after rule registration,
-    /// before any consumer reads summaries that depend on
-    /// transitive ownership.
+    /// Idempotent.  Call once per file before any consumer reads
+    /// summaries that depend on transitive ownership.
     pub fn resolveTransitiveTakes(self: *FileCache) !void {
         const model = try self.fileModel();
         const lexer = @import("lexer.zig");
@@ -274,11 +264,11 @@ pub const FileCache = struct {
 
         // Phase 4: fixed-point R7 inference — propagate
         // `returns = .borrowed_from(N)` across delegating wrappers.
-        // Mirrors annotations.zig's R7 pass: a fn whose body returns a
-        // delegating call to another fn that's annotated/inferred
-        // borrowed_from inherits the borrowed_from with the local
-        // param index.  Skipped when the fn's returns is already known
-        // (preserves .heap / .owned / explicit borrowed_from).
+        // A fn whose body returns a delegating call to another fn
+        // that's inferred borrowed_from inherits the borrowed_from
+        // with the local param index.  Skipped when the fn's returns
+        // is already known (preserves .heap / .owned / explicit
+        // borrowed_from).
         iters = 0;
         while (iters < 16) : (iters += 1) {
             var changed = false;
@@ -303,8 +293,7 @@ pub const FileCache = struct {
         const body = lexer.bodyOf(self.tree, fn_decl) orelse return false;
 
         const s_ptr = try self.summaryOfFn(fn_decl);
-        // Only fill when returns hasn't been determined yet.  Matches
-        // annotations.zig R7's "only fills missing annotation" rule.
+        // Only fill when returns hasn't been determined yet.
         switch (s_ptr.returns) {
             .unknown => {},
             else => return false,
@@ -319,9 +308,9 @@ pub const FileCache = struct {
         return false;
     }
 
-    /// Mirror annotations.inferDelegatorBorrow.  Tries the single-return
-    /// shape first; falls back to multi-return.  Returns the borrowed
-    /// param index when inference fires.
+    /// R7 delegator-borrow inference.  Tries the single-return shape
+    /// first; falls back to multi-return.  Returns the borrowed param
+    /// index when inference fires.
     fn inferDelegatorBorrow(
         self: *FileCache,
         proto: Ast.full.FnProto,
@@ -440,8 +429,7 @@ pub const FileCache = struct {
         return fn_summary.resolveParamIndex(tree, proto, arg_name);
     }
 
-    /// Same-file equivalent of annotations.lookupBorrowedFromSameFile.
-    /// Looks up a top-level fn by name and returns its `borrowed_from`
+    /// Look up a top-level fn by name and return its `borrowed_from`
     /// target index when the summary's returns is that variant.
     fn lookupBorrowedFromSameFile(self: *FileCache, method_name: []const u8) !?u32 {
         const s = (try self.summaryByName(method_name)) orelse return null;
@@ -639,8 +627,6 @@ pub const FileCache = struct {
     ///
     /// Composes FileModel + summaryOfFn — runs FnSummary inference
     /// across the type's methods, short-circuits on first hit.
-    /// Replaces the old `db.fns.iter()` heap_allocates_self scan
-    /// from annotations.Db.
     pub fn anyMethodAllocatesSelf(
         self: *FileCache,
         type_name: []const u8,

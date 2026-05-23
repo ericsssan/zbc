@@ -494,11 +494,10 @@ fn anyPatternMatches(text: []const u8, patterns: []const []const u8) bool {
 /// tagged as Origin.ast inflate the AstId counter but don't cause
 /// false-positive invariant findings.
 /// True if the param's type mentions the ast_type_name OR any
-/// configured ast_holder_types.  Same logic as annotations.zig's
-/// inference, duplicated to keep cfg free of annotation dependencies.
-/// Used by seedParams to give holder-typed params Origin.ast so the
-/// flow-side checks fire on call sites inside fns that receive a
-/// wrapped Ast (e.g. *const LintContext).
+/// configured ast_holder_types.  Used by seedParams to give
+/// holder-typed params Origin.ast so the flow-side checks fire
+/// on call sites inside fns that receive a wrapped Ast (e.g.
+/// *const LintContext).
 fn paramTypeCarriesAst(tree: *const Ast, type_node: Ast.Node.Index, config: *const Config) bool {
     if (typeMentionsAst(tree, type_node, config.ast_type_name)) return true;
     for (config.ast_holder_types) |holder| {
@@ -2432,9 +2431,8 @@ const Builder = struct {
     /// Returns true if anything was emitted; caller may use this to
     /// decide whether to additionally emit a use/gap.  Does NOT
     /// terminate the block for noreturn — callers handle that.
-    /// If `init_expr` resolves to a call whose callee FnEntry has
-    /// `result_heap_fields` (per annotations.zig's
-    /// inferConstructorFieldHeaps), emit one
+    /// If `init_expr` resolves to a call whose callee FnSummary has
+    /// `result_heap_fields` set, emit one
     /// `field_assign(local, field_name, .heap_alloc(fresh))` per
     /// recorded field.  Handles `try` / `catch` wrappers.
     fn emitConstructorResultHeapFields(
@@ -3013,10 +3011,9 @@ const Builder = struct {
         else
             null;
 
-        // Resolve callee's may_free_fields.  Cache filter now matches
-        // annotations.zig R10 Case B precision: only fires when the
-        // field's actual type has the exact matched method declared
-        // locally.  Cache-first → db → cross-file fallback.
+        // Resolve callee's may_free_fields via the FnSummary cache.
+        // The filter only fires when the field's actual type has the
+        // exact matched method declared locally.
         const Free = struct { param: u32, field: []const u8 };
         var free_buf: [16]Free = undefined;
         const frees: []const Free = blk: {
@@ -3316,23 +3313,9 @@ const Builder = struct {
                     if (std.mem.eql(u8, fname, "ptr")) {
                         return .{ .copy_of = id };
                     }
-                    // NOTE: pre-inference-migration this site also
-                    // looked up `/// @borrowed` field annotations via
-                    // db.isBorrowedField and treated the read as a
-                    // borrow of the parent local.  Zero real-world
-                    // usage of `/// @borrowed` was found across 5
-                    // corpora (bun, tigerbeetle, ghostty, mach, Ez),
-                    // so the special case was dead.  Removed
-                    // alongside the broader annotation -> inference
-                    // migration; if pointer-typed-field borrows ever
-                    // need re-tracking, do it via a model.fieldKind
-                    // inference, not annotation lookup.
                     return .{ .field_copy_of = .{ .parent = id, .name = fname } };
                 }
             }
-            // Deep-chain `/// @borrowed` lookup removed alongside
-            // the single-level check above (same rationale — zero
-            // real-world usage across the test corpora).
         }
 
         // Identifier reference → .undef / .copy_of(local) if known
@@ -4575,10 +4558,8 @@ const Builder = struct {
     }
 
     /// Map a FnSummary's inferred return shape to the ExprKind we
-    /// emit at the call site.  Mirrors what annotations.zig used to
-    /// do via the parsed `/// @returns ...` doc-comment, but driven
-    /// purely from body-shape inference.  `.unknown` and `.plain`
-    /// produce null (caller's existing ExprKind stands).
+    /// emit at the call site.  Body-shape driven; `.unknown` and
+    /// `.plain` produce null (caller's existing ExprKind stands).
     fn applySummaryReturnsToCall(
         self: *Builder,
         ret: fn_summary.Returns,

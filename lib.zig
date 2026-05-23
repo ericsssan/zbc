@@ -180,15 +180,6 @@ test "lib API: analyzeEscape end-to-end flags arena escape" {
     try std.testing.expect(found);
 }
 
-// NOTE: 6 cross-file annotation tests removed when remote_resolver
-// was retired (R7 anytype/imap-scan, R7 type-name resolution, R8
-// alloc/free wrappers, R10 chain, R10 field-chain, type-aware
-// overload disambiguation).  Cross-module reasoning now flows
-// through ZLS-based type resolution (zls_resolver.zig +
-// cfg.receiverTypeOfNode).  ZLS does not parse zbc's `/// @returns`
-// comments, so cross-file annotation propagation is no longer
-// supported.  Same-file inference is unchanged.
-
 test {
     _ = cfg_mod;
     _ = analyzer_mod;

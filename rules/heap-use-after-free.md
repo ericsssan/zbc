@@ -31,36 +31,31 @@ through the same name before re-use:
   persist.  Naming the constructor `init`/`create`/`new`/`open`
   helps the classifier recognise the fresh allocation.
 
-## Borrow-tracking annotations
+## Borrow-tracking via inference
 
 When the use happens through a borrow rather than the freed pointer
-itself, zbc relies on annotations to connect the borrow back to the
-owner.
+itself, zbc infers the ownership chain from body shape:
 
-- `/// @takes ownership(<param>)` on a fn marks the call as a
-  free of the named param.  Without it, `owner.die()` cannot kill
-  owner's storage and downstream reads are not flagged.
-- `/// @borrowed` on a struct field marks the field's storage as
-  owned by the containing struct.  Reading or copying the field
-  yields a borrow tied to the parent's lifetime; a later
-  `@takes(0)` call on the parent invalidates the borrow.  Without
-  the annotation, zbc treats field reads as independent values
-  (no propagation) to avoid false positives on the many fields
-  that ARE independent — `arr.len`, `obj.tag`, etc.
+- A method whose body calls `allocator.free(self.field)` or
+  `allocator.destroy(self)` is inferred as taking ownership of its
+  receiver.  Subsequent uses of the receiver (or aliases captured
+  before the call) fire as use-after-free.
+- Pointer-typed struct fields (`*T`, `?*T`) are treated as borrows;
+  reads do not propagate ownership.  Non-pointer fields (`[]u8`,
+  `T`) read as owned-by-parent when the destructor frees them.
 
 Example:
 
     const Owner = struct {
-        /// @borrowed
-        data: []u8 = &.{},
-
-        /// @takes ownership(self)
-        pub fn die(self: *Owner) void { /* ... */ }
+        data: []u8,
+        pub fn die(self: *Owner, gpa: std.mem.Allocator) void {
+            gpa.free(self.data);
+        }
     };
 
-    var owner: Owner = .{};
+    var owner = Owner{ .data = try gpa.alloc(u8, 16) };
     const borrowed = owner.data; // borrowed origin tied to owner
-    owner.die();
+    owner.die(gpa);              // inferred as takes ownership(self)
     _ = borrowed;                // ← heap-use-after-free fires
 
 ## Related

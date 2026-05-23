@@ -27,15 +27,12 @@ return a value type that doesn't borrow from the arena:
 
 ## When this might be a false positive
 
-- The function is annotated `@returns owns_locals` — the caller
-  understands it is receiving ownership of the arena and its
-  contents.  Without the annotation, zbc treats the embedded
-  borrow as escaping.
 - The arena is moved into a struct field on the return value
   (composite ownership transfer).  If zbc can't see the move
   through your construction code, the embedded borrow still flags;
   reshape so the move is via a recognised constructor name
-  (`init` / `create` / `new` / `open`).
+  (`init` / `create` / `new` / `open`), or suppress the line with
+  `// zbc-disable-line:arena-escape`.
 
 ## Related
 

@@ -27,13 +27,14 @@ allocator:
 
 - The borrow conceptually outlives the arena because it was COPIED
   out (e.g. duped into a longer-lived allocator).  zbc does not
-  track ownership transfer through `dupe` calls — annotate the
-  callee with `@returns owned` if it copies the input.
+  track ownership transfer through `dupe` calls; suppress the line
+  with `// zbc-disable-line:arena-use-after-kill` if the copy
+  semantics are real.
 - The arena is itself heap-allocated and ownership of the *whole*
   arena was transferred (assigned into a struct field that
   outlives the function).  zbc's `pointer_write` semantic
   preserves the arena origin through field writes, but transfer
-  via an untracked call may need `@returns owns_locals`.
+  via an untracked call may need a suppression.
 
 ## Related
 

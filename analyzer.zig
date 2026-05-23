@@ -300,7 +300,6 @@ test "switch-case UAF: kill in one case, use after merge" {
     var problems = try analyze(gpa,
         \\const std = @import("std");
         \\const Arena = struct {
-        \\    /// @returns borrowed_from(self)
         \\    pub fn slice(self: *const Arena) []const u8 {
         \\        _ = self; return "";
         \\    }
@@ -324,7 +323,6 @@ test "branch-specific UAF: kill in one if-branch, use after merge" {
     var problems = try analyze(gpa,
         \\const std = @import("std");
         \\const Arena = struct {
-        \\    /// @returns borrowed_from(self)
         \\    pub fn slice(self: *const Arena) []const u8 {
         \\        _ = self; return "";
         \\    }
@@ -408,7 +406,6 @@ test "R7 inference: wrapper-of-wrapper across source order via fixed-point" {
         \\const std = @import("std");
         \\const Ctx = struct {
         \\    inner: std.heap.ArenaAllocator,
-        \\    /// @returns borrowed_from(self)
         \\    pub fn text(self: *const Ctx) []const u8 { _ = self; return ""; }
         \\};
         \\// wrap_outer is defined BEFORE wrap_inner in source order —
@@ -466,7 +463,6 @@ test "R7 inference: delegator wrap fires escape on local-arena caller" {
         \\const std = @import("std");
         \\const Ctx = struct {
         \\    inner: std.heap.ArenaAllocator,
-        \\    /// @returns borrowed_from(self)
         \\    pub fn text(self: *const Ctx) []const u8 { _ = self; return ""; }
         \\};
         \\pub fn wrap(c: *const Ctx) []const u8 {
@@ -492,7 +488,6 @@ test "R7 inference: multi-return body — every return delegates to same param" 
         \\const std = @import("std");
         \\const MyArena = struct {
         \\    inner: std.heap.ArenaAllocator,
-        \\    /// @returns borrowed_from(self)
         \\    pub fn text(self: *const MyArena) []const u8 { _ = self; return ""; }
         \\};
         \\pub fn conditional(c: *const MyArena, cond: bool) []const u8 {
@@ -608,12 +603,10 @@ test "arena_escape: @returns owns_locals suppresses composite-borrow check" {
     var problems = try analyze(gpa,
         \\const std = @import("std");
         \\const Arena = struct {
-        \\    /// @returns borrowed_from(self)
         \\    pub fn text(self: *const Arena) []const u8 { _ = self; return ""; }
         \\};
         \\const Wrapper = struct { s: []const u8 };
         \\const Holder = struct { arena: std.heap.ArenaAllocator };
-        \\/// @returns owns_locals
         \\pub fn foo() Wrapper {
         \\    var h = Holder{ .arena = std.heap.ArenaAllocator.init(undefined) };
         \\    var a = Arena{};
@@ -635,11 +628,9 @@ test "heap_use_after_free: through function-pointer binding" {
     const gpa = std.testing.allocator;
     var problems = try analyze(gpa,
         \\const std = @import("std");
-        \\/// @returns heap
         \\fn xalloc(g: std.mem.Allocator, n: usize) []u8 {
         \\    return g.alloc(u8, n) catch unreachable;
         \\}
-        \\/// @takes ownership(p)
         \\fn dispose(g: std.mem.Allocator, p: []u8) void {
         \\    g.free(p);
         \\}
@@ -1176,11 +1167,9 @@ test "heap_use_after_free: @returns heap wrapper + @takes ownership wrapper" {
     const gpa = std.testing.allocator;
     var problems = try analyze(gpa,
         \\const std = @import("std");
-        \\/// @returns heap
         \\pub fn xalloc(g: std.mem.Allocator, n: usize) []u8 {
         \\    return g.alloc(u8, n) catch unreachable;
         \\}
-        \\/// @takes ownership(p)
         \\pub fn dispose(g: std.mem.Allocator, p: []u8) void {
         \\    g.free(p);
         \\}
@@ -1203,11 +1192,9 @@ test "heap_double_free: via @takes ownership wrapper" {
     const gpa = std.testing.allocator;
     var problems = try analyze(gpa,
         \\const std = @import("std");
-        \\/// @returns heap
         \\pub fn xalloc(g: std.mem.Allocator, n: usize) []u8 {
         \\    return g.alloc(u8, n) catch unreachable;
         \\}
-        \\/// @takes ownership(p)
         \\pub fn dispose(g: std.mem.Allocator, p: []u8) void {
         \\    g.free(p);
         \\}
@@ -1763,7 +1750,6 @@ test "field_use prefix emission: depth-1 free + depth-2 use still fires UAF" {
         \\const Handlers = struct { x: u32 = 0 };
         \\const T = struct {
         \\    handlers: *Handlers,
-        \\    /// @takes ownership(this)
         \\    pub fn deactivate(this: *T) void { _ = this; }
         \\};
         \\pub fn buggy(t: *T) void {

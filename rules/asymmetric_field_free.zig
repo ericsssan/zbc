@@ -344,9 +344,7 @@ fn checkFn(
 
     // For each sibling group, check coverage.  Two filters:
     //   - Skip pointer-typed fields — heuristic for "this is a
-    //     borrow, not an owned value."  Replaces the older
-    //     `db.isBorrowedField` query that read `/// @borrowed`
-    //     annotations; pure inference uses the type shape.
+    //     borrow, not an owned value."
     //   - Skip the entire group when the inner named type doesn't
     //     have a discoverable `deinit` method — those `?<X>` shapes
     //     are almost always borrowed pointers / string IDs that

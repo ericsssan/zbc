@@ -1,9 +1,7 @@
 //! Per-fn behavioral summary, inferred from the body (purely
-//! syntactic).  Parallel API to the older annotations.Db — same
-//! semantic ground, but no `/// @returns` doc-comment parsing.
-//! The author overrides the tool's inferred belief via
-//! `// zbc-disable-line:` suppressions, not by asserting alternative
-//! semantics.
+//! syntactic).  No annotations are read — the author overrides
+//! the tool's inferred belief via `// zbc-disable-line:` suppressions,
+//! not by asserting alternative semantics.
 //!
 //! Summary fields are deliberately COARSE.  Each one answers a
 //! specific question a downstream consumer asks:
@@ -42,12 +40,11 @@ pub const Returns = union(enum) {
     unknown,
 };
 
-/// A `<param>.<field>` chain that a fn's body destroys.  Multiple
-/// entries per fn possible — `fn deinit(self) { self.x.free(); self.y.close(); }`
-/// emits two.  Same shape as the old `annotations.FieldFree` plus
-/// a `method` slot so post-inference filters can check the SPECIFIC
-/// method's existence on the field's type (rather than just "any
-/// cleanup method").
+/// A `<param>.<field>.<method>()` chain that a fn's body destroys.
+/// Multiple entries per fn possible — `fn deinit(self) {
+/// self.x.free(); self.y.close(); }` emits two.  The `method` slot
+/// lets post-inference filters check the SPECIFIC method's existence
+/// on the field's type (rather than just "any cleanup method").
 pub const FieldFree = struct {
     /// 0-indexed param whose `.<field>` is freed (0 = receiver).
     param: u32,
@@ -62,8 +59,8 @@ pub const FieldFree = struct {
 pub const FnSummary = struct {
     returns: Returns = .unknown,
     /// If non-null, the call site invalidates the value passed at
-    /// this parameter index.  Mirrors `@takes ownership(<param>)` from
-    /// the old annotation system.
+    /// this parameter index — i.e. the callee takes ownership of
+    /// that arg.
     takes_ownership_of: ?u32 = null,
     /// Body returns via `unreachable` / calls `@panic` / signature
     /// says `noreturn`.
@@ -180,7 +177,7 @@ pub fn inferFromBody(
 
 /// R8a: body is `{ return EXPR; }` or `{ var x = EXPR; return x; }`
 /// where EXPR (after stripping try/catch wrappers) is a call to an
-/// allocator-vocabulary method.  Matches annotations.zig's R8a port,
+/// allocator-vocabulary method.  The matched pattern is:
 /// with the vocabulary-based "is alloc method" check instead of
 /// string-pattern matching.
 pub fn inferReturnsHeap(tree: *const Ast, body_node: Ast.Node.Index) bool {
@@ -325,14 +322,14 @@ fn paramIndex(tree: *const Ast, proto: Ast.full.FnProto, name: []const u8) ?u32 
 ///
 /// Matches `.free(<param>)` / `.destroy(<param>)` — the param is
 /// passed as the explicit arg to an allocator-vocabulary free.
-/// Mirrors annotations.zig R8b.
+/// R8b: `fn(g, p) void { g.free(p); }` infers  ownership(p).
 ///
 /// Deliberately does NOT match `<param>.deinit()` / `.close()` /
 /// other receiver-cleanup forms.  Those signals are ambiguous: a
 /// fn body can call `self.deinit(); self.entries = ...;` as a
 /// reset-and-resurrect pattern where self isn't actually consumed.
 /// Without dataflow tracking we can't tell the difference, so we
-/// stay conservative — annotations.zig's same restriction.
+/// stay conservative.
 ///
 /// Returns the FIRST match.  When multiple params are consumed the
 /// summary only records one; consumers that need fuller fidelity
@@ -384,7 +381,7 @@ pub fn inferDirectTakes(
 // ── R7 helpers (delegating-return inference) ──────────────
 //
 // Pure-syntactic helpers used by FileCache's R7 pass.  Mirror
-// annotations.zig's R7 helpers but live here so FileCache can run
+// R7-style helpers — live here so FileCache can run
 // delegator-borrow inference without consulting the legacy db.
 // Cache-dependent steps (callee summary lookup, cross-file
 // resolution) live in FileCache.
@@ -557,7 +554,7 @@ pub fn inferMayFreeFields(
         // count — `.free` / `.destroy` take their ARG instead.
         if (!isReceiverCleanupMethodName(method)) continue;
         // Field path: source-slice from first field's start to last
-        // field's end.  Same shape annotations.zig's R10 Case B uses.
+        // field's end.  Same shape as the R10 Case B inference.
         const start_byte = tree.tokens.items(.start)[first_field_tok];
         const last_start = tree.tokens.items(.start)[last_field_tok];
         const last_len = tree.tokenSlice(last_field_tok).len;
@@ -623,7 +620,7 @@ pub fn inferResultHeapFields(
     body: Ast.Node.Index,
 ) ![]const []const u8 {
     var out: std.ArrayListUnmanaged([]const u8) = .empty;
-    // Text-based approach matching the original annotations.zig
+    // Text-based approach for
     // pipeline: find a `return ... { .X = ... }` struct-literal
     // shape, then text-match each field's RHS against the alloc-call
     // vocabulary.  Per-token introspection of a struct literal AST
@@ -697,7 +694,7 @@ pub fn inferResultHeapFields(
 
 /// True iff `text` contains a substring matching the alloc-pattern
 /// vocabulary.  Conservative text match (same shape the old
-/// annotations.zig pipeline used).
+/// inference uses).
 fn rhsTextLooksAlloc(text: []const u8) bool {
     const patterns = [_][]const u8{
         ".alloc(", ".allocSentinel(", ".allocAdvanced(",
