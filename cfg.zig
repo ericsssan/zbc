@@ -4032,29 +4032,38 @@ const Builder = struct {
                 else => break,
             }
         }
-        switch (tree.nodeTag(node)) {
-            .call, .call_one, .call_comma, .call_one_comma => {
+        const token_inferred: ?[]const u8 = switch (tree.nodeTag(node)) {
+            .call, .call_one, .call_comma, .call_one_comma => blk: {
                 var buf: [1]Ast.Node.Index = undefined;
-                const call = tree.fullCall(&buf, node) orelse return null;
+                const call = tree.fullCall(&buf, node) orelse break :blk null;
                 const callee = call.ast.fn_expr;
-                if (tree.nodeTag(callee) != .field_access) return null;
+                if (tree.nodeTag(callee) != .field_access) break :blk null;
                 const fa = tree.nodeData(callee).node_and_token;
                 const method_name = tree.tokenSlice(fa[1]);
-                if (!isConstructorName(method_name)) return null;
-                return self.lastIdentInDottedChain(fa[0]);
+                if (!isConstructorName(method_name)) break :blk null;
+                break :blk self.lastIdentInDottedChain(fa[0]);
             },
             .struct_init,
             .struct_init_comma,
             .struct_init_one,
             .struct_init_one_comma,
-            => {
+            => blk: {
                 var buf: [2]Ast.Node.Index = undefined;
-                const si = tree.fullStructInit(&buf, node) orelse return null;
-                const type_expr = si.ast.type_expr.unwrap() orelse return null;
-                return self.lastIdentInDottedChain(type_expr);
+                const si = tree.fullStructInit(&buf, node) orelse break :blk null;
+                const type_expr = si.ast.type_expr.unwrap() orelse break :blk null;
+                break :blk self.lastIdentInDottedChain(type_expr);
             },
-            else => return null,
+            else => null,
+        };
+        if (token_inferred) |t| return t;
+        // ZLS fallback: handles `var x = makeThing()`, `var x =
+        // some_var.method()`, `var x = ns.factory(...)` — shapes the
+        // token-pattern match above can't classify because the type
+        // isn't syntactically visible at the call site.
+        if (self.zls) |z| {
+            return z.typeNameOfNode(init_node) catch null;
         }
+        return null;
     }
 
     /// Return the LAST identifier token slice in a dotted chain.
