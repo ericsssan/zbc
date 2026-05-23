@@ -157,12 +157,62 @@ pub fn inferFromBody(
         out.returns = classifyReturnExpr(tree, proto, re.first, re.last, out.allocates);
     }
 
+    // R8a: stronger `.heap` inference covers the two-statement form
+    // (`{ var x = alloc(); return x; }`) that firstReturnExpr's
+    // token-walk doesn't handle.  Overrides `.owned` because `.heap`
+    // mints a HeapId (enables UAF + double-free tracking).  Skipped
+    // when `returns` is already a concrete signal (`.borrowed_from`
+    // — those carry MORE information than `.heap`).
+    switch (out.returns) {
+        .unknown, .owned, .heap => {
+            if (inferReturnsHeap(tree, body)) out.returns = .heap;
+        },
+        .borrowed_from, .plain => {},
+    }
+
     // Direct takes_ownership_of inference (R8b-style: .free(<param>)
     // / .destroy(<param>) only).  See inferDirectTakes for the
     // conservative rationale around <param>.deinit() being excluded.
     out.takes_ownership_of = inferDirectTakes(tree, proto, body);
 
     return out;
+}
+
+/// R8a: body is `{ return EXPR; }` or `{ var x = EXPR; return x; }`
+/// where EXPR (after stripping try/catch wrappers) is a call to an
+/// allocator-vocabulary method.  Matches annotations.zig's R8a port,
+/// with the vocabulary-based "is alloc method" check instead of
+/// string-pattern matching.
+pub fn inferReturnsHeap(tree: *const Ast, body_node: Ast.Node.Index) bool {
+    var expr = singleReturnExpr(tree, body_node) orelse return false;
+    while (true) {
+        switch (tree.nodeTag(expr)) {
+            .@"try" => expr = tree.nodeData(expr).node,
+            .@"catch" => expr = tree.nodeData(expr).node_and_node[0],
+            else => break,
+        }
+    }
+    const is_call = switch (tree.nodeTag(expr)) {
+        .call, .call_one, .call_comma, .call_one_comma => true,
+        else => false,
+    };
+    if (!is_call) return false;
+    // Walk the call's token range looking for the LAST `.<ident>(` —
+    // that's the method name on the deepest receiver chain.
+    const tags = tree.tokens.items(.tag);
+    const first = tree.firstToken(expr);
+    const last = tree.lastToken(expr);
+    var last_method: ?lexer.TokenIndex = null;
+    var t: lexer.TokenIndex = first;
+    while (t + 2 <= last) : (t += 1) {
+        if (tags[t] != .period) continue;
+        if (tags[t + 1] != .identifier) continue;
+        if (tags[t + 2] != .l_paren) continue;
+        last_method = t + 1;
+    }
+    const m = last_method orelse return false;
+    if (vocabulary.lookupMethod(tree.tokenSlice(m))) |vs| return vs.allocates;
+    return false;
 }
 
 /// Token range of a `return <expr>;` body, if the body has one at

@@ -186,7 +186,6 @@ pub const FileCache = struct {
         for (raw) |ff| {
             const param_ty = paramTypeName(tree, proto, ff.param) orelse continue;
             if (!model.hasType(param_ty)) continue;
-            if (model.fieldIsPointer(param_ty, ff.field)) continue;
             const field_ty = model.fieldType(param_ty, ff.field) orelse continue;
             if (!model.hasType(field_ty)) continue;
             const ti = model.findType(field_ty) orelse continue;
