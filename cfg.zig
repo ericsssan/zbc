@@ -32,6 +32,7 @@ const abstract_state = @import("abstract_state.zig");
 const config_mod = @import("config.zig");
 const file_cache = @import("file_cache.zig");
 const fn_summary = @import("fn_summary.zig");
+const lexer = @import("lexer.zig");
 const zls_resolver_mod = @import("zls_resolver.zig");
 
 pub const Config = config_mod.Config;
@@ -2072,7 +2073,7 @@ const Builder = struct {
             // pointer-typed parent — pure-local field writes don't
             // outlive the frame and aren't observable.
             if (self.locals.items[@intFromEnum(fref.parent)].is_pointer) {
-                try self.maybePartialUnionWrite(cur.*, rhs,
+                try self.maybePartialUnionWrite(cur.*, rhs, fref.parent,
                     self.posOf(assign_node), self.endPosOf(assign_node));
             }
             // Escape-via-out-param: `out.field = X` where `out` is a
@@ -2126,7 +2127,7 @@ const Builder = struct {
             // observed field LHSs ARE unions).
             const tn = self.locals.items[@intFromEnum(out_local)].type_name;
             if (tn != null and self.typeIsTaggedUnion(tn.?)) {
-                try self.maybePartialUnionWrite(cur.*, rhs,
+                try self.maybePartialUnionWrite(cur.*, rhs, out_local,
                     self.posOf(assign_node), self.endPosOf(assign_node));
             }
         } else if (tree.nodeTag(lhs) == .identifier and
@@ -4320,6 +4321,7 @@ const Builder = struct {
         self: *Builder,
         cur: BlockId,
         rhs: Ast.Node.Index,
+        lhs_local: LocalId,
         pos: SrcPos,
         end_pos: SrcPos,
     ) !void {
@@ -4338,11 +4340,56 @@ const Builder = struct {
         const field_value = init.ast.fields[0];
         const tag_name = self.fieldInitName(field_value) orelse return;
         if (!self.fieldValueHasEarlyExit(field_value)) return;
+        // Observability gate: the partial-write hazard only matters
+        // if SOMEONE reads the LHS on the error path.  In practice
+        // that means an `errdefer` in the same fn that touches the
+        // LHS's parent (the canonical `errdefer this.deinit()` that
+        // dispatches on the union's tag).  Without such an errdefer
+        // the error propagates without reading the partial state,
+        // so no observable hazard — skip.
+        const lhs_name = self.locals.items[@intFromEnum(lhs_local)].name;
+        if (!self.anyErrdeferMentions(lhs_name)) return;
         try self.appendStmt(cur, .{
             .kind = .{ .partial_union_write = .{ .tag_name = tag_name } },
             .pos = pos,
             .end_pos = end_pos,
         });
+    }
+
+    /// True iff any `errdefer` keyword in the fn body has a body
+    /// (inline statement or `{...}` block) that mentions `<name>`
+    /// as an identifier.
+    fn anyErrdeferMentions(self: *Builder, name: []const u8) bool {
+        const tree = self.tree;
+        const tags = tree.tokens.items(.tag);
+        const last = self.fn_body_last;
+        if (last == 0) return false;
+        var t: Ast.TokenIndex = 0;
+        while (t <= last) : (t += 1) {
+            if (tags[t] != .keyword_errdefer) continue;
+            // Determine the errdefer body extent.  Skip optional
+            // `|err|` capture.
+            var b = t + 1;
+            if (b <= last and tags[b] == .pipe) {
+                b += 1;
+                while (b <= last and tags[b] != .pipe) : (b += 1) {}
+                if (b > last) continue;
+                b += 1;
+            }
+            if (b > last) continue;
+            const body_end: Ast.TokenIndex = if (tags[b] == .l_brace)
+                lexer.matchBrace(tags, b, last) orelse continue
+            else
+                lexer.findStmtSemicolon(tags, b, last) orelse continue;
+            // Scan body for `name` as an identifier.
+            var k = b;
+            while (k <= body_end) : (k += 1) {
+                if (tags[k] != .identifier) continue;
+                if (std.mem.eql(u8, tree.tokenSlice(k), name)) return true;
+            }
+            t = body_end;
+        }
+        return false;
     }
 
     /// Build a dotted path `prefix.leaf` and stash the allocated bytes
