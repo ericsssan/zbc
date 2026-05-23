@@ -108,8 +108,9 @@ where source shape is ambiguous:
 ```zig
 const zbc = @import("zbc");
 
-const problems = try zbc.analyzeEscape(
-    gpa, io, path, /*cache=*/null, &zbc.DefaultConfig,
-);
+const problems = try zbc.analyzeEscape(gpa, io, path, &zbc.DefaultConfig);
 defer zbc.freeProblems(gpa, problems);
 ```
+
+Cross-module type resolution is handled internally via ZLS (declared as
+a build-time dependency in `build.zig.zon`).  No setup required.
