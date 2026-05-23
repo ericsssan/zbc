@@ -279,6 +279,34 @@ pub const FileModel = struct {
         return false;
     }
 
+    /// True iff the field is declared `<field>: ?T = null` — an
+    /// optional with the null default.  The first non-null write to
+    /// such a field is initializing it, not overwriting a prior
+    /// owned value — the overwrite-without-deinit rule should not
+    /// fire on the lazy-init pattern (e.g. `attachSignal` setting
+    /// `this.signal` for the first time).
+    pub fn fieldIsOptionalNullDefault(
+        self: *const FileModel,
+        struct_name: []const u8,
+        field_name: []const u8,
+    ) bool {
+        const ti = self.findType(struct_name) orelse return false;
+        const f = ti.findField(field_name) orelse return false;
+        if (!f.has_default) return false;
+        const tags = self.tree.tokens.items(.tag);
+        // Type must begin with `?` to qualify as optional.
+        if (tags[f.type_first] != .question_mark) return false;
+        // Locate the `=` after `type_last`; default value's first
+        // token sits at `=` + 1.
+        var eq: TokenIndex = f.type_last + 1;
+        while (eq < self.tree.tokens.len and tags[eq] != .equal) : (eq += 1) {}
+        if (eq >= self.tree.tokens.len) return false;
+        const dv = eq + 1;
+        if (dv >= self.tree.tokens.len) return false;
+        if (tags[dv] != .identifier) return false;
+        return std.mem.eql(u8, self.tree.tokenSlice(dv), "null");
+    }
+
     /// True iff `struct_name`.`field_name` is the heap-owning half of
     /// a flag-paired ownership pattern: a sibling field
     /// `<field_name>_allocated: bool` exists on the same struct.

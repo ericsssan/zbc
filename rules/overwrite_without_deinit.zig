@@ -112,6 +112,13 @@ fn checkBody(
             t = sc;
             continue;
         }
+        // Skip optional fields with a `null` default — first write
+        // initializes the field rather than overwriting an owned
+        // prior value (`signal: ?*Ref = null` lazy-init pattern).
+        if (model.fieldIsOptionalNullDefault(ct, field_name)) {
+            t = sc;
+            continue;
+        }
         // Skip when RHS is a `null` / `undefined` sentinel write —
         // canonical "clear after draining" pattern (event-loop free
         // lists, optional resets after consumption).  The leak, if
