@@ -47,6 +47,18 @@ pub fn check(
     defer gpa.free(outers);
 
     for (outers) |outer| {
+        // Bun convention skip: `pub const new = bun.TrivialNew(T);`
+        // (or `bun.New(T)`) declares the type as heap-allocated and
+        // owned by a parent — the parent's deinit handles the
+        // teardown, so absence of a deinit on T isn't a leak.  This
+        // is a strong signal in Bun's codebase and orthogonal to
+        // the "plain value type" case the rule targets.
+        if (hasNewFactoryDecl(tree, outer)) continue;
+        // Same convention via init-shape: `init(...) !*@This()` /
+        // `init(...) *Self` means the struct is heap-allocated and
+        // owned by an external caller — cleanup happens at the
+        // owner's hand, not via a fn on the value.
+        if (hasPointerReturningInit(tree, outer)) continue;
         // Find the first value-typed field whose type has a NON-TRIVIAL
         // cleanup method.  If the inner type's `deinit` (or whichever
         // cleanup method) has an empty / discard-only body, it does
@@ -73,6 +85,58 @@ pub fn check(
         trace.match(R, tree, field.name_token, "owned field with no outer cleanup");
         try report(gpa, problems, tree, outer.name, field.name_token, field.name, inner.name);
     }
+}
+
+/// True iff the type has an `init` / `create` / `new` method whose
+/// return type is `*Self` (after stripping `!` and `?`).  Pointer-
+/// returning constructors mark the type as heap-allocated and
+/// owned by an external caller — common in Bun's JSC bridge
+/// (`globalThis.allocator().create(@This())`).  The outer's
+/// missing inline cleanup isn't a leak because the owning caller
+/// is responsible for teardown.
+fn hasPointerReturningInit(tree: *const Ast, ti: *const fmodel.TypeInfo) bool {
+    const tags = tree.tokens.items(.tag);
+    for (ti.methods) |m| {
+        if (!std.mem.eql(u8, m.name, "init") and
+            !std.mem.eql(u8, m.name, "create") and
+            !std.mem.eql(u8, m.name, "new")) continue;
+        var buf: [1]Ast.Node.Index = undefined;
+        const proto = tree.fullFnProto(&buf, m.fn_decl) orelse continue;
+        const rt = proto.ast.return_type.unwrap() orelse continue;
+        const first = tree.firstToken(rt);
+        if (tags[first] == .asterisk) return true;
+        // `?*T`: `?` then `*` next.
+        if (tags[first] == .question_mark and first + 1 < tree.tokens.len and tags[first + 1] == .asterisk) return true;
+    }
+    return false;
+}
+
+/// True iff the type body declares a `pub const new = ...` (or
+/// `const new = ...`) initializer that names a heap-factory call —
+/// `bun.TrivialNew(T)` / `bun.New(T)`.  Bun convention: such types
+/// are heap-allocated and owned by a parent struct that's
+/// responsible for cleanup, so a missing inline `deinit` on `T`
+/// isn't a leak.  Token-scan over the type body for the prefix.
+fn hasNewFactoryDecl(tree: *const Ast, ti: *const fmodel.TypeInfo) bool {
+    const tags = tree.tokens.items(.tag);
+    if (ti.body_first >= ti.body_last) return false;
+    var t: Ast.TokenIndex = ti.body_first;
+    while (t + 4 < ti.body_last) : (t += 1) {
+        // Match `[pub] const new =`.
+        var k: Ast.TokenIndex = t;
+        if (tags[k] == .keyword_pub) k += 1;
+        if (tags[k] != .keyword_const) continue;
+        if (tags[k + 1] != .identifier) continue;
+        if (!std.mem.eql(u8, tree.tokenSlice(k + 1), "new")) continue;
+        if (tags[k + 2] != .equal) continue;
+        // RHS must be a call expression — common factory shapes:
+        // `bun.TrivialNew(T)`, `bun.New(T)`.  Look at next few
+        // tokens for an identifier (or `bun.<id>`) followed by `(`.
+        var r: Ast.TokenIndex = k + 3;
+        while (r < ti.body_last and (tags[r] == .identifier or tags[r] == .period)) : (r += 1) {}
+        if (r < ti.body_last and tags[r] == .l_paren) return true;
+    }
+    return false;
 }
 
 /// True iff `ti` has at least one cleanup-named method whose body is
