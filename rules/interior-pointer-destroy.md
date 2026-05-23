@@ -1,58 +1,58 @@
 # interior-pointer-destroy
 
-Calling a cleanup-shape method (`deinit` / `close` / `dispose` /
-`release` / `deref` / `unref` / `finalize` / `removeRef`) on a
-pointer that is NOT the result of `allocator.create()` is
-suspect.  Cleanup methods typically assume the receiver IS a
-fresh heap allocation OR that the receiver's storage is exclusive
-to the caller; calling one on an interior pointer (`&array[i]`,
-a for-loop pointer-capture into a container, etc.) at minimum
-violates the convention, and when the method actually calls
-`allocator.destroy(self)` corrupts the allocator's metadata or
-frees the wrong allocation entirely.
+Calling a method that destroys its receiver (`allocator.destroy(self)`
+or `allocator.free(self)` in the body) on a pointer that is NOT the
+result of `allocator.create()` is undefined behavior.  The most
+common shape: a for-loop captures into a container by-pointer
+(`for (entries.items) |*r|`), then calls a destructor-shape method
+on that interior pointer.  The allocator never returned that
+pointer, so passing it to `destroy` corrupts allocator metadata or
+frees an unrelated allocation.
 
-zbc fires on the **pattern** (cleanup-named method on an interior
-pointer) — not on proven destruction.  Whether the method actually
-calls `allocator.destroy(self)` requires inferring takes-ownership
-semantics that often span files / generic instantiations.  The
-pattern is the suspect: even when the method just releases internal
-fields, calling it on an interior pointer signals a likely
-ownership-model confusion.
+zbc fires only when inference proves the method takes ownership of
+its receiver — i.e. the method's body literally calls
+`<allocator>.destroy(self)` or `<allocator>.free(self)`.  Methods
+named `deinit` / `close` / `deref` / `release` / etc. that merely
+release sub-fields are NOT flagged: they're safe to call on interior
+pointers because the container still owns the backing storage.
+
+Cross-module destructors (callee defined in another file) are not
+inferred and so don't fire today.  This is a deliberate trade-off:
+firing on name alone produced ~200 false positives on real codebases
+(refcount `deref()`, allocator-arg `deinit(alloc)`, etc.), drowning
+out any real signal.
 
 ## Example
 
-Incorrect — `result` is a pointer INTO `entries.items`, not a
-fresh allocation:
+Incorrect — `result` is a pointer INTO `entries.items`, not a fresh
+allocation, AND `Entry.destroy` calls `gpa.destroy(self)`:
+
+    const Entry = struct {
+        pub fn destroy(self: *Entry, gpa: std.mem.Allocator) void {
+            gpa.destroy(self);  // ← inferred: takes ownership(self)
+        }
+    };
 
     for (entries.items) |*result| {
-        result.destroy();           // ← UB; interior pointer
+        result.destroy(gpa);    // ← UB; interior pointer
     }
-    entries.deinit();                // ← may then double-free
-
-zbc reports the destroy call.  The cascading double-free (when
-`entries.deinit()` also frees the same backing) shows as a
-separate `heap-double-free` finding.
+    entries.deinit();           // ← may then double-free
 
 Fix — let the container own the lifecycle:
 
     for (entries.items) |result| {
-        // Don't destroy from interior; consume the element's
-        // fields directly, then let entries.deinit clean up.
+        // Consume the element's fields directly; let entries.deinit
+        // clean up the backing storage.
     }
     entries.deinit();
 
 ## When this might be a false positive
 
-- The cleanup method is genuinely safe for interior pointers
-  (e.g. it only releases shared sub-resources without freeing
-  storage).  The pattern is still worth a second look — if the
-  method really doesn't take ownership of self, consider
-  renaming it to something OUT of `deinit` / `close` / `dispose`
-  / `release` / `deref` / `unref` / `finalize` / `removeRef`, or
-  suppressing the line with `// zbc-disable-line: interior-pointer-destroy`.
-- The container's element storage is itself stack-only (e.g. a
-  comptime-known fixed array) — the "interior pointer" framing
-  doesn't apply since there's no allocator involved.
+- The destructor IS the canonical `allocator.destroy(self)` shape but
+  the call site passes an interior pointer intentionally because the
+  container is being torn down element-by-element and the allocator
+  was constructed to track per-element slots.  Suppress with
+  `// zbc-disable-line:interior-pointer-destroy`.
 
 ## Related
 

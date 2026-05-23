@@ -3673,18 +3673,26 @@ const Builder = struct {
     /// (.arena_local or .arena_allocator), return that local.
     /// Receiver may itself be a chained field access (`x.y.method()`),
     /// in which case we walk to the head identifier.
-    /// If `call_node` is `<recv>.<destructor_name>(...)` where
-    /// `recv` is a local with `from_container` set (a for-loop
-    /// pointer-capture into a container) AND the callee actually
-    /// calls `allocator.destroy(self)` internally (signaled via
-    /// `@takes ownership(self)` inferred from the body — present
-    /// only for destructors like `MarkedArrayBuffer.destroy()`,
-    /// NOT for destructors that merely free sub-fields like
-    /// `Problem.deinit()`), return the receiver + container pair.
+    /// If `call_node` is `<recv>.<method>(...)` where `recv` is a
+    /// local with `from_container` set (a for-loop pointer-capture
+    /// into a container) AND the callee provably takes ownership of
+    /// its receiver (i.e. `takes_ownership_of == 0` inferred from
+    /// the body), return the receiver + container pair.
     ///
-    /// The takes-self gate is essential: zbc's own
-    /// `Problem.deinit` and other "iter-and-deinit-sub-fields"
-    /// patterns would otherwise FP loudly.
+    /// "Provably" means: the method body contains
+    /// `<allocator>.destroy(self)` or `<allocator>.free(self)` — the
+    /// shapes fn_summary's R8b inference recognizes.  Methods named
+    /// `deinit`/`close`/`deref`/etc. that merely release sub-fields
+    /// (the common case in Bun and most Zig code) do NOT fire,
+    /// because they're safe to call on interior pointers — the
+    /// container still owns the storage.
+    ///
+    /// Cross-module destructors (callee in another file) are not
+    /// inferred today; the rule conservatively no-fires rather than
+    /// guessing from the name.  Worst case: a real interior-pointer
+    /// destroy in a third-party type goes undetected — but the
+    /// inverse (firing 200+ FPs on every for-loop with a cleanup
+    /// call) is far worse for usability.  See FP audit 2026-05-23.
     const InteriorPtrDestructor = struct { receiver: LocalId, container: LocalId };
     fn interiorPointerDestructor(self: *Builder, call_node: Ast.Node.Index) ?InteriorPtrDestructor {
         const tree = self.tree;
@@ -3699,25 +3707,9 @@ const Builder = struct {
         const recv_local = self.name_to_local.get(recv_name) orelse return null;
         const container = self.locals.items[@intFromEnum(recv_local)].from_container orelse return null;
 
-        // Receiver IS an interior pointer (for-loop capture into a
-        // container).  Fire on EITHER of:
-        //   - The method provably frees its receiver
-        //     (`takesOwnershipFreedLocal`), OR
-        //   - The method NAME is cleanup-style (deinit/close/dispose/
-        //     etc.) — a strong convention that "this releases the
-        //     receiver's owned resources."  Even when the body
-        //     doesn't literally call `.free(self)` / `.destroy(self)`
-        //     (it usually frees the receiver's FIELDS instead, leaving
-        //     the storage logically dead), invoking it on an interior
-        //     pointer is the suspect pattern the rule warns about.
-        if (self.takesOwnershipFreedLocal(call_node)) |freed| {
-            if (freed == recv_local) return .{ .receiver = recv_local, .container = container };
-        }
-        const method_name = tree.tokenSlice(fa[1]);
-        if (fn_summary.isReceiverCleanupMethodName(method_name)) {
-            return .{ .receiver = recv_local, .container = container };
-        }
-        return null;
+        const freed = self.takesOwnershipFreedLocal(call_node) orelse return null;
+        if (freed != recv_local) return null;
+        return .{ .receiver = recv_local, .container = container };
     }
 
     /// For a call like `<recv>.alloc(...)`, `<recv>.free(...)`,
