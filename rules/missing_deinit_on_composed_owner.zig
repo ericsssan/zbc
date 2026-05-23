@@ -20,6 +20,7 @@ const Ast = std.zig.Ast;
 const fmodel = @import("../model.zig");
 const mq = @import("../model_query.zig");
 const query = @import("../query.zig");
+const lexer = @import("../lexer.zig");
 const problem = @import("../problem.zig");
 const testing = @import("../testing.zig");
 const config_mod = @import("../config.zig");
@@ -57,9 +58,9 @@ pub fn check(
         defer gpa.free(fields);
 
         for (fields) |field| {
-            // Build the body pattern: `<X>.<field>.<cleanup>(`.
-            // X is wildcarded (typically self/this).  The body pattern
-            // is built per-field since `.text` needs the field's name.
+            // Direct: `<X>.<field>.<cleanup>(`.  X is wildcarded
+            // (typically self/this).  The body pattern is built
+            // per-field since `.text` needs the field's name.
             const cleanup_call = &[_]query.Atom{
                 .{ .tok = .identifier },
                 .{ .tok = .period },
@@ -70,10 +71,75 @@ pub fn check(
             };
             if (mq.methodBodyContains(tree, deinit, cleanup_call)) continue;
 
+            // Optional-unwrap: `if (X.field) |*?cap| { ... cap.<cleanup>(...); ... }`.
+            // The user explicitly handled the optional and called
+            // cleanup on the unwrapped capture — no leak.
+            if (bodyHandlesFieldViaUnwrap(tree, deinit, field.name)) continue;
+
             const ti = mq.resolveFieldType(tree, model, field).?;
             try report(gpa, problems, tree, field.name_token, field.name, ti.name);
         }
     }
+}
+
+/// True iff the method's body contains an `if (X.<field>) |...cap...| { ... }`
+/// shape where the if-body calls a cleanup-named method on `cap`.
+/// Matches the canonical handling for `field: ?T` where T has a deinit:
+///
+///     pub fn deinit(self: *Outer, alloc: Allocator) void {
+///         if (self.field) |*cap| cap.deinit(alloc);
+///     }
+///
+/// Conservative: requires the if-condition's final tokens to be
+/// `.<field>` (with our field name), and the capture token to be a
+/// bare identifier (`|cap|` or `|*cap|`).  Doesn't try to match
+/// `while (X.field) |cap|` (loops on an optional field are rare for
+/// cleanup) or nested patterns.
+fn bodyHandlesFieldViaUnwrap(tree: *const Ast, method: *const fmodel.MethodInfo, field_name: []const u8) bool {
+    const tags = tree.tokens.items(.tag);
+    const first = method.body_first;
+    const last = method.body_last;
+    var t: Ast.TokenIndex = first;
+    while (t + 5 <= last) : (t += 1) {
+        if (tags[t] != .keyword_if) continue;
+        if (tags[t + 1] != .l_paren) continue;
+        const rparen = lexer.matchParen(tags, t + 1, last) orelse continue;
+        // The condition's last two tokens must be `.<field_name>`.
+        if (rparen < t + 4) continue;
+        if (tags[rparen - 2] != .period) continue;
+        if (tags[rparen - 1] != .identifier) continue;
+        if (!std.mem.eql(u8, tree.tokenSlice(rparen - 1), field_name)) continue;
+        // Capture: `|...|` immediately after `)`.
+        if (rparen + 1 > last or tags[rparen + 1] != .pipe) continue;
+        // Capture name: skip optional `*`.
+        var cap_tok = rparen + 2;
+        if (cap_tok <= last and tags[cap_tok] == .asterisk) cap_tok += 1;
+        if (cap_tok > last or tags[cap_tok] != .identifier) continue;
+        const cap_name = tree.tokenSlice(cap_tok);
+        // Find the closing `|`, then the if-body extent.
+        var close_pipe = cap_tok + 1;
+        while (close_pipe <= last and tags[close_pipe] != .pipe) close_pipe += 1;
+        if (close_pipe > last) continue;
+        // Body extent: either `{ ... }` or a single statement up to `;`.
+        const body_start = close_pipe + 1;
+        if (body_start > last) continue;
+        const body_end: Ast.TokenIndex = if (tags[body_start] == .l_brace)
+            lexer.matchBrace(tags, body_start, last) orelse continue
+        else
+            lexer.findStmtSemicolon(tags, body_start, last) orelse continue;
+
+        // Scan the body for `<cap_name>.<cleanup>(`.
+        var k: Ast.TokenIndex = body_start;
+        while (k + 3 <= body_end) : (k += 1) {
+            if (tags[k] != .identifier) continue;
+            if (!std.mem.eql(u8, tree.tokenSlice(k), cap_name)) continue;
+            if (tags[k + 1] != .period) continue;
+            if (tags[k + 2] != .identifier) continue;
+            if (tags[k + 3] != .l_paren) continue;
+            if (isCleanupName(tree.tokenSlice(k + 2))) return true;
+        }
+    }
+    return false;
 }
 
 fn isCleanupName(name: []const u8) bool {
@@ -174,6 +240,36 @@ test "optional value-typed field (?Inner) fires" {
         \\    inner: ?Inner,
         \\    pub fn deinit(self: *Outer) void {
         \\        _ = self;
+        \\    }
+        \\};
+    );
+}
+
+test "optional field cleaned up via `if (x.f) |*cap| cap.deinit(...)` — no fire" {
+    try testing.expectNoFire(check,
+        \\const Inner = struct {
+        \\    pub fn deinit(self: *Inner) void { _ = self; }
+        \\};
+        \\const Outer = struct {
+        \\    inner: ?Inner,
+        \\    pub fn deinit(self: *Outer) void {
+        \\        if (self.inner) |*cap| {
+        \\            cap.deinit();
+        \\        }
+        \\    }
+        \\};
+    );
+}
+
+test "optional field unwrap with mismatched capture cleanup still recognized" {
+    try testing.expectNoFire(check,
+        \\const Inner = struct {
+        \\    pub fn deinit(self: *Inner) void { _ = self; }
+        \\};
+        \\const Outer = struct {
+        \\    inner: ?Inner,
+        \\    pub fn deinit(self: *Outer) void {
+        \\        if (self.inner) |inner| inner.deinit();
         \\    }
         \\};
     );
