@@ -2815,6 +2815,8 @@ const Builder = struct {
         }
         if (tree.nodeTag(callee) == .field_access) {
             const recv = tree.nodeData(callee).node_and_token[0];
+            // Cross-file FnSummary first, then db fallback.
+            if (self.lookupRemoteSummary(recv, name)) |s| if (s.is_noreturn) return true;
             if (self.lookupRemoteEntry(recv, name)) |entry| if (entry.is_noreturn) return true;
         }
         // Aliased noreturn local: `const exit = std.process.exit;`
@@ -2858,6 +2860,28 @@ const Builder = struct {
         const imap_entry = remote.imap.lookup(recv_name) orelse return null;
         const remote_file = (remote.cache.loadOrLookup(remote.base_dir, imap_entry.path) catch return null) orelse return null;
         return remote_file.db.lookup(method_name);
+    }
+
+    /// FnSummary-equivalent of lookupRemoteEntry — queries the
+    /// imported file's FileCache (FnSummary inference, post-R10
+    /// transitive resolution) instead of its annotation Db.  Used
+    /// by callers that prefer the cache-first / db-fallback chain.
+    fn lookupRemoteSummary(
+        self: *Builder,
+        recv_node: Ast.Node.Index,
+        method_name: []const u8,
+    ) ?*const fn_summary.FnSummary {
+        const remote = self.remote orelse return null;
+        const tree = self.tree;
+        if (tree.nodeTag(recv_node) != .identifier) return null;
+        const recv_name = tree.tokenSlice(tree.nodeMainToken(recv_node));
+        const imap_entry = remote.imap.lookup(recv_name) orelse return null;
+        const remote_file = (remote.cache.loadOrLookup(remote.base_dir, imap_entry.path) catch return null) orelse return null;
+        // remote_file.fcache.tree is &remote_file.tree (stable).
+        // Cast away const so the cache's mutable lazy-init paths work;
+        // the outer caller treats the result as borrowed.
+        const cache: *file_cache.FileCache = @constCast(&remote_file.fcache);
+        return cache.summaryByName(method_name) catch null;
     }
 
     /// If the callee has `@takes ownership(p)`, return the LocalId
@@ -2923,13 +2947,19 @@ const Builder = struct {
                     if (entry.takes) |t| break :blk switch (t) { .ownership => |i| i };
                 }
             }
-            // Cross-file (CFG-5 territory).
+            // Cross-file: FnSummary first, db fallback.
             if (recv_ty) |ty| {
+                if (self.lookupCrossFileSummary(ty, callee_name)) |s| {
+                    if (s.takes_ownership_of) |i| break :blk i;
+                }
                 if (self.lookupCrossFileMethod(ty, callee_name)) |entry| {
                     if (entry.takes) |t| break :blk switch (t) { .ownership => |i| i };
                 }
             }
             if (receiver_is_arg0) {
+                if (self.lookupRemoteSummary(recv_node.?, callee_name)) |s| {
+                    if (s.takes_ownership_of) |i| break :blk i;
+                }
                 if (self.lookupRemoteTakes(recv_node.?, callee_name)) |t| {
                     break :blk switch (t) { .ownership => |i| i };
                 }
@@ -3016,10 +3046,14 @@ const Builder = struct {
                     if (entry.takes) |t| break :blk switch (t) { .ownership => |i| i };
                 }
             }
-            // Cross-file: the field's type may be defined in an
-            // imported file (e.g. `r.foo: *RemoteType; r.foo.method()`
-            // where RemoteType lives in lib.zig).
+            // Cross-file: FnSummary first, db fallback.  Field's
+            // type may be defined in an imported file (e.g.
+            // `r.foo: *RemoteType; r.foo.method()` where RemoteType
+            // lives in lib.zig).
             if (recv_ty) |ty| {
+                if (self.lookupCrossFileSummary(ty, method_name)) |s| {
+                    if (s.takes_ownership_of) |i| break :blk i;
+                }
                 if (self.lookupCrossFileMethod(ty, method_name)) |entry| {
                     if (entry.takes) |t| break :blk switch (t) { .ownership => |i| i };
                 }
@@ -3168,6 +3202,27 @@ const Builder = struct {
             const remote_file = (remote.cache.loadOrLookup(remote.base_dir, kv.value_ptr.path) catch continue) orelse continue;
             if (!remote_file.db.hasType(type_name)) continue;
             if (remote_file.db.lookupTyped(type_name, method_name)) |e| return e;
+        }
+        return null;
+    }
+
+    /// FnSummary-equivalent of lookupCrossFileMethod — walks imap to
+    /// find a remote file declaring `type_name`, then queries its
+    /// FileCache (typed lookup, since `<recv>.<method>` is the
+    /// shape this helper resolves).
+    fn lookupCrossFileSummary(
+        self: *Builder,
+        type_name: []const u8,
+        method_name: []const u8,
+    ) ?*const fn_summary.FnSummary {
+        const remote = self.remote orelse return null;
+        var it = remote.imap.entries.iterator();
+        while (it.next()) |kv| {
+            const remote_file = (remote.cache.loadOrLookup(remote.base_dir, kv.value_ptr.path) catch continue) orelse continue;
+            const cache: *file_cache.FileCache = @constCast(&remote_file.fcache);
+            const model = cache.fileModel() catch continue;
+            if (!model.hasType(type_name)) continue;
+            if (cache.summaryByMethod(type_name, method_name) catch null) |s| return s;
         }
         return null;
     }

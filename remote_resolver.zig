@@ -23,6 +23,7 @@ const Ast = std.zig.Ast;
 
 const annotations = @import("annotations.zig");
 const imports_mod = @import("imports.zig");
+const file_cache_mod = @import("file_cache.zig");
 
 pub const RemoteFile = struct {
     /// Borrowed view of the cache's key for this file.  Used by
@@ -33,12 +34,18 @@ pub const RemoteFile = struct {
     src_z: [:0]u8,
     tree: Ast,
     db: annotations.Db,
+    /// FileCache for the new FnSummary / FileModel queries on this
+    /// file.  Built alongside db during loadOrLookup; consumers
+    /// (cfg.zig's cross-file lookup helpers) prefer cache queries
+    /// over db queries during the annotation->inference migration.
+    fcache: file_cache_mod.FileCache,
     /// This file's own @import extractions, used to chase one extra
     /// level when callers see `lib.Submodule.method(...)`.
     imap: imports_mod.Map,
 
     pub fn deinit(self: *RemoteFile, gpa: std.mem.Allocator) void {
         self.imap.deinit(gpa);
+        self.fcache.deinit();
         self.db.deinit(gpa);
         self.tree.deinit(gpa);
         gpa.free(self.src_z);
@@ -226,8 +233,17 @@ pub const Cache = struct {
             .src_z = src_z,
             .tree = tree,
             .db = db,
+            // fcache.tree must point at box.tree (not the local
+            // `tree` that's about to go out of scope).  Initialize
+            // with a placeholder then re-point after box assignment.
+            .fcache = file_cache_mod.FileCache.init(self.gpa, &tree),
             .imap = imap,
         };
+        box.fcache = file_cache_mod.FileCache.init(self.gpa, &box.tree);
+        // Resolve R10 transitive takes for this imported file's
+        // summaries.  Failure is non-fatal — drop the file rather
+        // than poison the cache.
+        box.fcache.resolveTransitiveTakes() catch {};
 
         // Re-check under lock: another worker may have inserted the
         // same path while we were parsing.  If so, discard our
