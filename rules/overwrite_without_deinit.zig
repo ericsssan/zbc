@@ -120,6 +120,33 @@ fn checkBody(
             t = sc;
             continue;
         }
+        // Constructor-undef skip: when a constructor (init / create
+        // / new / from*) initialises this field to `undefined` —
+        // either via a struct-literal `.<field> = undefined,` in a
+        // return shape or via an imperative `<self>.<field> =
+        // undefined;` — the field starts life with no owned value.
+        // The FIRST write in some other method (typically a setter
+        // / loader) overwrites the undef sentinel; nothing to leak.
+        // Gate on `priorWriteInFn` returning false so subsequent
+        // writes in the same fn still fire (those DO need cleanup).
+        if (initFnSetsFieldToUndefined(tree, ct_ti, field_name) and
+            !priorWriteInFn(tree, first, t, this_name, field_name))
+        {
+            t = sc;
+            continue;
+        }
+        // Default-undefined skip: when the field's declared default
+        // is `undefined`, the first write in any method has no
+        // prior owned value.  Gated on `priorWriteInFn` so later
+        // writes in the same fn still fire.  Previously this was
+        // only applied inside the tagged-union branch below —
+        // hoisted here so the general overwrite path also benefits.
+        if (fieldDefaultIsUndefinedTi(tree, ct_ti, field_name) and
+            !priorWriteInFn(tree, first, t, this_name, field_name))
+        {
+            t = sc;
+            continue;
+        }
         // Skip when RHS is a `null` / `undefined` sentinel write —
         // canonical "clear after draining" pattern (event-loop free
         // lists, optional resets after consumption).  The leak, if
@@ -750,6 +777,52 @@ fn initFnDefaultUnionTag(
         }
     }
     return null;
+}
+
+/// True iff any of the type's constructor methods (`init` / `create`
+/// / `new` / `from*`) sets `<field>` to the literal `undefined` in
+/// its body — typically inside the returned struct literal:
+///   `return Self{ ..., .<field> = undefined, ... };`
+/// or imperatively `<self>.<field> = undefined;`.  In either case
+/// the field starts life undef, so the FIRST overwrite in some
+/// other method (a setter / load step) has no prior owned value to
+/// deinit.  Subsequent writes WOULD leak — gate the skip on
+/// `priorWriteInFn` returning false.
+fn initFnSetsFieldToUndefined(
+    tree: *const Ast,
+    ti: *const fmodel.TypeInfo,
+    field_name: []const u8,
+) bool {
+    const tags = tree.tokens.items(.tag);
+    for (ti.methods) |m| {
+        if (!isConstructorName(m.name)) continue;
+        var t: Ast.TokenIndex = m.body_first;
+        const last = m.body_last;
+        while (t + 4 <= last) : (t += 1) {
+            // `.<field> = undefined`
+            if (tags[t] == .period and
+                tags[t + 1] == .identifier and
+                std.mem.eql(u8, tree.tokenSlice(t + 1), field_name) and
+                tags[t + 2] == .equal and
+                tags[t + 3] == .identifier and
+                std.mem.eql(u8, tree.tokenSlice(t + 3), "undefined"))
+            {
+                return true;
+            }
+            // `<recv>.<field> = undefined`
+            if (t > 0 and tags[t - 1] == .identifier and
+                tags[t] == .period and
+                tags[t + 1] == .identifier and
+                std.mem.eql(u8, tree.tokenSlice(t + 1), field_name) and
+                tags[t + 2] == .equal and
+                tags[t + 3] == .identifier and
+                std.mem.eql(u8, tree.tokenSlice(t + 3), "undefined"))
+            {
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 /// Walk backward from `assign_tok` to `body_first` looking for the
