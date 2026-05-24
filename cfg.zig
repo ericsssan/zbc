@@ -571,6 +571,49 @@ fn fieldPathHasPointerName(path: []const u8) bool {
 
 /// True iff the body tokens `[name_tok+1 .. last]` contain `<name>.*`
 /// somewhere — i.e. the local declared at `name_tok` is dereferenced
+/// Return the base type identifier of a field's declared type —
+/// strips `?`/`const`/`[]`/`*`/`[N]` wrappers and returns the last
+/// dotted-chain identifier.  Used to descend through field-type
+/// chains (`outer.foo: Inner` → "Inner", `outer.bar: *lib.Bar` →
+/// "Bar").  Returns null on unparseable shapes.
+fn baseTypeNameOfField(tree: *const Ast, field: *const model_mod.FieldInfo) ?[]const u8 {
+    const tags = tree.tokens.items(.tag);
+    var t: Ast.TokenIndex = field.type_first;
+    while (t <= field.type_last) : (t += 1) {
+        switch (tags[t]) {
+            .question_mark, .asterisk, .keyword_const => continue,
+            .l_bracket => {
+                // Skip the bracket group `[...]`.
+                var d: u32 = 1;
+                t += 1;
+                while (t <= field.type_last and d > 0) : (t += 1) {
+                    if (tags[t] == .l_bracket) d += 1;
+                    if (tags[t] == .r_bracket) d -= 1;
+                }
+                if (t > field.type_last) return null;
+                t -= 1; // re-step into the next-iteration `t += 1`
+            },
+            .identifier, .builtin => break,
+            else => return null,
+        }
+    }
+    if (t > field.type_last) return null;
+    // Walk dotted-chain identifiers; return the LAST.
+    var last_name: ?[]const u8 = null;
+    var expecting_ident: bool = true;
+    while (t <= field.type_last) : (t += 1) {
+        if (expecting_ident) {
+            if (tags[t] != .identifier and tags[t] != .builtin) return last_name;
+            last_name = tree.tokenSlice(t);
+            expecting_ident = false;
+        } else {
+            if (tags[t] != .period) break;
+            expecting_ident = true;
+        }
+    }
+    return last_name;
+}
+
 /// True iff `init_node` is a call expression whose final method
 /// name is one of the conventional pointer-yielding cast/accessor
 /// names — `as`, `cast`, `ptrCast`, `getPtr`, `getParent`,
@@ -5423,17 +5466,88 @@ const Builder = struct {
         for (init.ast.fields) |field_value| {
             const leaf = self.fieldInitName(field_value) orelse continue;
             const path = try self.allocDottedPath(prefix, leaf);
+            var rhs_kind = self.classifyExpr(field_value);
+            // Fixed-array undef skip: when the field's declared type
+            // is `[N]T` (a fixed-size array, not a slice), `<field>
+            // = undefined` leaves the array's CONTENTS undef but
+            // `.len`/`.ptr` are comptime-defined.  Reading `.len`
+            // (`if (arr.len > X) ...`) is therefore safe.
+            // Reclassify the rhs from `.undef` → `.plain` so the
+            // field doesn't get tracked as undef.
+            if (rhs_kind == .undef and self.fieldHasFixedArrayType(parent, path)) {
+                rhs_kind = .plain;
+            }
             try self.appendStmt(cur, .{
                 .kind = .{ .field_assign = .{
                     .parent = parent,
                     .name = path,
-                    .rhs_kind = self.classifyExpr(field_value),
+                    .rhs_kind = rhs_kind,
                 } },
                 .pos = pos,
                 .end_pos = end_pos,
             });
             try self.unpackStructInitFields(cur, parent, path, field_value, pos, end_pos);
         }
+    }
+
+    /// True iff the field at the dotted `path` (under `parent`'s type)
+    /// has a declared type of the shape `[N]T` (fixed-size array).
+    /// Resolves the path through the file model + cross-file index
+    /// (via the cache).  Returns false when any step fails — caller
+    /// then keeps the original `.undef` classification.
+    fn fieldHasFixedArrayType(
+        self: *Builder,
+        parent: LocalId,
+        path: []const u8,
+    ) bool {
+        const cache = self.cache orelse return false;
+        const parent_ty = self.locals.items[@intFromEnum(parent)].type_name orelse return false;
+        const model = cache.fileModel() catch return false;
+        var cur_ti = model.findType(parent_ty) orelse blk: {
+            // Fall back to the cross-file index for the root type.
+            break :blk cache.findTypeAcrossImports(parent_ty) orelse return false;
+        };
+        const tree = self.tree;
+        const tags = tree.tokens.items(.tag);
+        var rest = path;
+        // Walk the dotted path one segment at a time, descending
+        // into nested field types as we go.
+        while (rest.len > 0) {
+            const dot_at = std.mem.indexOfScalar(u8, rest, '.');
+            const seg = if (dot_at) |i| rest[0..i] else rest;
+            const field = cur_ti.findField(seg) orelse return false;
+            const remainder = if (dot_at) |i| rest[i + 1 ..] else "";
+            if (remainder.len == 0) {
+                // Last segment: check the field's type tokens for
+                // a leading `[` followed by a non-`]` (i.e. fixed
+                // array, NOT a `[]` slice).
+                if (field.type_first > field.type_last) return false;
+                var t: Ast.TokenIndex = field.type_first;
+                // Peel `?`/`const` wrappers.
+                while (t <= field.type_last) : (t += 1) {
+                    switch (tags[t]) {
+                        .question_mark, .keyword_const => continue,
+                        else => break,
+                    }
+                }
+                if (t > field.type_last) return false;
+                if (tags[t] != .l_bracket) return false;
+                if (t + 1 > field.type_last) return false;
+                // Slice `[]` / `[*]` / `[*c]` etc. — the next token
+                // is `]` (slice) or `*` (many-item pointer).  We
+                // want literal arrays: `[N]` / `[N:S]` where N is a
+                // number / identifier (not `]` or `*`).
+                return tags[t + 1] != .r_bracket and tags[t + 1] != .asterisk;
+            }
+            // Descend into the field's TYPE for the next segment.
+            // baseTypeName + findType (or cross-file lookup).
+            const inner_name = baseTypeNameOfField(tree, field) orelse return false;
+            cur_ti = model.findType(inner_name) orelse blk: {
+                break :blk cache.findTypeAcrossImports(inner_name) orelse return false;
+            };
+            rest = remainder;
+        }
+        return false;
     }
 
     /// Walk LHS tokens of an assignment with a non-identifier target
