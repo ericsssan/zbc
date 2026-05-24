@@ -495,6 +495,33 @@ pub const FileModel = struct {
         return std.mem.eql(u8, self.tree.tokenSlice(dv), "null");
     }
 
+    /// True iff `<struct_name>.<field_name>`'s declared default value
+    /// is `.{}` — an empty struct literal.  Such a default is the
+    /// type's all-fields-default form; if all of the type's own
+    /// fields default to non-owning values (the canonical case for
+    /// types with `field: T = .{}` shape), dropping a default
+    /// instance can't leak anything.  Conservative: this check
+    /// only confirms the LITERAL is `.{}` — the caller is
+    /// responsible for further checks if it wants to confirm the
+    /// type's defaults are themselves non-owning.
+    pub fn fieldDefaultIsEmptyStructLiteral(
+        self: *const FileModel,
+        struct_name: []const u8,
+        field_name: []const u8,
+    ) bool {
+        const ti = self.findType(struct_name) orelse return false;
+        const f = ti.findField(field_name) orelse return false;
+        if (!f.has_default) return false;
+        const tags = self.tree.tokens.items(.tag);
+        var eq: TokenIndex = f.type_last + 1;
+        while (eq < self.tree.tokens.len and tags[eq] != .equal) : (eq += 1) {}
+        if (eq + 2 >= self.tree.tokens.len) return false;
+        // `.{}` is tokens: `.` `{` `}`.
+        return tags[eq + 1] == .period and
+            tags[eq + 2] == .l_brace and
+            (eq + 3 < self.tree.tokens.len and tags[eq + 3] == .r_brace);
+    }
+
     /// Whether `<struct_name>.<field_name>`'s default value is a
     /// tagged-union variant whose payload is NON-OWNED — a bare
     /// tag like `.pending` (no payload) or `.empty`.  Returns the

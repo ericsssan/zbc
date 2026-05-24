@@ -147,6 +147,21 @@ fn checkBody(
             t = sc;
             continue;
         }
+        // Default-empty-struct-literal skip: `<field>: T = .{}` —
+        // the field's declared default is the all-fields-default
+        // form.  For types whose own field defaults are non-owning
+        // (empty strings, null pointers, `false` flags, etc.), the
+        // initial value holds no resources, so the first overwrite
+        // in any method has nothing to deinit.  Gated on
+        // `priorWriteInFn` so subsequent writes still fire.
+        // Conservative — could miss leaks when the type's own
+        // defaults ARE owning, but that's unusual in practice.
+        if (model.fieldDefaultIsEmptyStructLiteral(ct, field_name) and
+            !priorWriteInFn(tree, first, t, this_name, field_name))
+        {
+            t = sc;
+            continue;
+        }
         // Skip when RHS is a `null` / `undefined` sentinel write —
         // canonical "clear after draining" pattern (event-loop free
         // lists, optional resets after consumption).  The leak, if
