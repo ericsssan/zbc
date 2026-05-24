@@ -107,6 +107,16 @@ pub fn check(
             // into specific owned sub-fields.
             if (methodBodyMentionsField(tree, deinit, field.name)) continue;
 
+            // Circular-ownership skip: when the inner's `deinit`
+            // body navigates back to the outer via
+            // `@fieldParentPtr("<field>", self)` and calls the
+            // outer's `destroy`/`deinit`, the cleanup is intended
+            // to be invoked from OUTSIDE the outer's deinit chain
+            // (calling it from inside would recurse).  The inner
+            // is a view embedded in the outer's allocation; no
+            // separate cleanup is needed when the outer is freed.
+            if (innerDeinitUsesFieldParentPtr(tree, inner_ti, field.name)) continue;
+
             // Caller-supplied field skip: if the type's `init` /
             // `create` method takes a parameter whose name matches
             // the field, the value is owned by the caller and only
@@ -119,6 +129,38 @@ pub fn check(
             try report(gpa, problems, tree, field.name_token, field.name, inner_ti.name);
         }
     }
+}
+
+/// True iff the inner type has a `deinit` (or `close`/`destroy`/
+/// `finalize`/`dispose`) method whose body contains
+/// `@fieldParentPtr("<field_name>", ...)` — the canonical
+/// embedded-view pattern where the inner navigates back to its
+/// enclosing outer struct.  Such a cleanup is meant to be invoked
+/// from outside the outer's deinit chain (calling it from inside
+/// would recurse); the inner is a view of the outer's own storage
+/// and gets freed when the outer is freed.
+fn innerDeinitUsesFieldParentPtr(
+    tree: *const Ast,
+    inner_ti: *const fmodel.TypeInfo,
+    field_name: []const u8,
+) bool {
+    const tags = tree.tokens.items(.tag);
+    for (inner_ti.methods) |m| {
+        if (!isCleanupName(m.name)) continue;
+        var t: Ast.TokenIndex = m.body_first;
+        while (t + 3 <= m.body_last) : (t += 1) {
+            if (tags[t] != .builtin) continue;
+            if (!std.mem.eql(u8, tree.tokenSlice(t), "@fieldParentPtr")) continue;
+            if (tags[t + 1] != .l_paren) continue;
+            if (tags[t + 2] != .string_literal) continue;
+            // string_literal token includes the quotes — strip them.
+            const lit = tree.tokenSlice(t + 2);
+            if (lit.len < 2) continue;
+            const inner = lit[1 .. lit.len - 1];
+            if (std.mem.eql(u8, inner, field_name)) return true;
+        }
+    }
+    return false;
 }
 
 /// True iff the type has an `init` / `create` / `from*` method
