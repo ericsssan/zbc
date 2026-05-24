@@ -216,6 +216,19 @@ fn checkBody(
             t = sc;
             continue;
         }
+        // Save-and-restore skip: the RHS of `<this>.<field> = X` is
+        // a bare identifier whose source binding was
+        // `<keyword> X = <this>.<field>;` earlier in the fn — the
+        // statement RESTORES the saved value, it doesn't replace
+        // it.  Common pattern when wiping the whole struct then
+        // preserving one field:
+        //   const handlers = this.handlers;
+        //   this.* = undefined;
+        //   this.handlers = handlers;
+        if (rhsIsSavedFromSameField(tree, first, t, sc, this_name, field_name)) {
+            t = sc;
+            continue;
+        }
         // Scan backward up to K tokens looking for prior cleanup
         // of <this>.<field>.
         if (priorCleanupExists(tree, first, t, this_name, field_name)) {
@@ -905,6 +918,49 @@ fn priorVariantInFn(
 ///     var prev = this.field;
 ///     this.field = new;
 ///     prev.deinit();
+/// True iff the RHS of `<this>.<field> = X` at `assign_tok` is a
+/// bare identifier `X` whose binding earlier in the fn was
+/// `<keyword> X = <this>.<field>;` — the canonical save form for a
+/// save-and-restore pattern.  Used to skip the rule on
+/// `<this>.<field> = <saved-local>;` after the local was previously
+/// captured from the same field.
+fn rhsIsSavedFromSameField(
+    tree: *const Ast,
+    body_first: Ast.TokenIndex,
+    assign_tok: Ast.TokenIndex,
+    sc: Ast.TokenIndex,
+    this_name: []const u8,
+    field_name: []const u8,
+) bool {
+    const tags = tree.tokens.items(.tag);
+    // The assignment is `<this> . <field> = <rhs> ;` — the `=` is
+    // at assign_tok + 3.  RHS starts at assign_tok + 4.
+    if (assign_tok + 4 >= sc) return false;
+    if (tags[assign_tok + 4] != .identifier) return false;
+    // RHS must be a BARE identifier (single token followed by `;`).
+    if (assign_tok + 5 != sc) return false;
+    const rhs_name = tree.tokenSlice(assign_tok + 4);
+    // Backward scan for `<keyword_var|const> <rhs_name> = <this> . <field> ;`.
+    const K: u32 = 30;
+    var t: Ast.TokenIndex = assign_tok;
+    var i: u32 = 0;
+    while (t > body_first and i < K) : (i += 1) {
+        t -= 1;
+        if (tags[t] != .keyword_var and tags[t] != .keyword_const) continue;
+        if (t + 5 >= assign_tok) continue;
+        if (tags[t + 1] != .identifier) continue;
+        if (!std.mem.eql(u8, tree.tokenSlice(t + 1), rhs_name)) continue;
+        if (tags[t + 2] != .equal) continue;
+        if (tags[t + 3] != .identifier) continue;
+        if (!std.mem.eql(u8, tree.tokenSlice(t + 3), this_name)) continue;
+        if (tags[t + 4] != .period) continue;
+        if (tags[t + 5] != .identifier) continue;
+        if (!std.mem.eql(u8, tree.tokenSlice(t + 5), field_name)) continue;
+        return true;
+    }
+    return false;
+}
+
 fn savedAndCleanedUp(
     tree: *const Ast,
     body_first: Ast.TokenIndex,
