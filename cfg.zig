@@ -1832,8 +1832,26 @@ const Builder = struct {
         //     };
         //     return x;
         // never clears x's .undef — the &x is never lowered.
+        //
+        // Restricted to CALL value-expressions: walking arbitrary
+        // value expressions (slices, field reads) also fires
+        // use-undef on legitimate slice reads after partial array
+        // writes (`field[0] = 0; break :blk field[0..0:0];`).  The
+        // only payoff we actually want here is by-ref arg clearing
+        // — which is a call-expr shape by construction.
         if (opt_value_node.unwrap()) |v| {
-            try self.emitUsesInExpr(v, cur.*, null);
+            const vt = tree.nodeTag(v);
+            const is_call_value = switch (vt) {
+                .call, .call_one, .call_comma, .call_one_comma,
+                .builtin_call, .builtin_call_two,
+                .builtin_call_comma, .builtin_call_two_comma,
+                .@"switch", .switch_comma,
+                => true,
+                else => false,
+            };
+            if (is_call_value) {
+                try self.emitUsesInExpr(v, cur.*, null);
+            }
         }
         if (opt_label_tok.unwrap()) |lt| {
             const wanted = tree.tokenSlice(lt);
