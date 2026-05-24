@@ -197,6 +197,15 @@ fn scanWrites(
                 if (model.fieldType(ty, field_name)) |ft| {
                     if (isPrimitiveTypeName(ft)) continue;
                 }
+                // Qualified-path resolution: when the field's
+                // declared type is dotted (`Result.Pending.State`),
+                // resolve to the LEAF TypeInfo and skip when it's
+                // an enum (no payload, can't borrow) or a struct
+                // whose fields are all primitives / pointers.
+                if (model.resolveFieldTypeQualified(ty, field_name)) |leaf_ti| {
+                    if (leaf_ti.kind == .enum_) continue;
+                    if (leaf_ti.kind == .struct_ and structOnlyHoldsPrimitivesOrPointers(tree, leaf_ti)) continue;
+                }
             }
         }
         // RHS-shape check: when the assigned value comes from a
@@ -400,6 +409,29 @@ fn rhsContainsCopyingCall(tree: *const Ast, start: Ast.TokenIndex, end: Ast.Toke
     return false;
 }
 
+/// True iff every field of `ti` is a primitive (`u32`/`bool`/etc.)
+/// or a pointer (`*T` / `?*T`).  Such structs hold no slice fields
+/// and can't carry a borrowed slice from a deferred local — the
+/// out-param write through `<out>.<field> = <call>` where `<field>`
+/// has this shape can't dangle into a deferred local.
+fn structOnlyHoldsPrimitivesOrPointers(tree: *const Ast, ti: *const fmodel.TypeInfo) bool {
+    const tags = tree.tokens.items(.tag);
+    if (ti.fields.len == 0) return false;
+    for (ti.fields) |f| {
+        var t = f.type_first;
+        while (t <= f.type_last and tags[t] == .question_mark) : (t += 1) {}
+        if (t > f.type_last) return false;
+        // Pointer field: `*T` / `?*T` — already past `?` strip.
+        if (tags[t] == .asterisk) continue;
+        // Slice or array: leak risk if contents are bytes.
+        if (tags[t] == .l_bracket) return false;
+        if (tags[t] != .identifier) return false;
+        const name = tree.tokenSlice(t);
+        if (!isPrimitiveTypeName(name)) return false;
+    }
+    return true;
+}
+
 fn isCopyingMethodName(name: []const u8) bool {
     return std.mem.eql(u8, name, "toOwnedSlice") or
         std.mem.eql(u8, name, "toOwnedSliceSentinel") or
@@ -457,12 +489,58 @@ fn rhsCallIsResultIndependent(
     if (p > end or tags[p] != .l_paren) return false;
     const name_tok = last_ident orelse return false;
     const fn_name = tree.tokenSlice(name_tok);
-    // Look up the fn by name — top-level OR a method of any type
-    // in the file model.  Cross-file calls are unhandled.
     const model = cache.fileModel() catch return false;
-    const fn_decl = findFnDeclByName(model, fn_name) orelse return false;
-    const summary = cache.summaryOfFn(fn_decl) catch return false;
-    return summary.result_independent_of_args;
+    // Direct hit: the outer call is itself result-independent.
+    if (findFnDeclByName(model, fn_name)) |fn_decl| {
+        const summary = cache.summaryOfFn(fn_decl) catch return false;
+        if (summary.result_independent_of_args) return true;
+    }
+    // Wrapper passthrough: outer call is a wrapper constructor
+    // (`Errorable.ok(...)`, `Result.ok(...)`, `Maybe.success(...)`)
+    // — recurse into the FIRST arg, which is the wrapped value.
+    // If the inner call's result is independent of its args, the
+    // wrapped value's borrow lifetime is the inner call's, not the
+    // outer wrapper's.
+    if (isWrapperCtorName(fn_name)) {
+        const arg_start = p + 1;
+        const arg_end = matchParenEnd(tags, p, end) orelse return false;
+        return rhsCallIsResultIndependent(tree, cache, arg_start, arg_end - 1);
+    }
+    return false;
+}
+
+/// True iff the call name is a known wrapper constructor that
+/// boxes its first arg into an Ok/Success variant without
+/// changing the borrow lifetime.  Recursing through wrappers lets
+/// us inspect the underlying call.
+fn isWrapperCtorName(name: []const u8) bool {
+    return std.mem.eql(u8, name, "ok") or
+        std.mem.eql(u8, name, "Ok") or
+        std.mem.eql(u8, name, "success") or
+        std.mem.eql(u8, name, "Success") or
+        std.mem.eql(u8, name, "result");
+}
+
+/// Given an `(` token position, return the position of the matching
+/// `)` (1-paren-depth balanced scan).  Returns null when unmatched.
+fn matchParenEnd(
+    tags: []const std.zig.Token.Tag,
+    lparen: Ast.TokenIndex,
+    end: Ast.TokenIndex,
+) ?Ast.TokenIndex {
+    var depth: u32 = 1;
+    var t: Ast.TokenIndex = lparen + 1;
+    while (t <= end) : (t += 1) {
+        switch (tags[t]) {
+            .l_paren => depth += 1,
+            .r_paren => {
+                depth -= 1;
+                if (depth == 0) return t;
+            },
+            else => {},
+        }
+    }
+    return null;
 }
 
 /// Find a fn_decl AST node by name — top-level OR a method of

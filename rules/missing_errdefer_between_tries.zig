@@ -406,13 +406,21 @@ fn consumedAsEnumSwitch(
     body_last: Ast.TokenIndex,
 ) bool {
     // Walk forward from the binding's terminating `;` looking for
-    // `switch ( <name> )`.  K=20 tokens bounds the gap.
+    // either `switch (<name>)` with payload-less arms OR
+    // `@tagName(<name>)` — both signal an enum tag.  Either form
+    // up to K=60 tokens (enough to span a single short statement).
     var t: Ast.TokenIndex = b.rhs_last + 1; // step past `;`
     var i: u32 = 0;
-    while (t < body_last and i < 20) : ({
+    while (t < body_last and i < 60) : ({
         t += 1;
         i += 1;
     }) {
+        // `@tagName(<name>)` — only valid for enum/union tags.
+        if (tags[t] == .builtin and std.mem.eql(u8, tree.tokenSlice(t), "@tagName")) {
+            if (t + 3 <= body_last and tags[t + 1] == .l_paren and
+                tags[t + 2] == .identifier and
+                std.mem.eql(u8, tree.tokenSlice(t + 2), b.name)) return true;
+        }
         if (tags[t] != .keyword_switch) continue;
         if (t + 4 > body_last) return false;
         if (tags[t + 1] != .l_paren) return false;
