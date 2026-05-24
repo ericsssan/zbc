@@ -570,6 +570,50 @@ fn fieldPathHasPointerName(path: []const u8) bool {
 
 /// True iff the body tokens `[name_tok+1 .. last]` contain `<name>.*`
 /// somewhere — i.e. the local declared at `name_tok` is dereferenced
+/// True iff `init_node` is a call expression whose final method
+/// name is one of the conventional pointer-yielding cast/accessor
+/// names — `as`, `cast`, `ptrCast`, `getPtr`, `getParent`,
+/// `parent`.  Used by `lowerVarDecl` to infer `is_pointer` from
+/// the init shape so `var x = recv.as(Ty); return &x.field;`
+/// doesn't fire stack-escape (the underlying pointee lives in
+/// caller / heap storage, not this frame).
+fn initCallNameIsPointerReturning(tree: *const Ast, init_node: Ast.Node.Index) bool {
+    const tag = tree.nodeTag(init_node);
+    const is_call = switch (tag) {
+        .call,
+        .call_comma,
+        .call_one,
+        .call_one_comma,
+        => true,
+        else => false,
+    };
+    if (!is_call) return false;
+    // The call's callee is at the node's main_token-1 or so; the
+    // method name is the LAST identifier before the `(`.  Walk the
+    // call's source tokens from firstToken to lastToken, find the
+    // first `(`, and grab the preceding identifier.
+    const tags = tree.tokens.items(.tag);
+    const first = tree.firstToken(init_node);
+    const last = tree.lastToken(init_node);
+    var t: Ast.TokenIndex = first;
+    var name_tok: ?Ast.TokenIndex = null;
+    while (t <= last) : (t += 1) {
+        switch (tags[t]) {
+            .identifier => name_tok = t,
+            .l_paren => break,
+            else => {},
+        }
+    }
+    const nt = name_tok orelse return false;
+    const name = tree.tokenSlice(nt);
+    return std.mem.eql(u8, name, "as") or
+        std.mem.eql(u8, name, "cast") or
+        std.mem.eql(u8, name, "ptrCast") or
+        std.mem.eql(u8, name, "getPtr") or
+        std.mem.eql(u8, name, "getParent") or
+        std.mem.eql(u8, name, "parent");
+}
+
 /// later in the body.  Used by `lowerVarDecl` to infer `is_pointer`
 /// for opaque-init locals (`var p = pool.get(); p.* = …;`) so
 /// `&p.field` later doesn't fire stack-escape.
@@ -2143,6 +2187,19 @@ const Builder = struct {
             if (!is_pointer and init_kind == .unknown) {
                 if (localIsDereferencedAfter(self.tree, name, name_tok, self.fn_body_last)) {
                     is_pointer = true;
+                }
+            }
+            // Init-shape signal: `<recv>.<method>(...)` where
+            // `<method>` is one of the conventional pointer-yielding
+            // cast/accessor names (`as`, `cast`, `ptrCast`,
+            // `getPtr`, `getParent`, `parent`).  These reliably
+            // return `*T` in Zig idioms (`@ptrCast`, tagged-union
+            // `.as(Ty)`, `@fieldParentPtr`-wrapping helpers).
+            // Suppresses stack-escape FPs on `&casted.<field>`
+            // shapes (interpreter.zig:1552 etc.).
+            if (!is_pointer and init_kind == .unknown) {
+                if (init_opt) |init| {
+                    if (initCallNameIsPointerReturning(tree, init)) is_pointer = true;
                 }
             }
         }
