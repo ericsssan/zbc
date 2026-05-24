@@ -239,6 +239,18 @@ fn scanWrites(
         // of its args.
         if (rhsCallIsResultIndependent(tree, cache, w.end + 1, sc - 1)) continue;
         const dn = rhsMentionsDeferred(tree, w.end + 1, sc - 1, deferred) orelse continue;
+        // Switch-scrutinee-only skip: when the RHS is
+        // `switch (<expr-mentioning-deferred>) { <arms-not-mentioning-it> }`,
+        // the deferred slice is consumed by the expression that the
+        // switch is BRANCHING on; the arms build the result from the
+        // unpacked union payloads, not from the slice.  Common shape
+        // around connect/dispatch APIs:
+        //   `this.socket = switch (group.connect(..., hostz, ...)) {
+        //        .failed => return error..., .socket => |s| ..., }`
+        // Net effect: the deferred slice is transient (lives only
+        // through the call), and the out-param holds independent
+        // bytes (the unpacked Socket).
+        if (deferredOnlyInSwitchScrutinee(tree, w.end + 1, sc - 1, dn)) continue;
         try report(gpa, problems, tree, w.start, out_name, dn);
     }
 }
@@ -529,6 +541,73 @@ fn isWrapperCtorName(name: []const u8) bool {
         std.mem.eql(u8, name, "success") or
         std.mem.eql(u8, name, "Success") or
         std.mem.eql(u8, name, "result");
+}
+
+/// True iff the RHS at `[start..end]` is a `switch (...) { ... }`
+/// expression whose `<deferred_name>` mentions appear ONLY inside
+/// the switch's scrutinee `(...)` — i.e., never inside the arms
+/// block `{ ... }`.  When the deferred slice is consumed by the
+/// expression the switch branches on, and the arms build the
+/// result from unpacked union payloads (not from the slice), the
+/// slice is transient and can't reach the out-param.
+fn deferredOnlyInSwitchScrutinee(
+    tree: *const Ast,
+    start: Ast.TokenIndex,
+    end: Ast.TokenIndex,
+    deferred_name: []const u8,
+) bool {
+    const tags = tree.tokens.items(.tag);
+    // Peel optional leading `try`.
+    var t: Ast.TokenIndex = start;
+    if (t <= end and tags[t] == .keyword_try) t += 1;
+    if (t > end or tags[t] != .keyword_switch) return false;
+    // Scrutinee starts at the next `(`.
+    var p = t + 1;
+    while (p <= end and tags[p] != .l_paren) : (p += 1) {}
+    if (p > end or tags[p] != .l_paren) return false;
+    const scrut_end = matchParenEnd(tags, p, end) orelse return false;
+    if (scrut_end + 1 > end or tags[scrut_end + 1] != .l_brace) return false;
+    const arms_open: Ast.TokenIndex = scrut_end + 1;
+    const arms_close = matchBraceEnd(tags, arms_open, end) orelse return false;
+    // Walk RHS; ensure all deferred-name mentions land in
+    // (p, scrut_end) and NONE land in (arms_open, arms_close].
+    var saw_in_scrut = false;
+    var k: Ast.TokenIndex = start;
+    while (k <= end) : (k += 1) {
+        if (tags[k] != .identifier) continue;
+        if (!std.mem.eql(u8, tree.tokenSlice(k), deferred_name)) continue;
+        if (k > p and k < scrut_end) {
+            saw_in_scrut = true;
+        } else if (k > arms_open and k <= arms_close) {
+            // Mention in the arm block — slice CAN reach the result.
+            return false;
+        } else {
+            // Mention outside both — unexpected shape, bail.
+            return false;
+        }
+    }
+    return saw_in_scrut;
+}
+
+/// Given a `{` token position, return the matching `}`.
+fn matchBraceEnd(
+    tags: []const std.zig.Token.Tag,
+    lbrace: Ast.TokenIndex,
+    end: Ast.TokenIndex,
+) ?Ast.TokenIndex {
+    var depth: u32 = 1;
+    var t: Ast.TokenIndex = lbrace + 1;
+    while (t <= end) : (t += 1) {
+        switch (tags[t]) {
+            .l_brace => depth += 1,
+            .r_brace => {
+                depth -= 1;
+                if (depth == 0) return t;
+            },
+            else => {},
+        }
+    }
+    return null;
 }
 
 /// Given an `(` token position, return the position of the matching
