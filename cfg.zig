@@ -442,6 +442,15 @@ pub fn lowerFunctionFullWithZls(
         returnTypeIsBorrowed(tree, rt)
     else
         false;
+    // Noreturn fn (`!noreturn` / `noreturn`): the fn never returns
+    // normally — Global.exit / @panic / infinite loops.  Any
+    // stack-escape via out-param-write is unobservable: the
+    // caller never resumes to read the dangling pointer.  Skip
+    // the entire stack-escape analysis for these fns.
+    const is_noreturn_fn = if (fn_proto.ast.return_type.unwrap()) |rt|
+        returnTypeIsNoreturn(tree, rt)
+    else
+        false;
 
     // `owns_locals` was an annotation-comment opt-out that suppressed
     // composite-borrow detection inside a fn body.  With annotation
@@ -465,6 +474,7 @@ pub fn lowerFunctionFullWithZls(
         .zls = zls,
         .config = config,
         .is_borrowed_return_type = is_borrowed_ret,
+        .is_noreturn_fn = is_noreturn_fn,
         .suppress_composite_borrow = suppress_cb,
         .fn_proto = fn_proto,
         .fn_body_last = tree.lastToken(body_node),
@@ -675,6 +685,7 @@ const Builder = struct {
     /// True iff the enclosing fn returns a borrowed-shape type.
     /// Threaded into `Stmt.ret.is_borrowed_return_type`.
     is_borrowed_return_type: bool = false,
+    is_noreturn_fn: bool = false,
     /// Set when the enclosing fn carries `@returns owns_locals`.
     /// firstBorrowedLocal returns null when this is set, so the
     /// composite-borrow check stays silent for explicit
@@ -2365,7 +2376,7 @@ const Builder = struct {
             // that case.
             if (self.locals.items[@intFromEnum(fref.parent)].is_pointer) {
                 const recv_name = self.locals.items[@intFromEnum(fref.parent)].name;
-                if (!self.fieldPathRestoredByDefer(recv_name, fref.name)) {
+                if (!self.fieldPathRestoredByDefer(recv_name, fref.name) and !self.is_noreturn_fn) {
                     try self.appendStmt(cur.*, .{
                         .kind = .{ .out_param_write = .{
                             .out = fref.parent,
@@ -5625,6 +5636,24 @@ const Builder = struct {
         };
     }
 };
+
+/// True iff the return type is `noreturn` (or `!noreturn` /
+/// `Errors!noreturn`).  Such fns never return normally, so any
+/// stack-escape via out-param-write isn't observable by a
+/// (non-existent) returning caller.  Used to skip the entire
+/// stack-escape analysis on `pub fn run(...) !noreturn { ... }`
+/// CLI entry points.
+fn returnTypeIsNoreturn(tree: *const Ast, node: Ast.Node.Index) bool {
+    const tags = tree.tokens.items(.tag);
+    const first = tree.firstToken(node);
+    const last = tree.lastToken(node);
+    var t: Ast.TokenIndex = first;
+    while (t <= last) : (t += 1) {
+        if (tags[t] != .identifier) continue;
+        if (std.mem.eql(u8, tree.tokenSlice(t), "noreturn")) return true;
+    }
+    return false;
+}
 
 /// True iff the return-type node text starts with `*` or `[` after
 /// stripping leading `?` / `E!`.  Same heuristic the Layer-1 rule uses
