@@ -101,6 +101,11 @@ pub fn check(
             // the field never leaks regardless of the variant
             // held, so a missing inline cleanup is harmless.
             if (allUnionVariantsNonOwned(model, inner_ti)) continue;
+            // File-scan: if the field's default is a non-owned
+            // variant AND no assignment in this file ever writes
+            // an OWNED variant to `<recv>.<field>`, the field
+            // never holds an owned value — drop is safe.
+            if (fieldStaysNonOwnedAcrossFile(tree, model, outer, f, inner_ti)) continue;
             hit = i;
             break;
         }
@@ -190,6 +195,65 @@ fn isLinkedListNode(tree: *const Ast, ti: *const fmodel.TypeInfo) bool {
             std.mem.eql(u8, tname, ti.name)) return true;
     }
     return false;
+}
+
+/// True iff:
+///   - the field's declared type is a tagged union,
+///   - the field's default value is a non-owned variant,
+///   - no `<recv>.<field> = .{ .<owned_variant> = ... };` or
+///     `<recv>.<field> = .<owned_variant>;` assignment appears
+///     anywhere in this file (other writes use non-owned variants
+///     or sentinels).
+///
+/// When all three hold, the field never holds an owned payload
+/// at runtime — a missing outer cleanup can't leak.  Catches the
+/// canonical "optional config: TaggedUnion = .none" pattern
+/// where the owned variant is only set by code in a DIFFERENT
+/// file that owns the value via other means.
+fn fieldStaysNonOwnedAcrossFile(
+    tree: *const Ast,
+    model: *const fmodel.FileModel,
+    outer: *const fmodel.TypeInfo,
+    field: *const fmodel.FieldInfo,
+    inner_ti: *const fmodel.TypeInfo,
+) bool {
+    if (!model.isTaggedUnion(inner_ti.name)) return false;
+    // Field default must be a non-owned variant tag.
+    const default_tag = model.fieldDefaultUnionTag(outer.name, field.name) orelse return false;
+    const default_owned = model.unionVariantIsOwnedTi(inner_ti, default_tag) orelse return false;
+    if (default_owned) return false;
+    // Scan the WHOLE FILE for assignments to `<recv>.<field_name>`.
+    const tags = tree.tokens.items(.tag);
+    var t: Ast.TokenIndex = 0;
+    while (t + 5 < tree.tokens.len) : (t += 1) {
+        if (tags[t] != .identifier) continue;
+        if (tags[t + 1] != .period) continue;
+        if (tags[t + 2] != .identifier) continue;
+        if (!std.mem.eql(u8, tree.tokenSlice(t + 2), field.name)) continue;
+        if (tags[t + 3] != .equal) continue;
+        // Get the RHS variant tag — accept `.{ .<tag> = ... }` and
+        // `.<tag>` forms.
+        if (tags[t + 4] != .period) continue;
+        if (tags[t + 5] == .identifier) {
+            // Form: `<recv>.<field> = .<tag>;` — bare variant.
+            const tag_name = tree.tokenSlice(t + 5);
+            if (model.unionVariantIsOwnedTi(inner_ti, tag_name) orelse true) return false;
+            continue;
+        }
+        if (t + 7 < tree.tokens.len and
+            tags[t + 4] == .period and
+            tags[t + 5] == .l_brace and
+            tags[t + 6] == .period and
+            tags[t + 7] == .identifier)
+        {
+            const tag_name = tree.tokenSlice(t + 7);
+            if (model.unionVariantIsOwnedTi(inner_ti, tag_name) orelse true) return false;
+            continue;
+        }
+        // Unknown RHS shape (call, identifier) — assume owned.
+        return false;
+    }
+    return true;
 }
 
 /// True iff `ti` is a tagged union (`union(enum)`) AND every
