@@ -258,6 +258,13 @@ pub const FileModel = struct {
         while (i > 0) {
             i -= 1;
             const parent_idx = cur orelse return false;
+            // Defensive bounds check: in pathological cases (e.g. an
+            // arena reused across builds or a model snapshot taken
+            // mid-construction) a parent index might exceed the
+            // final slice length.  ReleaseSafe would panic; we
+            // prefer a graceful "no match" so the call site falls
+            // back to the first-identifier heuristic.
+            if (parent_idx >= self.types.len) return false;
             const parent_ti = &self.types[parent_idx];
             if (!std.mem.eql(u8, parent_ti.name, path[i])) return false;
             cur = parent_ti.parent;
