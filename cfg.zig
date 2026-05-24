@@ -2078,6 +2078,10 @@ const Builder = struct {
             // stack-escape on the canonical fn-local singleton
             // pattern.
             if (init_opt) |i| if (self.initIsContainerDecl(i)) break :blk .type_alias;
+            // `const X = comptime <expr>;` — X lives in static
+            // / data-segment memory.  `&X` is NOT a stack borrow.
+            // Common in vtable-construction patterns.
+            if (init_opt) |i| if (tree.nodeTag(i) == .@"comptime") break :blk .type_alias;
             // Struct-wrap propagation: `var ma = Wrapper{ .inner =
             // arena };` — ma carries arena via its field.  Override
             // init_kind to .copy_of(wrapper) so transferDecl
@@ -3693,6 +3697,12 @@ const Builder = struct {
             if (tree.nodeTag(inner) == .identifier) {
                 const name = tree.tokenSlice(tree.nodeMainToken(inner));
                 if (self.name_to_local.get(name)) |id| {
+                    // Comptime-initialized locals (`const X = comptime
+                    // .{...};`) and type aliases live in static memory.
+                    // `&X` borrows into static storage — not a stack
+                    // escape.
+                    const info = self.locals.items[@intFromEnum(id)];
+                    if (info.init_hint == .type_alias) return .unknown;
                     return .{ .stack_ref = id };
                 }
             }
@@ -3952,7 +3962,16 @@ const Builder = struct {
                     if (next == .period or next == .l_bracket) continue;
                 }
                 const name = tree.tokenSlice(t + 1);
-                if (self.name_to_local.get(name)) |local| return local;
+                if (self.name_to_local.get(name)) |local| {
+                    // Comptime-initialized locals (`const X =
+                    // comptime ...;`) live in static memory.
+                    // `&X` inside a return composite isn't a
+                    // stack borrow.  Common for vtable returns:
+                    // `return .{ .vtable = &vtable };`.
+                    const info = self.locals.items[@intFromEnum(local)];
+                    if (info.init_hint == .type_alias) continue;
+                    return local;
+                }
                 continue;
             }
             // Slice/index of a stack array: `<ident> [`
