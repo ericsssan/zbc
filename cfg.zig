@@ -4356,6 +4356,17 @@ const Builder = struct {
         recv_name: []const u8,
         path: []const u8,
     ) bool {
+        if (self.fieldPathRestoredViaDeferKw(recv_name, path)) return true;
+        return self.fieldPathSaveRestoredDirectly(recv_name, path);
+    }
+
+    /// Variant 1 — `defer <recv>.<path> = <ident>;` matches the LHS.
+    /// Canonical form: explicit defer with the save-local on the RHS.
+    fn fieldPathRestoredViaDeferKw(
+        self: *const Builder,
+        recv_name: []const u8,
+        path: []const u8,
+    ) bool {
         const tree = self.tree;
         const tags = tree.tokens.items(.tag);
         const starts = tree.tokens.items(.start);
@@ -4376,6 +4387,87 @@ const Builder = struct {
             if (b >= tree.source.len) continue;
             if (tree.source[b] != '=') continue;
             return true;
+        }
+        return false;
+    }
+
+    /// Variant 2 — direct save-restore (no `defer`):
+    ///     const old_X = <recv>.<path>;
+    ///     <recv>.<path> = &stack_local;
+    ///     ...
+    ///     <recv>.<path> = old_X;   ← restore (identifier RHS)
+    ///
+    /// Detect via two passes over the fn body:
+    ///   - any `const <ident> = <recv>.<path>;` (the save).
+    ///   - any `<recv>.<path> = <ident>;` (a restore, identifier RHS).
+    /// Both present anywhere in the body is a strong signal of the
+    /// save-restore-by-direct-assignment idiom, so the offending
+    /// stack-escape write is bounded.
+    fn fieldPathSaveRestoredDirectly(
+        self: *const Builder,
+        recv_name: []const u8,
+        path: []const u8,
+    ) bool {
+        if (self.fn_body_last == 0) return false;
+        const tree = self.tree;
+        const tags = tree.tokens.items(.tag);
+        const expected_lhs_len = recv_name.len + 1 + path.len;
+        // Pass 1: look for the save `const <ident> = <recv>.<path>;`.
+        var saw_save = false;
+        var t: Ast.TokenIndex = self.fn_body_first;
+        while (t + 4 <= self.fn_body_last) : (t += 1) {
+            if (tags[t] != .keyword_const) continue;
+            if (tags[t + 1] != .identifier) continue;
+            if (tags[t + 2] != .equal) continue;
+            // RHS source bytes must start with `<recv>.<path>` and
+            // be followed by `;` (or whitespace then `;`).
+            const rhs_start = tree.tokens.items(.start)[t + 3];
+            if (rhs_start + expected_lhs_len > tree.source.len) continue;
+            const got = tree.source[rhs_start .. rhs_start + expected_lhs_len];
+            if (!std.mem.startsWith(u8, got, recv_name)) continue;
+            if (got[recv_name.len] != '.') continue;
+            if (!std.mem.eql(u8, got[recv_name.len + 1 ..], path)) continue;
+            var b: usize = rhs_start + expected_lhs_len;
+            while (b < tree.source.len and (tree.source[b] == ' ' or tree.source[b] == '\t' or tree.source[b] == '\n')) : (b += 1) {}
+            if (b >= tree.source.len) continue;
+            if (tree.source[b] != ';') continue;
+            saw_save = true;
+            break;
+        }
+        if (!saw_save) return false;
+        // Pass 2: look for the restore `<recv>.<path> = <ident>;`.
+        // The fn-body source contains the LHS substring followed by
+        // ` = <ident>;`.  Scan tokens for the pattern.
+        t = self.fn_body_first;
+        while (t + 5 <= self.fn_body_last) : (t += 1) {
+            if (tags[t] != .identifier) continue;
+            if (!std.mem.eql(u8, tree.tokenSlice(t), recv_name)) continue;
+            const lhs_start = tree.tokens.items(.start)[t];
+            if (lhs_start + expected_lhs_len > tree.source.len) continue;
+            const got_lhs = tree.source[lhs_start .. lhs_start + expected_lhs_len];
+            if (!std.mem.startsWith(u8, got_lhs, recv_name)) continue;
+            if (got_lhs[recv_name.len] != '.') continue;
+            if (!std.mem.eql(u8, got_lhs[recv_name.len + 1 ..], path)) continue;
+            // Walk past whitespace to find `= <ident> ;`.
+            var b: usize = lhs_start + expected_lhs_len;
+            while (b < tree.source.len and (tree.source[b] == ' ' or tree.source[b] == '\t')) : (b += 1) {}
+            if (b >= tree.source.len or tree.source[b] != '=') continue;
+            b += 1;
+            while (b < tree.source.len and (tree.source[b] == ' ' or tree.source[b] == '\t')) : (b += 1) {}
+            // Next must be an identifier-start.
+            if (b >= tree.source.len) continue;
+            const c = tree.source[b];
+            if (!(c == '_' or (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z'))) continue;
+            // Walk the identifier and then expect `;` (ignoring whitespace).
+            var e: usize = b + 1;
+            while (e < tree.source.len) : (e += 1) {
+                const cc = tree.source[e];
+                if (cc == '_' or (cc >= 'a' and cc <= 'z') or
+                    (cc >= 'A' and cc <= 'Z') or (cc >= '0' and cc <= '9')) continue;
+                break;
+            }
+            while (e < tree.source.len and (tree.source[e] == ' ' or tree.source[e] == '\t')) : (e += 1) {}
+            if (e < tree.source.len and tree.source[e] == ';') return true;
         }
         return false;
     }
