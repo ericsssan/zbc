@@ -1820,7 +1820,21 @@ const Builder = struct {
         // then fall through to loop_stack.  Done BEFORE the "no
         // loops" check so `break :blk` inside a labeled block (which
         // doesn't push onto loop_stack) still resolves correctly.
-        const opt_label_tok = tree.nodeData(node).opt_token_and_opt_node[0];
+        const data = tree.nodeData(node).opt_token_and_opt_node;
+        const opt_label_tok = data[0];
+        const opt_value_node = data[1];
+        // Process the break's value expression FIRST so any
+        // address-of args (`&local`) clear .undef state before
+        // the edge to merge is taken.  Without this, code like
+        //     var x = undefined;
+        //     const rc = blk: {
+        //         break :blk fn_call(&x);
+        //     };
+        //     return x;
+        // never clears x's .undef — the &x is never lowered.
+        if (opt_value_node.unwrap()) |v| {
+            try self.emitUsesInExpr(v, cur.*, null);
+        }
         if (opt_label_tok.unwrap()) |lt| {
             const wanted = tree.tokenSlice(lt);
             // Block labels: break only.  Continue to a block label is
