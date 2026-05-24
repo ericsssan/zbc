@@ -105,6 +105,16 @@ pub fn check(
             // their responsibility, not ours.  Same heuristic as
             // composed-owner uses.
             if (fieldIsCallerSupplied(tree, outer, f.name)) continue;
+            // Nested-type-owned-by-parent skip: when `outer` is a
+            // nested type whose ENCLOSING type has a cleanup
+            // method, the parent owns the entries.  Common Bun
+            // pattern:
+            //     pub const FSWatchTask = struct {
+            //         entries: [8]Entry = undefined,
+            //         pub const Entry = struct { event: Event, ... };
+            //         pub fn deinit(this: *FSWatchTask) void { this.cleanEntries(); ... }
+            //     };
+            if (outerIsNestedInsideCleanupType(model, outer)) continue;
             const inner_ti = mq.resolveFieldTypeScoped(tree, model, outer, f) orelse continue;
             if (!anyNonTrivialCleanup(tree, inner_ti)) continue;
             if (!outer_has_allocator and allCleanupMethodsNeedExtraArg(tree, inner_ti)) continue;
@@ -408,6 +418,25 @@ fn hasPointerReturningInit(tree: *const Ast, ti: *const fmodel.TypeInfo) bool {
 /// are heap-allocated and owned by a parent struct that's
 /// responsible for cleanup, so a missing inline `deinit` on `T`
 /// isn't a leak.  Token-scan over the type body for the prefix.
+/// True iff `outer` is a NESTED type (declared inside another
+/// type's body) AND the enclosing parent has a cleanup method.
+/// Parent-owns-children pattern — the parent's deinit is
+/// responsible for tearing down nested-type instances; a
+/// missing inline cleanup on the nested type is harmless.
+fn outerIsNestedInsideCleanupType(
+    model: *const fmodel.FileModel,
+    outer: *const fmodel.TypeInfo,
+) bool {
+    const parent_idx = outer.parent orelse return false;
+    if (parent_idx >= model.types.len) return false;
+    const parent_ti = &model.types[parent_idx];
+    return parent_ti.hasMethod("deinit") or
+        parent_ti.hasMethod("destroy") or
+        parent_ti.hasMethod("finalize") or
+        parent_ti.hasMethod("close") or
+        parent_ti.hasMethod("free");
+}
+
 /// True iff the type has an `init` / `create` / `from*` method
 /// that takes a parameter of the same name as `field_name` —
 /// evidence that the field is initialised from a caller-supplied
