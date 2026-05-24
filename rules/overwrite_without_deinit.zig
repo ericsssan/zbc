@@ -219,10 +219,323 @@ fn checkBody(
                 t = sc;
                 continue;
             }
+            // Switch-arm awareness: when the assignment sits in
+            // an arm of `switch (<this>.<field>) { ... }`, the
+            // prior variant is constrained by the arm pattern.
+            //  - `.X =>` arm: prior IS `.X` (just matched).
+            //  - `else =>` arm: prior is in the COMPLEMENT of the
+            //    explicit arms.
+            // If every constrained-prior variant is non-owned,
+            // the retag doesn't leak.
+            if (switchArmRetagIsSafe(tree, model, un, first, t,
+                this_name, field_name)) {
+                t = sc;
+                continue;
+            }
         }
         try report(gpa, problems, tree, t, this_name, field_name, ct);
         t = sc;
     }
+}
+
+/// Switch-arm awareness for tagged-union retag safety.  When the
+/// assignment sits inside a `switch (<this>.<field>) { ... }`,
+/// the prior variant is constrained by which arm the assignment
+/// sits in:
+///   - `.<X> =>` arm: prior variant IS `.X`.
+///   - `else =>` arm: prior is in the complement of the explicit
+///     arms.
+/// Returns true iff every possible prior variant (per the arm's
+/// constraint) is non-owned — the retag can't leak.
+fn switchArmRetagIsSafe(
+    tree: *const Ast,
+    model: *const fmodel.FileModel,
+    union_type_name: []const u8,
+    body_first: Ast.TokenIndex,
+    assign_tok: Ast.TokenIndex,
+    this_name: []const u8,
+    field_name: []const u8,
+) bool {
+    const arm = findEnclosingSwitchArm(tree, body_first, assign_tok, this_name, field_name) orelse return false;
+    switch (arm) {
+        .specific_tag => |tag| {
+            return (model.unionVariantIsOwned(union_type_name, tag) orelse true) == false;
+        },
+        .else_arm => |explicit_tags| {
+            // Walk all variants of the union; for any variant
+            // NOT in explicit_tags, check it's non-owned.
+            return allVariantsExceptAreNonOwned(model, union_type_name, explicit_tags);
+        },
+    }
+}
+
+const SwitchArm = union(enum) {
+    specific_tag: []const u8,
+    else_arm: [16][]const u8,
+};
+
+/// Walk back from `assign_tok` looking for an enclosing
+/// `switch (<this>.<field>) { ... }`.  When found, identify
+/// which arm contains the assignment and return its pattern:
+/// specific tag name or `else` (with the list of OTHER arm's
+/// explicit tags).
+fn findEnclosingSwitchArm(
+    tree: *const Ast,
+    body_first: Ast.TokenIndex,
+    assign_tok: Ast.TokenIndex,
+    this_name: []const u8,
+    field_name: []const u8,
+) ?SwitchArm {
+    const tags = tree.tokens.items(.tag);
+    // Walk back finding the immediate enclosing `{` then check if
+    // it's the body of an arm `=> { ... }` whose switch matches.
+    var depth: i32 = 0;
+    var t: Ast.TokenIndex = assign_tok;
+    while (t > body_first) {
+        t -= 1;
+        switch (tags[t]) {
+            .r_brace => depth += 1,
+            .l_brace => {
+                if (depth == 0) {
+                    // `{` found.  Check shape backward: `=>` then
+                    // pattern then `,` (or beginning of switch body).
+                    return classifySwitchArm(tree, body_first, t, this_name, field_name);
+                }
+                depth -= 1;
+            },
+            else => {},
+        }
+    }
+    return null;
+}
+
+fn classifySwitchArm(
+    tree: *const Ast,
+    body_first: Ast.TokenIndex,
+    arm_lbrace: Ast.TokenIndex,
+    this_name: []const u8,
+    field_name: []const u8,
+) ?SwitchArm {
+    const tags = tree.tokens.items(.tag);
+    if (arm_lbrace < body_first + 4) return null;
+    // Walk back from `{` past optional capture `|cap|` to the
+    // `=>` token.
+    var t: Ast.TokenIndex = arm_lbrace;
+    // Optional capture: `|<ident>|` or `|*<ident>|` — single-line.
+    if (t > body_first and tags[t - 1] == .pipe) {
+        // walk back to the matching `|`.
+        t -= 1;
+        while (t > body_first and tags[t - 1] != .pipe) : (t -= 1) {}
+        if (t == 0 or tags[t - 1] != .pipe) return null;
+        t -= 1;
+    }
+    if (t == 0 or tags[t - 1] != .equal_angle_bracket_right) return null;
+    const arrow_pos = t - 1;
+    // Now walk back over the pattern (one token: `.<id>` / `else`,
+    // OR multiple tokens for `.X, .Y => …`).  Detect the FIRST
+    // token of the pattern by walking back over `.`, ident,
+    // ident-comma sequences at paren-depth 0.
+    if (arrow_pos < body_first + 1) return null;
+    var p: Ast.TokenIndex = arrow_pos;
+    var saw_else = false;
+    // Collect tag names BACKWARD until we hit a `,` (separating
+    // arms), `{` (switch body open), or some other delimiter.
+    var tag_names: [16][]const u8 = undefined;
+    var n_tags: u32 = 0;
+    while (p > body_first) {
+        p -= 1;
+        switch (tags[p]) {
+            .keyword_else => {
+                saw_else = true;
+                break;
+            },
+            .identifier => {
+                if (n_tags < tag_names.len) {
+                    tag_names[n_tags] = tree.tokenSlice(p);
+                    n_tags += 1;
+                }
+            },
+            .period, .comma => {},
+            .l_brace => {
+                // Reached switch body open — stop.
+                break;
+            },
+            else => break,
+        }
+    }
+    // Find the enclosing `switch ((<this>.<field>)) { ... }`.
+    // Walk back past the comma-or-brace boundary; expect `)` then
+    // walk back to `(` then `switch`.
+    var s: Ast.TokenIndex = p;
+    var brace_depth: i32 = 0;
+    while (s > body_first) {
+        s -= 1;
+        switch (tags[s]) {
+            .r_brace => brace_depth += 1,
+            .l_brace => {
+                if (brace_depth == 0) break;
+                brace_depth -= 1;
+            },
+            else => {},
+        }
+    }
+    if (s == body_first) return null;
+    // `s` is the switch-body `{`.  Walk back past `)` to `(` to
+    // `switch`.
+    if (s < body_first + 5) return null;
+    if (tags[s - 1] != .r_paren) return null;
+    var pd: i32 = 1;
+    var q: Ast.TokenIndex = s - 1;
+    while (q > body_first and pd > 0) {
+        q -= 1;
+        switch (tags[q]) {
+            .r_paren => pd += 1,
+            .l_paren => pd -= 1,
+            else => {},
+        }
+    }
+    if (pd != 0) return null;
+    if (q == 0 or tags[q - 1] != .keyword_switch) return null;
+    // The scrutinee tokens are between (q+1) and (s-2) inclusive.
+    // Check they're exactly `<this_name> . <field_name>` (possibly
+    // wrapped in extra parens).
+    var lo: Ast.TokenIndex = q + 1;
+    var hi: Ast.TokenIndex = s - 2;
+    while (lo + 1 < hi and tags[lo] == .l_paren and tags[hi] == .r_paren) {
+        lo += 1;
+        hi -= 1;
+    }
+    if (lo + 2 > hi) return null;
+    if (tags[lo] != .identifier) return null;
+    if (!std.mem.eql(u8, tree.tokenSlice(lo), this_name)) return null;
+    if (tags[lo + 1] != .period) return null;
+    if (tags[lo + 2] != .identifier) return null;
+    if (!std.mem.eql(u8, tree.tokenSlice(lo + 2), field_name)) return null;
+    if (lo + 2 != hi) return null;
+
+    // Match.  Determine which arm pattern.
+    if (saw_else) {
+        // `else =>`: need to walk the switch body forward to
+        // collect ALL explicit-tag arms.
+        var explicit: [16][]const u8 = undefined;
+        var n_exp = collectSwitchExplicitTags(tree, s, &explicit);
+        _ = &n_exp;
+        return .{ .else_arm = explicit };
+    }
+    if (n_tags == 0) return null;
+    // Specific-tag arm: use the FIRST collected tag (closest to
+    // `=>`).  Multi-pattern arms like `.X, .Y =>` may have prior
+    // = .X or .Y — handle by checking only the first; the rule's
+    // fire-on-first-owned approach is sufficiently conservative.
+    return .{ .specific_tag = tag_names[0] };
+}
+
+fn collectSwitchExplicitTags(
+    tree: *const Ast,
+    body_lbrace: Ast.TokenIndex,
+    out: *[16][]const u8,
+) u32 {
+    const tags = tree.tokens.items(.tag);
+    var n: u32 = 0;
+    // Walk between `{` and matching `}` of the switch body.
+    var depth: i32 = 1;
+    var t: Ast.TokenIndex = body_lbrace + 1;
+    while (t < tags.len and depth > 0) : (t += 1) {
+        switch (tags[t]) {
+            .l_brace => depth += 1,
+            .r_brace => depth -= 1,
+            .period => {
+                if (depth == 1 and t + 1 < tags.len and tags[t + 1] == .identifier) {
+                    if (n < out.len) {
+                        out[n] = tree.tokenSlice(t + 1);
+                        n += 1;
+                    }
+                }
+            },
+            else => {},
+        }
+    }
+    return n;
+}
+
+fn allVariantsExceptAreNonOwned(
+    model: *const fmodel.FileModel,
+    union_type_name: []const u8,
+    explicit_tags: [16][]const u8,
+) bool {
+    const tree = model.tree;
+    const ti = model.findType(union_type_name) orelse return false;
+    const tags = tree.tokens.items(.tag);
+    var t = ti.body_first + 1;
+    while (t < ti.body_last) : (t += 1) {
+        if (tags[t] == .keyword_fn or tags[t] == .keyword_pub or
+            tags[t] == .keyword_const or tags[t] == .keyword_var)
+        {
+            t = skipPastTypeDecl(tags, t, ti.body_last);
+            continue;
+        }
+        if (tags[t] != .identifier) continue;
+        const name = tree.tokenSlice(t);
+        // Is `name` in explicit_tags?  If yes, skip (it's the
+        // arm-matched variant).
+        var found = false;
+        for (explicit_tags) |et| {
+            if (et.len == 0) continue;
+            if (std.mem.eql(u8, et, name)) {
+                found = true;
+                break;
+            }
+        }
+        if (found) {
+            // Skip past variant's payload to next.
+            if (t + 1 < ti.body_last and tags[t + 1] == .colon) {
+                t = skipPastVariantPayload(tags, t + 2, ti.body_last);
+            }
+            continue;
+        }
+        // Variant not in explicit set; must be non-owned.
+        if (model.unionVariantIsOwned(union_type_name, name) orelse true) {
+            return false;
+        }
+        if (t + 1 < ti.body_last and tags[t + 1] == .colon) {
+            t = skipPastVariantPayload(tags, t + 2, ti.body_last);
+        }
+    }
+    return true;
+}
+
+fn skipPastTypeDecl(tags: []const std.zig.Token.Tag, start: Ast.TokenIndex, last: Ast.TokenIndex) Ast.TokenIndex {
+    var t = start;
+    var brace: i32 = 0;
+    var paren: i32 = 0;
+    while (t < last) : (t += 1) {
+        switch (tags[t]) {
+            .l_brace => brace += 1,
+            .r_brace => {
+                brace -= 1;
+                if (brace == 0 and paren == 0) return t;
+            },
+            .l_paren => paren += 1,
+            .r_paren => paren -= 1,
+            .semicolon => if (brace == 0 and paren == 0) return t,
+            else => {},
+        }
+    }
+    return last;
+}
+
+fn skipPastVariantPayload(tags: []const std.zig.Token.Tag, start: Ast.TokenIndex, last: Ast.TokenIndex) Ast.TokenIndex {
+    var t = start;
+    var pd: i32 = 0;
+    while (t < last) : (t += 1) {
+        switch (tags[t]) {
+            .l_paren, .l_bracket, .l_brace => pd += 1,
+            .r_paren, .r_bracket, .r_brace => pd -= 1,
+            .comma => if (pd == 0) return t,
+            else => {},
+        }
+    }
+    return last;
 }
 
 /// Extract the LAST identifier of a field's declared type path.
