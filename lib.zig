@@ -46,6 +46,7 @@ pub fn analyzeEscape(
     const src = try gpa.allocSentinel(u8, src_bytes.len, 0);
     defer gpa.free(src);
     @memcpy(src[0..src_bytes.len], src_bytes);
+    rewriteNonStandardSyntax(src);
 
     var tree = try Ast.parse(gpa, src, .zig);
     defer tree.deinit(gpa);
@@ -115,6 +116,35 @@ pub fn analyzeEscape(
     var supp = try suppressions_mod.parse(gpa, src);
     defer supp.deinit();
     return try filterSuppressed(gpa, &problems, &supp);
+}
+
+/// Bun's codebase uses a non-standard `fn #<name>(...)` method-name
+/// syntax (their build pipeline preprocesses it).  The stock Zig
+/// tokenizer chokes on `#` and emits `invalid` tokens, which causes
+/// the AST past the first such fn to be lost — entire types appear
+/// to have no methods, masking real cleanup methods like `finalize`
+/// and producing cascades of FPs (missing-deinit, owned-field-no-
+/// outer-cleanup, etc.) on every file that touches the pattern.
+///
+/// Workaround: in-place byte-level rewrite of `fn #` → `fn _` and
+/// `.#<ident>(` → `._<ident>(` (call-site form).  Both replacements
+/// are length-preserving so source positions remain stable.
+/// Replacing only after `fn ` or `.` avoids touching `#`-containing
+/// string literals or comments that happen to start a line.
+fn rewriteNonStandardSyntax(src: [:0]u8) void {
+    if (src.len < 4) return;
+    var i: usize = 0;
+    while (i + 4 <= src.len) : (i += 1) {
+        // `fn #` pattern at start of word.
+        if (src[i] == 'f' and src[i + 1] == 'n' and src[i + 2] == ' ' and src[i + 3] == '#') {
+            src[i + 3] = '_';
+            continue;
+        }
+        // `.#<ident>` call-site form.
+        if (src[i] == '.' and src[i + 1] == '#') {
+            src[i + 1] = '_';
+        }
+    }
 }
 
 /// Drop any Problems whose start.line matches an active suppression.

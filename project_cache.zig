@@ -98,6 +98,7 @@ pub const ProjectCache = struct {
         defer self.gpa.free(src_bytes);
         const src = try self.gpa.allocSentinel(u8, src_bytes.len, 0);
         @memcpy(src[0..src_bytes.len], src_bytes);
+        rewriteNonStandardSyntaxInPlace(src);
         // src is now owned by the new entry.
         var tree = Ast.parse(self.gpa, src, .zig) catch {
             self.gpa.free(src);
@@ -127,6 +128,24 @@ pub const ProjectCache = struct {
         return &entry.model;
     }
 };
+
+/// In-place rewrite of bun's non-standard `fn #<name>` / `.#<name>`
+/// syntax to `fn _<name>` / `._<name>`.  Length-preserving so source
+/// positions stay aligned.  See lib.zig:rewriteNonStandardSyntax
+/// for the rationale.
+fn rewriteNonStandardSyntaxInPlace(src: [:0]u8) void {
+    if (src.len < 4) return;
+    var i: usize = 0;
+    while (i + 4 <= src.len) : (i += 1) {
+        if (src[i] == 'f' and src[i + 1] == 'n' and src[i + 2] == ' ' and src[i + 3] == '#') {
+            src[i + 3] = '_';
+            continue;
+        }
+        if (src[i] == '.' and src[i + 1] == '#') {
+            src[i + 1] = '_';
+        }
+    }
+}
 
 /// True iff `import_str` looks like a relative file-system path
 /// (ends in `.zig` / `.zon` AND uses `./` or `../` or no leading
