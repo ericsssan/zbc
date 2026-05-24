@@ -213,6 +213,13 @@ fn scanWrites(
         // After the copy the field holds independent bytes; the
         // deferred local's storage going away doesn't dangle it.
         if (rhsEndsWithArrayDeref(tree, w.end + 1, sc - 1)) continue;
+        // RHS contains `<X>.create(... allocator ... <slice> ...)`
+        // — the call is an allocator-backed constructor that
+        // canonically dupes its non-allocator args (Bun's
+        // `Type.create(global, allocator, ..., slice)` pattern,
+        // body does `allocator.dupe(u8, slice)`).  The out-param
+        // receives the new owned copy, not a borrow.
+        if (rhsContainsAllocatorConstructor(tree, w.end + 1, sc - 1)) continue;
         const dn = rhsMentionsDeferred(tree, w.end + 1, sc - 1, deferred) orelse continue;
         try report(gpa, problems, tree, w.start, out_name, dn);
     }
@@ -394,6 +401,62 @@ fn isCopyingMethodName(name: []const u8) bool {
         std.mem.eql(u8, name, "copyFrom") or
         std.mem.eql(u8, name, "copyForwards") or
         std.mem.eql(u8, name, "copyBackwards");
+}
+
+/// True iff the RHS contains a `<X>.create(...)` or `<X>.init(...)`
+/// or `<X>.new(...)` call whose args include an allocator token —
+/// strong heuristic that the constructor dupes its non-allocator
+/// args via that allocator (canonical Bun pattern:
+/// `ResolveMessage.create(global, allocator, msg, slice)` does
+/// `allocator.dupe(u8, slice)` internally).  Cross-fn dupe
+/// inference without an actual cross-fn lookup: the presence of
+/// an allocator in the call shape is the signal.
+fn rhsContainsAllocatorConstructor(
+    tree: *const Ast,
+    start: Ast.TokenIndex,
+    end: Ast.TokenIndex,
+) bool {
+    const tags = tree.tokens.items(.tag);
+    if (start + 2 > end) return false;
+    var t: Ast.TokenIndex = start;
+    while (t + 2 <= end) : (t += 1) {
+        if (tags[t] != .period) continue;
+        if (tags[t + 1] != .identifier) continue;
+        if (tags[t + 2] != .l_paren) continue;
+        const m = tree.tokenSlice(t + 1);
+        const is_ctor = std.mem.eql(u8, m, "create") or
+            std.mem.eql(u8, m, "init") or
+            std.mem.eql(u8, m, "new") or
+            std.mem.eql(u8, m, "from") or
+            std.mem.eql(u8, m, "fromJS") or
+            std.mem.eql(u8, m, "fromUTF8") or
+            std.mem.eql(u8, m, "make");
+        if (!is_ctor) continue;
+        // Walk arg tokens balanced to the matching `)`, checking
+        // for an allocator name.
+        var depth: u32 = 1;
+        var u: Ast.TokenIndex = t + 3;
+        while (u <= end and depth > 0) : (u += 1) {
+            switch (tags[u]) {
+                .l_paren => depth += 1,
+                .r_paren => {
+                    depth -= 1;
+                    if (depth == 0) break;
+                },
+                .identifier => {
+                    const id = tree.tokenSlice(u);
+                    if (std.mem.eql(u8, id, "allocator") or
+                        std.mem.eql(u8, id, "alloc") or
+                        std.mem.eql(u8, id, "gpa") or
+                        std.mem.endsWith(u8, id, "_allocator") or
+                        std.mem.endsWith(u8, id, "Allocator"))
+                        return true;
+                },
+                else => {},
+            }
+        }
+    }
+    return false;
 }
 
 /// True iff the type expression at `[first, last]` starts with `*`
