@@ -383,6 +383,21 @@ fn isPrimitiveTypeName(name: []const u8) bool {
         for (name[1..]) |c| if (c < '0' or c > '9') return false;
         return true;
     }
+    // Bitset/packed-flag naming convention: protocol-parsing code
+    // routinely declares packed-struct types named `*Flags`,
+    // `*Status`, `*Mode`, `*Kind`, `*Capabilities`, `*Bits`,
+    // `*Mask`.  These can be assumed to hold no slice/pointer
+    // fields (they're bit-flag wrappers around an integer base
+    // type), so a field of this shape can't carry a borrow.
+    // Imported across files, the structural check can't see this —
+    // the suffix is the next-best signal.
+    if (std.mem.endsWith(u8, name, "Flags")) return true;
+    if (std.mem.endsWith(u8, name, "Status")) return true;
+    if (std.mem.endsWith(u8, name, "Mode")) return true;
+    if (std.mem.endsWith(u8, name, "Kind")) return true;
+    if (std.mem.endsWith(u8, name, "Capabilities")) return true;
+    if (std.mem.endsWith(u8, name, "Bits")) return true;
+    if (std.mem.endsWith(u8, name, "Mask")) return true;
     return false;
 }
 
@@ -457,6 +472,8 @@ fn structOnlyHoldsPrimitivesOrPointers(tree: *const Ast, ti: *const fmodel.TypeI
 fn isCopyingMethodName(name: []const u8) bool {
     return std.mem.eql(u8, name, "toOwnedSlice") or
         std.mem.eql(u8, name, "toOwnedSliceSentinel") or
+        std.mem.eql(u8, name, "toOwned") or
+        std.mem.eql(u8, name, "intoOwned") or
         std.mem.eql(u8, name, "dupe") or
         std.mem.eql(u8, name, "dupeZ") or
         std.mem.eql(u8, name, "clone") or

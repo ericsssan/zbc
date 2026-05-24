@@ -134,15 +134,13 @@ pub const ProjectCache = struct {
 /// positions stay aligned.  See lib.zig:rewriteNonStandardSyntax
 /// for the rationale.
 fn rewriteNonStandardSyntaxInPlace(src: [:0]u8) void {
-    if (src.len < 4) return;
+    if (src.len < 2) return;
     var i: usize = 0;
-    while (i + 4 <= src.len) : (i += 1) {
-        if (src[i] == 'f' and src[i + 1] == 'n' and src[i + 2] == ' ' and src[i + 3] == '#') {
-            src[i + 3] = '_';
-            continue;
-        }
-        if (src[i] == '.' and src[i + 1] == '#') {
-            src[i + 1] = '_';
+    while (i + 1 < src.len) : (i += 1) {
+        if (src[i] != '#') continue;
+        const c = src[i + 1];
+        if ((c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or c == '_') {
+            src[i] = '_';
         }
     }
 }

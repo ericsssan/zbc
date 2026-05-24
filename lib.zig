@@ -132,19 +132,28 @@ pub fn analyzeEscape(
 /// Replacing only after `fn ` or `.` avoids touching `#`-containing
 /// string literals or comments that happen to start a line.
 fn rewriteNonStandardSyntax(src: [:0]u8) void {
-    if (src.len < 4) return;
+    if (src.len < 2) return;
+    // `#` is not a valid token start in Zig 0.17.  Bun uses it as
+    // a private-name prefix in three positions:
+    //   1. method decls:  `fn #foo(...)`
+    //   2. field decls:   `#foo: Foo = .{}`
+    //   3. accesses:      `this.#foo` / `this.#foo()`
+    // In all three, `#` is immediately followed by an identifier
+    // character (letter or `_`).  Rewriting `#<id-char>` → `_<id-char>`
+    // covers all three positions and is length-preserving.  The only
+    // false-positive is a `#` inside a STRING LITERAL whose next char
+    // is a letter — but the analyzer doesn't track string CONTENTS,
+    // so it's harmless.
     var i: usize = 0;
-    while (i + 4 <= src.len) : (i += 1) {
-        // `fn #` pattern at start of word.
-        if (src[i] == 'f' and src[i + 1] == 'n' and src[i + 2] == ' ' and src[i + 3] == '#') {
-            src[i + 3] = '_';
-            continue;
-        }
-        // `.#<ident>` call-site form.
-        if (src[i] == '.' and src[i + 1] == '#') {
-            src[i + 1] = '_';
-        }
+    while (i + 1 < src.len) : (i += 1) {
+        if (src[i] != '#') continue;
+        const next = src[i + 1];
+        if (isIdentStart(next)) src[i] = '_';
     }
+}
+
+fn isIdentStart(c: u8) bool {
+    return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or c == '_';
 }
 
 /// Drop any Problems whose start.line matches an active suppression.

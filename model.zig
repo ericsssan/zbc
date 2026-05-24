@@ -891,12 +891,97 @@ pub fn build(gpa: std.mem.Allocator, tree: *const Ast) !FileModel {
         });
     }
 
+    // File-as-struct: if the file declares `const <Name> = @This();`
+    // at top level, synthesize a TypeInfo for it with file-top-level
+    // fields and methods (the file-level fn list).  Lets findType /
+    // fieldType / etc. resolve fields and methods uniformly across
+    // `const X = struct { ... }` and `const X = @This();` shapes.
+    if (detectFileStructName(tree)) |fs_name| {
+        // Skip if a type with the same name was already collected
+        // (defensive — shouldn't happen since file-struct decls don't
+        // open a brace body and aren't picked up by collectTypesInRange).
+        const dup = blk: {
+            for (types.items) |ti| {
+                if (std.mem.eql(u8, ti.name, fs_name)) break :blk true;
+            }
+            break :blk false;
+        };
+        if (!dup) {
+            const fs_fields = try collectFields(a, tree, 0, last);
+            // Convert file-level fns into method-shape entries.
+            var fs_methods: std.ArrayListUnmanaged(MethodInfo) = .empty;
+            for (fns.items) |f| {
+                var proto_buf: [1]Ast.Node.Index = undefined;
+                const proto = lexer.fnProto(tree, &proto_buf, f.fn_decl) orelse continue;
+                try fs_methods.append(a, .{
+                    .name = f.name,
+                    .name_token = f.name_token,
+                    .fn_decl = f.fn_decl,
+                    .body = f.body,
+                    .body_first = f.body_first,
+                    .body_last = f.body_last,
+                    .is_pub = f.is_pub,
+                    .receiver = extractReceiver(tree, proto, fs_name),
+                });
+            }
+            // Find the name token of the `@This()` decl as a stable
+            // pos anchor (mirrors how collectTypesInRange records
+            // name_token).
+            const fs_name_tok = findFileStructNameToken(tree, fs_name) orelse 0;
+            try types.append(a, .{
+                .name = fs_name,
+                .name_token = fs_name_tok,
+                .kind = .struct_,
+                .body_first = 0,
+                .body_last = last,
+                .fields = fs_fields,
+                .methods = try fs_methods.toOwnedSlice(a),
+                .parent = null,
+            });
+        }
+    }
+
     return .{
         .arena = arena,
         .tree = tree,
         .types = try types.toOwnedSlice(a),
         .fns = try fns.toOwnedSlice(a),
     };
+}
+
+fn detectFileStructName(tree: *const Ast) ?[]const u8 {
+    const tags = tree.tokens.items(.tag);
+    const tok_count: u32 = @intCast(tree.tokens.len);
+    var t: TokenIndex = 0;
+    var scanned: u32 = 0;
+    while (t + 4 < tok_count and scanned < 64) : (t += 1) {
+        if (tags[t] != .keyword_const) continue;
+        scanned += 1;
+        if (tags[t + 1] != .identifier) continue;
+        if (tags[t + 2] != .equal) continue;
+        if (tags[t + 3] != .builtin) continue;
+        if (!std.mem.eql(u8, tree.tokenSlice(t + 3), "@This")) continue;
+        return tree.tokenSlice(t + 1);
+    }
+    return null;
+}
+
+fn findFileStructNameToken(tree: *const Ast, name: []const u8) ?TokenIndex {
+    const tags = tree.tokens.items(.tag);
+    const tok_count: u32 = @intCast(tree.tokens.len);
+    var t: TokenIndex = 0;
+    var scanned: u32 = 0;
+    while (t + 4 < tok_count and scanned < 64) : (t += 1) {
+        if (tags[t] != .keyword_const) continue;
+        scanned += 1;
+        if (tags[t + 1] != .identifier) continue;
+        if (!std.mem.eql(u8, tree.tokenSlice(t + 1), name)) continue;
+        if (tags[t + 2] != .equal) continue;
+        if (tags[t + 3] != .builtin) continue;
+        if (!std.mem.eql(u8, tree.tokenSlice(t + 3), "@This")) continue;
+        return t + 1;
+    }
+    return null;
 }
 
 // ── Internal: type, field, method extraction ──────────────
