@@ -129,6 +129,15 @@ fn checkFn(
             t = cp;
             continue;
         }
+        // Length-precondition skip: `assert(<param>.len <op> <N>);`
+        // is a defensive contract check — caller is expected to
+        // pre-validate, and the fn would still do further parsing
+        // afterwards.  Distinct from out-of-bounds index asserts
+        // like `assert(buf[idx] == X);` which DO crash on bad data.
+        if (isLengthPreconditionAssert(tree, t + 2, cp - 1, params.items)) {
+            t = cp;
+            continue;
+        }
         try report(gpa, problems, tree, t);
         t = cp;
     }
@@ -171,6 +180,48 @@ fn isParserName(name: []const u8) bool {
 /// True iff `[start, end]` mentions one of the slice-typed
 /// parameter names — as a bare identifier OR as the receiver of
 /// a `.<field>` / `[<expr>]` access.
+/// True iff the assert expression is a LENGTH precondition on
+/// a parameter — `<param>.len > <N>` / `<param>.len >= <N>` /
+/// `<param>.len % <N> == 0` / etc.  These are defensive contract
+/// checks (caller pre-validates); they don't trip on crafted
+/// bytes any differently than caller-side validation would.
+///
+/// The DANGEROUS asserts the rule wants to catch are
+/// out-of-bounds-derived checks: `assert(buf[idx] == ...)`,
+/// `assert(parse_tag(buf) == .X)` etc.  Those panic on
+/// untrusted input.
+fn isLengthPreconditionAssert(
+    tree: *const Ast,
+    start: Ast.TokenIndex,
+    end: Ast.TokenIndex,
+    params: []const []const u8,
+) bool {
+    const tags = tree.tokens.items(.tag);
+    // Walk tokens looking for `<param-ident> . len`.  If found AND
+    // no `[` (index-access) appears in the expression, treat as
+    // length-precondition.
+    var saw_param_len = false;
+    var t: Ast.TokenIndex = start;
+    while (t + 2 <= end) : (t += 1) {
+        if (tags[t] == .l_bracket) return false; // index-access — too dangerous
+        if (tags[t] != .identifier) continue;
+        if (t > 0 and tags[t - 1] == .period) continue;
+        const name = tree.tokenSlice(t);
+        var is_param = false;
+        for (params) |p| if (std.mem.eql(u8, p, name)) {
+            is_param = true;
+            break;
+        };
+        if (!is_param) continue;
+        if (tags[t + 1] != .period) continue;
+        if (tags[t + 2] != .identifier) continue;
+        if (std.mem.eql(u8, tree.tokenSlice(t + 2), "len")) {
+            saw_param_len = true;
+        }
+    }
+    return saw_param_len;
+}
+
 fn assertMentionsParam(
     tree: *const Ast,
     start: Ast.TokenIndex,
@@ -303,7 +354,20 @@ test "assert-on-untrusted-input: parser fn without slice param doesn't fire" {
     try std.testing.expectEqual(@as(usize, 0), problems.items.len);
 }
 
-test "assert-on-untrusted-input: assert mentions slice-typed param fires" {
+test "assert-on-untrusted-input: assert with index-access on slice-typed param fires" {
+    const gpa = std.testing.allocator;
+    var problems = try runOn(gpa,
+        \\fn assert(_: bool) void {}
+        \\pub fn decode_frame(frame: []const u8) !void {
+        \\    assert(frame[0] == 0xCA);
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 1), problems.items.len);
+}
+
+test "assert-on-untrusted-input: pure length precondition doesn't fire" {
     const gpa = std.testing.allocator;
     var problems = try runOn(gpa,
         \\fn assert(_: bool) void {}
@@ -313,5 +377,5 @@ test "assert-on-untrusted-input: assert mentions slice-typed param fires" {
         \\
     );
     defer freeProblems(gpa, &problems);
-    try std.testing.expectEqual(@as(usize, 1), problems.items.len);
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
 }
