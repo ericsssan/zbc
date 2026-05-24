@@ -27,13 +27,21 @@ recognize that calling `owner.deinit(gpa)` invalidates `owner.data`.
 ## Usage
 
 ```sh
-zig build -Doptimize=ReleaseFast
+zig build -Doptimize=ReleaseSafe   # ~150× faster than Debug; bounds checks still on
 zbc path/to/file.zig
 zbc path/to/dir              # recursive
 zbc --format=compact path     # grep-friendly
 zbc --list-rules
 zbc --explain <rule-id>
 ```
+
+**Build mode matters.** Default `zig build` produces Debug, which
+is ~150× slower than ReleaseSafe on multi-file sweeps (e.g.
+bun's 1290-file corpus: Debug 6+ min, ReleaseSafe ~3.5 s wall).
+ReleaseFast is faster still but currently triggers a SIGSEGV on
+some files — bounds checks in ReleaseSafe catch it as a recoverable
+error.  Always prefer ReleaseSafe for sweeps; Debug is fine only
+for single-file or test-driven workflows.
 
 Exit 0 if clean, 1 if problems found.  Default output uses a
 caret + secondary span pointing at the free / kill / borrow site.
