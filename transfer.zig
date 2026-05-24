@@ -622,6 +622,19 @@ fn transferOutParamWrite(
             // `out.field = &local` / `out.* = &local` — unambiguous
             // stack-frame escape regardless of out's pointee type.
             if (!config_mod.isEnabled(ctx.config, .stack_escape)) return;
+            // Scope-bounded install: when `out` itself is a HEAP
+            // LOCAL (allocated in this fn via `allocator.create(T)`
+            // / `bun.new(T)` etc.) — as opposed to a parameter
+            // pointing at caller-owned storage — both `out` and the
+            // borrowed local share this frame's lifecycle.  Either
+            // `out` is destroyed via defer in the same fn (in which
+            // case the borrowed pointee never outlives the borrower)
+            // OR the heap descriptor leaks, which is a separate
+            // class of bug other rules catch.  Either way, firing
+            // stack-escape here is wrong: the borrow IS the
+            // intended install protocol, scoped to this fn.
+            const out_info = ctx.locals[@intFromEnum(w.out)];
+            if (out_info.init_hint == .heap_local) return;
             const src_name = ctx.locals[@intFromEnum(src_local)].name;
             try report(ctx, "stack-escape", pos, end_pos, .@"error",
                 "writing a pointer to function-local stack variable `{s}` through `{s}` (escapes its frame)",
