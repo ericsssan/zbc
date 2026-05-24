@@ -88,6 +88,14 @@ fn checkFn(
     const fn_name = tree.tokenSlice(name_tok);
     if (!isParserName(fn_name)) return;
 
+    // Skip when the fn doesn't return an error union — the
+    // canonical "external untrusted input" decoder signals
+    // invalid data via `error.Invalid…`.  A fn returning
+    // `usize` / `void` / `T` is an INTERNAL helper whose caller
+    // is responsible for input validity (e.g. TigerBeetle's
+    // ewah decode_chunk: caller pre-validates chunk alignment).
+    if (!returnsErrorUnion(tree, proto)) return;
+
     const bindings = try cache.localBindings(proto, body);
 
     // Collect param names whose declared type starts with `[` (slice
@@ -124,6 +132,23 @@ fn checkFn(
         try report(gpa, problems, tree, t);
         t = cp;
     }
+}
+
+/// True iff the fn's return type starts with `!` (or has `!` in
+/// its tokens — handles `error{X,Y}!T` forms too).  Used to
+/// distinguish external decoders (`fn decode(buf) !T`) from
+/// internal helpers (`fn decode_chunk(buf) usize`).
+fn returnsErrorUnion(tree: *const Ast, proto: Ast.full.FnProto) bool {
+    const rt = proto.ast.return_type.unwrap() orelse return false;
+    const tags = tree.tokens.items(.tag);
+    const first = tree.firstToken(rt);
+    if (first > 0 and tags[first - 1] == .bang) return true;
+    const last = tree.lastToken(rt);
+    var t: Ast.TokenIndex = first;
+    while (t <= last) : (t += 1) {
+        if (tags[t] == .bang) return true;
+    }
+    return false;
 }
 
 fn isParserName(name: []const u8) bool {
