@@ -3974,13 +3974,31 @@ const Builder = struct {
                 }
                 continue;
             }
-            // Slice/index of a stack array: `<ident> [`
+            // Slice of a stack array: `<ident> [ ... .. ... ]`.
+            // Bare INDEX access `<ident> [ <expr> ]` (no `..`)
+            // produces a VALUE — not a pointer.  Walk past `[`
+            // to see if `..` appears before the matching `]`.
             if (tags[t] == .identifier and t + 1 <= last and tags[t + 1] == .l_bracket) {
                 // Skip if preceded by `.` (struct field access on something).
                 if (t > 0 and tags[t - 1] == .period) continue;
                 const name = tree.tokenSlice(t);
                 const local = self.name_to_local.get(name) orelse continue;
-                if (self.locals.items[@intFromEnum(local)].is_array) return local;
+                if (!self.locals.items[@intFromEnum(local)].is_array) continue;
+                // Slice vs index: scan to matching `]` looking
+                // for `..`.  Only slices borrow the array's
+                // storage — index access is a value copy.
+                var u: Ast.TokenIndex = t + 2;
+                var br: i32 = 1;
+                var saw_dotdot = false;
+                while (u <= last and br > 0) : (u += 1) {
+                    switch (tags[u]) {
+                        .l_bracket => br += 1,
+                        .r_bracket => br -= 1,
+                        .ellipsis2 => saw_dotdot = true,
+                        else => {},
+                    }
+                }
+                if (saw_dotdot) return local;
             }
         }
         return null;
