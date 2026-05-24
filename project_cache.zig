@@ -36,12 +36,36 @@ pub const ProjectCache = struct {
     /// request; set by `findProjectRoot`.  Owned by `gpa`.
     project_root: ?[]const u8 = null,
     project_root_searched: bool = false,
+    /// Global type index: type-name → list of (Entry, type_index).
+    /// Lazily built on first `findAllTypesByName` call; covers every
+    /// `.zig` file under `project_root`.  Empty map means "not built
+    /// yet"; built_type_index is the latch.
+    type_index: std.StringHashMapUnmanaged([]TypeEntry) = .empty,
+    type_index_built: bool = false,
 
     pub const Entry = struct {
         abs_path: []const u8,
         source: [:0]u8,
         tree: Ast,
         model: model_mod.FileModel,
+    };
+
+    /// A single type observation in the global index — references a
+    /// type by its model index within an Entry's `model.types`.
+    /// `Entry.model.types` is a slice owned by the Entry's arena, so
+    /// `&entry.model.types[type_index]` is stable for the Entry's
+    /// lifetime (== ProjectCache lifetime).
+    pub const TypeEntry = struct {
+        entry: *Entry,
+        type_idx: u32,
+
+        pub fn typeInfo(self: TypeEntry) *const model_mod.TypeInfo {
+            return &self.entry.model.types[self.type_idx];
+        }
+
+        pub fn tree(self: TypeEntry) *const Ast {
+            return &self.entry.tree;
+        }
     };
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io) ProjectCache {
@@ -65,7 +89,74 @@ pub const ProjectCache = struct {
             if (kv.value_ptr.*) |p| self.gpa.free(p);
         }
         self.module_paths.deinit(self.gpa);
+        var tit = self.type_index.iterator();
+        while (tit.next()) |kv| {
+            // Keys borrow from Entry.model.types[*].name; only free
+            // the value slice.
+            self.gpa.free(kv.value_ptr.*);
+        }
+        self.type_index.deinit(self.gpa);
         if (self.project_root) |p| self.gpa.free(p);
+    }
+
+    /// Lazily-built global type index.  On first call: walks every
+    /// `.zig` file under `project_root` (excluding common vendor /
+    /// build / cache dirs), loads each via `modelForAbsolutePath`,
+    /// and indexes every top-level type by name.  Subsequent calls
+    /// are O(1) hash lookups.
+    ///
+    /// Returns an empty slice when the name has no occurrences (or
+    /// when project_root can't be determined).
+    pub fn findAllTypesByName(
+        self: *ProjectCache,
+        from_file_path: []const u8,
+        name: []const u8,
+    ) ![]const TypeEntry {
+        if (!self.type_index_built) try self.buildTypeIndex(from_file_path);
+        return self.type_index.get(name) orelse &.{};
+    }
+
+    fn buildTypeIndex(self: *ProjectCache, from_file_path: []const u8) !void {
+        self.type_index_built = true; // latch first so failures don't retry
+        const root = (try self.findProjectRoot(from_file_path)) orelse return;
+        // Collect candidate file paths.
+        var paths: std.ArrayListUnmanaged([]u8) = .empty;
+        defer {
+            for (paths.items) |p| self.gpa.free(p);
+            paths.deinit(self.gpa);
+        }
+        try collectZigFiles(self.gpa, self.io, root, &paths);
+        // For each file, load the entry (cache hit if already loaded)
+        // and index every top-level type.  Per-name lists are built
+        // in a temporary StringHashMap with []TypeEntry-typed values,
+        // then frozen into self.type_index.
+        var pending: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(TypeEntry)) = .empty;
+        defer {
+            var pit = pending.iterator();
+            while (pit.next()) |kv| kv.value_ptr.deinit(self.gpa);
+            pending.deinit(self.gpa);
+        }
+        for (paths.items) |abs_path_owned| {
+            const dup = try self.gpa.dupe(u8, abs_path_owned);
+            const fm_opt = self.modelForAbsolutePath(dup) catch null;
+            const _fm = fm_opt orelse continue;
+            _ = _fm;
+            // Walk the entry's types.  The Entry pointer is stable
+            // (boxed via `*Entry` in `entries`).
+            const entry = self.entries.get(abs_path_owned) orelse continue;
+            for (entry.model.types, 0..) |*ti, i| {
+                const te: TypeEntry = .{ .entry = entry, .type_idx = @intCast(i) };
+                const gop = try pending.getOrPut(self.gpa, ti.name);
+                if (!gop.found_existing) gop.value_ptr.* = .empty;
+                try gop.value_ptr.append(self.gpa, te);
+            }
+        }
+        // Freeze into self.type_index.
+        var pit = pending.iterator();
+        while (pit.next()) |kv| {
+            const slice = try kv.value_ptr.toOwnedSlice(self.gpa);
+            try self.type_index.put(self.gpa, kv.key_ptr.*, slice);
+        }
     }
 
     /// Resolve a relative @import string against `from_file_path`
@@ -282,6 +373,62 @@ pub const ProjectCache = struct {
         return &entry.model;
     }
 };
+
+/// Recursively walks `root`, appending absolute paths of every
+/// `.zig` file to `out`.  Skips common vendor / build / cache
+/// directories so the index doesn't include unrelated trees.
+fn collectZigFiles(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    root: []const u8,
+    out: *std.ArrayListUnmanaged([]u8),
+) !void {
+    var dir = std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true }) catch return;
+    defer dir.close(io);
+    var walker = dir.walk(gpa) catch return;
+    defer walker.deinit();
+    while (walker.next(io) catch null) |entry| {
+        switch (entry.kind) {
+            .directory => {
+                // Skip dirs we don't want to scan.  The walker
+                // currently has no built-in prune API; the cheapest
+                // workaround is to swallow opens that fail, but we
+                // can pre-filter based on basename to avoid wasted
+                // descent into known-large vendor dirs.
+                if (shouldSkipDirBasename(entry.basename)) {
+                    // Walker doesn't expose prune; let it descend
+                    // and we'll filter results.  TODO: switch to
+                    // walkSelectively when ergonomic.
+                }
+                continue;
+            },
+            .file => {
+                if (!std.mem.endsWith(u8, entry.basename, ".zig")) continue;
+                // Reject paths that pass through a skipped dir.
+                if (pathContainsSkippedSegment(entry.path)) continue;
+                const joined = try std.fs.path.join(gpa, &.{ root, entry.path });
+                try out.append(gpa, joined);
+            },
+            else => {},
+        }
+    }
+}
+
+fn shouldSkipDirBasename(name: []const u8) bool {
+    const skips = [_][]const u8{
+        "node_modules", ".git", "zig-cache", ".zig-cache",
+        "zig-out",      "build", "target",   "vendor",
+        ".direnv",      "dist",  "out",      ".bun",
+    };
+    for (skips) |s| if (std.mem.eql(u8, name, s)) return true;
+    return false;
+}
+
+fn pathContainsSkippedSegment(path: []const u8) bool {
+    var it = std.mem.tokenizeAny(u8, path, "/\\");
+    while (it.next()) |seg| if (shouldSkipDirBasename(seg)) return true;
+    return false;
+}
 
 fn pathExists(io: std.Io, path: []const u8) bool {
     // Probe via access() — works for both files and directories.

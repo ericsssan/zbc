@@ -86,7 +86,18 @@ pub const FileCache = struct {
         if (model.findType(name)) |ti| return ti;
         const pc = self.project orelse return null;
         if (self.file_path.len == 0) return null;
-        return findTypeViaImports(pc, self.tree, self.file_path, name, 4);
+        // Try @import-chain walk first (cheap, anchored at this file's
+        // direct imports; succeeds for the common shallow re-export case).
+        if (findTypeViaImports(pc, self.tree, self.file_path, name, 4)) |ti| return ti;
+        // Fall back to the global type index — covers deep namespace
+        // chains the bounded import walk can't reach.  Returns the
+        // FIRST observation; collisions across files yield arbitrary
+        // ordering and the caller doesn't disambiguate.  Acceptable
+        // for the current use-sites (existence checks / method lookup
+        // where the type name alone is descriptive enough).
+        const entries = pc.findAllTypesByName(self.file_path, name) catch return null;
+        if (entries.len == 0) return null;
+        return entries[0].typeInfo();
     }
 
     /// Resolved cross-file method lookup result.  When the method
@@ -115,7 +126,16 @@ pub const FileCache = struct {
         }
         const pc = self.project orelse return null;
         if (self.file_path.len == 0) return null;
-        return findMethodViaImports(pc, self.tree, self.file_path, type_name, method_name, 4);
+        if (findMethodViaImports(pc, self.tree, self.file_path, type_name, method_name, 4)) |rm| return rm;
+        // Global-index fallback.  Try EVERY type observation matching
+        // `type_name` (multiple files may declare a same-named type)
+        // and return the first that also has the requested method.
+        const entries = pc.findAllTypesByName(self.file_path, type_name) catch return null;
+        for (entries) |te| {
+            const ti = te.typeInfo();
+            if (ti.findMethod(method_name)) |m| return .{ .tree = te.tree(), .method = m };
+        }
+        return null;
     }
 
     pub fn deinit(self: *FileCache) void {
