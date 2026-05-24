@@ -121,6 +121,15 @@ fn checkFn(
         if (isOwnershipTransferMethod(meth)) {
             if (parsed.type_name.len == 0 or parsed.type_name[0] < 'A' or parsed.type_name[0] > 'Z') continue;
             if (!typeHasDeinit(model, parsed.type_name)) continue;
+            // Refine via the binding's explicit `: <Type>`
+            // annotation when present.  When the LHS type is in
+            // the file model AND demonstrably has no deinit, the
+            // value doesn't need cleanup regardless of what the
+            // RHS' fromJS / fromXxx returns.  This catches cases
+            // where parsed.type_name resolves to a generic
+            // namespace like `bun.SignalCode` (we'd see "SignalCode"
+            // as the RHS type; cross-file means we can't refute).
+            if (typeAnnotationLacksDeinit(tree, b, model)) continue;
         } else if (isFileHandleOpenerMethod(meth)) {
             is_fd_open = true;
         } else continue;
@@ -288,6 +297,81 @@ fn isFileHandleOpenerMethod(name: []const u8) bool {
         std.mem.eql(u8, name, "open") or
         std.mem.eql(u8, name, "socket") or
         std.mem.eql(u8, name, "accept");
+}
+
+/// True iff the binding has an explicit `: <Type>` type annotation
+/// AND that `<Type>` is a known no-deinit type — a primitive
+/// (numeric / bool), an enum tag, or a struct in the file model
+/// with no deinit method.  Used to suppress the rule on bindings
+/// whose annotated type proves cleanup is unnecessary, even when
+/// the RHS's apparent type can't be cross-file-resolved.
+fn typeAnnotationLacksDeinit(
+    tree: *const Ast,
+    b: anytype,
+    model: *const fmodel.FileModel,
+) bool {
+    const tags = tree.tokens.items(.tag);
+    // Annotation sits between `name_token` and the binding's `=`.
+    // The `=` is one token before `rhs_first` (when no `try`) or
+    // two before (when leading `try`).  Anchor on the colon.
+    var t = b.name_token + 1;
+    if (t >= tags.len or tags[t] != .colon) return false;
+    t += 1;
+    // Walk past `?` / `*` / `const` qualifiers to the first
+    // identifier.
+    while (t < tags.len) : (t += 1) {
+        switch (tags[t]) {
+            .question_mark, .asterisk, .keyword_const, .keyword_var => continue,
+            .identifier => break,
+            else => return false,
+        }
+    }
+    if (t >= tags.len or tags[t] != .identifier) return false;
+    const first_id = tree.tokenSlice(t);
+    // Primitive numeric / bool: never have deinit.
+    if (isPrimitiveBaseName(first_id)) return true;
+    // Possibly `bun.Foo` / `bun.api.Foo` etc. — walk a `.<ident>`
+    // chain and take the LAST identifier as the type name.
+    var last_id = first_id;
+    var u: TokenIndex = t + 1;
+    while (u + 1 < tags.len and tags[u] == .period and tags[u + 1] == .identifier) {
+        last_id = tree.tokenSlice(u + 1);
+        u += 2;
+    }
+    // If the type is in this file's model, ask it directly.
+    if (model.hasType(last_id)) {
+        return !model.typeHasMethod(last_id, "deinit");
+    }
+    // Common Bun naming conventions for non-owned scalar types:
+    // `SignalCode` / `ErrorCode` / `<X>Code`, `FileFD`, `<X>Id`.
+    // Conservative — only trip on suffixes that strongly imply
+    // an enum/int alias, not a heap-owning struct.
+    if (std.mem.endsWith(u8, last_id, "Code")) return true;
+    if (std.mem.endsWith(u8, last_id, "Id") and last_id.len >= 3) return true;
+    if (std.mem.endsWith(u8, last_id, "ID") and last_id.len >= 3) return true;
+    if (std.mem.endsWith(u8, last_id, "Tag")) return true;
+    if (std.mem.endsWith(u8, last_id, "Kind")) return true;
+    if (std.mem.endsWith(u8, last_id, "Flags")) return true;
+    return false;
+}
+
+const TokenIndex = Ast.TokenIndex;
+
+fn isPrimitiveBaseName(name: []const u8) bool {
+    if (std.mem.eql(u8, name, "bool")) return true;
+    if (std.mem.eql(u8, name, "void")) return true;
+    if (std.mem.eql(u8, name, "anyopaque")) return true;
+    if (std.mem.eql(u8, name, "usize")) return true;
+    if (std.mem.eql(u8, name, "isize")) return true;
+    if (std.mem.eql(u8, name, "comptime_int")) return true;
+    if (std.mem.eql(u8, name, "comptime_float")) return true;
+    if (name.len < 2) return false;
+    const lead = name[0];
+    if (lead == 'f' or lead == 'u' or lead == 'i') {
+        for (name[1..]) |c| if (c < '0' or c > '9') return false;
+        return true;
+    }
+    return false;
 }
 
 /// True iff `Type` has a `deinit` method discoverable in the
