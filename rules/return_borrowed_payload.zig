@@ -51,7 +51,6 @@ pub fn check(
     problems: *std.ArrayListUnmanaged(Problem),
 ) !void {
     if (!config_mod.isEnabled(config, .return_borrowed_payload)) return;
-    _ = cache;
 
     var node_idx: u32 = 1;
     while (node_idx < tree.nodes.len) : (node_idx += 1) {
@@ -59,13 +58,14 @@ pub fn check(
         if (tree.nodeTag(node) != .fn_decl) continue;
         if (returnsType(tree, node)) continue;
         const body = bodyOf(tree, node) orelse continue;
-        try checkBody(gpa, tree, body, problems);
+        try checkBody(gpa, tree, cache, body, problems);
     }
 }
 
 fn checkBody(
     gpa: std.mem.Allocator,
     tree: *const Ast,
+    cache: *file_cache_mod.FileCache,
     body: Ast.Node.Index,
     problems: *std.ArrayListUnmanaged(Problem),
 ) !void {
@@ -86,7 +86,12 @@ fn checkBody(
         if (cp + 1 > last or tags[cp + 1] != .l_brace) continue;
         const sw_body_start = cp + 1;
         const sw_body_end = matchBrace(tags, sw_body_start, last) orelse continue;
-        try checkSwitchArms(gpa, tree, sw_body_start + 1, sw_body_end - 1, problems);
+        // Resolve the scrutinee's union type (if same-file or
+        // resolvable cross-file) so bare-return arms can be filtered
+        // by payload-type: pointer-payload arms return the cached
+        // pointer (not a borrow into the input), so they're safe.
+        const scrut_union = scrutineeUnionType(tree, cache, t + 3, cp - 1);
+        try checkSwitchArms(gpa, tree, scrut_union, sw_body_start + 1, sw_body_end - 1, problems);
         t = sw_body_end;
     }
 }
@@ -98,9 +103,148 @@ const ArmInfo = struct {
     has_clone: bool,
 };
 
+/// Resolve the scrutinee expression `switch (<expr>)` (token range
+/// [start, end] = inside the parens) to a union TypeInfo when:
+///   - the expression is a single identifier (a local) whose
+///     binding chain we can follow, OR
+///   - the expression is `<ident>.*` / `<ident>.<field>` shapes
+///     where the leaf type is a union.
+/// Returns null when unresolvable.  Used by the rule to filter
+/// pointer-payload arms.
+fn scrutineeUnionType(
+    tree: *const Ast,
+    cache: *file_cache_mod.FileCache,
+    start: Ast.TokenIndex,
+    end: Ast.TokenIndex,
+) ?*const @import("../model.zig").TypeInfo {
+    const tags = tree.tokens.items(.tag);
+    if (start > end) return null;
+    // Handle `<ident>.*` (deref).  Zig lexes `.*` as one token,
+    // so the shape is `<ident>` `.*` (token tag `period_asterisk`).
+    if (end == start + 1 and
+        tags[start] == .identifier and
+        tags[start + 1] == .period_asterisk)
+    {
+        const ident = tree.tokenSlice(start);
+        return resolveLocalTypeAsUnion(tree, cache, start, ident);
+    }
+    // Handle bare `<ident>` — usually a method receiver `this`/`self`.
+    if (start == end and tags[start] == .identifier) {
+        const ident = tree.tokenSlice(start);
+        return resolveLocalTypeAsUnion(tree, cache, start, ident);
+    }
+    return null;
+}
+
+/// Find the local named `ident` in the enclosing fn's prototype,
+/// extract the base type identifier, look it up via file model +
+/// cross-file index.  Return the TypeInfo only if it's a union.
+fn resolveLocalTypeAsUnion(
+    tree: *const Ast,
+    cache: *file_cache_mod.FileCache,
+    ident_tok: Ast.TokenIndex,
+    ident: []const u8,
+) ?*const @import("../model.zig").TypeInfo {
+    const fn_decl = enclosingFnDecl(tree, ident_tok) orelse return null;
+    var proto_buf: [1]Ast.Node.Index = undefined;
+    const proto = lexer.fnProto(tree, &proto_buf, fn_decl) orelse return null;
+    var it = proto.iterate(tree);
+    while (it.next()) |p| {
+        const nt = p.name_token orelse continue;
+        if (!std.mem.eql(u8, tree.tokenSlice(nt), ident)) continue;
+        const type_node = p.type_expr orelse return null;
+        const type_name = baseTypeNameOfNode(tree, type_node) orelse return null;
+        const model = cache.fileModel() catch return null;
+        const ti = model.findType(type_name) orelse blk: {
+            break :blk cache.findTypeAcrossImports(type_name) orelse return null;
+        };
+        if (ti.kind != .union_) return null;
+        return ti;
+    }
+    return null;
+}
+
+fn enclosingFnDecl(tree: *const Ast, tok: Ast.TokenIndex) ?Ast.Node.Index {
+    var idx: u32 = 1;
+    var best: ?Ast.Node.Index = null;
+    var best_first: Ast.TokenIndex = 0;
+    while (idx < tree.nodes.len) : (idx += 1) {
+        const node: Ast.Node.Index = @enumFromInt(idx);
+        if (tree.nodeTag(node) != .fn_decl) continue;
+        const f = tree.firstToken(node);
+        const l = tree.lastToken(node);
+        if (tok < f or tok > l) continue;
+        if (best == null or f > best_first) {
+            best = node;
+            best_first = f;
+        }
+    }
+    return best;
+}
+
+fn baseTypeNameOfNode(tree: *const Ast, type_node: Ast.Node.Index) ?[]const u8 {
+    const tags = tree.tokens.items(.tag);
+    const first = tree.firstToken(type_node);
+    const last = tree.lastToken(type_node);
+    var t: Ast.TokenIndex = first;
+    while (t <= last) : (t += 1) {
+        switch (tags[t]) {
+            .question_mark, .asterisk, .keyword_const => continue,
+            .l_bracket => {
+                var d: u32 = 1;
+                t += 1;
+                while (t <= last and d > 0) : (t += 1) {
+                    if (tags[t] == .l_bracket) d += 1;
+                    if (tags[t] == .r_bracket) d -= 1;
+                }
+                if (t > last) return null;
+                t -= 1;
+            },
+            .identifier, .builtin => break,
+            else => return null,
+        }
+    }
+    if (t > last) return null;
+    var last_name: ?[]const u8 = null;
+    var expecting_ident: bool = true;
+    while (t <= last) : (t += 1) {
+        if (expecting_ident) {
+            if (tags[t] == .identifier) {
+                last_name = tree.tokenSlice(t);
+                expecting_ident = false;
+            } else return last_name;
+        } else {
+            if (tags[t] == .period) {
+                expecting_ident = true;
+            } else break;
+        }
+    }
+    return last_name;
+}
+
+/// True iff the union variant `tag_name`'s declared payload type
+/// is a pointer (`*T` / `?*T`).  Pointer payloads in a switch arm
+/// `.tag => |v| v` are STABLE — `v` IS the pointer, returning it
+/// doesn't borrow from any caller input.
+fn unionVariantHasPointerPayload(
+    tree: *const Ast,
+    un_ti: *const @import("../model.zig").TypeInfo,
+    tag_name: []const u8,
+) bool {
+    const field = un_ti.findField(tag_name) orelse return false;
+    const tags = tree.tokens.items(.tag);
+    var t: Ast.TokenIndex = field.type_first;
+    while (t <= field.type_last) : (t += 1) {
+        if (tags[t] == .question_mark) continue;
+        return tags[t] == .asterisk;
+    }
+    return false;
+}
+
 fn checkSwitchArms(
     gpa: std.mem.Allocator,
     tree: *const Ast,
+    scrut_union: ?*const @import("../model.zig").TypeInfo,
     start: Ast.TokenIndex,
     end: Ast.TokenIndex,
     problems: *std.ArrayListUnmanaged(Problem),
@@ -147,10 +291,20 @@ fn checkSwitchArms(
         else
             body_end_inclusive;
 
-        const is_bare = if (capture_name) |cap|
+        const tag_name = tree.tokenSlice(tag_tok);
+        var is_bare = if (capture_name) |cap|
             armIsBareReturn(tree, scan_start, scan_end, cap)
         else
             false;
+        // Pointer-payload skip: when the union variant's declared
+        // payload type is `*T` / `?*T`, the captured `v` IS a
+        // pointer.  Returning it bare doesn't borrow from any
+        // caller input — it returns the cached heap pointer.
+        if (is_bare and scrut_union != null and
+            unionVariantHasPointerPayload(tree, scrut_union.?, tag_name))
+        {
+            is_bare = false;
+        }
         const has_clone = armHasClone(tree, scan_start, scan_end);
         try arms.append(gpa, .{
             .tag_tok = tag_tok,
