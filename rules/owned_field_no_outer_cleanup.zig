@@ -94,7 +94,7 @@ pub fn check(
         const outer_has_allocator = outerHasAllocatorField(tree, outer);
         var hit: ?usize = null;
         for (fields, 0..) |f, i| {
-            const inner_ti = mq.resolveFieldType(tree, model, f) orelse continue;
+            const inner_ti = mq.resolveFieldTypeScoped(tree, model, outer, f) orelse continue;
             if (!anyNonTrivialCleanup(tree, inner_ti)) continue;
             if (!outer_has_allocator and allCleanupMethodsNeedExtraArg(tree, inner_ti)) continue;
             // Tagged-union with ALL non-owned variants: dropping
@@ -111,7 +111,7 @@ pub fn check(
         }
         const idx = hit orelse continue;
         const field = fields[idx];
-        const inner = mq.resolveFieldType(tree, model, field).?;
+        const inner = mq.resolveFieldTypeScoped(tree, model, outer, field).?;
         trace.match(R, tree, field.name_token, "owned field with no outer cleanup");
         try report(gpa, problems, tree, outer.name, field.name_token, field.name, inner.name);
     }

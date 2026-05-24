@@ -220,6 +220,28 @@ pub fn resolveFieldType(
     return model.findType(name);
 }
 
+/// Like `resolveFieldType`, but uses `model.findTypeInScope` rooted
+/// at `owner` — resolves the field's type starting from `owner`'s
+/// own NESTED types, then its parent's siblings, etc.  Falls back
+/// to the simple findType behavior when `owner` is null.  Used to
+/// disambiguate name collisions where the same identifier
+/// (`Future`, `State`) names a type in multiple enclosing scopes.
+pub fn resolveFieldTypeScoped(
+    tree: *const Ast,
+    model: *const fmodel.FileModel,
+    owner: *const fmodel.TypeInfo,
+    field: *const fmodel.FieldInfo,
+) ?*const fmodel.TypeInfo {
+    const tags = tree.tokens.items(.tag);
+    var t: TokenIndex = field.type_first;
+    if (t > field.type_last) return null;
+    if (tags[t] == .question_mark) t += 1;
+    if (t > field.type_last) return null;
+    if (tags[t] != .identifier) return null;
+    const name = tree.tokenSlice(t);
+    return model.findTypeInScope(name, owner);
+}
+
 // ── Body-pattern integration ─────────────────────────────────
 
 /// True iff the method's body contains a match for `atoms` (skipping

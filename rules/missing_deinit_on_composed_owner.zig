@@ -67,7 +67,7 @@ pub fn check(
             // (e.g. "Route" for `Route.RefCount`), but the suffix
             // signal lives at the chain's tail.
             if (fieldTypeTrailingNameEndsWith(tree, field, "RefCount")) continue;
-            const inner_ti = mq.resolveFieldType(tree, model, field) orelse continue;
+            const inner_ti = mq.resolveFieldTypeScoped(tree, model, outer, field) orelse continue;
 
             // Trivial-deinit skip: when the inner's `deinit` (or
             // any cleanup-named method) is a no-op `_ = self; _ =
