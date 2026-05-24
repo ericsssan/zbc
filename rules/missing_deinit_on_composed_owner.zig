@@ -69,6 +69,15 @@ pub fn check(
             if (fieldTypeTrailingNameEndsWith(tree, field, "RefCount")) continue;
             const inner_ti = mq.resolveFieldType(tree, model, field) orelse continue;
 
+            // Trivial-deinit skip: when the inner's `deinit` (or
+            // any cleanup-named method) is a no-op `_ = self; _ =
+            // allocator;` body, dropping it never leaks anything,
+            // regardless of whether the outer calls it.  Common
+            // for trait-uniform value types that conform to the
+            // `deinit(self, allocator)` signature for API
+            // uniformity but do no real cleanup.
+            if (!anyNonTrivialCleanup(tree, inner_ti)) continue;
+
             // Direct: `<X>.<field>.<cleanup>(`.  X is wildcarded
             // (typically self/this).  The body pattern is built
             // per-field since `.text` needs the field's name.
@@ -129,6 +138,49 @@ pub fn check(
             try report(gpa, problems, tree, field.name_token, field.name, inner_ti.name);
         }
     }
+}
+
+/// True iff `ti` has at least one cleanup-named method whose
+/// body is non-trivial — i.e. contains something other than
+/// `_ = <expr>;` discards.  An empty `{}` or all-discards body
+/// means the method does nothing on drop, so a missing outer
+/// cleanup of the field is harmless.
+fn anyNonTrivialCleanup(tree: *const Ast, ti: *const fmodel.TypeInfo) bool {
+    for (ti.methods) |m| {
+        if (!isCleanupName(m.name)) continue;
+        if (!isTrivialBody(tree, m.body_first, m.body_last)) return true;
+    }
+    return false;
+}
+
+/// True iff the body `[body_first..body_last]` (inclusive `{` ... `}`)
+/// is empty or contains only `_ = <expr>;` discard statements.
+fn isTrivialBody(tree: *const Ast, body_first: Ast.TokenIndex, body_last: Ast.TokenIndex) bool {
+    const tags = tree.tokens.items(.tag);
+    if (body_first >= body_last) return true;
+    if (body_first + 1 == body_last) return true;
+    var t: Ast.TokenIndex = body_first + 1;
+    while (t < body_last) {
+        if (tags[t] != .identifier) return false;
+        if (!std.mem.eql(u8, tree.tokenSlice(t), "_")) return false;
+        if (t + 1 >= body_last or tags[t + 1] != .equal) return false;
+        var depth: u32 = 0;
+        var k = t + 2;
+        while (k < body_last) : (k += 1) {
+            switch (tags[k]) {
+                .l_paren, .l_brace, .l_bracket => depth += 1,
+                .r_paren, .r_brace, .r_bracket => {
+                    if (depth == 0) return false;
+                    depth -= 1;
+                },
+                .semicolon => if (depth == 0) break,
+                else => {},
+            }
+        }
+        if (k >= body_last or tags[k] != .semicolon) return false;
+        t = k + 1;
+    }
+    return true;
 }
 
 /// True iff the inner type has a `deinit` (or `close`/`destroy`/
@@ -360,8 +412,8 @@ fn report(
 test "outer deinit forgets inner field deinit fires" {
     try testing.expectFires(check, R,
         \\const MemoryAccessor = struct {
-        \\    fd: i32,
-        \\    pub fn deinit(self: *MemoryAccessor) void { _ = self; }
+        \\    fd: i32 = -1,
+        \\    pub fn deinit(self: *MemoryAccessor) void { self.fd = -1; }
         \\};
         \\const StackIterator = struct {
         \\    ma: MemoryAccessor,
@@ -413,7 +465,8 @@ test "pointer field (likely borrow) doesn't fire" {
 test "optional value-typed field (?Inner) fires" {
     try testing.expectFires(check, R,
         \\const Inner = struct {
-        \\    pub fn deinit(self: *Inner) void { _ = self; }
+        \\    fd: i32 = -1,
+        \\    pub fn deinit(self: *Inner) void { self.fd = -1; }
         \\};
         \\const Outer = struct {
         \\    inner: ?Inner,

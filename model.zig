@@ -478,6 +478,13 @@ pub const FileModel = struct {
         start: TokenIndex,
         last: TokenIndex,
     ) bool {
+        // Anonymous-struct payload (`struct { ... }`): walk its
+        // fields and treat as non-owned only if every field is a
+        // pointer or primitive.  A pointer field is a BORROW; a
+        // primitive field is a value — neither leaks on drop.
+        if (start < last and tags[start] == .keyword_struct) {
+            return anonStructHasOwnedField(self, tags, start, last);
+        }
         // Walk type tokens; collect the last identifier (the base
         // type name).  Stop at the next top-level comma.
         var t: TokenIndex = start;
@@ -809,6 +816,117 @@ fn collectTypesInRange(
         // Skip past the body so the outer scan doesn't re-enter it.
         t = body_last;
     }
+}
+
+/// True iff the anonymous struct payload starting at `start`
+/// (the `struct` keyword) contains at least one OWNED field —
+/// a non-pointer non-primitive whose type has a `deinit` (or
+/// equivalent).  Returns false when every field is `*T` / `?*T`
+/// (a borrow) or a primitive (a value) — no leak possible.
+fn anonStructHasOwnedField(
+    model: *const FileModel,
+    tags: []const TokenTag,
+    start: TokenIndex,
+    last: TokenIndex,
+) bool {
+    if (start + 2 > last) return true;
+    if (tags[start] != .keyword_struct) return true;
+    if (tags[start + 1] != .l_brace) return true;
+    var t: TokenIndex = start + 2;
+    var depth: i32 = 1;
+    while (t < last and depth > 0) {
+        // A field starts with an identifier (the field name)
+        // followed by `:` at brace depth 1.  Skip method / const
+        // decls.
+        switch (tags[t]) {
+            .l_brace => {
+                depth += 1;
+                t += 1;
+                continue;
+            },
+            .r_brace => {
+                depth -= 1;
+                t += 1;
+                continue;
+            },
+            .keyword_fn, .keyword_pub, .keyword_const, .keyword_var => {
+                t = skipDeclStmt(tags, t, last);
+                t += 1;
+                continue;
+            },
+            .identifier => {
+                if (t + 1 < last and tags[t + 1] == .colon) {
+                    // Field — parse type tokens.
+                    const type_start = t + 2;
+                    // Scan the type tokens up to the next `,` / `}`
+                    // / default `=` at depth 1.
+                    var u: TokenIndex = type_start;
+                    var pd: i32 = 0;
+                    while (u < last) : (u += 1) {
+                        switch (tags[u]) {
+                            .l_paren, .l_bracket, .l_brace => pd += 1,
+                            .r_paren, .r_bracket, .r_brace => {
+                                if (pd == 0) break;
+                                pd -= 1;
+                            },
+                            .comma, .equal => if (pd == 0) break,
+                            else => {},
+                        }
+                    }
+                    // Field-type tokens are [type_start, u-1].
+                    if (fieldTypeIsOwnedValue(model, tags, type_start, u)) return true;
+                    t = u;
+                    continue;
+                }
+                t += 1;
+                continue;
+            },
+            else => {
+                t += 1;
+                continue;
+            },
+        }
+    }
+    return false;
+}
+
+/// True iff the type tokens `[start, end)` form an OWNED VALUE —
+/// not a pointer (`*T` / `?*T`) and not a primitive.  Used by
+/// `anonStructHasOwnedField` to classify each field of an
+/// anonymous struct payload.
+fn fieldTypeIsOwnedValue(
+    model: *const FileModel,
+    tags: []const TokenTag,
+    start: TokenIndex,
+    end: TokenIndex,
+) bool {
+    if (start >= end) return false;
+    var t: TokenIndex = start;
+    // Skip `?` qualifier; a `?*T` is still a pointer.
+    while (t < end and tags[t] == .question_mark) : (t += 1) {}
+    if (t < end and tags[t] == .asterisk) return false; // pointer
+    if (t < end and tags[t] == .l_bracket) return false; // slice/array
+    // Collect the last identifier as the base type.
+    var last_id: ?[]const u8 = null;
+    var pd: i32 = 0;
+    while (t < end) : (t += 1) {
+        switch (tags[t]) {
+            .l_paren, .l_bracket => pd += 1,
+            .r_paren, .r_bracket => pd -= 1,
+            .identifier => last_id = model.tree.tokenSlice(t),
+            else => {},
+        }
+    }
+    const name = last_id orelse return false;
+    if (isPrimitiveBaseName(name)) return false;
+    if (model.findType(name)) |ti| {
+        return ti.hasMethod("deinit") or
+            ti.hasMethod("deref") or
+            ti.hasMethod("destroy") or
+            ti.hasMethod("close");
+    }
+    // Cross-file unknown — conservatively treat as owned.
+    return true;
 }
 
 /// Token-walk past one top-level decl (`pub fn …`, `const X = …;`,
