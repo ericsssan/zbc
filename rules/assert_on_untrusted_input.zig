@@ -138,6 +138,19 @@ fn checkFn(
             t = cp;
             continue;
         }
+        // Path/semantic-precondition skip: `assert(<path-named-param>[0] == <char-lit>);`
+        // — a constant-index byte check on a string-named param
+        // (`path`, `file_path`, `url`, `name`, `key`, etc.).  These
+        // are caller-validated structural invariants on text inputs
+        // (e.g., "absolute path begins with /"), not data-derived
+        // out-of-bounds reads.  Distinct from byte-stream parsing
+        // (`buffer[0] == 0xFF`) which we DO fire on — magic-byte
+        // sanity checks against attacker-controlled bytes need to be
+        // converted to explicit validation.
+        if (isSemanticStringPreconditionAssert(tree, t + 2, cp - 1, params.items)) {
+            t = cp;
+            continue;
+        }
         try report(gpa, problems, tree, t);
         t = cp;
     }
@@ -220,6 +233,51 @@ fn isLengthPreconditionAssert(
         }
     }
     return saw_param_len;
+}
+
+/// True iff the assert expression is a semantic-string precondition
+/// of the form `<path-named-param>[<int-literal>] <cmp> <char-lit>`.
+/// Param-name allowlist: text-shaped slices (path / file_path /
+/// url / name / key / ext / suffix / prefix / dir / dirname /
+/// basename / filename).  Byte-stream params (buffer / buf / bytes
+/// / data / input / wire / pkt / packet / msg / frame) keep firing
+/// — magic-byte sanity checks on attacker-controlled bytes need
+/// explicit `if (...) return error.X;` validation.
+fn isSemanticStringPreconditionAssert(
+    tree: *const Ast,
+    start: Ast.TokenIndex,
+    end: Ast.TokenIndex,
+    params: []const []const u8,
+) bool {
+    _ = params;
+    const tags = tree.tokens.items(.tag);
+    var saw_non_const_bracket = false;
+    var found = false;
+    var t: Ast.TokenIndex = start;
+    while (t + 3 <= end) : (t += 1) {
+        if (tags[t] != .l_bracket) continue;
+        if (tags[t + 1] != .number_literal or tags[t + 2] != .r_bracket) {
+            saw_non_const_bracket = true;
+            continue;
+        }
+        if (t == 0 or tags[t - 1] != .identifier) continue;
+        const name = tree.tokenSlice(t - 1);
+        if (!isSemanticStringName(name)) continue;
+        found = true;
+    }
+    return found and !saw_non_const_bracket;
+}
+
+fn isSemanticStringName(name: []const u8) bool {
+    const list = [_][]const u8{
+        "path",       "file_path",  "filePath", "url",
+        "name",       "key",        "ext",      "suffix",
+        "prefix",     "dir",        "dirname",  "basename",
+        "filename",   "label",      "ident",    "identifier",
+        "text",       "str",        "string",
+    };
+    for (list) |s| if (std.mem.eql(u8, s, name)) return true;
+    return false;
 }
 
 fn assertMentionsParam(
