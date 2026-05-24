@@ -163,12 +163,13 @@ fn checkFn(
     if (deferred.items.len == 0) return;
 
     // Find writes through pointer params; check RHS for any deferred name.
-    try scanWrites(gpa, tree, write_via_out, first, last, model, pointer_params.items, deferred.items, problems);
+    try scanWrites(gpa, tree, cache, write_via_out, first, last, model, pointer_params.items, deferred.items, problems);
 }
 
 fn scanWrites(
     gpa: std.mem.Allocator,
     tree: *const Ast,
+    cache: *file_cache_mod.FileCache,
     atoms: []const Atom,
     first: Ast.TokenIndex,
     last: Ast.TokenIndex,
@@ -220,6 +221,14 @@ fn scanWrites(
         // body does `allocator.dupe(u8, slice)`).  The out-param
         // receives the new owned copy, not a borrow.
         if (rhsContainsAllocatorConstructor(tree, w.end + 1, sc - 1)) continue;
+        // Cross-fn dupe inference: if the RHS is a single same-file
+        // fn call whose body's returns NEVER mention any of its
+        // params, the result can't carry a borrow back from any
+        // arg.  Resolves the `this.x = makePlaceholder(decoded.rgba,
+        // decoded.width, decoded.height)` shape where makePlaceholder
+        // builds a new heap allocation and returns it independently
+        // of its args.
+        if (rhsCallIsResultIndependent(tree, cache, w.end + 1, sc - 1)) continue;
         const dn = rhsMentionsDeferred(tree, w.end + 1, sc - 1, deferred) orelse continue;
         try report(gpa, problems, tree, w.start, out_name, dn);
     }
@@ -411,6 +420,68 @@ fn isCopyingMethodName(name: []const u8) bool {
 /// `allocator.dupe(u8, slice)` internally).  Cross-fn dupe
 /// inference without an actual cross-fn lookup: the presence of
 /// an allocator in the call shape is the signal.
+/// Cross-fn dupe inference: the RHS is a single call `<X>(args...)`
+/// (optionally wrapped in `try`/`catch`); look up the fn by name in
+/// the file model, check its FnSummary's
+/// `result_independent_of_args`.  Returns true when the call's
+/// result demonstrably can't carry a borrow from any arg.
+///
+/// Conservative — only fires when the RHS shape is a SINGLE call
+/// expression (not a chain or struct-init wrapper) AND the called
+/// fn is in the local model.  Cross-file calls are unhandled
+/// (would need a project-wide model).
+fn rhsCallIsResultIndependent(
+    tree: *const Ast,
+    cache: *file_cache_mod.FileCache,
+    start: Ast.TokenIndex,
+    end: Ast.TokenIndex,
+) bool {
+    const tags = tree.tokens.items(.tag);
+    // Peel optional leading `try`.
+    var t: Ast.TokenIndex = start;
+    if (t <= end and tags[t] == .keyword_try) t += 1;
+    if (t + 2 > end) return false;
+    // RHS shape: [`<recv>`,`.`]* `<id>` `(` ... `)` [`catch` ...].
+    // Walk to the FIRST `(` collecting the immediately-preceding
+    // identifier as the method/fn name.
+    var p: Ast.TokenIndex = t;
+    var last_ident: ?Ast.TokenIndex = null;
+    while (p <= end) : (p += 1) {
+        switch (tags[p]) {
+            .identifier => last_ident = p,
+            .period, .builtin => {},
+            .l_paren => break,
+            else => return false,
+        }
+    }
+    if (p > end or tags[p] != .l_paren) return false;
+    const name_tok = last_ident orelse return false;
+    const fn_name = tree.tokenSlice(name_tok);
+    // Look up the fn by name — top-level OR a method of any type
+    // in the file model.  Cross-file calls are unhandled.
+    const model = cache.fileModel() catch return false;
+    const fn_decl = findFnDeclByName(model, fn_name) orelse return false;
+    const summary = cache.summaryOfFn(fn_decl) catch return false;
+    return summary.result_independent_of_args;
+}
+
+/// Find a fn_decl AST node by name — top-level OR a method of
+/// any type.  Conservative: returns null on the FIRST match;
+/// multiple methods with the same name across types collapse to
+/// the first.  Acceptable because the borrowed-slice analysis
+/// is opportunistic (false-negative is fine).
+fn findFnDeclByName(model: *const fmodel.FileModel, name: []const u8) ?Ast.Node.Index {
+    for (model.fns) |f| {
+        if (std.mem.eql(u8, f.name, name)) return f.fn_decl;
+    }
+    for (model.types) |ti| {
+        for (ti.methods) |m| {
+            if (std.mem.eql(u8, m.name, name)) return m.fn_decl;
+        }
+    }
+    return null;
+}
+
 fn rhsContainsAllocatorConstructor(
     tree: *const Ast,
     start: Ast.TokenIndex,
@@ -610,7 +681,10 @@ test "defer arena.deinit + out-param write using arena fires" {
     try testing.expectFires(check, R,
         \\const std = @import("std");
         \\const ZigString = struct {
-        \\    pub fn init(_: anytype) ZigString { return .{}; }
+        \\    raw: u64 = 0,
+        \\    // Returns a borrow of `s` — captures it into the
+        \\    // result, so the result's lifetime is tied to `s`.
+        \\    pub fn init(s: anytype) ZigString { return .{ .raw = s }; }
         \\};
         \\pub fn parse(out: *ZigString, gpa_alloc: std.mem.Allocator) !void {
         \\    var arena = std.heap.ArenaAllocator.init(gpa_alloc);

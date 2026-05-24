@@ -86,6 +86,14 @@ pub const FnSummary = struct {
     /// own type.  Filled when the containing type is known; null
     /// when the fn is top-level (no containing type).
     heap_allocates_self: bool = false,
+    /// True iff EVERY return statement's expression is structurally
+    /// independent of every parameter — no param name appears in any
+    /// return.  Used by borrowed-slice analysis to suppress
+    /// "<deferred>.field passed to F(...)" fires when F's result
+    /// can't carry a borrow back from any of its args.  Conservative:
+    /// false when any return expression touches a param OR when the
+    /// fn's body has a non-statement return path we can't see.
+    result_independent_of_args: bool = false,
     /// Internal flag: true iff FileCache.summaryOfFn has fully
     /// populated this entry (cheap + deep inference).  Distinct
     /// from "no fields detected" — without this flag, fns with
@@ -172,7 +180,76 @@ pub fn inferFromBody(
     // conservative rationale around <param>.deinit() being excluded.
     out.takes_ownership_of = inferDirectTakes(tree, proto, body);
 
+    // result_independent_of_args: scan all `return <expr>` statements;
+    // if no return expression mentions any param name, the fn's
+    // result can't carry a borrow back from any of its args.  Used
+    // by borrowed-slice analysis to suppress fires on call results
+    // that don't structurally borrow from <deferred>.
+    out.result_independent_of_args = inferResultIndependentOfArgs(tree, proto, first, last);
+
     return out;
+}
+
+/// Walk every `return <expr>` statement in the fn body; if no return
+/// expression's token range contains any parameter name as an
+/// identifier, the result can't carry a borrow from any arg.  Conservative
+/// when in doubt (return statement we can't parse, body too small, etc.).
+fn inferResultIndependentOfArgs(
+    tree: *const Ast,
+    proto: Ast.full.FnProto,
+    first: Ast.TokenIndex,
+    last: Ast.TokenIndex,
+) bool {
+    const tags = tree.tokens.items(.tag);
+    // Collect param names.  Skip when fn has no params (trivially
+    // independent — no args to borrow from anyway).
+    var param_buf: [16][]const u8 = undefined;
+    var n_params: u32 = 0;
+    var it = proto.iterate(tree);
+    while (it.next()) |p| {
+        if (p.name_token) |nt| {
+            if (n_params < param_buf.len) {
+                param_buf[n_params] = tree.tokenSlice(nt);
+                n_params += 1;
+            }
+        }
+    }
+    if (n_params == 0) return false; // no args means nothing to borrow
+    // Walk for `return` tokens; each is followed by an expression
+    // up to a `;` at brace/paren depth 0.  Check the expr tokens
+    // for any param-name identifier (not post-period — `.field`
+    // accesses on unrelated receivers don't count).
+    var saw_any_return = false;
+    var t: Ast.TokenIndex = first;
+    while (t <= last) : (t += 1) {
+        if (tags[t] == .keyword_fn) {
+            t = lexer.skipNestedFn(tags, t, last);
+            continue;
+        }
+        if (tags[t] != .keyword_return) continue;
+        saw_any_return = true;
+        var u: Ast.TokenIndex = t + 1;
+        var pd: i32 = 0;
+        while (u <= last) : (u += 1) {
+            switch (tags[u]) {
+                .l_paren, .l_bracket, .l_brace => pd += 1,
+                .r_paren, .r_bracket, .r_brace => {
+                    if (pd == 0) break;
+                    pd -= 1;
+                },
+                .semicolon => if (pd == 0) break,
+                .identifier => {
+                    if (u > 0 and tags[u - 1] == .period) continue;
+                    const name = tree.tokenSlice(u);
+                    for (param_buf[0..n_params]) |p| {
+                        if (std.mem.eql(u8, p, name)) return false;
+                    }
+                },
+                else => {},
+            }
+        }
+    }
+    return saw_any_return;
 }
 
 /// R8a: body is `{ return EXPR; }` or `{ var x = EXPR; return x; }`
