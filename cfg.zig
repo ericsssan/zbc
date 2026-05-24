@@ -2114,6 +2114,9 @@ const Builder = struct {
             // / data-segment memory.  `&X` is NOT a stack borrow.
             // Common in vtable-construction patterns.
             if (init_opt) |i| if (tree.nodeTag(i) == .@"comptime") break :blk .type_alias;
+            // `comptime var X = ...;` — comptime-storage variable.
+            // Lives in static memory; `&X` is safe to return.
+            if (var_decl.comptime_token != null) break :blk .type_alias;
             // Struct-wrap propagation: `var ma = Wrapper{ .inner =
             // arena };` — ma carries arena via its field.  Override
             // init_kind to .copy_of(wrapper) so transferDecl
