@@ -150,7 +150,8 @@ pub const FileCache = struct {
     /// Lazily build (and cache) the FileModel for this file.
     pub fn fileModel(self: *FileCache) !*const fmodel.FileModel {
         if (self.file_model == null) {
-            self.file_model = try fmodel.build(self.gpa, self.tree);
+            const fp: ?[]const u8 = if (self.file_path.len > 0) self.file_path else null;
+            self.file_model = try fmodel.buildWithPath(self.gpa, self.tree, fp);
         }
         return &self.file_model.?;
     }

@@ -241,10 +241,22 @@ pub const ProjectCache = struct {
     ) !?[]const u8 {
         if (self.project_root_searched) return self.project_root;
         self.project_root_searched = true;
-        const abs_from = if (std.fs.path.isAbsolute(from_file_path))
-            try self.gpa.dupe(u8, from_file_path)
-        else
-            try std.fs.path.resolve(self.gpa, &.{from_file_path});
+        // Convert to absolute path via libc `realpath(3)` — handles
+        // both relative inputs (resolved against CWD) and symlink
+        // following.  std.fs.path.resolve does NEITHER (just
+        // normalises `./`/`../` components).
+        const abs_from = blk: {
+            if (std.fs.path.isAbsolute(from_file_path)) {
+                break :blk try self.gpa.dupe(u8, from_file_path);
+            }
+            const z = try self.gpa.dupeSentinel(u8, from_file_path, 0);
+            defer self.gpa.free(z);
+            var resolved_buf: [4096]u8 = undefined;
+            const got_opt = std.c.realpath(z.ptr, &resolved_buf);
+            const got = got_opt orelse break :blk try self.gpa.dupe(u8, from_file_path);
+            const len = std.mem.indexOfSentinel(u8, 0, got);
+            break :blk try self.gpa.dupe(u8, resolved_buf[0..len]);
+        };
         defer self.gpa.free(abs_from);
         var cur: []const u8 = std.fs.path.dirname(abs_from) orelse return null;
         // First pass: walk up looking for `.git` (the outermost
@@ -362,7 +374,7 @@ pub const ProjectCache = struct {
             .tree = tree,
             .model = undefined,
         };
-        entry.model = model_mod.build(self.gpa, &entry.tree) catch {
+        entry.model = model_mod.buildWithPath(self.gpa, &entry.tree, entry.abs_path) catch {
             entry.tree.deinit(self.gpa);
             self.gpa.free(entry.source);
             self.gpa.free(entry.abs_path);

@@ -80,6 +80,12 @@ fn checkFn(
         // last token of the iterable; the `)` is at rhs_last + 1.
         const list_field_name = lastFieldIdentBefore(tree, b.rhs_last + 1) orelse continue;
         if (!isPointerListField(tree, list_field_name)) continue;
+        // Self-destroying deinit skip: if the element type's `deinit`
+        // body ALREADY calls `bun.destroy(<self>)` /
+        // `<allocator>.destroy(<self>)`, the per-iteration deinit
+        // already reclaims the heap descriptor.  Rule's prescription
+        // (add an outer destroy) would cause a double-free.
+        if (elementTypeDeinitSelfDestroys(tree, cache, list_field_name)) continue;
 
         // Report at the `for` keyword.  Walk back from name_token to
         // find the enclosing `keyword_for`.
@@ -218,6 +224,113 @@ fn lastFieldIdentBefore(tree: *const Ast, close_paren: Ast.TokenIndex) ?[]const 
 /// whose type expression contains `(*` — i.e. the list's element
 /// type is a pointer.  Loose but accurate for the canonical
 /// `field: std.ArrayListUnmanaged(*T) = .{}` pattern.
+/// True iff the field named `field_name` is declared with a list
+/// element type whose `deinit` body itself calls
+/// `bun.destroy(<self>)` / `<allocator>.destroy(<self>)` — i.e. the
+/// deinit is self-destroying.  Adding an outer destroy in the caller
+/// would double-free.
+///
+/// Resolution: scan the field's type expression for the element-
+/// type identifier inside the LAST `(...)` (e.g.
+/// `ArrayListUnmanaged(*H2.PendingConnect)` → `PendingConnect`).
+/// Then use the cross-file project index to find that type's
+/// `deinit` method and walk its body for the destroy call.
+fn elementTypeDeinitSelfDestroys(
+    tree: *const Ast,
+    cache: *file_cache_mod.FileCache,
+    field_name: []const u8,
+) bool {
+    const elem_name = elementTypeNameOfField(tree, field_name) orelse return false;
+    const rm = cache.findMethodAcrossImports(elem_name, "deinit") orelse return false;
+    return methodBodyContainsSelfDestroy(rm.tree, rm.method);
+}
+
+/// Extract the element-type identifier from a field whose type is a
+/// list/managed-list/etc. parameterised with a pointer element.
+/// Source-scan-based: find the `<field>: ` decl, peel its bounded
+/// type-expression slice, return the LAST identifier inside the
+/// innermost `(...)` whose preceding `(*` confirms pointer shape.
+fn elementTypeNameOfField(tree: *const Ast, field_name: []const u8) ?[]const u8 {
+    const src = tree.source;
+    var pat_buf: [256]u8 = undefined;
+    if (field_name.len + 2 > pat_buf.len) return null;
+    @memcpy(pat_buf[0..field_name.len], field_name);
+    pat_buf[field_name.len] = ':';
+    pat_buf[field_name.len + 1] = ' ';
+    const pat = pat_buf[0 .. field_name.len + 2];
+    var idx: usize = 0;
+    while (std.mem.indexOfPos(u8, src, idx, pat)) |found| {
+        if (found > 0 and isIdentByte(src[found - 1])) {
+            idx = found + 1;
+            continue;
+        }
+        const type_start = found + pat.len;
+        const type_end = fieldTypeExprEnd(src, type_start);
+        const slice = src[type_start..type_end];
+        // Find a `(*` then walk forward to the next non-ident-non-dot
+        // boundary; the LAST identifier in that span is the element
+        // type name (handles `*T`, `*lib.T`).
+        const star_pos = std.mem.indexOf(u8, slice, "(*") orelse return null;
+        var k: usize = star_pos + 2;
+        var last_ident_start: usize = 0;
+        var in_ident: bool = false;
+        var cur_start: usize = 0;
+        while (k < slice.len) : (k += 1) {
+            const c = slice[k];
+            if (isIdentByte(c)) {
+                if (!in_ident) {
+                    cur_start = k;
+                    in_ident = true;
+                }
+                continue;
+            }
+            if (in_ident) {
+                last_ident_start = cur_start;
+                in_ident = false;
+                if (c != '.') break;
+            }
+        }
+        const last_ident_end = blk: {
+            var j = last_ident_start;
+            while (j < slice.len and isIdentByte(slice[j])) : (j += 1) {}
+            break :blk j;
+        };
+        if (last_ident_end <= last_ident_start) return null;
+        return slice[last_ident_start..last_ident_end];
+    }
+    return null;
+}
+
+/// True iff the method's body contains `bun.destroy(<self>)` or
+/// `<x>.destroy(<self>)` / `<x>.free(<self>)` / `<x>.destroy(@self)`
+/// where `<self>` is the method's receiver parameter name.
+fn methodBodyContainsSelfDestroy(
+    tree: *const Ast,
+    method: *const @import("../model.zig").MethodInfo,
+) bool {
+    const tags = tree.tokens.items(.tag);
+    const recv = method.receiver orelse return false;
+    const recv_name = recv.name;
+    var t: Ast.TokenIndex = method.body_first;
+    const end = method.body_last;
+    while (t + 3 <= end) : (t += 1) {
+        // Pattern A: `bun.destroy(<recv>)` — identifier `bun`,
+        // period, `destroy`, `(`, identifier `<recv>`, `)`.
+        if (tags[t] == .identifier and t + 4 <= end and
+            tags[t + 1] == .period and tags[t + 2] == .identifier and
+            tags[t + 3] == .l_paren and tags[t + 4] == .identifier)
+        {
+            const m = tree.tokenSlice(t + 2);
+            if ((std.mem.eql(u8, m, "destroy") or std.mem.eql(u8, m, "free")) and
+                std.mem.eql(u8, tree.tokenSlice(t + 4), recv_name))
+            {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 fn isPointerListField(tree: *const Ast, field_name: []const u8) bool {
     const src = tree.source;
     var pat_buf: [256]u8 = undefined;
@@ -228,15 +341,57 @@ fn isPointerListField(tree: *const Ast, field_name: []const u8) bool {
     const pat = pat_buf[0 .. field_name.len + 2];
     var idx: usize = 0;
     while (std.mem.indexOfPos(u8, src, idx, pat)) |found| {
-        // Look at the next ~120 bytes after the `:` for `(*` or
-        // `[*]` / `[]*` substring.
-        const end = @min(found + pat.len + 120, src.len);
-        const slice = src[found + pat.len .. end];
+        // Word-boundary check: the byte BEFORE the match must not be
+        // an identifier continuation char.  Otherwise `entries: ` would
+        // match inside `extra_execution_entries: `, picking up the
+        // outer field's type expression instead of the named field's.
+        if (found > 0 and isIdentByte(src[found - 1])) {
+            idx = found + 1;
+            continue;
+        }
+        // Examine ONLY the bytes belonging to this field's type
+        // expression — bounded by the next `,` or `=` (default) or
+        // newline at brace-depth 0.  Without the bound, a 120-byte
+        // window leaked into adjacent field decls (`entries: ...,
+        // afterAll: Managed(*ExecutionEntry),` — the `(*` belongs
+        // to afterAll, not entries).
+        const type_start = found + pat.len;
+        const type_end = fieldTypeExprEnd(src, type_start);
+        const slice = src[type_start..type_end];
         if (std.mem.indexOf(u8, slice, "(*") != null) return true;
         if (std.mem.indexOf(u8, slice, "[]*") != null) return true;
-        idx = found + pat.len;
+        idx = type_start;
     }
     return false;
+}
+
+fn isIdentByte(c: u8) bool {
+    return (c >= 'a' and c <= 'z') or
+        (c >= 'A' and c <= 'Z') or
+        (c >= '0' and c <= '9') or
+        c == '_';
+}
+
+/// Find the end of a field's type expression starting at `start`.
+/// Stops at the first `,` or `=` at brace/paren/bracket depth 0
+/// (the field's own depth — the type expression itself may open
+/// parens for generic args like `Managed(T)`).  Caps at 256 bytes
+/// so a malformed file doesn't blow the scan out.
+fn fieldTypeExprEnd(src: []const u8, start: usize) usize {
+    var depth: u32 = 0;
+    const limit = @min(start + 256, src.len);
+    var i: usize = start;
+    while (i < limit) : (i += 1) {
+        switch (src[i]) {
+            '(', '[', '{' => depth += 1,
+            ')', ']', '}' => if (depth > 0) {
+                depth -= 1;
+            } else return i,
+            ',', '=' => if (depth == 0) return i,
+            else => {},
+        }
+    }
+    return limit;
 }
 
 fn isDestructorName(name: []const u8) bool {

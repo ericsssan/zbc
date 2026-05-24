@@ -820,6 +820,17 @@ fn baseTypeName(tree: *const Ast, first: TokenIndex, last: TokenIndex) ?[]const 
 
 /// Build a FileModel for the given Ast.  `tree` must outlive the model.
 pub fn build(gpa: std.mem.Allocator, tree: *const Ast) !FileModel {
+    return buildWithPath(gpa, tree, null);
+}
+
+/// Like `build` but also infers a file-as-struct name from the
+/// filename's stem when the source uses the bun convention
+/// (`pub const new = bun.TrivialNew(@This())` / `bun.New(@This())` /
+/// `RefCount(@This(), ...)`) without an explicit `const X = @This();`.
+/// Pass `file_path` (absolute or relative — only the basename is
+/// used) so cross-file lookups can resolve types named after their
+/// containing file.
+pub fn buildWithPath(gpa: std.mem.Allocator, tree: *const Ast, file_path: ?[]const u8) !FileModel {
     var arena = std.heap.ArenaAllocator.init(gpa);
     errdefer arena.deinit();
     const a = arena.allocator();
@@ -896,7 +907,19 @@ pub fn build(gpa: std.mem.Allocator, tree: *const Ast) !FileModel {
     // fields and methods (the file-level fn list).  Lets findType /
     // fieldType / etc. resolve fields and methods uniformly across
     // `const X = struct { ... }` and `const X = @This();` shapes.
-    if (detectFileStructName(tree)) |fs_name| {
+    const inferred_name: ?[]const u8 = detectFileStructName(tree) orelse blk: {
+        if (file_path) |fp| {
+            if (fileLooksLikeStruct(tree)) {
+                const base = std.fs.path.basename(fp);
+                // Strip `.zig` suffix to get the stem.
+                if (std.mem.endsWith(u8, base, ".zig") and base.len > 4) {
+                    break :blk base[0 .. base.len - 4];
+                }
+            }
+        }
+        break :blk null;
+    };
+    if (inferred_name) |fs_name| {
         // Skip if a type with the same name was already collected
         // (defensive — shouldn't happen since file-struct decls don't
         // open a brace body and aren't picked up by collectTypesInRange).
@@ -947,6 +970,33 @@ pub fn build(gpa: std.mem.Allocator, tree: *const Ast) !FileModel {
         .types = try types.toOwnedSlice(a),
         .fns = try fns.toOwnedSlice(a),
     };
+}
+
+/// True iff the file's top-level syntax looks like a struct
+/// definition: contains the bun convention `bun.TrivialNew(@This())`
+/// / `bun.New(@This())` / `RefCount(@This(), ...)` mixin OR a
+/// `pub fn <name>(<recv>: *@This())` method (recv typed as @This()
+/// — strong signal of "file IS the struct").  Used by buildWithPath
+/// to recover the implicit type name from the filename when the
+/// source doesn't have a `const X = @This();` alias.
+fn fileLooksLikeStruct(tree: *const Ast) bool {
+    const tags = tree.tokens.items(.tag);
+    const tok_count: u32 = @intCast(tree.tokens.len);
+    // Scan for `<ident>(@This())` patterns or `*@This()` in fn
+    // signatures.  Bound the scan to the first ~512 tokens for
+    // performance — the convention places these markers near the
+    // file head.
+    var t: TokenIndex = 0;
+    const scan_end: TokenIndex = if (tok_count < 1024) tok_count else 1024;
+    while (t + 2 < scan_end) : (t += 1) {
+        if (tags[t] != .builtin) continue;
+        if (!std.mem.eql(u8, tree.tokenSlice(t), "@This")) continue;
+        // `@This()` — confirmed.  This appears in any of the bun
+        // mixins (TrivialNew / New / RefCount) and in `*@This()`
+        // method receivers; either signals file-struct usage.
+        return true;
+    }
+    return false;
 }
 
 fn detectFileStructName(tree: *const Ast) ?[]const u8 {
