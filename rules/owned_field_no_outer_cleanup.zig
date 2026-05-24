@@ -47,6 +47,11 @@ pub fn check(
     defer gpa.free(outers);
 
     for (outers) |outer| {
+        // HashMap-context skip: a type whose only methods are
+        // `hash` / `eql` is a comparison-key shape, not an owner.
+        // Fields are values used for comparison (FD-as-key, etc.),
+        // not allocations to free.
+        if (isHashContextType(outer)) continue;
         // Linked-list node skip: if the type has a `next: ?*Self`
         // (or `prev: ?*Self`) field, it's a node in an external
         // intrusive container — the container's deinit walks the
@@ -100,6 +105,27 @@ pub fn check(
         trace.match(R, tree, field.name_token, "owned field with no outer cleanup");
         try report(gpa, problems, tree, outer.name, field.name_token, field.name, inner.name);
     }
+}
+
+/// True iff the type's only methods are the HashMap-context
+/// shape (`hash` and `eql`).  Such types are comparison keys —
+/// fields hold VALUES (often FDs, IDs, etc.) used for hashing/
+/// equality, not owned allocations.  Common in Bun's hashmap
+/// adapters.
+fn isHashContextType(ti: *const fmodel.TypeInfo) bool {
+    if (ti.methods.len == 0) return false;
+    var saw_hash = false;
+    var saw_eql = false;
+    for (ti.methods) |m| {
+        if (std.mem.eql(u8, m.name, "hash")) {
+            saw_hash = true;
+        } else if (std.mem.eql(u8, m.name, "eql")) {
+            saw_eql = true;
+        } else {
+            return false;
+        }
+    }
+    return saw_hash and saw_eql;
 }
 
 /// True iff the type has a `next: ?*Self` (or `next: ?*<TypeName>` /
