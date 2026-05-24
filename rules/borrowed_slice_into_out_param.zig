@@ -206,6 +206,18 @@ fn scanWrites(
                     if (leaf_ti.kind == .enum_) continue;
                     if (leaf_ti.kind == .struct_ and structOnlyHoldsPrimitivesOrPointers(tree, leaf_ti)) continue;
                 }
+                // Cross-file fallback: when the field's type is a
+                // simple identifier that resolves through the
+                // global type index to an enum (or pointer/primitive-
+                // only struct), the field can't hold a borrowed
+                // slice.  Handles \`field: AuthMethod\` where
+                // AuthMethod is an enum defined in another file.
+                if (model.fieldType(ty, field_name)) |ft| {
+                    if (cache.findTypeAcrossImports(ft)) |leaf_ti| {
+                        if (leaf_ti.kind == .enum_) continue;
+                        if (leaf_ti.kind == .struct_ and structOnlyHoldsPrimitivesOrPointers(tree, leaf_ti)) continue;
+                    }
+                }
             }
         }
         // RHS-shape check: when the assigned value comes from a
