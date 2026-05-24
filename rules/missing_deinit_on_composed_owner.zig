@@ -107,9 +107,46 @@ pub fn check(
             // into specific owned sub-fields.
             if (methodBodyMentionsField(tree, deinit, field.name)) continue;
 
+            // Caller-supplied field skip: if the type's `init` /
+            // `create` method takes a parameter whose name matches
+            // the field, the value is owned by the caller and only
+            // BORROWED into the struct.  The outer's deinit
+            // legitimately leaves cleanup to the caller.  Common
+            // in Bun's container types (e.g. `Entry.promise: Promise`
+            // initialised from `create(allocator, command, promise)`).
+            if (fieldIsCallerSupplied(tree, outer, field.name)) continue;
+
             try report(gpa, problems, tree, field.name_token, field.name, inner_ti.name);
         }
     }
+}
+
+/// True iff the type has an `init` / `create` / `from*` method
+/// that takes a parameter of the same name as `field_name` —
+/// evidence that the field is initialised from a caller-supplied
+/// value (BORROWED in, not owned by this struct), so the outer's
+/// deinit legitimately defers cleanup to the caller.
+fn fieldIsCallerSupplied(
+    tree: *const Ast,
+    outer: *const fmodel.TypeInfo,
+    field_name: []const u8,
+) bool {
+    for (outer.methods) |m| {
+        const is_constructor = std.mem.eql(u8, m.name, "init") or
+            std.mem.eql(u8, m.name, "create") or
+            std.mem.startsWith(u8, m.name, "from") or
+            std.mem.eql(u8, m.name, "new");
+        if (!is_constructor) continue;
+        var buf: [1]Ast.Node.Index = undefined;
+        const proto = tree.fullFnProto(&buf, m.fn_decl) orelse continue;
+        var it = proto.iterate(tree);
+        while (it.next()) |p| {
+            const name_tok = p.name_token orelse continue;
+            const name = tree.tokenSlice(name_tok);
+            if (std.mem.eql(u8, name, field_name)) return true;
+        }
+    }
+    return false;
 }
 
 /// True iff the field's declared type ends with `<suffix>`.  Looks
