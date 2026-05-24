@@ -215,6 +215,45 @@ fn isLinkedListNode(tree: *const Ast, ti: *const fmodel.TypeInfo) bool {
 /// canonical "optional config: TaggedUnion = .none" pattern
 /// where the owned variant is only set by code in a DIFFERENT
 /// file that owns the value via other means.
+/// TypeInfo-anchored variant of `fieldDefaultUnionTag`.  Bypasses
+/// the `findType(name)` lookup that would land on the wrong
+/// nested-type collision (e.g. `Writable.Pending` vs
+/// `Result.Pending` — same name, different fields).  Caller
+/// passes the resolved outer TypeInfo directly.
+fn fieldDefaultUnionTagTi(
+    tree: *const Ast,
+    outer: *const fmodel.TypeInfo,
+    field: *const fmodel.FieldInfo,
+) ?[]const u8 {
+    _ = outer;
+    if (!field.has_default) return null;
+    const tags = tree.tokens.items(.tag);
+    var eq: Ast.TokenIndex = field.type_last + 1;
+    while (eq < tags.len and tags[eq] != .equal) : (eq += 1) {}
+    if (eq + 1 >= tags.len) return null;
+    const dv = eq + 1;
+    // Bare `. <tag>` not followed by `{` / `(` / `.`.
+    if (dv + 1 < tags.len and tags[dv] == .period and tags[dv + 1] == .identifier) {
+        const next = dv + 2;
+        if (next < tags.len) {
+            switch (tags[next]) {
+                .l_brace, .l_paren, .period => {},
+                else => return tree.tokenSlice(dv + 1),
+            }
+        } else return tree.tokenSlice(dv + 1);
+    }
+    // Struct-init form: `. { . <tag> = ... }`.
+    if (dv + 3 < tags.len and
+        tags[dv] == .period and
+        tags[dv + 1] == .l_brace and
+        tags[dv + 2] == .period and
+        tags[dv + 3] == .identifier)
+    {
+        return tree.tokenSlice(dv + 3);
+    }
+    return null;
+}
+
 fn fieldStaysNonOwnedAcrossFile(
     tree: *const Ast,
     model: *const fmodel.FileModel,
@@ -223,8 +262,11 @@ fn fieldStaysNonOwnedAcrossFile(
     inner_ti: *const fmodel.TypeInfo,
 ) bool {
     if (!model.isTaggedUnion(inner_ti.name)) return false;
-    // Field default must be a non-owned variant tag.
-    const default_tag = model.fieldDefaultUnionTag(outer.name, field.name) orelse return false;
+    // Field default must be a non-owned variant tag.  Use the
+    // outer TypeInfo DIRECTLY (not by name) to avoid the
+    // findType collision when multiple types in the file share
+    // a name (`Writable.Pending` vs `Result.Pending`).
+    const default_tag = fieldDefaultUnionTagTi(tree, outer, field) orelse return false;
     const default_owned = model.unionVariantIsOwnedTi(inner_ti, default_tag) orelse return false;
     if (default_owned) return false;
     // Scan the WHOLE FILE for assignments to `<recv>.<field_name>`.
