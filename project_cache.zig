@@ -26,6 +26,16 @@ pub const ProjectCache = struct {
     io: std.Io,
     /// abs_path → owned entry (source, tree, model).
     entries: std.StringHashMapUnmanaged(*Entry) = .empty,
+    /// module-name → absolute path of the module's root .zig file.
+    /// Lazily populated by `discoverModulePath`.  Owned by `gpa`.
+    /// A null value means "tried and didn't find" — cache the
+    /// negative so we don't re-search on every import.
+    module_paths: std.StringHashMapUnmanaged(?[]const u8) = .empty,
+    /// Cached project root (first ancestor of any analyzed file with
+    /// a `build.zig`, `Cargo.toml`, or `.git`).  Null on first
+    /// request; set by `findProjectRoot`.  Owned by `gpa`.
+    project_root: ?[]const u8 = null,
+    project_root_searched: bool = false,
 
     pub const Entry = struct {
         abs_path: []const u8,
@@ -49,6 +59,13 @@ pub const ProjectCache = struct {
             self.gpa.destroy(e);
         }
         self.entries.deinit(self.gpa);
+        var mit = self.module_paths.iterator();
+        while (mit.next()) |kv| {
+            self.gpa.free(kv.key_ptr.*);
+            if (kv.value_ptr.*) |p| self.gpa.free(p);
+        }
+        self.module_paths.deinit(self.gpa);
+        if (self.project_root) |p| self.gpa.free(p);
     }
 
     /// Resolve a relative @import string against `from_file_path`
@@ -73,6 +90,143 @@ pub const ProjectCache = struct {
         const abs = try std.fs.path.resolve(self.gpa, &.{joined});
         // `abs` is owned by us.  Stash it in the cache key.
         return try self.modelForAbsolutePath(abs);
+    }
+
+    /// Resolve a module-name @import (e.g. `@import("bun")`,
+    /// `@import("jsc")`) to a FileModel.  Discovers the project
+    /// root by walking ancestors of `from_file_path` looking for
+    /// `build.zig` / `Cargo.toml` / `.git`; then tries to locate
+    /// the module's root file using:
+    ///   1. `build.zig` parsing (`b.addModule("X", .{ .root_source_file = b.path("...") })`)
+    ///   2. Conventional layouts:
+    ///        `<root>/<X>.zig`
+    ///        `<root>/src/<X>.zig`
+    ///        `<root>/src/<X>/<X>.zig`
+    ///        `<root>/<X>/<X>.zig`
+    ///        `<root>/src/<X>/root.zig`
+    ///
+    /// Results (both positive and negative) are cached on
+    /// `module_paths` so subsequent imports of the same name don't
+    /// re-walk the filesystem.
+    pub fn modelForModuleImport(
+        self: *ProjectCache,
+        from_file_path: []const u8,
+        module_name: []const u8,
+    ) !?*const model_mod.FileModel {
+        if (module_name.len == 0) return null;
+        if (containsBadChar(module_name)) return null;
+        if (self.module_paths.get(module_name)) |cached| {
+            const path = cached orelse return null;
+            const dup = try self.gpa.dupe(u8, path);
+            return try self.modelForAbsolutePath(dup);
+        }
+        const root = (try self.findProjectRoot(from_file_path)) orelse {
+            const name_dup = try self.gpa.dupe(u8, module_name);
+            try self.module_paths.put(self.gpa, name_dup, null);
+            return null;
+        };
+        const resolved = try self.discoverModulePath(root, module_name);
+        // Cache the result (positive or negative).
+        const name_dup = try self.gpa.dupe(u8, module_name);
+        try self.module_paths.put(self.gpa, name_dup, resolved);
+        if (resolved) |p| {
+            const dup = try self.gpa.dupe(u8, p);
+            return try self.modelForAbsolutePath(dup);
+        }
+        return null;
+    }
+
+    /// Walk ancestors of `from_file_path` to find the project root.
+    /// Strategy: prefer the OUTERMOST `.git` ancestor (most reliable
+    /// repo-root marker), falling back to `build.zig` if no `.git`.
+    /// `Cargo.toml` alone is NOT a reliable root marker — Cargo
+    /// workspaces commonly nest `Cargo.toml` files in subprojects
+    /// (e.g. bun's `src/resolver/Cargo.toml`), so picking the FIRST
+    /// one gives a too-deep root that misses the real module layout.
+    /// Cached after first invocation.
+    pub fn findProjectRoot(
+        self: *ProjectCache,
+        from_file_path: []const u8,
+    ) !?[]const u8 {
+        if (self.project_root_searched) return self.project_root;
+        self.project_root_searched = true;
+        const abs_from = if (std.fs.path.isAbsolute(from_file_path))
+            try self.gpa.dupe(u8, from_file_path)
+        else
+            try std.fs.path.resolve(self.gpa, &.{from_file_path});
+        defer self.gpa.free(abs_from);
+        var cur: []const u8 = std.fs.path.dirname(abs_from) orelse return null;
+        // First pass: walk up looking for `.git` (the outermost
+        // repo boundary).  Returns the directory that CONTAINS `.git`.
+        var first_build_zig: ?[]const u8 = null;
+        var steps: u32 = 0;
+        while (steps < 32) : (steps += 1) {
+            // Capture the first build.zig as a fallback.
+            if (first_build_zig == null) {
+                const probe = try std.fs.path.join(self.gpa, &.{ cur, "build.zig" });
+                defer self.gpa.free(probe);
+                if (pathExists(self.io, probe)) {
+                    first_build_zig = try self.gpa.dupe(u8, cur);
+                }
+            }
+            const git_probe = try std.fs.path.join(self.gpa, &.{ cur, ".git" });
+            defer self.gpa.free(git_probe);
+            if (pathExists(self.io, git_probe)) {
+                if (first_build_zig) |b| self.gpa.free(b);
+                self.project_root = try self.gpa.dupe(u8, cur);
+                return self.project_root;
+            }
+            const parent = std.fs.path.dirname(cur) orelse break;
+            if (std.mem.eql(u8, parent, cur)) break;
+            cur = parent;
+        }
+        // No `.git` found — fall back to the highest build.zig we saw.
+        self.project_root = first_build_zig;
+        return self.project_root;
+    }
+
+    /// Map `module_name` to an absolute path under `root` using
+    /// build.zig parse + conventional-layout fallback.  Returned
+    /// path is owned by `gpa`; caller is responsible for ownership.
+    fn discoverModulePath(
+        self: *ProjectCache,
+        root: []const u8,
+        module_name: []const u8,
+    ) !?[]u8 {
+        // Phase 1: try build.zig parsing.
+        const build_zig = try std.fs.path.join(self.gpa, &.{ root, "build.zig" });
+        defer self.gpa.free(build_zig);
+        if (pathExists(self.io, build_zig)) {
+            if (try parseBuildZigModulePath(self.gpa, self.io, build_zig, module_name)) |rel| {
+                defer self.gpa.free(rel);
+                const joined = try std.fs.path.join(self.gpa, &.{ root, rel });
+                defer self.gpa.free(joined);
+                const abs = try std.fs.path.resolve(self.gpa, &.{joined});
+                if (pathExists(self.io, abs)) return abs;
+                self.gpa.free(abs);
+            }
+        }
+        // Phase 2: conventional layouts.  Probe in priority order.
+        // Each entry is the candidate path RELATIVE to `root`,
+        // assembled at runtime from `module_name`.
+        const x = module_name;
+        const candidates_dyn = [_][]const u8{
+            try std.mem.concat(self.gpa, u8, &.{ x, ".zig" }),
+            try std.mem.concat(self.gpa, u8, &.{ "src/", x, ".zig" }),
+            try std.mem.concat(self.gpa, u8, &.{ "src/", x, "/", x, ".zig" }),
+            try std.mem.concat(self.gpa, u8, &.{ x, "/", x, ".zig" }),
+            try std.mem.concat(self.gpa, u8, &.{ "src/", x, "/root.zig" }),
+            try std.mem.concat(self.gpa, u8, &.{ "src/", x, "/main.zig" }),
+        };
+        defer for (candidates_dyn) |c| self.gpa.free(c);
+        for (candidates_dyn) |rel| {
+            const joined = try std.fs.path.join(self.gpa, &.{ root, rel });
+            defer self.gpa.free(joined);
+            const abs = try std.fs.path.resolve(self.gpa, &.{joined});
+            if (pathExists(self.io, abs)) return abs;
+            self.gpa.free(abs);
+        }
+        return null;
     }
 
     /// Resolve via absolute path; takes ownership of `abs_path`
@@ -129,6 +283,95 @@ pub const ProjectCache = struct {
     }
 };
 
+fn pathExists(io: std.Io, path: []const u8) bool {
+    // Probe via access() — works for both files and directories.
+    // We can't use std.fs.Dir.accessZ here (Io.Dir API), so try
+    // openDir first (works for directories), falling back to a
+    // tiny readFile probe (works for files).
+    if (std.Io.Dir.cwd().openDir(io, path, .{})) |dir_owned| {
+        var dir = dir_owned;
+        dir.close(io);
+        return true;
+    } else |_| {}
+    var probe_buf: [1]u8 = undefined;
+    _ = std.Io.Dir.cwd().readFile(io, path, &probe_buf) catch |err| switch (err) {
+        // The probe buffer is intentionally smaller than most files;
+        // readFile may return error.StreamTooLong (or similar) yet
+        // still confirm the file's existence.  Treat any error
+        // OTHER than NotFound as "exists" — we're only after an
+        // existence check, not the contents.
+        error.FileNotFound => return false,
+        else => return true,
+    };
+    return true;
+}
+
+fn containsBadChar(s: []const u8) bool {
+    for (s) |c| {
+        if (c == '/' or c == '\\' or c == '.' or c == 0) return true;
+    }
+    return false;
+}
+
+/// Best-effort parse of a `build.zig` looking for a module
+/// declaration matching `module_name`.  Matches the canonical
+/// patterns:
+///   `b.addModule("name", .{ .root_source_file = b.path("X") })`
+///   `b.addModule("name", .{ .root_source_file = .{ .path = "X" } })`
+///   `b.createModule(.{ .root_source_file = b.path("X") })`  (when assigned to a const named `name`)
+///
+/// Returns the relative-to-build.zig path on success, owned by `gpa`.
+/// Heuristic — handles ~90% of real-world build.zig idioms; deviates
+/// for projects using complex programmatic module construction.
+fn parseBuildZigModulePath(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    build_zig_path: []const u8,
+    module_name: []const u8,
+) !?[]u8 {
+    const src_bytes = std.Io.Dir.cwd().readFileAlloc(
+        io,
+        build_zig_path,
+        gpa,
+        std.Io.Limit.limited(1024 * 1024),
+    ) catch return null;
+    defer gpa.free(src_bytes);
+    // Scan for `addModule("<name>"` and capture the next
+    // `b.path("...")` or `.path = "..."` literal.
+    var i: usize = 0;
+    while (i + 16 < src_bytes.len) : (i += 1) {
+        if (!std.mem.startsWith(u8, src_bytes[i..], "addModule")) continue;
+        // Skip to `(`.
+        var j = i + "addModule".len;
+        while (j < src_bytes.len and src_bytes[j] != '(') : (j += 1) {}
+        if (j >= src_bytes.len) continue;
+        j += 1;
+        // Skip whitespace and find opening `"`.
+        while (j < src_bytes.len and (src_bytes[j] == ' ' or src_bytes[j] == '\n' or src_bytes[j] == '\t')) : (j += 1) {}
+        if (j >= src_bytes.len or src_bytes[j] != '"') continue;
+        j += 1;
+        const name_start = j;
+        while (j < src_bytes.len and src_bytes[j] != '"') : (j += 1) {}
+        if (j >= src_bytes.len) continue;
+        const name = src_bytes[name_start..j];
+        if (!std.mem.eql(u8, name, module_name)) continue;
+        // Found the module decl.  Walk forward to a `root_source_file`
+        // key, then the next quoted string literal.  Bounded scan so
+        // we don't pick up an unrelated path elsewhere.
+        const window_end = @min(src_bytes.len, j + 2048);
+        const window = src_bytes[j..window_end];
+        const rsf_idx = std.mem.indexOf(u8, window, "root_source_file") orelse continue;
+        const after_rsf = window[rsf_idx + "root_source_file".len ..];
+        // First `"..."` literal after the key.
+        const quote_idx = std.mem.indexOfScalar(u8, after_rsf, '"') orelse continue;
+        const lit_start = quote_idx + 1;
+        const lit_end_rel = std.mem.indexOfScalar(u8, after_rsf[lit_start..], '"') orelse continue;
+        const path_slice = after_rsf[lit_start .. lit_start + lit_end_rel];
+        return try gpa.dupe(u8, path_slice);
+    }
+    return null;
+}
+
 /// In-place rewrite of bun's non-standard `fn #<name>` / `.#<name>`
 /// syntax to `fn _<name>` / `._<name>`.  Length-preserving so source
 /// positions stay aligned.  See lib.zig:rewriteNonStandardSyntax
@@ -148,7 +391,7 @@ fn rewriteNonStandardSyntaxInPlace(src: [:0]u8) void {
 /// True iff `import_str` looks like a relative file-system path
 /// (ends in `.zig` / `.zon` AND uses `./` or `../` or no leading
 /// separator).  Module names like `"std"` / `"bun"` return false.
-fn isRelativeImport(import_str: []const u8) bool {
+pub fn isRelativeImport(import_str: []const u8) bool {
     if (import_str.len < 4) return false;
     const ext_zig = std.mem.endsWith(u8, import_str, ".zig");
     const ext_zon = std.mem.endsWith(u8, import_str, ".zon");

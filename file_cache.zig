@@ -86,7 +86,7 @@ pub const FileCache = struct {
         if (model.findType(name)) |ti| return ti;
         const pc = self.project orelse return null;
         if (self.file_path.len == 0) return null;
-        return findTypeViaImports(pc, self.tree, self.file_path, name, 2);
+        return findTypeViaImports(pc, self.tree, self.file_path, name, 4);
     }
 
     /// Resolved cross-file method lookup result.  When the method
@@ -115,7 +115,7 @@ pub const FileCache = struct {
         }
         const pc = self.project orelse return null;
         if (self.file_path.len == 0) return null;
-        return findMethodViaImports(pc, self.tree, self.file_path, type_name, method_name, 2);
+        return findMethodViaImports(pc, self.tree, self.file_path, type_name, method_name, 4);
     }
 
     pub fn deinit(self: *FileCache) void {
@@ -911,11 +911,26 @@ fn findTypeViaImports(
         const lit = tree.tokenSlice(main + 2);
         if (lit.len < 2) continue;
         const import_str = lit[1 .. lit.len - 1];
-        const sub_model = (pc.modelForRelativeImport(from_path, import_str) catch null) orelse continue;
+        const sub_model_opt: ?*const fmodel.FileModel = blk: {
+            if (project_cache_mod.isRelativeImport(import_str)) {
+                break :blk pc.modelForRelativeImport(from_path, import_str) catch null;
+            }
+            break :blk pc.modelForModuleImport(from_path, import_str) catch null;
+        };
+        const sub_model = sub_model_opt orelse continue;
         if (sub_model.findType(name)) |ti| return ti;
-        // Recurse — the imported file may re-export the type from
-        // a deeper file via its own @import.
-        const next_from = resolveImportPath(pc.gpa, from_path, import_str) catch continue;
+        // Recurse — the imported file may re-export the type from a
+        // deeper file via its own @import.  Resolve the next "from"
+        // path for both relative and module-name imports.
+        const next_from_owned: ?[]u8 = blk: {
+            if (project_cache_mod.isRelativeImport(import_str)) {
+                break :blk resolveImportPath(pc.gpa, from_path, import_str) catch null;
+            }
+            const cached = pc.module_paths.get(import_str) orelse break :blk null;
+            const p = cached orelse break :blk null;
+            break :blk pc.gpa.dupe(u8, p) catch null;
+        };
+        const next_from = next_from_owned orelse continue;
         defer pc.gpa.free(next_from);
         if (findTypeViaImports(pc, sub_model.tree, next_from, name, depth_left - 1)) |ti| return ti;
     }
@@ -954,11 +969,32 @@ fn findMethodViaImports(
         const lit = tree.tokenSlice(main + 2);
         if (lit.len < 2) continue;
         const import_str = lit[1 .. lit.len - 1];
-        const sub_model = (pc.modelForRelativeImport(from_path, import_str) catch null) orelse continue;
+        // Resolve either a relative path import OR a module-name
+        // import via the project's build.zig / conventional layout.
+        const sub_model_opt: ?*const fmodel.FileModel = blk: {
+            if (project_cache_mod.isRelativeImport(import_str)) {
+                break :blk pc.modelForRelativeImport(from_path, import_str) catch null;
+            }
+            break :blk pc.modelForModuleImport(from_path, import_str) catch null;
+        };
+        const sub_model = sub_model_opt orelse continue;
         if (sub_model.findType(type_name)) |ti| {
             if (ti.findMethod(method_name)) |m| return .{ .tree = sub_model.tree, .method = m };
         }
-        const next_from = resolveImportPath(pc.gpa, from_path, import_str) catch continue;
+        // Recurse into the sub-model so re-exports / deep namespace
+        // chains resolve.  Compute the next "from" path:
+        //   relative imports: resolve against `from_path`'s dir.
+        //   module imports:   look up the resolved abs path in
+        //     ProjectCache's module_paths cache.
+        const next_from_owned: ?[]u8 = blk: {
+            if (project_cache_mod.isRelativeImport(import_str)) {
+                break :blk resolveImportPath(pc.gpa, from_path, import_str) catch null;
+            }
+            const cached = pc.module_paths.get(import_str) orelse break :blk null;
+            const p = cached orelse break :blk null;
+            break :blk pc.gpa.dupe(u8, p) catch null;
+        };
+        const next_from = next_from_owned orelse continue;
         defer pc.gpa.free(next_from);
         if (findMethodViaImports(pc, sub_model.tree, next_from, type_name, method_name, depth_left - 1)) |rm| return rm;
     }
