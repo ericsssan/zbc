@@ -47,6 +47,11 @@ pub fn check(
     defer gpa.free(outers);
 
     for (outers) |outer| {
+        // Linked-list node skip: if the type has a `next: ?*Self`
+        // (or `prev: ?*Self`) field, it's a node in an external
+        // intrusive container — the container's deinit walks the
+        // chain and cleans entries.  Common in Bun's queues.
+        if (isLinkedListNode(tree, outer)) continue;
         // Bun convention skip: `pub const new = bun.TrivialNew(T);`
         // (or `bun.New(T)`) declares the type as heap-allocated and
         // owned by a parent — the parent's deinit handles the
@@ -95,6 +100,31 @@ pub fn check(
         trace.match(R, tree, field.name_token, "owned field with no outer cleanup");
         try report(gpa, problems, tree, outer.name, field.name_token, field.name, inner.name);
     }
+}
+
+/// True iff the type has a `next: ?*Self` (or `next: ?*<TypeName>` /
+/// `prev: ?*Self`) field — strong signal that the type is a node
+/// in an intrusive linked list / queue.  The container's deinit
+/// walks the chain and frees the entries; the node type doesn't
+/// need its own deinit.  Skip the rule for such nodes.
+fn isLinkedListNode(tree: *const Ast, ti: *const fmodel.TypeInfo) bool {
+    const tags = tree.tokens.items(.tag);
+    for (ti.fields) |f| {
+        if (!std.mem.eql(u8, f.name, "next") and
+            !std.mem.eql(u8, f.name, "prev")) continue;
+        // Type must be `?*<Self|TypeName>`.
+        const t = f.type_first;
+        if (t > f.type_last) continue;
+        if (tags[t] != .question_mark) continue;
+        if (t + 1 > f.type_last) continue;
+        if (tags[t + 1] != .asterisk) continue;
+        if (t + 2 > f.type_last) continue;
+        if (tags[t + 2] != .identifier) continue;
+        const tname = tree.tokenSlice(t + 2);
+        if (std.mem.eql(u8, tname, "Self") or
+            std.mem.eql(u8, tname, ti.name)) return true;
+    }
+    return false;
 }
 
 /// True iff `ti` is a tagged union (`union(enum)`) AND every
