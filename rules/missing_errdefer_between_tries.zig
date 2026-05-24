@@ -130,6 +130,13 @@ fn checkFn(
             // namespace like `bun.SignalCode` (we'd see "SignalCode"
             // as the RHS type; cross-file means we can't refute).
             if (typeAnnotationLacksDeinit(tree, b, model)) continue;
+            // Switch-scrutinee shape skip: when the binding is
+            // IMMEDIATELY consumed by `switch (<name>) { .<tag> =>
+            // ..., .<tag> => ..., }` with payload-less arms, the
+            // value is an enum tag — no cleanup needed.  Catches
+            // cross-file enum types whose declaration we can't
+            // see (`bun.SignalCode`, `types.Tag`).
+            if (consumedAsEnumSwitch(tree, tags, b, last)) continue;
             // ZLS fallback: ask ZLS for the binding's RHS type.
             // When the RHS is `<ns>.<Type>.fromJS(...)` and `<ns>`
             // is an imported namespace, the local model can't see
@@ -387,6 +394,50 @@ fn isPrimitiveBaseName(name: []const u8) bool {
 /// (true) so we don't miss real bugs whose types are declared in
 /// another file.  Returns false only when the type IS in the local
 /// file AND demonstrably has no `deinit`.
+/// Switch-scrutinee shape inference.  When a try-bound local is
+/// IMMEDIATELY (within ~30 tokens) consumed by a switch whose
+/// arms are payload-less tag patterns (`.int8 => ...`), the
+/// value is an enum tag — no cleanup needed regardless of what
+/// the cross-file return type's name resolves to.
+fn consumedAsEnumSwitch(
+    tree: *const Ast,
+    tags: []const std.zig.Token.Tag,
+    b: anytype,
+    body_last: Ast.TokenIndex,
+) bool {
+    // Walk forward from the binding's terminating `;` looking for
+    // `switch ( <name> )`.  K=20 tokens bounds the gap.
+    var t: Ast.TokenIndex = b.rhs_last + 1; // step past `;`
+    var i: u32 = 0;
+    while (t < body_last and i < 20) : ({
+        t += 1;
+        i += 1;
+    }) {
+        if (tags[t] != .keyword_switch) continue;
+        if (t + 4 > body_last) return false;
+        if (tags[t + 1] != .l_paren) return false;
+        if (tags[t + 2] != .identifier) return false;
+        if (!std.mem.eql(u8, tree.tokenSlice(t + 2), b.name)) return false;
+        if (tags[t + 3] != .r_paren) return false;
+        if (tags[t + 4] != .l_brace) return false;
+        // Scan arms until matching `}`.  Every arm pattern must be
+        // `.<id>` (or `.<id>, .<id> ...`) followed by `=>` — no
+        // capture (`|cap|`) means no payload.
+        var depth: i32 = 1;
+        var u: Ast.TokenIndex = t + 5;
+        while (u < body_last and depth > 0) : (u += 1) {
+            switch (tags[u]) {
+                .l_brace => depth += 1,
+                .r_brace => depth -= 1,
+                .pipe => if (depth == 1) return false,
+                else => {},
+            }
+        }
+        return true;
+    }
+    return false;
+}
+
 /// ZLS-resolved type-of-RHS check.  Strip the leading `try` from
 /// the binding's RHS, ask the cache to resolve the call
 /// expression's type via ZLS, and return true when the resolved
