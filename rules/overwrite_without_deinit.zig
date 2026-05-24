@@ -1187,6 +1187,8 @@ fn isConstructorName(name: []const u8) bool {
     if (std.mem.eql(u8, name, "init")) return true;
     if (std.mem.eql(u8, name, "create")) return true;
     if (std.mem.eql(u8, name, "new")) return true;
+    if (std.mem.eql(u8, name, "setup")) return true;
+    if (std.mem.eql(u8, name, "configure")) return true;
     if (std.mem.startsWith(u8, name, "init")) return true;
     if (std.mem.startsWith(u8, name, "from")) return true;
     if (std.mem.startsWith(u8, name, "parse")) return true;
