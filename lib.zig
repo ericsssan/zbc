@@ -12,6 +12,7 @@ const rule_catalog_mod = @import("rule_catalog.zig");
 const file_cache_mod = @import("file_cache.zig");
 const suppressions_mod = @import("suppressions.zig");
 const zls_resolver_mod = @import("zls_resolver.zig");
+const project_cache_mod = @import("project_cache.zig");
 
 pub const Config = config_mod.Config;
 pub const DefaultConfig = config_mod.Default;
@@ -77,6 +78,12 @@ pub fn analyzeEscape(
     var rule_cache = file_cache_mod.FileCache.init(gpa, &tree);
     defer rule_cache.deinit();
     rule_cache.setZls(zls_ptr);
+    // Project-wide ProjectCache for cross-file model lookups via
+    // relative `@import("./X.zig")` declarations.  Static across
+    // the process so subsequent analyzeEscape calls reuse the
+    // loaded models — saves re-parsing the same shared headers
+    // across every file in a sweep.
+    rule_cache.setProject(getProjectCache(gpa, io), path);
     try rule_cache.resolveTransitiveTakes();
 
     // Flow analysis — per-fn CFG + worklist fixed-point.
@@ -131,6 +138,34 @@ fn filterSuppressed(
     }
     problems.deinit(gpa);
     return kept.toOwnedSlice(gpa);
+}
+
+/// Process-static ProjectCache.  Holds parsed FileModels for
+/// sibling `.zig` files reached via relative `@import("./X.zig")`
+/// declarations.  Initialised on first analyzeEscape call,
+/// persists for the process lifetime — multi-file sweeps reuse
+/// the loaded models.  Lives on the heap (c_allocator) so test
+/// gpa boundaries don't reclaim it.
+var global_project: ?*project_cache_mod.ProjectCache = null;
+
+fn getProjectCache(gpa: std.mem.Allocator, io: std.Io) *project_cache_mod.ProjectCache {
+    _ = gpa;
+    if (global_project) |p| return p;
+    const c = std.heap.c_allocator;
+    const p = c.create(project_cache_mod.ProjectCache) catch unreachable;
+    p.* = project_cache_mod.ProjectCache.init(c, io);
+    global_project = p;
+    return p;
+}
+
+/// Test-only: clear the process-static project cache so leak
+/// detectors don't see the cached entries between test gpas.
+pub fn clearProjectCacheForTesting() void {
+    if (global_project) |p| {
+        p.deinit();
+        std.heap.c_allocator.destroy(p);
+        global_project = null;
+    }
 }
 
 pub fn freeProblems(gpa: std.mem.Allocator, slice: []Problem) void {
@@ -205,5 +240,6 @@ test {
     _ = @import("local.zig");
     _ = @import("query.zig");
     _ = @import("model_query.zig");
+    _ = @import("project_cache.zig");
     std.testing.refAllDecls(@This());
 }

@@ -25,6 +25,7 @@ const fmodel = @import("model.zig");
 const local = @import("local.zig");
 const fn_summary = @import("fn_summary.zig");
 const zls_resolver_mod = @import("zls_resolver.zig");
+const project_cache_mod = @import("project_cache.zig");
 
 pub const FileCache = struct {
     gpa: std.mem.Allocator,
@@ -42,6 +43,15 @@ pub const FileCache = struct {
     /// instantiations, and pointer/optional chains uniformly instead
     /// of via fragile token-pattern proxies.
     zls: ?*zls_resolver_mod.ZlsResolver = null,
+    /// Optional project-wide cache for cross-file model lookups via
+    /// relative `@import("./file.zig")` declarations.  When set,
+    /// rules can ask "does <ImportAlias>.<TypeName> have a deinit?"
+    /// and the cache loads the target file lazily.
+    project: ?*project_cache_mod.ProjectCache = null,
+    /// Absolute (or project-relative) path of the file this cache
+    /// is analysing.  Used as the from-path for @import resolution
+    /// in the ProjectCache.  Empty string means "use cwd".
+    file_path: []const u8 = "",
 
     pub fn init(gpa: std.mem.Allocator, tree: *const Ast) FileCache {
         return .{ .gpa = gpa, .tree = tree };
@@ -49,6 +59,54 @@ pub const FileCache = struct {
 
     pub fn setZls(self: *FileCache, zls: ?*zls_resolver_mod.ZlsResolver) void {
         self.zls = zls;
+    }
+
+    pub fn setProject(
+        self: *FileCache,
+        project: ?*project_cache_mod.ProjectCache,
+        file_path: []const u8,
+    ) void {
+        self.project = project;
+        self.file_path = file_path;
+    }
+
+    /// Cross-file type lookup.  When `name` isn't found in the
+    /// current file's model, scan @import declarations and try
+    /// each imported file's model.  Walks one level of @import
+    /// indirection — doesn't recurse into the imported file's own
+    /// imports (a deeper search would risk diamond-load cycles and
+    /// blow up cache size for large projects).  Returns null when
+    /// the type is unresolvable in this file OR in any directly-
+    /// imported file.
+    pub fn findTypeAcrossImports(
+        self: *FileCache,
+        name: []const u8,
+    ) ?*const fmodel.TypeInfo {
+        const model = self.fileModel() catch return null;
+        if (model.findType(name)) |ti| return ti;
+        const pc = self.project orelse return null;
+        if (self.file_path.len == 0) return null;
+        // Walk the file's @import declarations for relative paths.
+        const tree = self.tree;
+        const tags = tree.tokens.items(.tag);
+        var idx: u32 = 1;
+        while (idx < tree.nodes.len) : (idx += 1) {
+            const node: Ast.Node.Index = @enumFromInt(idx);
+            if (tree.nodeTag(node) != .builtin_call_two) continue;
+            const main = tree.nodeMainToken(node);
+            if (main >= tree.tokens.len) continue;
+            if (tags[main] != .builtin) continue;
+            if (!std.mem.eql(u8, tree.tokenSlice(main), "@import")) continue;
+            // Arg is a single string literal.
+            if (main + 2 >= tree.tokens.len) continue;
+            if (tags[main + 2] != .string_literal) continue;
+            const lit = tree.tokenSlice(main + 2);
+            if (lit.len < 2) continue;
+            const import_str = lit[1 .. lit.len - 1];
+            const sub_model = (pc.modelForRelativeImport(self.file_path, import_str) catch null) orelse continue;
+            if (sub_model.findType(name)) |ti| return ti;
+        }
+        return null;
     }
 
     pub fn deinit(self: *FileCache) void {

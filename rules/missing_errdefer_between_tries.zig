@@ -120,7 +120,7 @@ fn checkFn(
         var is_fd_open = false;
         if (isOwnershipTransferMethod(meth)) {
             if (parsed.type_name.len == 0 or parsed.type_name[0] < 'A' or parsed.type_name[0] > 'Z') continue;
-            if (!typeHasDeinit(model, parsed.type_name)) continue;
+            if (!typeHasDeinitProject(cache, model, parsed.type_name)) continue;
             // Refine via the binding's explicit `: <Type>`
             // annotation when present.  When the LHS type is in
             // the file model AND demonstrably has no deinit, the
@@ -560,6 +560,29 @@ fn typeHasDeinit(model: *const fmodel.FileModel, type_name: []const u8) bool {
         return model.typeOrFileHasMethod(type_name, "deinit");
     }
     // Truly unknown (cross-file).  Conservative: assume has deinit.
+    return true;
+}
+
+/// Cross-file aware variant of `typeHasDeinit`.  Uses the
+/// FileCache's project-wide @import lookup to resolve type names
+/// that aren't in the current file model.  Returns:
+///   - true: type has a deinit method (or unresolvable → assume yes)
+///   - false: type RESOLVED to a model entry that has no deinit
+fn typeHasDeinitProject(
+    cache: *file_cache_mod.FileCache,
+    model: *const fmodel.FileModel,
+    type_name: []const u8,
+) bool {
+    if (model.hasType(type_name)) {
+        return model.typeHasMethod(type_name, "deinit");
+    }
+    if (model.fileIsTypeNamed(type_name)) {
+        return model.typeOrFileHasMethod(type_name, "deinit");
+    }
+    // Cross-file: scan @import("./...") declarations.
+    if (cache.findTypeAcrossImports(type_name)) |ti| {
+        return ti.hasMethod("deinit");
+    }
     return true;
 }
 
