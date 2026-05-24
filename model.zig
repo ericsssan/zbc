@@ -513,22 +513,30 @@ pub const FileModel = struct {
         var eq: TokenIndex = f.type_last + 1;
         while (eq < self.tree.tokens.len and tags[eq] != .equal) : (eq += 1) {}
         if (eq >= self.tree.tokens.len) return null;
-        // Default shape `.<tag>` — period + identifier immediately
-        // after `=`.  Reject `.{ .tag = … }` literals (those are
-        // payload-bearing) by requiring the token after the ident
-        // to NOT be `{` / `(` / `.`.
         const dv = eq + 1;
         if (dv + 1 >= self.tree.tokens.len) return null;
-        if (tags[dv] != .period) return null;
-        if (tags[dv + 1] != .identifier) return null;
-        const next = dv + 2;
-        if (next < self.tree.tokens.len) {
-            switch (tags[next]) {
-                .l_brace, .l_paren, .period => return null,
-                else => {},
+        // Bare tag: `. <ident>` not followed by `{` / `(` / `.`.
+        if (tags[dv] == .period and tags[dv + 1] == .identifier) {
+            const next = dv + 2;
+            if (next < self.tree.tokens.len) {
+                switch (tags[next]) {
+                    .l_brace, .l_paren, .period => {},
+                    else => return self.tree.tokenSlice(dv + 1),
+                }
+            } else {
+                return self.tree.tokenSlice(dv + 1);
             }
         }
-        return self.tree.tokenSlice(dv + 1);
+        // Struct-init form: `. { . <tag> = ... }`.
+        if (dv + 3 < self.tree.tokens.len and
+            tags[dv] == .period and
+            tags[dv + 1] == .l_brace and
+            tags[dv + 2] == .period and
+            tags[dv + 3] == .identifier)
+        {
+            return self.tree.tokenSlice(dv + 3);
+        }
+        return null;
     }
 
     /// True iff `type_name` is declared as a tagged union — any
