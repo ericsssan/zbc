@@ -4357,7 +4357,58 @@ const Builder = struct {
         path: []const u8,
     ) bool {
         if (self.fieldPathRestoredViaDeferKw(recv_name, path)) return true;
-        return self.fieldPathSaveRestoredDirectly(recv_name, path);
+        if (self.fieldPathSaveRestoredDirectly(recv_name, path)) return true;
+        return self.fieldPathOverwrittenByNonBorrow(recv_name, path);
+    }
+
+    /// Variant 3 — any later overwrite to `<recv>.<path>` with a
+    /// non-stack-borrow RHS bounds the stack-escape: the borrowed
+    /// pointer is replaced before the fn returns.  Detect a
+    /// `<recv>.<path> = <ident>;` (identifier RHS, not preceded by
+    /// `&` or `.{`) anywhere in the fn body.  The if-expr capture
+    /// save form (`const parent = if (this.ctx) |c| ... else null;`
+    /// → `this.ctx = parent;`) doesn't match the structured
+    /// save-restore detector but still bounds the borrow.
+    fn fieldPathOverwrittenByNonBorrow(
+        self: *const Builder,
+        recv_name: []const u8,
+        path: []const u8,
+    ) bool {
+        if (self.fn_body_last == 0) return false;
+        const tree = self.tree;
+        const tags = tree.tokens.items(.tag);
+        const expected_lhs_len = recv_name.len + 1 + path.len;
+        var t: Ast.TokenIndex = self.fn_body_first;
+        while (t + 4 <= self.fn_body_last) : (t += 1) {
+            if (tags[t] != .identifier) continue;
+            if (!std.mem.eql(u8, tree.tokenSlice(t), recv_name)) continue;
+            const lhs_start = tree.tokens.items(.start)[t];
+            if (lhs_start + expected_lhs_len > tree.source.len) continue;
+            const got_lhs = tree.source[lhs_start .. lhs_start + expected_lhs_len];
+            if (!std.mem.startsWith(u8, got_lhs, recv_name)) continue;
+            if (got_lhs[recv_name.len] != '.') continue;
+            if (!std.mem.eql(u8, got_lhs[recv_name.len + 1 ..], path)) continue;
+            // Walk past whitespace to `=`.
+            var b: usize = lhs_start + expected_lhs_len;
+            while (b < tree.source.len and (tree.source[b] == ' ' or tree.source[b] == '\t')) : (b += 1) {}
+            if (b >= tree.source.len or tree.source[b] != '=') continue;
+            // Reject compound assignment (`==`/`<=`).  `=` next char.
+            if (b + 1 < tree.source.len) {
+                const next = tree.source[b + 1];
+                if (next == '=') continue;
+            }
+            b += 1;
+            while (b < tree.source.len and (tree.source[b] == ' ' or tree.source[b] == '\t')) : (b += 1) {}
+            if (b >= tree.source.len) continue;
+            // Reject `&<ident>` (would still be stack-borrow) and
+            // `.{...}` struct-init forms.  Accept a bare identifier-
+            // start char.
+            const c = tree.source[b];
+            if (c == '&' or c == '.') continue;
+            if (!(c == '_' or (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z'))) continue;
+            return true;
+        }
+        return false;
     }
 
     /// Variant 1 — `defer <recv>.<path> = <ident>;` matches the LHS.
