@@ -405,6 +405,16 @@ fn rhsContainsCopyingCall(tree: *const Ast, start: Ast.TokenIndex, end: Ast.Toke
         if (tags[t + 2] != .l_paren) continue;
         const m = tree.tokenSlice(t + 1);
         if (isCopyingMethodName(m)) return true;
+        // Singleton-store .append pattern: `<X>.<...>.instance.append(`
+        // — Bun's `FileSystem.DirnameStore.instance.append(T, slice)`
+        // dupes the slice into the static store.  Recognising the
+        // `.instance.append(` shape catches the canonical case
+        // without broadening `.append` (which is also used by
+        // ArrayList for non-duping appends).
+        if (std.mem.eql(u8, m, "append") and t >= 2 and
+            tags[t - 2] == .period and
+            tags[t - 1] == .identifier and
+            std.mem.eql(u8, tree.tokenSlice(t - 1), "instance")) return true;
     }
     return false;
 }
