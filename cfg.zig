@@ -1372,6 +1372,45 @@ const Builder = struct {
     /// doesn't claim it frees self, return the type's name.  Used
     /// by `lowerFunctionBody` to emit a leak_warning stmt at body
     /// start.  Returns null in all other cases.
+    /// True iff the destructor body is empty (`{}`) or contains
+    /// only discard statements (`_ = self;`).  Such bodies can't
+    /// free `self` regardless — the leak warning is meaningless.
+    /// Used by `leakyDestructorTypeName` to suppress on no-op
+    /// finalize callbacks registered with JSC.
+    fn destructorBodyIsTrivial(self: *const Builder) bool {
+        if (self.fn_body_first == 0) return true;
+        const tags = self.tree.tokens.items(.tag);
+        const first = self.fn_body_first;
+        const last = self.fn_body_last;
+        if (first >= last) return true;
+        // body_first is `{`, body_last is `}`.  Empty body: nothing
+        // between (just `{` immediately followed by `}`).
+        if (first + 1 == last) return true;
+        // Walk statements; require each to be `_ = <expr>;`.
+        var t: Ast.TokenIndex = first + 1;
+        while (t < last) {
+            if (tags[t] != .identifier) return false;
+            if (!std.mem.eql(u8, self.tree.tokenSlice(t), "_")) return false;
+            if (t + 1 >= last or tags[t + 1] != .equal) return false;
+            var depth: u32 = 0;
+            var k = t + 2;
+            while (k < last) : (k += 1) {
+                switch (tags[k]) {
+                    .l_paren, .l_brace, .l_bracket => depth += 1,
+                    .r_paren, .r_brace, .r_bracket => {
+                        if (depth == 0) return false;
+                        depth -= 1;
+                    },
+                    .semicolon => if (depth == 0) break,
+                    else => {},
+                }
+            }
+            if (k >= last or tags[k] != .semicolon) return false;
+            t = k + 1;
+        }
+        return true;
+    }
+
     /// True iff the destructor's own body releases an `arena`-named
     /// field via `<self|this>.arena.deinit(...)`.  Heuristic for
     /// "self is housed in the arena it manages" — the arena's
@@ -1465,6 +1504,14 @@ const Builder = struct {
         // entire arena pool, so `self` is freed transitively —
         // no explicit `allocator.destroy(self)` needed.
         if (self.destructorReleasesOwnArena()) return null;
+        // Empty / discard-only destructor: `pub fn finalize(_:
+        // *T) callconv(.c) void {}` is a no-op intentionally —
+        // the type's cleanup happens via a different path (JSC
+        // GC, manual destroy at a different site, etc.).  An
+        // empty body can't free `self` because it can't do
+        // anything; the rule firing is shoutness without
+        // value.
+        if (self.destructorBodyIsTrivial()) return null;
 
         // The destructor must NOT have @takes(self) — that would
         // mean it does free self, no leak.
