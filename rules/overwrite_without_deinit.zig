@@ -216,6 +216,14 @@ fn checkBody(
         const last_id = fieldTypeLastIdent(tree, model, ct, field_name) orelse field_type;
         const union_ti: ?*const fmodel.TypeInfo = blk: {
             if (qualified_ti) |q| if (q.kind == .union_) break :blk q;
+            // Scope-aware lookup: when multiple like-named types
+            // exist in the file (e.g. Writable.Pending.Future and
+            // Result.Pending.Future), prefer the one in the SAME
+            // enclosing scope as the outer struct holding the
+            // field.  Resolves name-collisions that findType's
+            // first-match behavior gets wrong.
+            const scope_ti = model.findTypeInScope(last_id, ct_ti) orelse model.findTypeInScope(field_type, ct_ti);
+            if (scope_ti) |s| if (s.kind == .union_) break :blk s;
             if (model.isTaggedUnion(last_id)) break :blk model.findType(last_id);
             if (model.isTaggedUnion(field_type)) break :blk model.findType(field_type);
             break :blk null;
@@ -223,6 +231,16 @@ fn checkBody(
         if (union_ti) |un| {
             if (taggedUnionRetagIsSafeTi(tree, model, un,
                 first, t, sc, this_name, field_name, ct)) {
+                t = sc;
+                continue;
+            }
+            // `= undefined` default: no prior value to deinit.
+            // Use ct_ti directly to avoid the name-keyed findType
+            // collision (Writable.Pending vs Result.Pending both
+            // named "Pending").
+            if (fieldDefaultIsUndefinedTi(tree, ct_ti, field_name) and
+                !priorWriteInFn(tree, first, t, this_name, field_name))
+            {
                 t = sc;
                 continue;
             }
@@ -633,9 +651,60 @@ fn taggedUnionRetagIsSafeTi(
     if (priorVariantInFn(tree, body_first, assign_tok, this_name, field_name)) |prior_tag| {
         return (model.unionVariantIsOwnedTi(union_ti, prior_tag) orelse true) == false;
     }
-    const default_tag = model.fieldDefaultUnionTag(outer_type_name, field_name) orelse
-        initFnDefaultUnionTag(tree, model, outer_type_name, field_name) orelse return false;
-    return (model.unionVariantIsOwnedTi(union_ti, default_tag) orelse true) == false;
+    // No prior assignment in this fn.  Check the field's declared
+    // default tag first.  Then fall back to scanning the type's
+    // init method, then to `= undefined` (a non-owned sentinel —
+    // there's no prior value to deinit).
+    if (model.fieldDefaultUnionTag(outer_type_name, field_name)) |dt|
+        return (model.unionVariantIsOwnedTi(union_ti, dt) orelse true) == false;
+    if (initFnDefaultUnionTag(tree, model, outer_type_name, field_name)) |dt|
+        return (model.unionVariantIsOwnedTi(union_ti, dt) orelse true) == false;
+    return false;
+}
+
+/// True iff the field's declared default value is the literal
+/// `undefined`.  Used by the union retag check: an `undefined`
+/// default has no prior value to deinit on first write.
+fn fieldDefaultIsUndefinedTi(
+    tree: *const Ast,
+    ti: *const fmodel.TypeInfo,
+    field_name: []const u8,
+) bool {
+    const f = ti.findField(field_name) orelse return false;
+    if (!f.has_default) return false;
+    const tags = tree.tokens.items(.tag);
+    if (f.type_last + 1 >= tags.len) return false;
+    var eq: Ast.TokenIndex = f.type_last + 1;
+    while (eq < tags.len and tags[eq] != .equal) : (eq += 1) {}
+    if (eq >= tags.len) return false;
+    if (eq + 1 >= tags.len) return false;
+    if (tags[eq + 1] != .identifier) return false;
+    return std.mem.eql(u8, tree.tokenSlice(eq + 1), "undefined");
+}
+
+/// True iff the fn body contains a prior write to `<this>.<field>`
+/// before `assign_tok`.  Used to gate the undefined-default skip:
+/// only skip on the FIRST write in this fn.
+fn priorWriteInFn(
+    tree: *const Ast,
+    body_first: Ast.TokenIndex,
+    assign_tok: Ast.TokenIndex,
+    this_name: []const u8,
+    field_name: []const u8,
+) bool {
+    const tags = tree.tokens.items(.tag);
+    if (assign_tok < body_first + 4) return false;
+    var t: Ast.TokenIndex = body_first;
+    while (t + 4 <= assign_tok - 1) : (t += 1) {
+        if (tags[t] != .identifier) continue;
+        if (!std.mem.eql(u8, tree.tokenSlice(t), this_name)) continue;
+        if (tags[t + 1] != .period) continue;
+        if (tags[t + 2] != .identifier) continue;
+        if (!std.mem.eql(u8, tree.tokenSlice(t + 2), field_name)) continue;
+        if (tags[t + 3] != .equal) continue;
+        return true;
+    }
+    return false;
 }
 
 /// Fallback: when the field has no inline default `= .<tag>`,

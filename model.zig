@@ -218,6 +218,54 @@ pub const FileModel = struct {
         return null;
     }
 
+    /// Scope-aware type lookup.  Find `name` starting from
+    /// `start_ti`'s scope (sibling types in the same parent), then
+    /// walk OUTWARD through ancestor scopes, falling back to a
+    /// file-level scan.  Resolves the canonical
+    /// "outer.Inner.Outer.Inner" collision where a field in
+    /// `Pending: ... { future: Future }` should resolve to the
+    /// `Future` declared in the SAME enclosing scope as `Pending`
+    /// rather than an unrelated like-named type elsewhere in the
+    /// file.
+    pub fn findTypeInScope(self: *const FileModel, name: []const u8, start_ti: *const TypeInfo) ?*const TypeInfo {
+        // Compute `start_ti`'s INDEX in the types array — used to
+        // search its own NESTED types (children) before walking
+        // outward.  A field's type can reference a type DECLARED
+        // INSIDE its own owner (e.g. `Pending { future: Future,
+        // pub const Future = ... }`), so the first hop is into
+        // ct_ti itself.
+        var start_idx: ?u32 = null;
+        for (self.types, 0..) |*t, i| {
+            if (t == start_ti) {
+                start_idx = @intCast(i);
+                break;
+            }
+        }
+        // First pass: children of `start_ti`.
+        if (start_idx) |idx| {
+            for (self.types) |*t| {
+                if (t.parent != idx) continue;
+                if (std.mem.eql(u8, t.name, name)) return t;
+            }
+        }
+        // Walk outward through ancestor scopes.  At each level
+        // search the types whose parent matches the current scope.
+        var scope_parent: ?u32 = start_ti.parent;
+        while (true) {
+            for (self.types) |*t| {
+                if (t.parent != scope_parent) continue;
+                if (std.mem.eql(u8, t.name, name)) return t;
+            }
+            // Move to outer scope.
+            const parent_idx = scope_parent orelse break;
+            if (parent_idx >= self.types.len) break;
+            scope_parent = self.types[parent_idx].parent;
+        }
+        // Fallback: any like-named type in the file (existing
+        // findType behavior).
+        return self.findType(name);
+    }
+
     /// Resolve a qualified type path like `["Result", "Pending", "State"]`
     /// to the EXACT nested type, disambiguating against name collisions.
     /// `findType` returns the first match (often the wrong one); this
