@@ -2572,7 +2572,12 @@ const Builder = struct {
             // that case.
             if (self.locals.items[@intFromEnum(fref.parent)].is_pointer) {
                 const recv_name = self.locals.items[@intFromEnum(fref.parent)].name;
-                if (!self.fieldPathRestoredByDefer(recv_name, fref.name) and !self.is_noreturn_fn) {
+                const assign_tok = tree.firstToken(assign_node);
+                if (!self.fieldPathRestoredByDefer(recv_name, fref.name) and
+                    !self.is_noreturn_fn and
+                    !self.installIsScopeBoundedByCall(recv_name, fref.name, assign_tok) and
+                    !self.installIsConsumedByCrossFnRead(recv_name, fref.name, assign_tok))
+                {
                     try self.appendStmt(cur.*, .{
                         .kind = .{ .out_param_write = .{
                             .out = fref.parent,
@@ -4826,6 +4831,164 @@ const Builder = struct {
         return self.fieldPathOverwrittenByNonBorrow(recv_name, path);
     }
 
+    /// Scope-bounded-install detection via tail-position consumer call.
+    ///
+    /// Recognise the canonical pattern:
+    ///   recv.field = &local;
+    ///   recv.method(...);   // synchronous consumer; uses install
+    ///   return;             // fn ends within K stmts of install
+    ///
+    /// Specifically, after the install at `install_tok`:
+    ///   1. Within K_SCAN tokens, a call `recv.<m>(...)` on the SAME
+    ///      receiver appears at the same brace depth as the install.
+    ///   2. The fn's CLOSING brace (`fn_body_last`) is within
+    ///      K_TAIL_TOKENS of the matched call's `)`.
+    /// Both bounds are deliberately tight — this is the
+    /// "install-then-run-then-return" idiom (e.g. test_command.zig's
+    /// `vm_.arena = &arena; vm_.runWithAPILock(...);`), NOT the
+    /// "install-then-process-then-return" pattern which has too much
+    /// code between the call and fn end to be confidently bounded.
+    fn installIsScopeBoundedByCall(
+        self: *const Builder,
+        recv_name: []const u8,
+        path: []const u8,
+        install_tok: Ast.TokenIndex,
+    ) bool {
+        _ = path;
+        if (self.fn_body_last == 0) return false;
+        const tree = self.tree;
+        const tags = tree.tokens.items(.tag);
+        const last = self.fn_body_last;
+        // Scan forward from after the install for `<recv> . <ident> (`.
+        var t: Ast.TokenIndex = install_tok;
+        // Skip the install's own statement (find next `;`).
+        while (t <= last and tags[t] != .semicolon) : (t += 1) {}
+        if (t > last) return false;
+        t += 1;
+        // Bounded scan.
+        const k_scan: u32 = 200;
+        const scan_end: Ast.TokenIndex = if (t + k_scan <= last) t + k_scan else last;
+        while (t + 3 <= scan_end) : (t += 1) {
+            if (tags[t] != .identifier) continue;
+            if (!std.mem.eql(u8, tree.tokenSlice(t), recv_name)) continue;
+            if (tags[t + 1] != .period) continue;
+            if (tags[t + 2] != .identifier) continue;
+            if (tags[t + 3] != .l_paren) continue;
+            // Found `recv.<method>(`.  Find matching `)`.
+            const close = lexer.matchParen(tags, t + 3, last) orelse continue;
+            // Require fn end (closing `}` of fn body) within K_TAIL
+            // tokens after the call's `)`.  In source: typically `;`
+            // then `}` or `;` then a 1-2 stmt tail then `}`.
+            const k_tail: u32 = 32;
+            const tail_end: Ast.TokenIndex = if (close + k_tail <= last) close + k_tail else last;
+            // The fn_body_last token IS the closing `}`.  Check it's
+            // within tail_end.
+            if (last <= tail_end) return true;
+            return false;
+        }
+        return false;
+    }
+
+    /// Scope-bounded-install detection via cross-fn (same-file)
+    /// read/clear summary.
+    ///
+    /// At the install `recv.field = &local`, look forward in the fn
+    /// body for a call to a SAME-FILE fn whose summary records a
+    /// write to `<arg>.field` for some arg position — where `recv`
+    /// (or a field path through it) is passed at that arg position.
+    /// If found, the install is consumed by that call: the borrow's
+    /// lifetime is bounded by the call's execution.
+    ///
+    /// Conservative — only matches direct `<fn>(recv, ...)` /
+    /// `<recv>.<method>(...)` shapes against summaries known in our
+    /// file model.  Cross-file calls (the bun install/plugin cases)
+    /// require ZLS or external summary infrastructure and remain
+    /// uncovered by this path.
+    fn installIsConsumedByCrossFnRead(
+        self: *const Builder,
+        recv_name: []const u8,
+        path: []const u8,
+        install_tok: Ast.TokenIndex,
+    ) bool {
+        const cache = self.cache orelse return false;
+        const model = cache.fileModel() catch return false;
+        const tree = self.tree;
+        const tags = tree.tokens.items(.tag);
+        const last = self.fn_body_last;
+        if (last == 0) return false;
+        // Walk forward from the install for the next 200 tokens
+        // looking for a call `<fn>(<args>)` or `<recv>.<method>(<args>)`.
+        var t: Ast.TokenIndex = install_tok;
+        while (t <= last and tags[t] != .semicolon) : (t += 1) {}
+        if (t > last) return false;
+        t += 1;
+        const k_scan: u32 = 200;
+        const scan_end: Ast.TokenIndex = if (t + k_scan <= last) t + k_scan else last;
+        while (t + 1 <= scan_end) : (t += 1) {
+            if (tags[t] != .identifier) continue;
+            // Resolve fn name: either bare `<fn>(` or `<recv>.<m>(`.
+            const fn_name: []const u8 = blk: {
+                if (t + 1 <= scan_end and tags[t + 1] == .l_paren) {
+                    break :blk tree.tokenSlice(t);
+                }
+                if (t + 3 <= scan_end and
+                    tags[t + 1] == .period and
+                    tags[t + 2] == .identifier and
+                    tags[t + 3] == .l_paren)
+                {
+                    break :blk tree.tokenSlice(t + 2);
+                }
+                continue;
+            };
+            // Find paren args and ensure `recv` appears among them.
+            var lp: Ast.TokenIndex = t;
+            while (lp <= scan_end and tags[lp] != .l_paren) : (lp += 1) {}
+            if (lp > scan_end) continue;
+            const close = lexer.matchParen(tags, lp, last) orelse continue;
+            // Cheap check: recv_name appears as a bare identifier in
+            // args (no `.` before it).
+            var has_recv: bool = false;
+            var k: Ast.TokenIndex = lp + 1;
+            while (k < close) : (k += 1) {
+                if (tags[k] != .identifier) continue;
+                if (!std.mem.eql(u8, tree.tokenSlice(k), recv_name)) continue;
+                if (k > 0 and tags[k - 1] == .period) continue;
+                has_recv = true;
+                break;
+            }
+            // For method form `<recv>.<m>(...)`, recv is the receiver.
+            if (!has_recv and t + 3 <= scan_end and
+                tags[t + 1] == .period and
+                std.mem.eql(u8, tree.tokenSlice(t), recv_name))
+            {
+                has_recv = true;
+            }
+            if (!has_recv) continue;
+            // Look up the called fn in our file model.  Need same-file
+            // fn match.  Methods on types live in TypeInfo.methods;
+            // top-level fns live in model.fns.
+            const target_fn_decl: ?Ast.Node.Index = blk: {
+                for (model.fns) |f| {
+                    if (std.mem.eql(u8, f.name, fn_name)) break :blk f.fn_decl;
+                }
+                for (model.types) |ti| {
+                    if (ti.findMethod(fn_name)) |m| break :blk m.fn_decl;
+                }
+                break :blk null;
+            };
+            const fn_decl = target_fn_decl orelse {
+                // Not a same-file fn — can't introspect.  Continue
+                // scanning (could match a later call).
+                t = close;
+                continue;
+            };
+            // Check the fn's body for `<param>.<path>` reads OR writes.
+            if (calledFnTouchesParamField(self.tree, fn_decl, path)) return true;
+            t = close;
+        }
+        return false;
+    }
+
     /// Variant 3 — any later overwrite to `<recv>.<path>` with a
     /// non-stack-borrow RHS bounds the stack-escape: the borrowed
     /// pointer is replaced before the fn returns.  Detect a
@@ -4871,6 +5034,61 @@ const Builder = struct {
             const c = tree.source[b];
             if (c == '&' or c == '.') continue;
             if (!(c == '_' or (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z'))) continue;
+            return true;
+        }
+        return false;
+    }
+
+    /// True iff the body of `fn_decl` reads or writes the field path
+    /// `path` through ANY of its parameters: i.e. `<param>.<path>`
+    /// appears anywhere in the body.  Conservative: any reference
+    /// (read OR write) is treated as "consumed during the call",
+    /// since at minimum the install's value is observed and the
+    /// borrow lifetime is bounded by the call's execution.
+    fn calledFnTouchesParamField(
+        tree: *const Ast,
+        fn_decl: Ast.Node.Index,
+        path: []const u8,
+    ) bool {
+        var proto_buf: [1]Ast.Node.Index = undefined;
+        const proto = lexer.fnProto(tree, &proto_buf, fn_decl) orelse return false;
+        const body = lexer.bodyOf(tree, fn_decl) orelse return false;
+        const tags = tree.tokens.items(.tag);
+        const body_first = tree.firstToken(body);
+        const body_last = tree.lastToken(body);
+        // Collect param names.
+        var param_names_buf: [16][]const u8 = undefined;
+        var n: usize = 0;
+        var it = proto.iterate(tree);
+        while (it.next()) |param| {
+            if (n == param_names_buf.len) break;
+            const name_tok = param.name_token orelse continue;
+            param_names_buf[n] = tree.tokenSlice(name_tok);
+            n += 1;
+        }
+        const param_names = param_names_buf[0..n];
+        if (param_names.len == 0) return false;
+        // Walk body tokens for `<param>.<path-first-ident>` shapes.
+        // `path` may itself be dotted (`a.b.c`); we only need the FIRST
+        // segment to confirm a match into the field chain.
+        const first_seg_end: usize = blk: {
+            for (path, 0..) |c, i| if (c == '.') break :blk i;
+            break :blk path.len;
+        };
+        const first_seg = path[0..first_seg_end];
+        var t: Ast.TokenIndex = body_first;
+        while (t + 2 <= body_last) : (t += 1) {
+            if (tags[t] != .identifier) continue;
+            const id = tree.tokenSlice(t);
+            var matches_param: bool = false;
+            for (param_names) |p| if (std.mem.eql(u8, p, id)) {
+                matches_param = true;
+                break;
+            };
+            if (!matches_param) continue;
+            if (tags[t + 1] != .period) continue;
+            if (tags[t + 2] != .identifier) continue;
+            if (!std.mem.eql(u8, tree.tokenSlice(t + 2), first_seg)) continue;
             return true;
         }
         return false;
