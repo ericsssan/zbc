@@ -2597,7 +2597,7 @@ const Builder = struct {
             // pointer-typed parent — pure-local field writes don't
             // outlive the frame and aren't observable.
             if (self.locals.items[@intFromEnum(fref.parent)].is_pointer) {
-                try self.maybePartialUnionWrite(cur.*, rhs, fref.parent,
+                try self.maybePartialUnionWrite(cur.*, rhs, fref.parent, fref.name,
                     self.posOf(assign_node), self.endPosOf(assign_node));
             }
             // Escape-via-out-param: `out.field = X` where `out` is a
@@ -2666,7 +2666,7 @@ const Builder = struct {
             // observed field LHSs ARE unions).
             const tn = self.locals.items[@intFromEnum(out_local)].type_name;
             if (tn != null and self.typeIsTaggedUnion(tn.?)) {
-                try self.maybePartialUnionWrite(cur.*, rhs, out_local,
+                try self.maybePartialUnionWrite(cur.*, rhs, out_local, null,
                     self.posOf(assign_node), self.endPosOf(assign_node));
             }
         } else if (tree.nodeTag(lhs) == .identifier and
@@ -5357,6 +5357,7 @@ const Builder = struct {
         cur: BlockId,
         rhs: Ast.Node.Index,
         lhs_local: LocalId,
+        lhs_field: ?[]const u8,
         pos: SrcPos,
         end_pos: SrcPos,
     ) !void {
@@ -5376,14 +5377,18 @@ const Builder = struct {
         const tag_name = self.fieldInitName(field_value) orelse return;
         if (!self.fieldValueHasEarlyExit(field_value)) return;
         // Observability gate: the partial-write hazard only matters
-        // if SOMEONE reads the LHS on the error path.  In practice
-        // that means an `errdefer` in the same fn that touches the
-        // LHS's parent (the canonical `errdefer this.deinit()` that
-        // dispatches on the union's tag).  Without such an errdefer
-        // the error propagates without reading the partial state,
-        // so no observable hazard — skip.
+        // if SOMEONE reads the partial-written field on the error
+        // path.  In practice that means an `errdefer` in the same
+        // fn that EITHER:
+        //   (a) reads `<lhs>.<field>` directly (interpreting the
+        //       stale union state), OR
+        //   (b) calls a destructor on `<lhs>` that's known to
+        //       dispatch on union tags (`<lhs>.deinit()` /
+        //       `.destroy()` / `.finalize()` / `.dispose()`).
+        // Errdefers that touch `<lhs>` but only OTHER fields don't
+        // observe the partial state — skip.
         const lhs_name = self.locals.items[@intFromEnum(lhs_local)].name;
-        if (!self.anyErrdeferMentions(lhs_name)) return;
+        if (!self.anyErrdeferObservesField(lhs_name, lhs_field)) return;
         try self.appendStmt(cur, .{
             .kind = .{ .partial_union_write = .{ .tag_name = tag_name } },
             .pos = pos,
@@ -5394,7 +5399,21 @@ const Builder = struct {
     /// True iff any `errdefer` keyword in the fn body has a body
     /// (inline statement or `{...}` block) that mentions `<name>`
     /// as an identifier.
-    fn anyErrdeferMentions(self: *Builder, name: []const u8) bool {
+    /// True iff some errdefer in this fn body observes the partial
+    /// union state on `<lhs_name>[.lhs_field]`:
+    ///   (a) reads `<lhs_name>.<lhs_field>` directly (when
+    ///       `lhs_field` is non-null), OR
+    ///   (b) calls a destructor on `<lhs_name>` known to dispatch
+    ///       on union state — `<lhs_name>.deinit()` /
+    ///       `.destroy()` / `.finalize()` / `.dispose()`, OR
+    ///   (c) `lhs_field` is null (whole-struct write via `<x>.*`):
+    ///       any mention of `<lhs_name>` counts (we can't be
+    ///       precise about the field being partial-written).
+    fn anyErrdeferObservesField(
+        self: *Builder,
+        lhs_name: []const u8,
+        lhs_field: ?[]const u8,
+    ) bool {
         const tree = self.tree;
         const tags = tree.tokens.items(.tag);
         const last = self.fn_body_last;
@@ -5402,8 +5421,6 @@ const Builder = struct {
         var t: Ast.TokenIndex = 0;
         while (t <= last) : (t += 1) {
             if (tags[t] != .keyword_errdefer) continue;
-            // Determine the errdefer body extent.  Skip optional
-            // `|err|` capture.
             var b = t + 1;
             if (b <= last and tags[b] == .pipe) {
                 b += 1;
@@ -5416,11 +5433,27 @@ const Builder = struct {
                 lexer.matchBrace(tags, b, last) orelse continue
             else
                 lexer.findStmtSemicolon(tags, b, last) orelse continue;
-            // Scan body for `name` as an identifier.
             var k = b;
-            while (k <= body_end) : (k += 1) {
+            while (k + 2 <= body_end) : (k += 1) {
                 if (tags[k] != .identifier) continue;
-                if (std.mem.eql(u8, tree.tokenSlice(k), name)) return true;
+                if (!std.mem.eql(u8, tree.tokenSlice(k), lhs_name)) continue;
+                // Word-boundary: not a field access from elsewhere.
+                if (k > 0 and tags[k - 1] == .period) continue;
+                // Whole-struct write: any bare mention counts.
+                if (lhs_field == null) return true;
+                // Otherwise need `<lhs_name>.<follow>` where follow
+                // is either the same field OR a known destructor.
+                if (tags[k + 1] != .period) continue;
+                if (tags[k + 2] != .identifier) continue;
+                const follow = tree.tokenSlice(k + 2);
+                if (std.mem.eql(u8, follow, lhs_field.?)) return true;
+                if (std.mem.eql(u8, follow, "deinit") or
+                    std.mem.eql(u8, follow, "destroy") or
+                    std.mem.eql(u8, follow, "finalize") or
+                    std.mem.eql(u8, follow, "dispose"))
+                {
+                    return true;
+                }
             }
             t = body_end;
         }
