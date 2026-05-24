@@ -94,6 +94,11 @@ pub fn check(
         const outer_has_allocator = outerHasAllocatorField(tree, outer);
         var hit: ?usize = null;
         for (fields, 0..) |f, i| {
+            // Optional-null-default skip: `<field>: ?T = null`
+            // only holds a non-null T when explicitly assigned.
+            // A missing outer cleanup doesn't leak when the field
+            // stays null — common for "lazy/optional sub-state".
+            if (model.fieldIsOptionalNullDefault(outer.name, f.name)) continue;
             const inner_ti = mq.resolveFieldTypeScoped(tree, model, outer, f) orelse continue;
             if (!anyNonTrivialCleanup(tree, inner_ti)) continue;
             if (!outer_has_allocator and allCleanupMethodsNeedExtraArg(tree, inner_ti)) continue;
