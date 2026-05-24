@@ -238,6 +238,13 @@ pub fn resolveFieldTypeScoped(
     if (tags[t] == .question_mark) t += 1;
     if (t > field.type_last) return null;
     if (tags[t] != .identifier) return null;
+    // If the type path is dotted (`Result.Pending.State`), prefer
+    // the LEAF type via qualified lookup; falls back to the
+    // first-identifier in-scope lookup when the chain doesn't
+    // resolve.
+    if (t + 2 <= field.type_last and tags[t + 1] == .period and tags[t + 2] == .identifier) {
+        if (model.resolveFieldTypeQualifiedTi(owner, field.name)) |ti| return ti;
+    }
     const name = tree.tokenSlice(t);
     return model.findTypeInScope(name, owner);
 }
