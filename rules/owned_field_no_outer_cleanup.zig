@@ -57,6 +57,11 @@ pub fn check(
         // intrusive container — the container's deinit walks the
         // chain and cleans entries.  Common in Bun's queues.
         if (isLinkedListNode(tree, outer)) continue;
+        // Queue/Fifo container declaration: a type whose body
+        // declares `pub const Queue = bun.LinearFifo(Self, ...)` /
+        // `bun.UnboundedQueue(Self, ...)` / similar is entries-only;
+        // the queue owns the lifecycle of its entries.
+        if (typeIsQueueEntry(tree, outer)) continue;
         // Bun convention skip: `pub const new = bun.TrivialNew(T);`
         // (or `bun.New(T)`) declares the type as heap-allocated and
         // owned by a parent — the parent's deinit handles the
@@ -126,6 +131,40 @@ fn isHashContextType(ti: *const fmodel.TypeInfo) bool {
         }
     }
     return saw_hash and saw_eql;
+}
+
+/// True iff the type's body declares a `pub const <Name> =
+/// bun.LinearFifo(<Self>, ...)` / `bun.UnboundedQueue(<Self>, ...)`
+/// — strong signal the type is an entry in an external queue.
+/// The queue's container manages the entries' lifecycles; the
+/// entry doesn't need its own deinit.
+fn typeIsQueueEntry(tree: *const Ast, ti: *const fmodel.TypeInfo) bool {
+    const tags = tree.tokens.items(.tag);
+    if (ti.body_first >= ti.body_last) return false;
+    var t: Ast.TokenIndex = ti.body_first;
+    while (t + 4 < ti.body_last) : (t += 1) {
+        // Match `[pub] const <id> = bun . <CallName> (`.
+        var k: Ast.TokenIndex = t;
+        if (tags[k] == .keyword_pub) k += 1;
+        if (tags[k] != .keyword_const) continue;
+        if (tags[k + 1] != .identifier) continue;
+        if (tags[k + 2] != .equal) continue;
+        // RHS shape: identifier `bun`, `.`, identifier (call name), `(`.
+        const r: Ast.TokenIndex = k + 3;
+        if (r + 4 > ti.body_last) continue;
+        if (tags[r] != .identifier) continue;
+        if (!std.mem.eql(u8, tree.tokenSlice(r), "bun")) continue;
+        if (tags[r + 1] != .period) continue;
+        if (tags[r + 2] != .identifier) continue;
+        const fname = tree.tokenSlice(r + 2);
+        if (!std.mem.eql(u8, fname, "LinearFifo") and
+            !std.mem.eql(u8, fname, "UnboundedQueue") and
+            !std.mem.eql(u8, fname, "FIFO") and
+            !std.mem.eql(u8, fname, "Fifo")) continue;
+        if (tags[r + 3] != .l_paren) continue;
+        return true;
+    }
+    return false;
 }
 
 /// True iff the type has a `next: ?*Self` (or `next: ?*<TypeName>` /
