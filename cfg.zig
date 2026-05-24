@@ -1452,6 +1452,54 @@ const Builder = struct {
     /// types whose destruction goes through `deref()` rather than
     /// the finalize callback.  Token-scans the type body for the
     /// canonical declaration shape.
+    /// True iff the type has a method with the canonical
+    /// singleton-accessor shape:
+    ///   `pub [inline] fn get() *Self`        (or `*<TypeName>`)
+    ///   `pub [inline] fn instance() *Self`
+    ///   `pub [inline] fn getOrNull() ?*Self`
+    /// — zero-parameter methods that return a pointer to the type.
+    /// Detection is purely token-walk over the type's body so it
+    /// works for file-as-struct types too.
+    fn typeHasSingletonAccessor(self: *Builder, type_name: []const u8) bool {
+        const cache = self.cache orelse return false;
+        const model = cache.fileModel() catch return false;
+        const ti = model.findType(type_name) orelse return false;
+        const tree = self.tree;
+        const tags = tree.tokens.items(.tag);
+        for (ti.methods) |m| {
+            const is_accessor_name =
+                std.mem.eql(u8, m.name, "get") or
+                std.mem.eql(u8, m.name, "getOrNull") or
+                std.mem.eql(u8, m.name, "instance");
+            if (!is_accessor_name) continue;
+            // Must be parameterless: tokens are `fn` `<name>` `(` `)`.
+            const name_tok = m.name_token;
+            if (name_tok + 2 >= tags.len) continue;
+            if (tags[name_tok + 1] != .l_paren) continue;
+            if (tags[name_tok + 2] != .r_paren) continue;
+            // Return type after `)`.  Expect optional `?`, then `*`,
+            // then an identifier or `@This()` that resolves to the
+            // enclosing type.
+            var t: Ast.TokenIndex = name_tok + 3;
+            if (t < tags.len and tags[t] == .question_mark) t += 1;
+            if (t >= tags.len or tags[t] != .asterisk) continue;
+            t += 1;
+            if (t >= tags.len) continue;
+            switch (tags[t]) {
+                .identifier => {
+                    const ret_name = tree.tokenSlice(t);
+                    if (std.mem.eql(u8, ret_name, type_name)) return true;
+                    if (std.mem.eql(u8, ret_name, "Self")) return true;
+                },
+                .builtin => {
+                    if (std.mem.eql(u8, tree.tokenSlice(t), "@This")) return true;
+                },
+                else => {},
+            }
+        }
+        return false;
+    }
+
     fn typeBodyHasRefCountMixin(self: *Builder, type_name: []const u8) bool {
         const cache = self.cache orelse return false;
         const model = cache.fileModel() catch return false;
@@ -1523,6 +1571,16 @@ const Builder = struct {
         // anything; the rule firing is shoutness without
         // value.
         if (self.destructorBodyIsTrivial()) return null;
+        // Singleton-accessor pattern: types with `pub [inline] fn
+        // get() *Self` (or `instance()` / `getOrNull()`) returning a
+        // pointer to the type are conventional process-global
+        // singletons (the canonical `VirtualMachine.get()` shape).
+        // Such types are heap-allocated ONCE at startup and live
+        // until process exit; the destructor exists for orderly
+        // subsystem teardown but doesn't free `self` because there's
+        // no place to return memory TO.  The rule's prescription
+        // ("add bun.destroy(self)") doesn't apply.
+        if (self.typeHasSingletonAccessor(ct)) return null;
 
         // The destructor must NOT have @takes(self) — that would
         // mean it does free self, no leak.
