@@ -68,7 +68,7 @@ pub const ZlsResolver = struct {
             .{ .path = p, .handle = .cwd() }
         else
             null;
-        const build_runner = if (zig_lib != null) findBuildRunner(arena_alloc) catch null else null;
+        const build_runner = if (zig_lib != null) findBuildRunner(arena_alloc, io) catch null else null;
 
         self.document_store = .{
             .io = io,
@@ -203,14 +203,20 @@ fn runCapture(gpa: std.mem.Allocator, io: std.Io, argv: []const []const u8) ![]u
 }
 
 /// Discover the build-runner script that ZLS loads to introspect
-/// the active project's build.zig.  ZLS ships one inside its own
-/// package; without it, `@import("foo")` chains that resolve via
-/// build.zig modules can't be followed.  Skipped for now — the
-/// std.fs API churned across Zig versions and the build-runner
-/// path can be wired explicitly when needed.  ZLS still works
-/// without it (stdlib types resolve via zig_lib_dir).
-fn findBuildRunner(arena: std.mem.Allocator) ![]const u8 {
-    _ = arena;
+/// the active project's build.zig.  zbc vendors the ZLS package
+/// under `zig-pkg/zls-*/src/build_runner/build_runner.zig`.  Try
+/// the canonical relative paths; ZLS keeps working without it,
+/// just can't follow cross-module `@import("foo")` chains that
+/// resolve via build.zig modules.
+fn findBuildRunner(arena: std.mem.Allocator, io: std.Io) ![]const u8 {
+    const candidates = [_][]const u8{
+        "zig-pkg/zls-0.17.0-dev-rmm5fhwjJgCaQB3fCtSi_8xBQvGJJqz9BBeQHjZK9jet/src/build_runner/build_runner.zig",
+    };
+    for (candidates) |path| {
+        const handle = std.Io.Dir.cwd().openFile(io, path, .{}) catch continue;
+        handle.close(io);
+        return try arena.dupe(u8, path);
+    }
     return error.NotFound;
 }
 
