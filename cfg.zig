@@ -5438,6 +5438,15 @@ const Builder = struct {
         else
             chain_end;
         if (last_field == null) return;
+        // Mutator-method handling: when the chain ends in
+        // `<deepest>.<method>(` and `<method>` is a mutator
+        // (`init` / `setup` / `reset`-prefix etc.), the deepest
+        // field is WRITTEN through implicit `&self`.  Emit a
+        // field_assign for it (clears .undef) and field_use for
+        // the strictly-shorter prefixes only (those are reads of
+        // intermediate path components).
+        const is_mutator_call = ends_in_call and
+            isMutatorMethodName(tree.tokenSlice(chain_end));
         // Emit one prefix per inclusive field ident.
         const start_byte = tree.tokens.items(.start)[first_field];
         var f: Ast.TokenIndex = first_field;
@@ -5445,11 +5454,20 @@ const Builder = struct {
             const f_start = tree.tokens.items(.start)[f];
             const f_len = tree.tokenSlice(f).len;
             const path = tree.source[start_byte..(f_start + f_len)];
-            try self.appendStmt(cur, .{
-                .kind = .{ .field_use = .{ .parent = parent, .name = path } },
-                .pos = pos,
-                .end_pos = end_pos,
-            });
+            // Deepest field of a mutator call: emit a write, not a read.
+            if (is_mutator_call and f == last_field.?) {
+                try self.appendStmt(cur, .{
+                    .kind = .{ .field_assign = .{ .parent = parent, .name = path, .rhs_kind = .unknown } },
+                    .pos = pos,
+                    .end_pos = end_pos,
+                });
+            } else {
+                try self.appendStmt(cur, .{
+                    .kind = .{ .field_use = .{ .parent = parent, .name = path } },
+                    .pos = pos,
+                    .end_pos = end_pos,
+                });
+            }
         }
     }
 
