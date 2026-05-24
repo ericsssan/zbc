@@ -218,6 +218,100 @@ pub const FileModel = struct {
         return null;
     }
 
+    /// Resolve a qualified type path like `["Result", "Pending", "State"]`
+    /// to the EXACT nested type, disambiguating against name collisions.
+    /// `findType` returns the first match (often the wrong one); this
+    /// follows the parent chain to find the nested type with the right
+    /// enclosing scope.
+    ///
+    /// Matching strategy: scan all types whose NAME matches the LAST
+    /// segment; for each candidate, walk its `parent` chain upward and
+    /// verify the chain's names match the path's earlier segments
+    /// (right-to-left).  Returns the first candidate whose chain
+    /// matches.
+    pub fn findQualifiedType(
+        self: *const FileModel,
+        path: []const []const u8,
+    ) ?*const TypeInfo {
+        if (path.len == 0) return null;
+        if (path.len == 1) return self.findType(path[0]);
+        const leaf_name = path[path.len - 1];
+        for (self.types) |*candidate| {
+            if (!std.mem.eql(u8, candidate.name, leaf_name)) continue;
+            if (self.qualifiedChainMatches(candidate, path)) return candidate;
+        }
+        return null;
+    }
+
+    /// True iff `ti`'s parent chain (walking outward) matches the
+    /// names in `path[0..path.len-1]` in reverse order.
+    fn qualifiedChainMatches(
+        self: *const FileModel,
+        ti: *const TypeInfo,
+        path: []const []const u8,
+    ) bool {
+        if (path.len < 2) return true;
+        // Walk from `ti`'s parent upward.  path[len-2] should match
+        // the immediate parent, path[len-3] the grandparent, etc.
+        var i: usize = path.len - 1;
+        var cur: ?u32 = ti.parent;
+        while (i > 0) {
+            i -= 1;
+            const parent_idx = cur orelse return false;
+            const parent_ti = &self.types[parent_idx];
+            if (!std.mem.eql(u8, parent_ti.name, path[i])) return false;
+            cur = parent_ti.parent;
+        }
+        return true;
+    }
+
+    /// Resolve a field's full type-path (`Result.Pending.State`) to
+    /// the nested TypeInfo.  Walks the field's declared type tokens,
+    /// strips wrappers (`*` / `?` / `[]`), collects each identifier
+    /// in the dotted chain, then calls `findQualifiedType`.  Returns
+    /// null when the path can't be resolved (cross-file, generic
+    /// instantiation, etc.).
+    pub fn resolveFieldTypeQualified(
+        self: *const FileModel,
+        struct_name: []const u8,
+        field_name: []const u8,
+    ) ?*const TypeInfo {
+        const ti = self.findType(struct_name) orelse return null;
+        return self.resolveFieldTypeQualifiedTi(ti, field_name);
+    }
+
+    /// TypeInfo-anchored variant of `resolveFieldTypeQualified`.
+    /// Bypasses the name-keyed lookup that would land on the wrong
+    /// nested-type collision when callers already hold a precise
+    /// outer type pointer.
+    pub fn resolveFieldTypeQualifiedTi(
+        self: *const FileModel,
+        ti: *const TypeInfo,
+        field_name: []const u8,
+    ) ?*const TypeInfo {
+        const f = ti.findField(field_name) orelse return null;
+        const tags = self.tree.tokens.items(.tag);
+        // Collect identifier chain inside the field's type-tokens.
+        var path_buf: [8][]const u8 = undefined;
+        var n: u32 = 0;
+        var t: TokenIndex = f.type_first;
+        while (t <= f.type_last) : (t += 1) {
+            switch (tags[t]) {
+                .asterisk, .question_mark, .keyword_const, .keyword_var, .l_bracket, .r_bracket => {},
+                .identifier => {
+                    if (n < path_buf.len) {
+                        path_buf[n] = self.tree.tokenSlice(t);
+                        n += 1;
+                    }
+                },
+                .period => {},
+                else => break,
+            }
+        }
+        if (n == 0) return null;
+        return self.findQualifiedType(path_buf[0..n]);
+    }
+
     /// Convenience: type exists AND has the named method.
     pub fn typeHasMethod(self: *const FileModel, type_name: []const u8, method_name: []const u8) bool {
         const ti = self.findType(type_name) orelse return false;
@@ -430,9 +524,21 @@ pub const FileModel = struct {
         variant_tag: []const u8,
     ) ?bool {
         const ti = self.findType(union_name) orelse return null;
+        return self.unionVariantIsOwnedTi(ti, variant_tag);
+    }
+
+    /// Variant of `unionVariantIsOwned` that takes the resolved
+    /// `TypeInfo` directly — used when the caller has already
+    /// disambiguated a qualified path (e.g. `Result.Pending.State`)
+    /// and doesn't want a `findType` re-lookup to grab the wrong
+    /// like-named type.
+    pub fn unionVariantIsOwnedTi(
+        self: *const FileModel,
+        ti: *const TypeInfo,
+        variant_tag: []const u8,
+    ) ?bool {
         if (ti.kind != .union_) return null;
         const tags = self.tree.tokens.items(.tag);
-        // Walk variants between `{` and `}`.
         var t: TokenIndex = ti.body_first + 1;
         const last = ti.body_last;
         while (t < last) : (t += 1) {

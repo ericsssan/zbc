@@ -62,7 +62,7 @@ pub fn check(
         const ct_ti = model.containingTypeOf(node) orelse continue;
         const this_name = lexer.firstParamName(tree, fp) orelse continue;
         const body = bodyOf(tree, node) orelse continue;
-        try checkBody(gpa, tree, model, ct_ti.name, this_name, body, problems);
+        try checkBody(gpa, tree, model, ct_ti, this_name, body, problems);
     }
 }
 
@@ -70,11 +70,12 @@ fn checkBody(
     gpa: std.mem.Allocator,
     tree: *const Ast,
     model: *const fmodel.FileModel,
-    ct: []const u8,
+    ct_ti: *const fmodel.TypeInfo,
     this_name: []const u8,
     body: Ast.Node.Index,
     problems: *std.ArrayListUnmanaged(Problem),
 ) !void {
+    const ct = ct_ti.name;
     const tags = tree.tokens.items(.tag);
     const first = tree.firstToken(body);
     const last = tree.lastToken(body);
@@ -179,14 +180,19 @@ fn checkBody(
             t = sc;
             continue;
         }
-        // Enum leaf-type skip: `field: ENS.NamespacedEnum` resolves
-        // via `baseTypeName` to the FIRST identifier (`ENS` here),
-        // and the rule lookup picks up that NAMESPACE type's deinit
-        // even though the actual field is a plain enum tag.  When
-        // the field's LEAF type identifier resolves to an `enum`
-        // in the model, the field has no payload and can never
-        // leak — skip.
-        if (fieldTypeLastIdent(tree, model, ct, field_name)) |leaf| {
+        // Enum leaf-type skip: when the field's qualified type
+        // path resolves to an `enum` in the model, the field has
+        // no payload and can never leak.  Uses
+        // `resolveFieldTypeQualifiedTi` so `state: Result.Pending.State`
+        // resolves to the NESTED `State` (an enum) rather than the
+        // outer `Result` union.  Falls back to leaf-identifier
+        // scan when the qualified resolver can't follow the chain.
+        if (model.resolveFieldTypeQualifiedTi(ct_ti, field_name)) |leaf_ti| {
+            if (leaf_ti.kind == .enum_) {
+                t = sc;
+                continue;
+            }
+        } else if (fieldTypeLastIdent(tree, model, ct, field_name)) |leaf| {
             if (model.findType(leaf)) |leaf_ti| {
                 if (leaf_ti.kind == .enum_) {
                     t = sc;
@@ -202,19 +208,20 @@ fn checkBody(
         // variant carries no owned payload, the retag doesn't
         // leak — there was nothing to deinit.
         //
-        // Two type-name candidates: the field type's FIRST id
-        // (what baseTypeName returns — "Result" for
-        // `Result.Pending.State`) AND the LAST id ("State").
-        // Nested-type qualified paths need the leaf name.
+        // Resolve the field's QUALIFIED type path
+        // (`Result.Pending.State` → nested `State`).  Fall back to
+        // leaf-id and first-id lookups when the qualified resolver
+        // can't follow the chain.
+        const qualified_ti = model.resolveFieldTypeQualifiedTi(ct_ti, field_name);
         const last_id = fieldTypeLastIdent(tree, model, ct, field_name) orelse field_type;
-        const union_name = if (model.isTaggedUnion(last_id))
-            last_id
-        else if (model.isTaggedUnion(field_type))
-            field_type
-        else
-            null;
-        if (union_name) |un| {
-            if (taggedUnionRetagIsSafe(tree, model, un,
+        const union_ti: ?*const fmodel.TypeInfo = blk: {
+            if (qualified_ti) |q| if (q.kind == .union_) break :blk q;
+            if (model.isTaggedUnion(last_id)) break :blk model.findType(last_id);
+            if (model.isTaggedUnion(field_type)) break :blk model.findType(field_type);
+            break :blk null;
+        };
+        if (union_ti) |un| {
+            if (taggedUnionRetagIsSafeTi(tree, model, un,
                 first, t, sc, this_name, field_name, ct)) {
                 t = sc;
                 continue;
@@ -227,7 +234,7 @@ fn checkBody(
             //    explicit arms.
             // If every constrained-prior variant is non-owned,
             // the retag doesn't leak.
-            if (switchArmRetagIsSafe(tree, model, un, first, t,
+            if (switchArmRetagIsSafeTi(tree, model, un, first, t,
                 this_name, field_name)) {
                 t = sc;
                 continue;
@@ -256,15 +263,29 @@ fn switchArmRetagIsSafe(
     this_name: []const u8,
     field_name: []const u8,
 ) bool {
+    const ti = model.findType(union_type_name) orelse return false;
+    return switchArmRetagIsSafeTi(tree, model, ti, body_first, assign_tok, this_name, field_name);
+}
+
+/// TypeInfo-anchored variant of `switchArmRetagIsSafe` — avoids
+/// the `findType(name)` re-lookup that would pick the wrong
+/// like-named type when nested-type collisions exist.
+fn switchArmRetagIsSafeTi(
+    tree: *const Ast,
+    model: *const fmodel.FileModel,
+    union_ti: *const fmodel.TypeInfo,
+    body_first: Ast.TokenIndex,
+    assign_tok: Ast.TokenIndex,
+    this_name: []const u8,
+    field_name: []const u8,
+) bool {
     const arm = findEnclosingSwitchArm(tree, body_first, assign_tok, this_name, field_name) orelse return false;
     switch (arm) {
         .specific_tag => |tag| {
-            return (model.unionVariantIsOwned(union_type_name, tag) orelse true) == false;
+            return (model.unionVariantIsOwnedTi(union_ti, tag) orelse true) == false;
         },
         .else_arm => |explicit_tags| {
-            // Walk all variants of the union; for any variant
-            // NOT in explicit_tags, check it's non-owned.
-            return allVariantsExceptAreNonOwned(model, union_type_name, explicit_tags);
+            return allVariantsExceptAreNonOwnedTi(model, union_ti, explicit_tags);
         },
     }
 }
@@ -463,8 +484,19 @@ fn allVariantsExceptAreNonOwned(
     union_type_name: []const u8,
     explicit_tags: [16][]const u8,
 ) bool {
-    const tree = model.tree;
     const ti = model.findType(union_type_name) orelse return false;
+    return allVariantsExceptAreNonOwnedTi(model, ti, explicit_tags);
+}
+
+/// TypeInfo-anchored variant of `allVariantsExceptAreNonOwned`.
+/// Walks the SAME `ti` rather than re-resolving the name (which
+/// would pick a like-named nested-type collision).
+fn allVariantsExceptAreNonOwnedTi(
+    model: *const fmodel.FileModel,
+    ti: *const fmodel.TypeInfo,
+    explicit_tags: [16][]const u8,
+) bool {
+    const tree = model.tree;
     const tags = tree.tokens.items(.tag);
     var t = ti.body_first + 1;
     while (t < ti.body_last) : (t += 1) {
@@ -494,7 +526,7 @@ fn allVariantsExceptAreNonOwned(
             continue;
         }
         // Variant not in explicit set; must be non-owned.
-        if (model.unionVariantIsOwned(union_type_name, name) orelse true) {
+        if (model.unionVariantIsOwnedTi(ti, name) orelse true) {
             return false;
         }
         if (t + 1 < ti.body_last and tags[t + 1] == .colon) {
@@ -580,22 +612,30 @@ fn taggedUnionRetagIsSafe(
     field_name: []const u8,
     outer_type_name: []const u8,
 ) bool {
+    const ti = model.findType(union_type_name) orelse return false;
+    return taggedUnionRetagIsSafeTi(tree, model, ti, body_first, assign_tok, sc, this_name, field_name, outer_type_name);
+}
+
+/// TypeInfo-anchored variant — eliminates the `findType(name)`
+/// lookup that would pick the wrong like-named nested type.
+fn taggedUnionRetagIsSafeTi(
+    tree: *const Ast,
+    model: *const fmodel.FileModel,
+    union_ti: *const fmodel.TypeInfo,
+    body_first: Ast.TokenIndex,
+    assign_tok: Ast.TokenIndex,
+    sc: Ast.TokenIndex,
+    this_name: []const u8,
+    field_name: []const u8,
+    outer_type_name: []const u8,
+) bool {
     _ = sc;
-    // Walk back for a prior assignment to this lvalue in the
-    // SAME fn body — order matters for variant flow.  Stop at
-    // the fn body start (no scope-restriction: any earlier write
-    // in this fn establishes the live variant).
     if (priorVariantInFn(tree, body_first, assign_tok, this_name, field_name)) |prior_tag| {
-        // We know the prior variant.  Safe iff it's non-owned.
-        return (model.unionVariantIsOwned(union_type_name, prior_tag) orelse true) == false;
+        return (model.unionVariantIsOwnedTi(union_ti, prior_tag) orelse true) == false;
     }
-    // No prior assignment in this fn.  Look for the field's
-    // declared default tag first; if the type uses an init()
-    // function instead of a field default (Bun convention), scan
-    // that for the initial tag.
     const default_tag = model.fieldDefaultUnionTag(outer_type_name, field_name) orelse
         initFnDefaultUnionTag(tree, model, outer_type_name, field_name) orelse return false;
-    return (model.unionVariantIsOwned(union_type_name, default_tag) orelse true) == false;
+    return (model.unionVariantIsOwnedTi(union_ti, default_tag) orelse true) == false;
 }
 
 /// Fallback: when the field has no inline default `= .<tag>`,

@@ -211,13 +211,37 @@ pub fn resolveFieldType(
     field: *const fmodel.FieldInfo,
 ) ?*const fmodel.TypeInfo {
     const tags = tree.tokens.items(.tag);
+    // Try qualified-path resolution first: when the field type
+    // is a dotted chain (`Result.Pending.State`), follow the
+    // nesting to find the LEAF type rather than the first-
+    // identifier match.
     var t: TokenIndex = field.type_first;
     if (t > field.type_last) return null;
-    if (tags[t] == .question_mark) t += 1;
-    if (t > field.type_last) return null;
-    if (tags[t] != .identifier) return null;
-    const name = tree.tokenSlice(t);
-    return model.findType(name);
+    while (t <= field.type_last and (tags[t] == .asterisk or tags[t] == .question_mark or
+        tags[t] == .keyword_const or tags[t] == .keyword_var)) : (t += 1)
+    {}
+    if (t > field.type_last or tags[t] != .identifier) return null;
+    // Collect the dotted chain.
+    var path_buf: [8][]const u8 = undefined;
+    var n: u32 = 0;
+    var k: TokenIndex = t;
+    while (k <= field.type_last) : (k += 1) {
+        switch (tags[k]) {
+            .identifier => {
+                if (n < path_buf.len) {
+                    path_buf[n] = tree.tokenSlice(k);
+                    n += 1;
+                }
+            },
+            .period => {},
+            else => break,
+        }
+    }
+    if (n > 1) {
+        if (model.findQualifiedType(path_buf[0..n])) |ti| return ti;
+    }
+    // Fallback: first-identifier match (existing behavior).
+    return model.findType(path_buf[0]);
 }
 
 // ── Body-pattern integration ─────────────────────────────────
