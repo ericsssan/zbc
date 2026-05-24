@@ -82,6 +82,10 @@ pub fn check(
             const inner_ti = mq.resolveFieldType(tree, model, f) orelse continue;
             if (!anyNonTrivialCleanup(tree, inner_ti)) continue;
             if (!outer_has_allocator and allCleanupMethodsNeedExtraArg(tree, inner_ti)) continue;
+            // Tagged-union with ALL non-owned variants: dropping
+            // the field never leaks regardless of the variant
+            // held, so a missing inline cleanup is harmless.
+            if (allUnionVariantsNonOwned(model, inner_ti)) continue;
             hit = i;
             break;
         }
@@ -91,6 +95,75 @@ pub fn check(
         trace.match(R, tree, field.name_token, "owned field with no outer cleanup");
         try report(gpa, problems, tree, outer.name, field.name_token, field.name, inner.name);
     }
+}
+
+/// True iff `ti` is a tagged union (`union(enum)`) AND every
+/// variant's payload is non-owned — empty (`.pending,`) or
+/// primitive (`.kind: u32`).  Dropping the field never leaks
+/// regardless of the variant held, so a missing inline cleanup
+/// on the outer is harmless.  Uses model.unionVariantIsOwned per
+/// variant; bails on the first owned variant found.
+fn allUnionVariantsNonOwned(model: *const fmodel.FileModel, ti: *const fmodel.TypeInfo) bool {
+    if (!model.isTaggedUnion(ti.name)) return false;
+    const tree = model.tree;
+    const tags = tree.tokens.items(.tag);
+    // Walk variant identifiers between `{` and `}`.
+    var t = ti.body_first + 1;
+    while (t < ti.body_last) : (t += 1) {
+        // Skip past method / const decls.
+        if (tags[t] == .keyword_fn or tags[t] == .keyword_pub or
+            tags[t] == .keyword_const or tags[t] == .keyword_var) {
+            t = skipPastDecl(tags, t, ti.body_last);
+            continue;
+        }
+        if (tags[t] != .identifier) continue;
+        const name = tree.tokenSlice(t);
+        if (model.unionVariantIsOwned(ti.name, name)) |is_owned| {
+            if (is_owned) return false;
+        }
+        // Skip past this variant's payload (if any) to the comma.
+        const after = t + 1;
+        if (after < ti.body_last and tags[after] == .colon) {
+            t = skipToNextComma(tags, after + 1, ti.body_last);
+        } else if (after < ti.body_last and tags[after] == .comma) {
+            // empty variant — t will increment past comma on next iter
+        }
+    }
+    return true;
+}
+
+fn skipPastDecl(tags: []const std.zig.Token.Tag, start: Ast.TokenIndex, last: Ast.TokenIndex) Ast.TokenIndex {
+    var t = start;
+    var brace: i32 = 0;
+    var paren: i32 = 0;
+    while (t < last) : (t += 1) {
+        switch (tags[t]) {
+            .l_brace => brace += 1,
+            .r_brace => {
+                brace -= 1;
+                if (brace == 0 and paren == 0) return t;
+            },
+            .l_paren => paren += 1,
+            .r_paren => paren -= 1,
+            .semicolon => if (brace == 0 and paren == 0) return t,
+            else => {},
+        }
+    }
+    return last;
+}
+
+fn skipToNextComma(tags: []const std.zig.Token.Tag, start: Ast.TokenIndex, last: Ast.TokenIndex) Ast.TokenIndex {
+    var t = start;
+    var pd: i32 = 0;
+    while (t < last) : (t += 1) {
+        switch (tags[t]) {
+            .l_paren, .l_bracket, .l_brace => pd += 1,
+            .r_paren, .r_bracket, .r_brace => pd -= 1,
+            .comma => if (pd == 0) return t,
+            else => {},
+        }
+    }
+    return last;
 }
 
 /// True iff the type has an `init` / `create` / `new` method whose
