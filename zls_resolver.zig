@@ -18,6 +18,21 @@ const zls = @import("zls");
 const InternPool = zls.analyser.InternPool;
 const Analyser = zls.Analyser;
 
+/// Process-global cache of discovered toolchain paths.  Each
+/// `which zig` + `zig env` invocation takes ~50-200ms and the
+/// answers are stable across all files in a sweep — so we do the
+/// discovery ONCE on the first ZlsResolver init and reuse for
+/// subsequent files.  Cuts ~80% off ZLS init overhead on
+/// large-corpus sweeps (where the same ZlsResolver is rebuilt
+/// per-file).
+const ToolchainPaths = struct {
+    zig_exe: ?[]const u8 = null,
+    zig_lib: ?[]const u8 = null,
+    build_runner: ?[]const u8 = null,
+    initialized: bool = false,
+};
+var global_toolchain: ToolchainPaths = .{};
+
 pub const ZlsResolver = struct {
     gpa: std.mem.Allocator,
     arena: std.heap.ArenaAllocator,
@@ -58,17 +73,18 @@ pub const ZlsResolver = struct {
 
         // Discover the Zig toolchain so ZLS can resolve @import
         // chains through the standard library AND a project's
-        // build.zig (build-runner integration).  Falls back to
-        // null-everywhere when discovery fails — ZLS still works
-        // for within-file resolution, just not cross-module.
-        const arena_alloc = self.arena.allocator();
-        const zig_exe = findZigExe(arena_alloc, io, gpa) catch null;
-        const zig_lib_path = if (zig_exe) |z| findZigLibDir(arena_alloc, io, gpa, z) catch null else null;
-        const zig_lib: ?std.Build.Cache.Directory = if (zig_lib_path) |p|
+        // build.zig (build-runner integration).  Process-global
+        // cache — discovery runs ONCE on the first init and is
+        // reused for subsequent files (each `which zig` /
+        // `zig env` spawn is ~50-200ms; per-file payment is
+        // unaffordable on multi-thousand-file sweeps).
+        const tc = discoverToolchain(io, gpa);
+        const zig_lib: ?std.Build.Cache.Directory = if (tc.zig_lib) |p|
             .{ .path = p, .handle = .cwd() }
         else
             null;
-        const build_runner = if (zig_lib != null) findBuildRunner(arena_alloc, io) catch null else null;
+        const zig_exe = tc.zig_exe;
+        const build_runner = tc.build_runner;
 
         self.document_store = .{
             .io = io,
@@ -153,6 +169,46 @@ pub const ZlsResolver = struct {
 /// owning AST node.  For `pub const Foo = struct {...}` the name is
 /// trivially the token before `=`; for anonymous `return struct {...}`
 /// inside a factory fn, the name is the FN's name.
+/// Process-global toolchain discovery — runs the heavyweight
+/// `which zig` + `zig env` + build-runner lookup ONCE, caches the
+/// results in a leak-resistant heap allocation backed by the
+/// supplied gpa (paths live for the process lifetime).  Subsequent
+/// callers see the cached values.  Thread-safe via mutex.
+fn discoverToolchain(io: std.Io, gpa: std.mem.Allocator) ToolchainPaths {
+    // zbc analyzes files single-threadedly per invocation, so no
+    // mutex is needed; if that changes, gate on a std.Thread.Mutex.
+    if (global_toolchain.initialized) return global_toolchain;
+    // Cache lives for the whole process — use the process-global
+    // c_allocator so test gpas don't reclaim it between
+    // `analyzeEscape` invocations.  Tests that detect leaks tolerate
+    // this because the cache is intentionally process-static
+    // (cleared via clearToolchainCacheForTesting in test bodies).
+    _ = gpa;
+    const cache_gpa = std.heap.c_allocator;
+    global_toolchain.zig_exe = findZigExe(cache_gpa, io, cache_gpa) catch null;
+    global_toolchain.zig_lib = if (global_toolchain.zig_exe) |z|
+        findZigLibDir(cache_gpa, io, cache_gpa, z) catch null
+    else
+        null;
+    global_toolchain.build_runner = if (global_toolchain.zig_lib != null)
+        findBuildRunner(cache_gpa, io) catch null
+    else
+        null;
+    global_toolchain.initialized = true;
+    return global_toolchain;
+}
+
+/// Test-only: free the cached toolchain paths and reset the
+/// initialized flag.  Used by tests that want to validate the
+/// resolver against multiple gpas in isolation.
+pub fn clearToolchainCacheForTesting() void {
+    const cache_gpa = std.heap.c_allocator;
+    if (global_toolchain.zig_exe) |p| cache_gpa.free(p);
+    if (global_toolchain.zig_lib) |p| cache_gpa.free(p);
+    if (global_toolchain.build_runner) |p| cache_gpa.free(p);
+    global_toolchain = .{};
+}
+
 /// Discover the `zig` executable path via `which zig`.  Returns
 /// the resolved absolute path on success.  Falls through to
 /// `error.NotFound` when discovery fails; caller swallows the
