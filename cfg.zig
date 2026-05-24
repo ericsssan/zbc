@@ -890,14 +890,20 @@ const Builder = struct {
     /// `&capture.field` doesn't fire stack-escape (the address-of
     /// borrows into heap-owned storage reached through the
     /// pointer).  Conservative: only fires when the scrutinee's
-    /// outermost call name is in the known-returns-pointer list.
+    /// outermost call name is in the known-returns-pointer list,
+    /// OR when the payload uses BY-POINTER form `|*cap|` and the
+    /// scrutinee is a field access whose receiver is itself a
+    /// pointer (`&dev.vm.debugger.field` lives in dev's storage,
+    /// not the local frame).
     fn inferPointerCapture(self: *Builder, payload_token: Ast.TokenIndex, cond_expr: Ast.Node.Index) void {
         const tree = self.tree;
         const tags = tree.tokens.items(.tag);
-        // Find the capture identifier (first non-`*`, non-`,`,
-        // non-`|` identifier after the opening `|`).
+        // Find the capture identifier — track whether `*` precedes
+        // it (by-pointer capture).
         var t: Ast.TokenIndex = payload_token;
+        var saw_star = false;
         while (t < tags.len and tags[t] != .identifier) : (t += 1) {
+            if (tags[t] == .asterisk) saw_star = true;
             if (tags[t] == .pipe and t != payload_token) return;
         }
         if (t >= tags.len) return;
@@ -914,9 +920,21 @@ const Builder = struct {
                 else => break,
             }
         }
-        const is_ptr_call = self.callReturnsOptionalPointer(node);
-        if (is_ptr_call) {
+        if (self.callReturnsOptionalPointer(node)) {
             self.locals.items[@intFromEnum(lid)].is_pointer = true;
+            return;
+        }
+        // By-pointer capture of a non-local field access:
+        // `if (recv.field) |*cap|` where recv is a pointer-typed
+        // local.  The capture points into recv's storage, not the
+        // current fn's frame.
+        if (saw_star and tree.nodeTag(node) == .field_access) {
+            if (self.fieldLhsFor(node)) |fref| {
+                const parent_info = self.locals.items[@intFromEnum(fref.parent)];
+                if (parent_info.is_pointer or parent_info.init_hint == .heap_local) {
+                    self.locals.items[@intFromEnum(lid)].is_pointer = true;
+                }
+            }
         }
     }
 
