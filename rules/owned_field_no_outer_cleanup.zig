@@ -99,6 +99,12 @@ pub fn check(
             // A missing outer cleanup doesn't leak when the field
             // stays null — common for "lazy/optional sub-state".
             if (model.fieldIsOptionalNullDefault(outer.name, f.name)) continue;
+            // Caller-supplied skip: the type's constructor takes a
+            // parameter of the same name as `f`.  The field is
+            // borrowed in from the caller's value; cleanup is
+            // their responsibility, not ours.  Same heuristic as
+            // composed-owner uses.
+            if (fieldIsCallerSupplied(tree, outer, f.name)) continue;
             const inner_ti = mq.resolveFieldTypeScoped(tree, model, outer, f) orelse continue;
             if (!anyNonTrivialCleanup(tree, inner_ti)) continue;
             if (!outer_has_allocator and allCleanupMethodsNeedExtraArg(tree, inner_ti)) continue;
@@ -402,6 +408,36 @@ fn hasPointerReturningInit(tree: *const Ast, ti: *const fmodel.TypeInfo) bool {
 /// are heap-allocated and owned by a parent struct that's
 /// responsible for cleanup, so a missing inline `deinit` on `T`
 /// isn't a leak.  Token-scan over the type body for the prefix.
+/// True iff the type has an `init` / `create` / `from*` method
+/// that takes a parameter of the same name as `field_name` —
+/// evidence that the field is initialised from a caller-supplied
+/// value (BORROWED in, not owned by this struct).  Same heuristic
+/// as the composed-owner rule.
+fn fieldIsCallerSupplied(
+    tree: *const Ast,
+    outer: *const fmodel.TypeInfo,
+    field_name: []const u8,
+) bool {
+    for (outer.methods) |m| {
+        const is_constructor = std.mem.eql(u8, m.name, "init") or
+            std.mem.eql(u8, m.name, "create") or
+            std.mem.startsWith(u8, m.name, "from") or
+            std.mem.eql(u8, m.name, "new") or
+            std.mem.eql(u8, m.name, "start") or
+            std.mem.eql(u8, m.name, "setup");
+        if (!is_constructor) continue;
+        var buf: [1]Ast.Node.Index = undefined;
+        const proto = tree.fullFnProto(&buf, m.fn_decl) orelse continue;
+        var it = proto.iterate(tree);
+        while (it.next()) |p| {
+            const name_tok = p.name_token orelse continue;
+            const name = tree.tokenSlice(name_tok);
+            if (std.mem.eql(u8, name, field_name)) return true;
+        }
+    }
+    return false;
+}
+
 fn hasNewFactoryDecl(tree: *const Ast, ti: *const fmodel.TypeInfo) bool {
     const tags = tree.tokens.items(.tag);
     if (ti.body_first >= ti.body_last) return false;
