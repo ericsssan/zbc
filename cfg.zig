@@ -365,6 +365,12 @@ pub const InitHint = enum {
     arena_allocator,
     heap_local,
     noreturn_alias,
+    /// Local is a TYPE ALIAS — `const X = struct {...};` /
+    /// `const X = enum {...};` etc.  No runtime storage; `X.<id>`
+    /// addresses a STATIC field, not a stack-frame slot.  Without
+    /// this, `&X.field` looks like a stack-borrow and fires
+    /// stack-escape on `return &X.<static_var>` (singleton pattern).
+    type_alias,
 };
 
 /// Known-stdlib noreturn callee chains.  Hoisted so both the
@@ -1930,6 +1936,13 @@ const Builder = struct {
             // Lets later call sites that use the alias terminate
             // their block.
             if (init_opt) |i| if (self.initIsNoreturnAlias(i)) break :blk .noreturn_alias;
+            // Type alias: `const X = struct {...};` / `enum` / `union`
+            // / `opaque`.  X has no runtime storage; `X.<id>` is a
+            // static (comptime / data-segment) lookup, not a stack
+            // borrow.  Without this, `&X.<static_var>` fires
+            // stack-escape on the canonical fn-local singleton
+            // pattern.
+            if (init_opt) |i| if (self.initIsContainerDecl(i)) break :blk .type_alias;
             // Struct-wrap propagation: `var ma = Wrapper{ .inner =
             // arena };` — ma carries arena via its field.  Override
             // init_kind to .copy_of(wrapper) so transferDecl
@@ -2589,6 +2602,36 @@ const Builder = struct {
     /// True iff `init_node`'s source text ends with one of the
     /// known-noreturn callee chains — set on the declaring local's
     /// init_hint so subsequent calls through the alias terminate.
+    /// True iff `init_node` is a container declaration —
+    /// `struct {...}` / `enum {...}` / `union {...}` / `opaque {}`
+    /// / `extern struct {...}` / `packed union {...}`.  Used to
+    /// recognise `const Name = struct {...};` type aliases so the
+    /// stack-escape analysis doesn't treat `&Name.static_field`
+    /// as a stack borrow.
+    fn initIsContainerDecl(self: *const Builder, init_node: Ast.Node.Index) bool {
+        const tree = self.tree;
+        // Peel `extern`/`packed` modifiers — they wrap the
+        // container_decl identifier in a `container_decl_*` AST
+        // node tag the same way as the bare form.
+        const tag = tree.nodeTag(init_node);
+        return switch (tag) {
+            .container_decl,
+            .container_decl_trailing,
+            .container_decl_two,
+            .container_decl_two_trailing,
+            .container_decl_arg,
+            .container_decl_arg_trailing,
+            .tagged_union,
+            .tagged_union_trailing,
+            .tagged_union_two,
+            .tagged_union_two_trailing,
+            .tagged_union_enum_tag,
+            .tagged_union_enum_tag_trailing,
+            => true,
+            else => false,
+        };
+    }
+
     fn initIsNoreturnAlias(self: *Builder, init_node: Ast.Node.Index) bool {
         const tree = self.tree;
         const first = tree.firstToken(init_node);
@@ -3534,6 +3577,14 @@ const Builder = struct {
                     // implicit-typed locals that weren't caught by
                     // is_pointer (no explicit type annotation).
                     if (parent_info.init_hint == .heap_local) {
+                        return .unknown;
+                    }
+                    // Type-alias parent: `const X = struct {...};`
+                    // declares X as a comptime type, not a stack
+                    // value.  `&X.<static_var>` addresses a static
+                    // / data-segment slot whose lifetime is the
+                    // whole program — not a stack escape.
+                    if (parent_info.init_hint == .type_alias) {
                         return .unknown;
                     }
                     // Pointer-named field in the chain: e.g.
