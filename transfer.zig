@@ -635,6 +635,17 @@ fn transferOutParamWrite(
             // Last-write-wins per out-param.
             try state.out_param_writes.put(ctx.gpa, w.out, hid);
         },
+        .plain, .undef => {
+            // Last-write-wins: a primitive / null / undefined
+            // sentinel write through `this.<field>` REPLACES any
+            // prior heap-owning value we'd tracked for this
+            // out-param.  Without removing it, an err-path
+            // `this.statement = null; destroy(stmt); deref(this);
+            // return err;` keeps the stale entry and the
+            // deferred check fires "heap freed before return" on
+            // a slot that's already been nulled out.
+            _ = state.out_param_writes.swapRemove(w.out);
+        },
         .arena, .arena_borrow => |aid| {
             // Arena-shaped value written to caller storage.  Only a
             // stack-allocated arena (`var a = ArenaAllocator.init(...)`)
