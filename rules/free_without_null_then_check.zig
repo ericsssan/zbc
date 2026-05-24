@@ -114,7 +114,11 @@ fn isDestructorName(name: []const u8) bool {
         std.mem.startsWith(u8, name, "take") or
         std.mem.startsWith(u8, name, "consume") or
         std.mem.startsWith(u8, name, "into") or
-        std.mem.eql(u8, name, "free") or
+        // Prefix match for `free*` catches `freeAndClear`, `freeAll`,
+        // `freeBuffers`, etc. — `free`-prefixed helpers, like other
+        // destructor-named fns, leave it to the caller to either
+        // discard or repopulate the freed slots.
+        std.mem.startsWith(u8, name, "free") or
         std.mem.eql(u8, name, "close");
 }
 
