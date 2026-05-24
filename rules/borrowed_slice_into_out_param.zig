@@ -512,10 +512,72 @@ fn rhsMentionsDeferred(
             // runs — it can't have registered cleanup.  Only count
             // defers whose enclosing scope encloses this write.
             if (t < d.scope_open or t > d.scope_close) continue;
+            // Scalar-field-access skip: `<deferred>.<scalar-field>`
+            // where the field is well-known to be scalar (width,
+            // height, len, count, etc.).  The borrow is into the
+            // scalar value, not into `<deferred>`'s allocation —
+            // the field's bytes already sit in the local's stack
+            // frame copy when accessed.  Conservative: only skip
+            // if the FIRST occurrence after `<deferred>` is a
+            // scalar-named field AND there are no other (more
+            // suspicious) mentions of `<deferred>` in the RHS.
+            if (allDeferredMentionsAreScalarFields(tree, start, end, d.name)) continue;
             return d.name;
         }
     }
     return null;
+}
+
+/// True iff every occurrence of `name` in `[start, end]` is
+/// `<name>.<scalar-field>` form — the deferred local is only
+/// accessed for primitive-named fields, never as the whole value
+/// or via slice-bearing fields.  When this holds, no slice borrow
+/// is taken from the deferred.
+fn allDeferredMentionsAreScalarFields(
+    tree: *const Ast,
+    start: Ast.TokenIndex,
+    end: Ast.TokenIndex,
+    name: []const u8,
+) bool {
+    const tags = tree.tokens.items(.tag);
+    var any_mention = false;
+    var t: Ast.TokenIndex = start;
+    while (t <= end) : (t += 1) {
+        if (tags[t] != .identifier) continue;
+        if (t > 0 and tags[t - 1] == .ampersand) continue;
+        if (t > 0 and tags[t - 1] == .period) continue;
+        if (!std.mem.eql(u8, tree.tokenSlice(t), name)) continue;
+        any_mention = true;
+        // Must be followed by `.<field>` where `<field>` is scalar.
+        if (t + 2 > end) return false;
+        if (tags[t + 1] != .period) return false;
+        if (tags[t + 2] != .identifier) return false;
+        if (!isScalarFieldName(tree.tokenSlice(t + 2))) return false;
+    }
+    return any_mention;
+}
+
+fn isScalarFieldName(name: []const u8) bool {
+    const known = [_][]const u8{
+        "width",   "height", "depth",    "len",      "size",
+        "count",   "cap",    "capacity", "num",      "n",
+        "w",       "h",      "x",        "y",        "z",
+        "x1",      "y1",     "x2",       "y2",       "rows",
+        "cols",    "fd",     "tag",      "kind",     "id",
+        "version", "flags",  "level",    "priority",
+    };
+    for (known) |k| {
+        if (std.mem.eql(u8, k, name)) return true;
+    }
+    // Suffix shapes.
+    if (std.mem.endsWith(u8, name, "_len") or
+        std.mem.endsWith(u8, name, "_count") or
+        std.mem.endsWith(u8, name, "_size") or
+        std.mem.endsWith(u8, name, "_bytes") or
+        std.mem.endsWith(u8, name, "_ms") or
+        std.mem.endsWith(u8, name, "_ns") or
+        std.mem.endsWith(u8, name, "_id")) return true;
+    return false;
 }
 
 fn report(
