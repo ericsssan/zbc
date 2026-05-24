@@ -147,6 +147,11 @@ fn checkFn(
             if (rhsTypeViaZlsLacksDeinit(cache, model, tags, b)) continue;
         } else if (isFileHandleOpenerMethod(meth)) {
             is_fd_open = true;
+            // FD wrapped into a helper struct with defer cleanup:
+            // `const fd = try sys.openat(...); const file = sys.File{
+            // .handle = fd }; defer file.close();` — the wrapper
+            // owns the fd's lifetime via its own defer.  Skip.
+            if (fdWrappedAndDeferred(tree, tags, b, last)) continue;
         } else continue;
 
         try tracked.append(gpa, .{
@@ -394,6 +399,68 @@ fn isPrimitiveBaseName(name: []const u8) bool {
 /// (true) so we don't miss real bugs whose types are declared in
 /// another file.  Returns false only when the type IS in the local
 /// file AND demonstrably has no `deinit`.
+/// Detect the FD-wrap-with-defer-cleanup pattern: the fd binding
+/// is immediately consumed into a helper struct's `.handle = <fd>`
+/// field, and that helper has a `defer <helper>.close();` (or
+/// `.deinit()`) within the same scope.  The wrapper takes
+/// ownership of the fd; cleanup flows through the wrapper.
+fn fdWrappedAndDeferred(
+    tree: *const Ast,
+    tags: []const std.zig.Token.Tag,
+    b: anytype,
+    body_last: Ast.TokenIndex,
+) bool {
+    // Scan forward from the binding's terminating `;` for a
+    // `<wrapper> = <SomeType>{ .handle = <name> }` shape — find
+    // the wrapper local name.  Bound to K=30 tokens for cheapness.
+    var t: Ast.TokenIndex = b.rhs_last + 1;
+    var i: u32 = 0;
+    while (t + 6 < body_last and i < 30) : ({
+        t += 1;
+        i += 1;
+    }) {
+        // Pattern: `const <wrapper> = <TypeRef>{ .handle = <name>, ... };`
+        if (tags[t] != .keyword_const and tags[t] != .keyword_var) continue;
+        if (t + 1 >= body_last or tags[t + 1] != .identifier) continue;
+        const wrapper_name = tree.tokenSlice(t + 1);
+        // Walk forward for `.handle = <b.name>` within the struct
+        // literal.  Bound by `;`.
+        var u: Ast.TokenIndex = t + 2;
+        while (u + 4 <= body_last and tags[u] != .semicolon) : (u += 1) {
+            if (tags[u] != .period) continue;
+            if (tags[u + 1] != .identifier) continue;
+            if (!std.mem.eql(u8, tree.tokenSlice(u + 1), "handle")) continue;
+            if (tags[u + 2] != .equal) continue;
+            if (tags[u + 3] != .identifier) continue;
+            if (!std.mem.eql(u8, tree.tokenSlice(u + 3), b.name)) continue;
+            // Found the wrap.  Now look for a defer on the wrapper
+            // within the remaining body.
+            if (deferCleanupOn(tree, tags, wrapper_name, u, body_last)) return true;
+        }
+    }
+    return false;
+}
+
+fn deferCleanupOn(
+    tree: *const Ast,
+    tags: []const std.zig.Token.Tag,
+    name: []const u8,
+    start: Ast.TokenIndex,
+    end: Ast.TokenIndex,
+) bool {
+    var u: Ast.TokenIndex = start;
+    while (u + 4 <= end) : (u += 1) {
+        if (tags[u] != .keyword_defer and tags[u] != .keyword_errdefer) continue;
+        if (tags[u + 1] != .identifier) continue;
+        if (!std.mem.eql(u8, tree.tokenSlice(u + 1), name)) continue;
+        if (tags[u + 2] != .period) continue;
+        if (tags[u + 3] != .identifier) continue;
+        const m = tree.tokenSlice(u + 3);
+        if (std.mem.eql(u8, m, "close") or std.mem.eql(u8, m, "deinit")) return true;
+    }
+    return false;
+}
+
 /// Switch-scrutinee shape inference.  When a try-bound local is
 /// IMMEDIATELY (within ~30 tokens) consumed by a switch whose
 /// arms are payload-less tag patterns (`.int8 => ...`), the
