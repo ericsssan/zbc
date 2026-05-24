@@ -152,6 +152,19 @@ pub fn check(
             // initialised from `create(allocator, command, promise)`).
             if (fieldIsCallerSupplied(tree, outer, field.name)) continue;
 
+            // Externally-cleaned-up skip: when `<this>.<field>.<cleanup>(...)`
+            // is invoked in OTHER methods of the same outer type
+            // (multiple lifecycle stages — request setup, async
+            // completion, ref drop), the field's cleanup is
+            // routinely run before the outer's deinit ever fires.
+            // The rule's prescription (call the inner's deinit from
+            // the outer's deinit) would either double-deinit or
+            // require the inner's deinit to be idempotent.  When the
+            // inner's deinit IS idempotent (canonical bun shape:
+            // \`this.* = .{}\` first, then frees), the call is safe
+            // either way — but firing on this shape is noisy.
+            if (siblingMethodsCleanField(tree, outer, deinit, field.name)) continue;
+
             try report(gpa, problems, tree, field.name_token, field.name, inner_ti.name);
         }
     }
@@ -198,6 +211,42 @@ fn isTrivialBody(tree: *const Ast, body_first: Ast.TokenIndex, body_last: Ast.To
         t = k + 1;
     }
     return true;
+}
+
+/// True iff some method of `outer` OTHER than `deinit_method`
+/// contains a call `<X>.<field_name>.<cleanup>(...)` — evidence
+/// that the field's cleanup is invoked routinely at a different
+/// lifecycle stage (request setup / async completion / ref drop /
+/// etc.), so the outer's destructor doesn't need to re-do it.
+/// The inner's deinit is conventionally idempotent in these shapes
+/// (canonical bun: `this.* = .{}` then frees, so double-calls are
+/// no-ops).
+fn siblingMethodsCleanField(
+    tree: *const Ast,
+    outer: *const fmodel.TypeInfo,
+    deinit_method: *const fmodel.MethodInfo,
+    field_name: []const u8,
+) bool {
+    const tags = tree.tokens.items(.tag);
+    for (outer.methods) |*m| {
+        if (m == deinit_method) continue;
+        // Walk the body for `<X> . <field_name> . <cleanup-name> (`.
+        var t: Ast.TokenIndex = m.body_first;
+        while (t + 5 <= m.body_last) : (t += 1) {
+            if (tags[t] != .identifier) continue;
+            // Word boundary at start.
+            if (t > 0 and tags[t - 1] == .period) continue;
+            if (tags[t + 1] != .period) continue;
+            if (tags[t + 2] != .identifier) continue;
+            if (!std.mem.eql(u8, tree.tokenSlice(t + 2), field_name)) continue;
+            if (tags[t + 3] != .period) continue;
+            if (tags[t + 4] != .identifier) continue;
+            if (tags[t + 5] != .l_paren) continue;
+            const cleanup = tree.tokenSlice(t + 4);
+            if (isCleanupName(cleanup)) return true;
+        }
+    }
+    return false;
 }
 
 /// True iff `inner_ti` is a refcounted type — its `deinit` is meant
