@@ -641,6 +641,32 @@ pub const FileCache = struct {
         return ti.hasMethod(method_name);
     }
 
+    /// ZLS-backed type-of-expression resolver.  Walk the AST for a
+    /// node whose `firstToken` equals `start_tok` and `lastToken`
+    /// equals `end_tok`, then ask ZLS for its container type name.
+    /// Used by rules to refine "unknown type → assume has deinit"
+    /// fallbacks when the binding's RHS is a cross-file call
+    /// whose return type isn't locally declared.
+    pub fn typeNameOfExpr(
+        self: *FileCache,
+        start_tok: Ast.TokenIndex,
+        end_tok: Ast.TokenIndex,
+    ) !?[]const u8 {
+        const zls = self.zls orelse return null;
+        const tree = self.tree;
+        // Scan all AST nodes for one matching the token range.
+        // Bounded by the tree's node count.
+        var idx: u32 = 1;
+        while (idx < tree.nodes.len) : (idx += 1) {
+            const node: Ast.Node.Index = @enumFromInt(idx);
+            const ft = tree.firstToken(node);
+            const lt = tree.lastToken(node);
+            if (ft != start_tok or lt != end_tok) continue;
+            return zls.typeNameOfNode(node) catch null;
+        }
+        return null;
+    }
+
     pub fn anyMethodAllocatesSelf(
         self: *FileCache,
         type_name: []const u8,

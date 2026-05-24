@@ -130,6 +130,14 @@ fn checkFn(
             // namespace like `bun.SignalCode` (we'd see "SignalCode"
             // as the RHS type; cross-file means we can't refute).
             if (typeAnnotationLacksDeinit(tree, b, model)) continue;
+            // ZLS fallback: ask ZLS for the binding's RHS type.
+            // When the RHS is `<ns>.<Type>.fromJS(...)` and `<ns>`
+            // is an imported namespace, the local model can't see
+            // `<Type>` — but ZLS can resolve through @import.
+            // If the resolved type is locally known AND has no
+            // deinit, skip.  If unresolvable, fall through and
+            // fire (conservative).
+            if (rhsTypeViaZlsLacksDeinit(cache, model, tags, b)) continue;
         } else if (isFileHandleOpenerMethod(meth)) {
             is_fd_open = true;
         } else continue;
@@ -379,6 +387,43 @@ fn isPrimitiveBaseName(name: []const u8) bool {
 /// (true) so we don't miss real bugs whose types are declared in
 /// another file.  Returns false only when the type IS in the local
 /// file AND demonstrably has no `deinit`.
+/// ZLS-resolved type-of-RHS check.  Strip the leading `try` from
+/// the binding's RHS, ask the cache to resolve the call
+/// expression's type via ZLS, and return true when the resolved
+/// type is locally declared AND demonstrably has no deinit (or
+/// is a file-struct with no top-level deinit fn).  Falls through
+/// to `false` on unresolved types so the rule stays conservative.
+fn rhsTypeViaZlsLacksDeinit(
+    cache: *file_cache_mod.FileCache,
+    model: *const fmodel.FileModel,
+    tags: []const std.zig.Token.Tag,
+    b: anytype,
+) bool {
+    var start = b.rhs_first;
+    if (start <= b.rhs_last and tags[start] == .keyword_try) start += 1;
+    // The binding's RHS may include trailing tokens (e.g. `orelse
+    // return null` after the call).  We want the inner call's
+    // first..last token.  For a fresh attempt, scan for the
+    // FIRST matching node and try several end-token candidates.
+    var end = b.rhs_last;
+    while (end >= start) : (end -= 1) {
+        const name_opt = cache.typeNameOfExpr(start, end) catch null;
+        if (name_opt) |name| {
+            if (model.hasType(name)) {
+                if (!model.typeHasMethod(name, "deinit")) return true;
+                return false;
+            }
+            if (model.fileIsTypeNamed(name)) {
+                return !model.typeOrFileHasMethod(name, "deinit");
+            }
+            // Resolved to a cross-file type name we can't refute.
+            return false;
+        }
+        if (end == start) break;
+    }
+    return false;
+}
+
 fn typeHasDeinit(model: *const fmodel.FileModel, type_name: []const u8) bool {
     if (model.hasType(type_name)) {
         return model.typeHasMethod(type_name, "deinit");
