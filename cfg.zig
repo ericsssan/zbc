@@ -884,6 +884,69 @@ const Builder = struct {
         _ = try self.registerCapturesWith(payload_token, null);
     }
 
+    /// Heuristic: when an `if (<Type>.fromJS(...))` scrutinee
+    /// unwraps to a capture, that capture is by Bun convention a
+    /// `*Type` pointer.  Set is_pointer on the capture so
+    /// `&capture.field` doesn't fire stack-escape (the address-of
+    /// borrows into heap-owned storage reached through the
+    /// pointer).  Conservative: only fires when the scrutinee's
+    /// outermost call name is in the known-returns-pointer list.
+    fn inferPointerCapture(self: *Builder, payload_token: Ast.TokenIndex, cond_expr: Ast.Node.Index) void {
+        const tree = self.tree;
+        const tags = tree.tokens.items(.tag);
+        // Find the capture identifier (first non-`*`, non-`,`,
+        // non-`|` identifier after the opening `|`).
+        var t: Ast.TokenIndex = payload_token;
+        while (t < tags.len and tags[t] != .identifier) : (t += 1) {
+            if (tags[t] == .pipe and t != payload_token) return;
+        }
+        if (t >= tags.len) return;
+        const cap_name = tree.tokenSlice(t);
+        if (std.mem.eql(u8, cap_name, "_")) return;
+        const lid = self.name_to_local.get(cap_name) orelse return;
+
+        // Inspect the scrutinee — peel `try`/`catch` wrappers.
+        var node = cond_expr;
+        while (true) {
+            switch (tree.nodeTag(node)) {
+                .@"try" => node = tree.nodeData(node).node,
+                .@"catch" => node = tree.nodeData(node).node_and_node[0],
+                else => break,
+            }
+        }
+        const is_ptr_call = self.callReturnsOptionalPointer(node);
+        if (is_ptr_call) {
+            self.locals.items[@intFromEnum(lid)].is_pointer = true;
+        }
+    }
+
+    /// True iff `expr_node` is a call whose method name is a
+    /// known-returns-`?*T` convention (`fromJS`, `as`).  Used by
+    /// `inferPointerCapture` to mark `if (X.fromJS(value)) |v|`'s
+    /// `v` as a pointer.
+    fn callReturnsOptionalPointer(self: *const Builder, expr_node: Ast.Node.Index) bool {
+        const tree = self.tree;
+        const tag = tree.nodeTag(expr_node);
+        const is_call = switch (tag) {
+            .call, .call_one, .call_comma, .call_one_comma => true,
+            else => false,
+        };
+        if (!is_call) return false;
+        // The first token of the call is the receiver chain; the
+        // LAST token before the `(` is the method name.  Walk back
+        // from the call's main token to find the method ident.
+        const main_tok = tree.nodeMainToken(expr_node);
+        // For a call like `X.Y.fromJS(args)`, main_tok is the `(`.
+        // The token immediately before is the method ident.
+        const tags = tree.tokens.items(.tag);
+        if (main_tok == 0) return false;
+        const m = main_tok - 1;
+        if (tags[m] != .identifier) return false;
+        const name = tree.tokenSlice(m);
+        return std.mem.eql(u8, name, "fromJS") or
+            std.mem.eql(u8, name, "as");
+    }
+
     /// Variant that, when `reset_into` is non-null, emits a
     /// .reset_capture stmt for each registered capture into the
     /// given block.  Used by loop lowerers so each iteration starts
@@ -1181,7 +1244,14 @@ const Builder = struct {
         // for the then-body only.  Reset at then-entry: when the if is
         // inside a loop body, the capture rebinds each iteration so
         // prior-iter state must not propagate.
-        if (if_data.payload_token) |pt| try self.registerCapturesWith(pt, then_block);
+        if (if_data.payload_token) |pt| {
+            try self.registerCapturesWith(pt, then_block);
+            // Infer is_pointer for the capture when the scrutinee is a
+            // `<Type>.fromJS(...)` call (Bun convention: returns
+            // `?*Type`).  Lets `&capture.field` skip stack-escape
+            // since `capture` is a heap pointer.
+            self.inferPointerCapture(pt, if_data.ast.cond_expr);
+        }
         var then_cur = then_block;
         try self.lowerStmt(if_data.ast.then_expr, &then_cur);
         // Then-branch exits flow into merge.
