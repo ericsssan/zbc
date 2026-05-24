@@ -4916,6 +4916,9 @@ const Builder = struct {
         const tags = tree.tokens.items(.tag);
         const last = self.fn_body_last;
         if (last == 0) return false;
+        // Receiver's type — required for cross-file method lookup.
+        const recv_lid = self.name_to_local.get(recv_name) orelse return false;
+        const recv_type_name = self.locals.items[@intFromEnum(recv_lid)].type_name;
         // Walk forward from the install for the next 200 tokens
         // looking for a call `<fn>(<args>)` or `<recv>.<method>(<args>)`.
         var t: Ast.TokenIndex = install_tok;
@@ -4927,47 +4930,46 @@ const Builder = struct {
         while (t + 1 <= scan_end) : (t += 1) {
             if (tags[t] != .identifier) continue;
             // Resolve fn name: either bare `<fn>(` or `<recv>.<m>(`.
-            const fn_name: []const u8 = blk: {
-                if (t + 1 <= scan_end and tags[t + 1] == .l_paren) {
-                    break :blk tree.tokenSlice(t);
-                }
-                if (t + 3 <= scan_end and
-                    tags[t + 1] == .period and
-                    tags[t + 2] == .identifier and
-                    tags[t + 3] == .l_paren)
-                {
-                    break :blk tree.tokenSlice(t + 2);
-                }
+            // For the method form, track the call's receiver's name
+            // so we can resolve its type for cross-file method lookup.
+            var fn_name: []const u8 = "";
+            var call_recv_name: ?[]const u8 = null;
+            var is_method_on_recv: bool = false;
+            if (t + 1 <= scan_end and tags[t + 1] == .l_paren) {
+                fn_name = tree.tokenSlice(t);
+            } else if (t + 3 <= scan_end and
+                tags[t + 1] == .period and
+                tags[t + 2] == .identifier and
+                tags[t + 3] == .l_paren)
+            {
+                fn_name = tree.tokenSlice(t + 2);
+                call_recv_name = tree.tokenSlice(t);
+                if (std.mem.eql(u8, tree.tokenSlice(t), recv_name)) is_method_on_recv = true;
+            } else {
                 continue;
-            };
-            // Find paren args and ensure `recv` appears among them.
+            }
+            // Find paren args.
             var lp: Ast.TokenIndex = t;
             while (lp <= scan_end and tags[lp] != .l_paren) : (lp += 1) {}
             if (lp > scan_end) continue;
             const close = lexer.matchParen(tags, lp, last) orelse continue;
-            // Cheap check: recv_name appears as a bare identifier in
-            // args (no `.` before it).
-            var has_recv: bool = false;
-            var k: Ast.TokenIndex = lp + 1;
-            while (k < close) : (k += 1) {
-                if (tags[k] != .identifier) continue;
-                if (!std.mem.eql(u8, tree.tokenSlice(k), recv_name)) continue;
-                if (k > 0 and tags[k - 1] == .period) continue;
-                has_recv = true;
-                break;
-            }
-            // For method form `<recv>.<m>(...)`, recv is the receiver.
-            if (!has_recv and t + 3 <= scan_end and
-                tags[t + 1] == .period and
-                std.mem.eql(u8, tree.tokenSlice(t), recv_name))
-            {
-                has_recv = true;
+            // Cheap check: recv_name appears as a bare identifier in args
+            // (no `.` before it), OR the call IS a method on recv.
+            var has_recv: bool = is_method_on_recv;
+            if (!has_recv) {
+                var k: Ast.TokenIndex = lp + 1;
+                while (k < close) : (k += 1) {
+                    if (tags[k] != .identifier) continue;
+                    if (!std.mem.eql(u8, tree.tokenSlice(k), recv_name)) continue;
+                    if (k > 0 and tags[k - 1] == .period) continue;
+                    has_recv = true;
+                    break;
+                }
             }
             if (!has_recv) continue;
-            // Look up the called fn in our file model.  Need same-file
-            // fn match.  Methods on types live in TypeInfo.methods;
-            // top-level fns live in model.fns.
-            const target_fn_decl: ?Ast.Node.Index = blk: {
+            // Try same-file lookup first.  Top-level fn or method on
+            // any type defined here.
+            const local_decl: ?Ast.Node.Index = blk: {
                 for (model.fns) |f| {
                     if (std.mem.eql(u8, f.name, fn_name)) break :blk f.fn_decl;
                 }
@@ -4976,14 +4978,31 @@ const Builder = struct {
                 }
                 break :blk null;
             };
-            const fn_decl = target_fn_decl orelse {
-                // Not a same-file fn — can't introspect.  Continue
-                // scanning (could match a later call).
+            if (local_decl) |fn_decl| {
+                if (calledFnTouchesParamField(self.tree, fn_decl, path)) return true;
                 t = close;
                 continue;
-            };
-            // Check the fn's body for `<param>.<path>` reads OR writes.
-            if (calledFnTouchesParamField(self.tree, fn_decl, path)) return true;
+            }
+            // Cross-file: method call on some receiver whose type we
+            // can resolve.  Two cases:
+            //   1. The method IS on the install's receiver: type = recv's type
+            //   2. The method is on a DIFFERENT local (e.g.
+            //      `plugin.callOnBeforeParsePlugins(this, ...)`)
+            //      — type = that local's declared type.
+            // Foreign tree from findMethodAcrossImports is used for
+            // the body walk; its token indices are distinct from ours.
+            if (call_recv_name) |crn| {
+                const call_recv_type: ?[]const u8 = blk: {
+                    if (is_method_on_recv) break :blk recv_type_name;
+                    const lid = self.name_to_local.get(crn) orelse break :blk null;
+                    break :blk self.locals.items[@intFromEnum(lid)].type_name;
+                };
+                if (call_recv_type) |tn| {
+                    if (cache.findMethodAcrossImports(tn, fn_name)) |rm| {
+                        if (calledFnTouchesParamField(rm.tree, rm.method.fn_decl, path)) return true;
+                    }
+                }
+            }
             t = close;
         }
         return false;

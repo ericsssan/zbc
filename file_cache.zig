@@ -89,6 +89,35 @@ pub const FileCache = struct {
         return findTypeViaImports(pc, self.tree, self.file_path, name, 2);
     }
 
+    /// Resolved cross-file method lookup result.  When the method
+    /// lives in a foreign file, `tree` points at THAT file's tree
+    /// (foreign token indices) — callers MUST use this returned
+    /// tree (not their own) for any token / node operations on
+    /// `method.fn_decl`.
+    pub const ResolvedMethod = struct {
+        tree: *const Ast,
+        method: *const fmodel.MethodInfo,
+    };
+
+    /// Look up `<type_name>.<method_name>` either in this file or
+    /// in any directly @import'd file (one hop), returning the
+    /// owning tree alongside the MethodInfo.  Used by cross-fn
+    /// lifecycle analysis to walk a called fn's body even when the
+    /// fn lives in a different file.
+    pub fn findMethodAcrossImports(
+        self: *FileCache,
+        type_name: []const u8,
+        method_name: []const u8,
+    ) ?ResolvedMethod {
+        const model = self.fileModel() catch return null;
+        if (model.findType(type_name)) |ti| {
+            if (ti.findMethod(method_name)) |m| return .{ .tree = self.tree, .method = m };
+        }
+        const pc = self.project orelse return null;
+        if (self.file_path.len == 0) return null;
+        return findMethodViaImports(pc, self.tree, self.file_path, type_name, method_name, 2);
+    }
+
     pub fn deinit(self: *FileCache) void {
         if (self.file_model) |*m| m.deinit();
         if (self.summary_arena) |*a| a.deinit();
@@ -889,6 +918,49 @@ fn findTypeViaImports(
         const next_from = resolveImportPath(pc.gpa, from_path, import_str) catch continue;
         defer pc.gpa.free(next_from);
         if (findTypeViaImports(pc, sub_model.tree, next_from, name, depth_left - 1)) |ti| return ti;
+    }
+    return null;
+}
+
+fn findMethodViaImports(
+    pc: *project_cache_mod.ProjectCache,
+    tree: *const Ast,
+    from_path: []const u8,
+    type_name: []const u8,
+    method_name: []const u8,
+    depth_left: u32,
+) ?FileCache.ResolvedMethod {
+    if (depth_left == 0) return null;
+    const tags = tree.tokens.items(.tag);
+    var idx: u32 = 1;
+    while (idx < tree.nodes.len) : (idx += 1) {
+        const node: Ast.Node.Index = @enumFromInt(idx);
+        const tag = tree.nodeTag(node);
+        const is_builtin_call = switch (tag) {
+            .builtin_call,
+            .builtin_call_two,
+            .builtin_call_comma,
+            .builtin_call_two_comma,
+            => true,
+            else => false,
+        };
+        if (!is_builtin_call) continue;
+        const main = tree.nodeMainToken(node);
+        if (main >= tree.tokens.len) continue;
+        if (tags[main] != .builtin) continue;
+        if (!std.mem.eql(u8, tree.tokenSlice(main), "@import")) continue;
+        if (main + 2 >= tree.tokens.len) continue;
+        if (tags[main + 2] != .string_literal) continue;
+        const lit = tree.tokenSlice(main + 2);
+        if (lit.len < 2) continue;
+        const import_str = lit[1 .. lit.len - 1];
+        const sub_model = (pc.modelForRelativeImport(from_path, import_str) catch null) orelse continue;
+        if (sub_model.findType(type_name)) |ti| {
+            if (ti.findMethod(method_name)) |m| return .{ .tree = sub_model.tree, .method = m };
+        }
+        const next_from = resolveImportPath(pc.gpa, from_path, import_str) catch continue;
+        defer pc.gpa.free(next_from);
+        if (findMethodViaImports(pc, sub_model.tree, next_from, type_name, method_name, depth_left - 1)) |rm| return rm;
     }
     return null;
 }
