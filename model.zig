@@ -343,27 +343,39 @@ pub const FileModel = struct {
         return self.tree.tokenSlice(dv + 1);
     }
 
-    /// True iff `type_name` is declared `union(enum)` (a tagged
-    /// union) — the form the overwrite-without-deinit's
-    /// variant-aware check needs to reason about.  Plain
+    /// True iff `type_name` is declared as a tagged union — any
+    /// `union(<TagType>) {...}` form (`union(enum)` is the most
+    /// common; `union(MyTag)` is also accepted).  Plain
     /// `union {...}` (untagged) doesn't qualify.
     pub fn isTaggedUnion(self: *const FileModel, type_name: []const u8) bool {
         const ti = self.findType(type_name) orelse return false;
         if (ti.kind != .union_) return false;
         const tags = self.tree.tokens.items(.tag);
-        // body_first is the `{`; walk back to find `union` and
-        // check for `(` after it.
+        // body_first is the `{`; walk back to find `union`.
         var t: TokenIndex = ti.body_first;
         while (t > 0) {
             t -= 1;
             if (tags[t] == .keyword_union) break;
         }
-        // After `union` we want `(` then `enum` then `)`.
-        if (t + 3 >= self.tree.tokens.len) return false;
+        // After `union` we want `(` ... `)` (tag-type in between).
+        // Most common: `(enum)` or `(MyTag)`.  Any non-empty
+        // parenthesised tag-type counts as tagged.
+        if (t + 2 >= self.tree.tokens.len) return false;
         if (tags[t + 1] != .l_paren) return false;
-        if (tags[t + 2] != .keyword_enum) return false;
-        if (tags[t + 3] != .r_paren) return false;
-        return true;
+        // Walk to matching `)`; depth-1 means at least one token
+        // (the tag type) sits inside.
+        var u: TokenIndex = t + 2;
+        var depth: i32 = 1;
+        while (u < self.tree.tokens.len and depth > 0) : (u += 1) {
+            switch (tags[u]) {
+                .l_paren => depth += 1,
+                .r_paren => depth -= 1,
+                else => {},
+            }
+        }
+        // Empty `()` is invalid syntax; assume non-empty parens
+        // mean a tag type.
+        return depth == 0 and u > t + 3;
     }
 
     /// Owned-ness of a tagged-union variant: true iff the variant

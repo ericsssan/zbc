@@ -179,15 +179,42 @@ fn checkBody(
             t = sc;
             continue;
         }
+        // Enum leaf-type skip: `field: ENS.NamespacedEnum` resolves
+        // via `baseTypeName` to the FIRST identifier (`ENS` here),
+        // and the rule lookup picks up that NAMESPACE type's deinit
+        // even though the actual field is a plain enum tag.  When
+        // the field's LEAF type identifier resolves to an `enum`
+        // in the model, the field has no payload and can never
+        // leak — skip.
+        if (fieldTypeLastIdent(tree, model, ct, field_name)) |leaf| {
+            if (model.findType(leaf)) |leaf_ti| {
+                if (leaf_ti.kind == .enum_) {
+                    t = sc;
+                    continue;
+                }
+            }
+        }
         // Tagged-union variant analysis: if the field's type is
-        // `union(enum)` AND the RHS is `.{ .<tag> = ... }` AND we
-        // can reason about the PRIOR variant (either the field's
-        // declared default OR a chronologically-prior assignment
-        // in this fn scope), AND that prior variant carries no
-        // owned payload, the retag doesn't leak — there was
-        // nothing to deinit.
-        if (model.isTaggedUnion(field_type)) {
-            if (taggedUnionRetagIsSafe(tree, model, field_type,
+        // `union(<Tag>)` AND the RHS is `.{ .<tag> = ... }` or
+        // `.<tag>` AND we can reason about the PRIOR variant
+        // (either the field's declared default OR a chronologically-
+        // prior assignment in this fn scope), AND that prior
+        // variant carries no owned payload, the retag doesn't
+        // leak — there was nothing to deinit.
+        //
+        // Two type-name candidates: the field type's FIRST id
+        // (what baseTypeName returns — "Result" for
+        // `Result.Pending.State`) AND the LAST id ("State").
+        // Nested-type qualified paths need the leaf name.
+        const last_id = fieldTypeLastIdent(tree, model, ct, field_name) orelse field_type;
+        const union_name = if (model.isTaggedUnion(last_id))
+            last_id
+        else if (model.isTaggedUnion(field_type))
+            field_type
+        else
+            null;
+        if (union_name) |un| {
+            if (taggedUnionRetagIsSafe(tree, model, un,
                 first, t, sc, this_name, field_name, ct)) {
                 t = sc;
                 continue;
@@ -196,6 +223,27 @@ fn checkBody(
         try report(gpa, problems, tree, t, this_name, field_name, ct);
         t = sc;
     }
+}
+
+/// Extract the LAST identifier of a field's declared type path.
+/// `state: Result.Pending.State = .none` → "State".  Used to find
+/// the LEAF type for tagged-union variant lookups when the field
+/// type is qualified across nested type scopes.
+fn fieldTypeLastIdent(
+    tree: *const Ast,
+    model: *const fmodel.FileModel,
+    struct_name: []const u8,
+    field_name: []const u8,
+) ?[]const u8 {
+    const ti = model.findType(struct_name) orelse return null;
+    const f = ti.findField(field_name) orelse return null;
+    const tags = tree.tokens.items(.tag);
+    var last_id: ?[]const u8 = null;
+    var t = f.type_first;
+    while (t <= f.type_last) : (t += 1) {
+        if (tags[t] == .identifier) last_id = tree.tokenSlice(t);
+    }
+    return last_id;
 }
 
 /// Tagged-union retag safety analysis.  For a `<this>.<field> =
