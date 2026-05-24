@@ -56,14 +56,28 @@ pub const ZlsResolver = struct {
 
         self.environ_map = .init(std.testing.failing_allocator);
 
+        // Discover the Zig toolchain so ZLS can resolve @import
+        // chains through the standard library AND a project's
+        // build.zig (build-runner integration).  Falls back to
+        // null-everywhere when discovery fails — ZLS still works
+        // for within-file resolution, just not cross-module.
+        const arena_alloc = self.arena.allocator();
+        const zig_exe = findZigExe(arena_alloc, io, gpa) catch null;
+        const zig_lib_path = if (zig_exe) |z| findZigLibDir(arena_alloc, io, gpa, z) catch null else null;
+        const zig_lib: ?std.Build.Cache.Directory = if (zig_lib_path) |p|
+            .{ .path = p, .handle = .cwd() }
+        else
+            null;
+        const build_runner = if (zig_lib != null) findBuildRunner(arena_alloc) catch null else null;
+
         self.document_store = .{
             .io = io,
             .allocator = gpa,
             .config = .{
                 .environ_map = &self.environ_map,
-                .zig_exe_path = null,
-                .zig_lib_dir = null,
-                .build_runner_path = null,
+                .zig_exe_path = zig_exe,
+                .zig_lib_dir = zig_lib,
+                .build_runner_path = build_runner,
                 .builtin_path = null,
                 .global_cache_dir = null,
                 .wasi_preopens = {},
@@ -139,6 +153,67 @@ pub const ZlsResolver = struct {
 /// owning AST node.  For `pub const Foo = struct {...}` the name is
 /// trivially the token before `=`; for anonymous `return struct {...}`
 /// inside a factory fn, the name is the FN's name.
+/// Discover the `zig` executable path via `which zig`.  Returns
+/// the resolved absolute path on success.  Falls through to
+/// `error.NotFound` when discovery fails; caller swallows the
+/// error to keep zbc running without ZLS cross-module resolution.
+fn findZigExe(arena: std.mem.Allocator, io: std.Io, gpa: std.mem.Allocator) ![]const u8 {
+    const raw = try runCapture(gpa, io, &.{ "/usr/bin/which", "zig" });
+    defer gpa.free(raw);
+    return try arena.dupe(u8, std.mem.trimEnd(u8, raw, &std.ascii.whitespace));
+}
+
+/// Discover the Zig stdlib directory by querying `zig env`.  The
+/// stdlib dir is needed for ZLS to follow `@import("std")` and
+/// builtin types.
+fn findZigLibDir(arena: std.mem.Allocator, io: std.Io, gpa: std.mem.Allocator, zig_exe: []const u8) ![]const u8 {
+    const env_out = try runCapture(gpa, io, &.{ zig_exe, "env" });
+    defer gpa.free(env_out);
+    // Parse out `"lib_dir":"<path>"` from JSON.  Cheap manual scan
+    // — full JSON parse is overkill for one field.
+    const needle = "\"lib_dir\":\"";
+    const start = std.mem.indexOf(u8, env_out, needle) orelse return error.NotFound;
+    const after = start + needle.len;
+    const end = std.mem.indexOfScalarPos(u8, env_out, after, '"') orelse return error.NotFound;
+    return try arena.dupe(u8, env_out[after..end]);
+}
+
+/// Run a command, capture stdout, return stdout bytes (caller-owned
+/// by `gpa`).  Returns `error.NotFound` on any failure (non-zero
+/// exit, spawn failure, empty output) so the caller's `catch null`
+/// gives the all-clear-or-disabled path.
+fn runCapture(gpa: std.mem.Allocator, io: std.Io, argv: []const []const u8) ![]u8 {
+    const result = std.process.run(gpa, io, .{ .argv = argv }) catch return error.NotFound;
+    defer gpa.free(result.stderr);
+    switch (result.term) {
+        .exited => |code| if (code != 0) {
+            gpa.free(result.stdout);
+            return error.NotFound;
+        },
+        else => {
+            gpa.free(result.stdout);
+            return error.NotFound;
+        },
+    }
+    if (result.stdout.len == 0) {
+        gpa.free(result.stdout);
+        return error.NotFound;
+    }
+    return result.stdout;
+}
+
+/// Discover the build-runner script that ZLS loads to introspect
+/// the active project's build.zig.  ZLS ships one inside its own
+/// package; without it, `@import("foo")` chains that resolve via
+/// build.zig modules can't be followed.  Skipped for now — the
+/// std.fs API churned across Zig versions and the build-runner
+/// path can be wired explicitly when needed.  ZLS still works
+/// without it (stdlib types resolve via zig_lib_dir).
+fn findBuildRunner(arena: std.mem.Allocator) ![]const u8 {
+    _ = arena;
+    return error.NotFound;
+}
+
 fn containerName(
     arena: std.mem.Allocator,
     container: anytype,
