@@ -1555,20 +1555,27 @@ const Builder = struct {
         const tree = self.tree;
         const tags = tree.tokens.items(.tag);
         for (ti.methods) |m| {
-            const is_accessor_name =
+            // Canonical accessors are parameterless.  Other names
+            // (\`initGlobal\`, \`init<X>\`) may take args but still
+            // return \`*Self\` and stash into a top-level var — they
+            // signal singleton ownership too.  We accept any method
+            // whose name matches the singleton convention AND whose
+            // return type is \`*Self\` / \`*<TypeName>\` / \`*@This()\`.
+            const is_singleton_name =
                 std.mem.eql(u8, m.name, "get") or
                 std.mem.eql(u8, m.name, "getOrNull") or
-                std.mem.eql(u8, m.name, "instance");
-            if (!is_accessor_name) continue;
-            // Must be parameterless: tokens are `fn` `<name>` `(` `)`.
+                std.mem.eql(u8, m.name, "instance") or
+                std.mem.eql(u8, m.name, "initGlobal") or
+                std.mem.eql(u8, m.name, "getInstance") or
+                std.mem.eql(u8, m.name, "global");
+            if (!is_singleton_name) continue;
+            // Walk past the method's param list to find the return type.
             const name_tok = m.name_token;
             if (name_tok + 2 >= tags.len) continue;
             if (tags[name_tok + 1] != .l_paren) continue;
-            if (tags[name_tok + 2] != .r_paren) continue;
-            // Return type after `)`.  Expect optional `?`, then `*`,
-            // then an identifier or `@This()` that resolves to the
-            // enclosing type.
-            var t: Ast.TokenIndex = name_tok + 3;
+            // Find the matching `)`.
+            const close = lexer.matchParen(tags, name_tok + 1, @intCast(tags.len - 1)) orelse continue;
+            var t: Ast.TokenIndex = close + 1;
             if (t < tags.len and tags[t] == .question_mark) t += 1;
             if (t >= tags.len or tags[t] != .asterisk) continue;
             t += 1;
