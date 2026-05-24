@@ -380,9 +380,15 @@ fn isPrimitiveBaseName(name: []const u8) bool {
 /// another file.  Returns false only when the type IS in the local
 /// file AND demonstrably has no `deinit`.
 fn typeHasDeinit(model: *const fmodel.FileModel, type_name: []const u8) bool {
-    if (model.hasType(type_name) and !model.typeHasMethod(type_name, "deinit")) {
-        return false;
+    if (model.hasType(type_name)) {
+        return model.typeHasMethod(type_name, "deinit");
     }
+    // File-struct fallback: `const <Name> = @This();` at the file
+    // head means the file IS the type — top-level fns are methods.
+    if (model.fileIsTypeNamed(type_name)) {
+        return model.typeOrFileHasMethod(type_name, "deinit");
+    }
+    // Truly unknown (cross-file).  Conservative: assume has deinit.
     return true;
 }
 

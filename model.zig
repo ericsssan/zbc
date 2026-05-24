@@ -171,6 +171,45 @@ pub const FileModel = struct {
         self.arena.deinit();
     }
 
+    /// True iff the file declares `const <type_name> = @This();` at
+    /// the top level — the file-struct pattern where the file
+    /// itself IS the type, and file-level fns are its methods.
+    /// Common in Bun (e.g. `ReadableStream.zig` starts with
+    /// `const ReadableStream = @This();`).
+    pub fn fileIsTypeNamed(self: *const FileModel, type_name: []const u8) bool {
+        const tags = self.tree.tokens.items(.tag);
+        var t: TokenIndex = 0;
+        // Scan the first few top-level decls; the @This() alias is
+        // conventionally near the file head.
+        var scanned: u32 = 0;
+        while (t + 4 < self.tree.tokens.len and scanned < 64) : (t += 1) {
+            if (tags[t] != .keyword_const) continue;
+            scanned += 1;
+            if (tags[t + 1] != .identifier) continue;
+            if (!std.mem.eql(u8, self.tree.tokenSlice(t + 1), type_name)) continue;
+            if (tags[t + 2] != .equal) continue;
+            if (tags[t + 3] != .builtin) continue;
+            if (!std.mem.eql(u8, self.tree.tokenSlice(t + 3), "@This")) continue;
+            return true;
+        }
+        return false;
+    }
+
+    /// True iff `<type_name>` has a method (or file-level fn, when
+    /// the file is a `@This()`-aliased file-struct) named `method`.
+    /// Composes `typeHasMethod` with the file-struct fallback.
+    pub fn typeOrFileHasMethod(self: *const FileModel, type_name: []const u8, method: []const u8) bool {
+        if (self.findType(type_name)) |ti| {
+            if (ti.hasMethod(method)) return true;
+        }
+        if (self.fileIsTypeNamed(type_name)) {
+            for (self.fns) |f| {
+                if (std.mem.eql(u8, f.name, method)) return true;
+            }
+        }
+        return false;
+    }
+
     /// Find a type by name (linear scan; types lists are small per file).
     pub fn findType(self: *const FileModel, name: []const u8) ?*const TypeInfo {
         for (self.types) |*t| {
