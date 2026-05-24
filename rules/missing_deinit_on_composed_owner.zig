@@ -86,6 +86,15 @@ pub fn check(
             // uniformity but do no real cleanup.
             if (!anyNonTrivialCleanup(tree, inner_ti)) continue;
 
+            // Refcounted-inner skip: when the inner type uses
+            // `bun.ptr.RefCount(@This(), ...)` machinery, its
+            // `deinit` is *private*, invoked automatically by the
+            // last `.deref()`.  Outer types must NOT call
+            // `<self>.<field>.deinit()` directly — they should call
+            // `.deref()` instead.  Our rule's prescription is
+            // wrong for refcounted innerss; skip.
+            if (innerIsRefCounted(tree, inner_ti)) continue;
+
             // Direct: `<X>.<field>.<cleanup>(`.  X is wildcarded
             // (typically self/this).  The body pattern is built
             // per-field since `.text` needs the field's name.
@@ -189,6 +198,31 @@ fn isTrivialBody(tree: *const Ast, body_first: Ast.TokenIndex, body_last: Ast.To
         t = k + 1;
     }
     return true;
+}
+
+/// True iff `inner_ti` is a refcounted type — its `deinit` is meant
+/// to be invoked only by the refcount machinery on the last
+/// `.deref()`, never by an outer's deinit directly.  Detection:
+/// the type has a `ref_count` field whose declared type expression
+/// contains `RefCount(@This(),` — the canonical bun shape produced
+/// by `bun.ptr.RefCount(@This(), "ref_count", deinit, ...)`.
+fn innerIsRefCounted(tree: *const Ast, inner_ti: *const fmodel.TypeInfo) bool {
+    const tags = tree.tokens.items(.tag);
+    // Look anywhere in the type's body for the canonical bun shape:
+    //   `RefCount(@This(), ...)` — typically the RHS of a
+    //   `const RefCount = bun.ptr.RefCount(@This(), "ref_count", deinit, .{});`
+    //   decl, but matching the call shape directly is robust against
+    //   whatever local alias name the type uses.
+    var t: Ast.TokenIndex = inner_ti.body_first;
+    while (t + 3 <= inner_ti.body_last) : (t += 1) {
+        if (tags[t] != .identifier) continue;
+        if (!std.mem.eql(u8, tree.tokenSlice(t), "RefCount")) continue;
+        if (tags[t + 1] != .l_paren) continue;
+        if (tags[t + 2] != .builtin) continue;
+        if (!std.mem.eql(u8, tree.tokenSlice(t + 2), "@This")) continue;
+        return true;
+    }
+    return false;
 }
 
 /// True iff the inner type has a `deinit` (or `close`/`destroy`/
