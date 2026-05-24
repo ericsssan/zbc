@@ -4837,6 +4837,15 @@ const Builder = struct {
         var catch_seen: bool = false;
         var t: Ast.TokenIndex = first;
         while (t <= last) : (t += 1) {
+            // Skip past nested fn bodies — `try` inside a nested
+            // dispatch closure runs at CALL TIME, not during the
+            // surrounding assignment.  Without this, anonymous fn
+            // values (`&struct { fn dispatch(...) !void { try ... }
+            // }.dispatch`) used as payload fields trip the rule.
+            if (tags[t] == .keyword_fn) {
+                t = lexer.skipNestedFn(tags, t, last);
+                continue;
+            }
             switch (tags[t]) {
                 .keyword_try => return true,
                 .keyword_catch => catch_seen = true,
