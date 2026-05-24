@@ -67,6 +67,14 @@ pub fn check(
             // (e.g. "Route" for `Route.RefCount`), but the suffix
             // signal lives at the chain's tail.
             if (fieldTypeTrailingNameEndsWith(tree, field, "RefCount")) continue;
+            // Optional-null-default skip: `<field>: ?T = null` only
+            // holds a non-null T when something explicitly assigned
+            // it.  An outer deinit that doesn't touch the field
+            // doesn't leak when the field stays null (the common
+            // case for "lazy/optional sub-state").  The
+            // overwrite-without-deinit rule covers the case where
+            // someone DOES assign to the field without prior cleanup.
+            if (model.fieldIsOptionalNullDefault(outer.name, field.name)) continue;
             const inner_ti = mq.resolveFieldTypeScoped(tree, model, outer, field) orelse continue;
 
             // Trivial-deinit skip: when the inner's `deinit` (or
