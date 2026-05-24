@@ -307,6 +307,158 @@ pub const FileModel = struct {
         return std.mem.eql(u8, self.tree.tokenSlice(dv), "null");
     }
 
+    /// Whether `<struct_name>.<field_name>`'s default value is a
+    /// tagged-union variant whose payload is NON-OWNED — a bare
+    /// tag like `.pending` (no payload) or `.empty`.  Returns the
+    /// tag name (e.g. "pending") on match, null otherwise.  Used
+    /// by the union-variant-aware overwrite check to recognise
+    /// "first write transitions from a known empty initial tag".
+    pub fn fieldDefaultUnionTag(
+        self: *const FileModel,
+        struct_name: []const u8,
+        field_name: []const u8,
+    ) ?[]const u8 {
+        const ti = self.findType(struct_name) orelse return null;
+        const f = ti.findField(field_name) orelse return null;
+        if (!f.has_default) return null;
+        const tags = self.tree.tokens.items(.tag);
+        var eq: TokenIndex = f.type_last + 1;
+        while (eq < self.tree.tokens.len and tags[eq] != .equal) : (eq += 1) {}
+        if (eq >= self.tree.tokens.len) return null;
+        // Default shape `.<tag>` — period + identifier immediately
+        // after `=`.  Reject `.{ .tag = … }` literals (those are
+        // payload-bearing) by requiring the token after the ident
+        // to NOT be `{` / `(` / `.`.
+        const dv = eq + 1;
+        if (dv + 1 >= self.tree.tokens.len) return null;
+        if (tags[dv] != .period) return null;
+        if (tags[dv + 1] != .identifier) return null;
+        const next = dv + 2;
+        if (next < self.tree.tokens.len) {
+            switch (tags[next]) {
+                .l_brace, .l_paren, .period => return null,
+                else => {},
+            }
+        }
+        return self.tree.tokenSlice(dv + 1);
+    }
+
+    /// True iff `type_name` is declared `union(enum)` (a tagged
+    /// union) — the form the overwrite-without-deinit's
+    /// variant-aware check needs to reason about.  Plain
+    /// `union {...}` (untagged) doesn't qualify.
+    pub fn isTaggedUnion(self: *const FileModel, type_name: []const u8) bool {
+        const ti = self.findType(type_name) orelse return false;
+        if (ti.kind != .union_) return false;
+        const tags = self.tree.tokens.items(.tag);
+        // body_first is the `{`; walk back to find `union` and
+        // check for `(` after it.
+        var t: TokenIndex = ti.body_first;
+        while (t > 0) {
+            t -= 1;
+            if (tags[t] == .keyword_union) break;
+        }
+        // After `union` we want `(` then `enum` then `)`.
+        if (t + 3 >= self.tree.tokens.len) return false;
+        if (tags[t + 1] != .l_paren) return false;
+        if (tags[t + 2] != .keyword_enum) return false;
+        if (tags[t + 3] != .r_paren) return false;
+        return true;
+    }
+
+    /// Owned-ness of a tagged-union variant: true iff the variant
+    /// has a payload type that itself has a `deinit` method (i.e.
+    /// the payload is OWNED storage).  Variants with no payload
+    /// (`.pending,`) or primitive payloads (`u32`/`bool`) are
+    /// considered non-owned — overwriting them never leaks.
+    ///
+    /// Returns `null` if the tag isn't a variant of this type.
+    pub fn unionVariantIsOwned(
+        self: *const FileModel,
+        union_name: []const u8,
+        variant_tag: []const u8,
+    ) ?bool {
+        const ti = self.findType(union_name) orelse return null;
+        if (ti.kind != .union_) return null;
+        const tags = self.tree.tokens.items(.tag);
+        // Walk variants between `{` and `}`.
+        var t: TokenIndex = ti.body_first + 1;
+        const last = ti.body_last;
+        while (t < last) : (t += 1) {
+            // Variant starts at an identifier at depth 0 of the
+            // union body (skip past method decls / nested types).
+            if (tags[t] == .keyword_fn or tags[t] == .keyword_pub or
+                tags[t] == .keyword_const or tags[t] == .keyword_var) {
+                // Skip the entire decl (method/const/etc.) — walk
+                // to its terminating `;` or end-of-block `}` at
+                // depth 0.
+                t = skipDeclStmt(tags, t, last);
+                continue;
+            }
+            if (tags[t] != .identifier) continue;
+            const name = self.tree.tokenSlice(t);
+            // Variant payload form: `<tag>: <type>,` or `<tag>,`.
+            // Skip if the next non-identifier-tail token is `=` /
+            // `.` (a `const X = …;` we didn't catch above) or `(`
+            // (a `pub fn …(` past the keyword_pub strip we lost).
+            const after = t + 1;
+            if (after >= last) break;
+            if (tags[after] == .comma) {
+                if (std.mem.eql(u8, name, variant_tag)) return false;
+                continue;
+            }
+            if (tags[after] == .colon) {
+                // Payload follows; parse its base type identifier.
+                if (std.mem.eql(u8, name, variant_tag)) {
+                    return self.payloadIsOwned(tags, after + 1, last);
+                }
+                // Skip to the next comma at depth 0.
+                t = skipToTopComma(tags, after + 1, last);
+                continue;
+            }
+            // Some other shape — give up on this iter.
+        }
+        return null;
+    }
+
+    fn payloadIsOwned(
+        self: *const FileModel,
+        tags: []const TokenTag,
+        start: TokenIndex,
+        last: TokenIndex,
+    ) bool {
+        // Walk type tokens; collect the last identifier (the base
+        // type name).  Stop at the next top-level comma.
+        var t: TokenIndex = start;
+        var last_id: ?[]const u8 = null;
+        var paren_depth: i32 = 0;
+        while (t < last) : (t += 1) {
+            switch (tags[t]) {
+                .l_paren, .l_bracket => paren_depth += 1,
+                .r_paren, .r_bracket => paren_depth -= 1,
+                .comma => if (paren_depth == 0) break,
+                .identifier => last_id = self.tree.tokenSlice(t),
+                else => {},
+            }
+        }
+        const name = last_id orelse return false;
+        // Primitive types: never owned.
+        if (isPrimitiveBaseName(name)) return false;
+        // Pointer/optional payloads: assume owned (`*T` / `?*T` /
+        // `?T` where T has deinit).  Cheap conservative call —
+        // the rule's purpose is to find leaks, so when in doubt
+        // treat as owned.
+        if (self.findType(name)) |payload_ti| {
+            return payload_ti.hasMethod("deinit") or
+                payload_ti.hasMethod("deref") or
+                payload_ti.hasMethod("destroy") or
+                payload_ti.hasMethod("close");
+        }
+        // Unknown type — assume owned (conservative; cross-file
+        // resolution could refine).
+        return true;
+    }
+
     /// True iff `struct_name`.`field_name` is the heap-owning half of
     /// a flag-paired ownership pattern: a sibling field
     /// `<field_name>_allocated: bool` exists on the same struct.
@@ -606,6 +758,77 @@ fn collectTypesInRange(
         // Skip past the body so the outer scan doesn't re-enter it.
         t = body_last;
     }
+}
+
+/// Token-walk past one top-level decl (`pub fn …`, `const X = …;`,
+/// `var Y = …;`) inside a type body.  Used by union-variant scans
+/// to step over method declarations between variants.  Returns the
+/// position of the decl's terminating `}` (for fn bodies) or `;`.
+fn skipDeclStmt(
+    tags: []const TokenTag,
+    start: TokenIndex,
+    last: TokenIndex,
+) TokenIndex {
+    var t: TokenIndex = start;
+    var brace_depth: i32 = 0;
+    var paren_depth: i32 = 0;
+    while (t < last) : (t += 1) {
+        switch (tags[t]) {
+            .l_brace => brace_depth += 1,
+            .r_brace => {
+                brace_depth -= 1;
+                if (brace_depth == 0 and paren_depth == 0) return t;
+            },
+            .l_paren => paren_depth += 1,
+            .r_paren => paren_depth -= 1,
+            .semicolon => if (brace_depth == 0 and paren_depth == 0) return t,
+            else => {},
+        }
+    }
+    return last;
+}
+
+/// Walk forward to the next comma at parenthesis/bracket depth 0.
+/// Used by union-variant scans to step from one variant's payload
+/// type to the next variant declaration.
+fn skipToTopComma(
+    tags: []const TokenTag,
+    start: TokenIndex,
+    last: TokenIndex,
+) TokenIndex {
+    var t: TokenIndex = start;
+    var pd: i32 = 0;
+    var bd: i32 = 0;
+    while (t < last) : (t += 1) {
+        switch (tags[t]) {
+            .l_paren, .l_bracket => pd += 1,
+            .r_paren, .r_bracket => pd -= 1,
+            .l_brace => bd += 1,
+            .r_brace => bd -= 1,
+            .comma => if (pd == 0 and bd == 0) return t,
+            else => {},
+        }
+    }
+    return last;
+}
+
+/// True iff `name` is a Zig primitive numeric / bool type.  Used
+/// by union-variant payload-owned-ness inference: a variant with
+/// a primitive payload can never leak.
+fn isPrimitiveBaseName(name: []const u8) bool {
+    if (std.mem.eql(u8, name, "bool")) return true;
+    if (std.mem.eql(u8, name, "void")) return true;
+    if (std.mem.eql(u8, name, "anyopaque")) return true;
+    if (std.mem.eql(u8, name, "usize")) return true;
+    if (std.mem.eql(u8, name, "isize")) return true;
+    if (std.mem.eql(u8, name, "f16") or std.mem.eql(u8, name, "f32") or
+        std.mem.eql(u8, name, "f64") or std.mem.eql(u8, name, "f80") or
+        std.mem.eql(u8, name, "f128")) return true;
+    if (name.len < 2) return false;
+    const lead = name[0];
+    if (lead != 'u' and lead != 'i') return false;
+    for (name[1..]) |c| if (c < '0' or c > '9') return false;
+    return true;
 }
 
 fn collectFields(

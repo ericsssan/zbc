@@ -179,9 +179,165 @@ fn checkBody(
             t = sc;
             continue;
         }
+        // Tagged-union variant analysis: if the field's type is
+        // `union(enum)` AND the RHS is `.{ .<tag> = ... }` AND we
+        // can reason about the PRIOR variant (either the field's
+        // declared default OR a chronologically-prior assignment
+        // in this fn scope), AND that prior variant carries no
+        // owned payload, the retag doesn't leak — there was
+        // nothing to deinit.
+        if (model.isTaggedUnion(field_type)) {
+            if (taggedUnionRetagIsSafe(tree, model, field_type,
+                first, t, sc, this_name, field_name, ct)) {
+                t = sc;
+                continue;
+            }
+        }
         try report(gpa, problems, tree, t, this_name, field_name, ct);
         t = sc;
     }
+}
+
+/// Tagged-union retag safety analysis.  For a `<this>.<field> =
+/// .{ .<tag> = ... };` where `<field>`'s type is `union(enum)`,
+/// the retag is safe iff the PRIOR variant carried no owned
+/// payload.  The prior variant is determined by:
+///   1. Walking BACK from the current assignment for a chronologically
+///      prior `<this>.<field> = .{ .<other> = ... };` in scope.
+///   2. If none found in this fn, falling back to the field's
+///      declared default `.<tag>`.
+/// "Owned" payload = a payload type that has a `deinit` method (or
+/// equivalent); empty / primitive payloads are non-owned.
+fn taggedUnionRetagIsSafe(
+    tree: *const Ast,
+    model: *const fmodel.FileModel,
+    union_type_name: []const u8,
+    body_first: Ast.TokenIndex,
+    assign_tok: Ast.TokenIndex,
+    sc: Ast.TokenIndex,
+    this_name: []const u8,
+    field_name: []const u8,
+    outer_type_name: []const u8,
+) bool {
+    _ = sc;
+    // Walk back for a prior assignment to this lvalue in the
+    // SAME fn body — order matters for variant flow.  Stop at
+    // the fn body start (no scope-restriction: any earlier write
+    // in this fn establishes the live variant).
+    if (priorVariantInFn(tree, body_first, assign_tok, this_name, field_name)) |prior_tag| {
+        // We know the prior variant.  Safe iff it's non-owned.
+        return (model.unionVariantIsOwned(union_type_name, prior_tag) orelse true) == false;
+    }
+    // No prior assignment in this fn.  Look for the field's
+    // declared default tag first; if the type uses an init()
+    // function instead of a field default (Bun convention), scan
+    // that for the initial tag.
+    const default_tag = model.fieldDefaultUnionTag(outer_type_name, field_name) orelse
+        initFnDefaultUnionTag(tree, model, outer_type_name, field_name) orelse return false;
+    return (model.unionVariantIsOwned(union_type_name, default_tag) orelse true) == false;
+}
+
+/// Fallback: when the field has no inline default `= .<tag>`,
+/// scan the containing type's `init` method body for the first
+/// `.<field> = .<tag>` (in a struct-init literal) or
+/// `<recv>.<field> = .<tag>` (imperative).  Returns the tag name
+/// when found.  Common in Bun's codebase where init() sets the
+/// initial union variant explicitly rather than declaring a
+/// field default.
+fn initFnDefaultUnionTag(
+    tree: *const Ast,
+    model: *const fmodel.FileModel,
+    outer_type_name: []const u8,
+    field_name: []const u8,
+) ?[]const u8 {
+    const ti = model.findType(outer_type_name) orelse return null;
+    const init_method = ti.findMethod("init") orelse return null;
+    const tags = tree.tokens.items(.tag);
+    var t: Ast.TokenIndex = init_method.body_first;
+    const last = init_method.body_last;
+    while (t + 4 <= last) : (t += 1) {
+        // Struct-init form: `. <field> = . <tag>`.
+        if (tags[t] == .period and
+            tags[t + 1] == .identifier and
+            std.mem.eql(u8, tree.tokenSlice(t + 1), field_name) and
+            tags[t + 2] == .equal and
+            tags[t + 3] == .period and
+            tags[t + 4] == .identifier)
+        {
+            return tree.tokenSlice(t + 4);
+        }
+        // Imperative form: `<recv> . <field> = . <tag>` — needs
+        // one more token before the period.
+        if (t > 0 and tags[t - 1] == .identifier and
+            tags[t] == .period and
+            tags[t + 1] == .identifier and
+            std.mem.eql(u8, tree.tokenSlice(t + 1), field_name) and
+            tags[t + 2] == .equal and
+            tags[t + 3] == .period and
+            tags[t + 4] == .identifier)
+        {
+            return tree.tokenSlice(t + 4);
+        }
+    }
+    return null;
+}
+
+/// Walk backward from `assign_tok` to `body_first` looking for the
+/// most-recent prior assignment `<this>.<field> = .{ .<tag> = ... };`.
+/// Returns the prior tag name on hit, null on miss.  Brace depth
+/// is NOT tracked: any earlier write in the same fn body establishes
+/// the variant that the abstract state holds when the current write
+/// executes (since assignments earlier in source order dominate later
+/// ones in the common straight-line case; nested-block writes are a
+/// conservative overestimate of "could have run").
+fn priorVariantInFn(
+    tree: *const Ast,
+    body_first: Ast.TokenIndex,
+    assign_tok: Ast.TokenIndex,
+    this_name: []const u8,
+    field_name: []const u8,
+) ?[]const u8 {
+    const tags = tree.tokens.items(.tag);
+    if (assign_tok < body_first + 5) return null;
+    var t: Ast.TokenIndex = assign_tok;
+    while (t > body_first + 4) {
+        t -= 1;
+        // Look for `<this> . <field> = . <tag>` at this position.
+        if (tags[t] != .identifier) continue;
+        if (!std.mem.eql(u8, tree.tokenSlice(t), this_name)) continue;
+        if (tags[t + 1] != .period) continue;
+        if (tags[t + 2] != .identifier) continue;
+        if (!std.mem.eql(u8, tree.tokenSlice(t + 2), field_name)) continue;
+        if (tags[t + 3] != .equal) continue;
+        // Two RHS shapes for tag extraction:
+        //   a) `.<tag>` — bare tag (no payload).
+        //   b) `.{ .<tag> = ... }` — struct-init form.
+        if (t + 5 >= tags.len) continue;
+        // Shape (a): `= .<tag>` then `;` or `,`.
+        if (tags[t + 4] == .period and tags[t + 5] == .identifier) {
+            const after = t + 6;
+            if (after < tags.len) {
+                switch (tags[after]) {
+                    .semicolon, .comma => return tree.tokenSlice(t + 5),
+                    else => {},
+                }
+            }
+        }
+        // Shape (b): `= . { . <tag> = …`.
+        if (t + 7 < tags.len and
+            tags[t + 4] == .period and
+            tags[t + 5] == .l_brace and
+            tags[t + 6] == .period and
+            tags[t + 7] == .identifier)
+        {
+            return tree.tokenSlice(t + 7);
+        }
+        // Other RHS shape (call returning union) — we can't extract
+        // a literal tag from here.  Treat as "prior variant unknown"
+        // by returning null so the caller falls back to default.
+        return null;
+    }
+    return null;
 }
 
 /// True iff there's a backward `var <X> = <this>.<field>;` binding
@@ -642,14 +798,18 @@ const freeProblems = testing.freeProblems;
 test "overwrite-without-deinit: reassign deinit-able field without prior cleanup fires" {
     const gpa = std.testing.allocator;
     var problems = try runOn(gpa,
+        \\const Owned = struct {
+        \\    buf: []u8,
+        \\    pub fn deinit(self: *Owned) void { self.buf.len = 0; }
+        \\};
         \\const NameOrIndex = union(enum) {
-        \\    name: u32,
+        \\    name: Owned,
         \\    index: u32,
         \\    duplicate,
         \\    pub fn deinit(self: *NameOrIndex) void { _ = self; self.* = .duplicate; }
         \\};
         \\const Field = struct {
-        \\    name_or_index: NameOrIndex = .duplicate,
+        \\    name_or_index: NameOrIndex = .name,
         \\    pub fn markDup(this: *Field) void {
         \\        this.name_or_index = .duplicate;
         \\    }
