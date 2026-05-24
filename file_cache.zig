@@ -86,27 +86,7 @@ pub const FileCache = struct {
         if (model.findType(name)) |ti| return ti;
         const pc = self.project orelse return null;
         if (self.file_path.len == 0) return null;
-        // Walk the file's @import declarations for relative paths.
-        const tree = self.tree;
-        const tags = tree.tokens.items(.tag);
-        var idx: u32 = 1;
-        while (idx < tree.nodes.len) : (idx += 1) {
-            const node: Ast.Node.Index = @enumFromInt(idx);
-            if (tree.nodeTag(node) != .builtin_call_two) continue;
-            const main = tree.nodeMainToken(node);
-            if (main >= tree.tokens.len) continue;
-            if (tags[main] != .builtin) continue;
-            if (!std.mem.eql(u8, tree.tokenSlice(main), "@import")) continue;
-            // Arg is a single string literal.
-            if (main + 2 >= tree.tokens.len) continue;
-            if (tags[main + 2] != .string_literal) continue;
-            const lit = tree.tokenSlice(main + 2);
-            if (lit.len < 2) continue;
-            const import_str = lit[1 .. lit.len - 1];
-            const sub_model = (pc.modelForRelativeImport(self.file_path, import_str) catch null) orelse continue;
-            if (sub_model.findType(name)) |ti| return ti;
-        }
-        return null;
+        return findTypeViaImports(pc, self.tree, self.file_path, name, 2);
     }
 
     pub fn deinit(self: *FileCache) void {
@@ -857,6 +837,67 @@ fn walkFieldPath(
         cur_outer = ftp.type_name;
     }
     return last_result;
+}
+
+/// Walk every `@import("./...")` builtin call in `tree` and try
+/// finding `name` in the target file's model.  Recurses up to
+/// `depth_left` more hops to follow re-export aliases (`pub const
+/// Tag = @import("./Tag.zig").Tag;` is a common 2-hop pattern in
+/// Bun's protocol modules).
+///
+/// Depth-bounded to prevent diamond-load cycles on highly
+/// interconnected projects.  Returns the FIRST hit across imports
+/// at that depth; ambiguity (same name in multiple imports) is
+/// fine for the rule's purposes (which only needs "has this
+/// method on this type" — re-exports of the SAME type produce
+/// the same answer).
+fn findTypeViaImports(
+    pc: *project_cache_mod.ProjectCache,
+    tree: *const Ast,
+    from_path: []const u8,
+    name: []const u8,
+    depth_left: u32,
+) ?*const fmodel.TypeInfo {
+    if (depth_left == 0) return null;
+    const tags = tree.tokens.items(.tag);
+    var idx: u32 = 1;
+    while (idx < tree.nodes.len) : (idx += 1) {
+        const node: Ast.Node.Index = @enumFromInt(idx);
+        const tag = tree.nodeTag(node);
+        const is_builtin_call = switch (tag) {
+            .builtin_call,
+            .builtin_call_two,
+            .builtin_call_comma,
+            .builtin_call_two_comma,
+            => true,
+            else => false,
+        };
+        if (!is_builtin_call) continue;
+        const main = tree.nodeMainToken(node);
+        if (main >= tree.tokens.len) continue;
+        if (tags[main] != .builtin) continue;
+        if (!std.mem.eql(u8, tree.tokenSlice(main), "@import")) continue;
+        if (main + 2 >= tree.tokens.len) continue;
+        if (tags[main + 2] != .string_literal) continue;
+        const lit = tree.tokenSlice(main + 2);
+        if (lit.len < 2) continue;
+        const import_str = lit[1 .. lit.len - 1];
+        const sub_model = (pc.modelForRelativeImport(from_path, import_str) catch null) orelse continue;
+        if (sub_model.findType(name)) |ti| return ti;
+        // Recurse — the imported file may re-export the type from
+        // a deeper file via its own @import.
+        const next_from = resolveImportPath(pc.gpa, from_path, import_str) catch continue;
+        defer pc.gpa.free(next_from);
+        if (findTypeViaImports(pc, sub_model.tree, next_from, name, depth_left - 1)) |ti| return ti;
+    }
+    return null;
+}
+
+fn resolveImportPath(gpa: std.mem.Allocator, from_path: []const u8, import_str: []const u8) ![]u8 {
+    const dir = std.fs.path.dirname(from_path) orelse ".";
+    const joined = try std.fs.path.join(gpa, &.{ dir, import_str });
+    defer gpa.free(joined);
+    return try std.fs.path.resolve(gpa, &.{joined});
 }
 
 // ── Tests ──────────────────────────────────────────────────
