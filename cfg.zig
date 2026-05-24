@@ -33,6 +33,7 @@ const config_mod = @import("config.zig");
 const file_cache = @import("file_cache.zig");
 const fn_summary = @import("fn_summary.zig");
 const lexer = @import("lexer.zig");
+const model_mod = @import("model.zig");
 const zls_resolver_mod = @import("zls_resolver.zig");
 
 pub const Config = config_mod.Config;
@@ -1791,18 +1792,98 @@ const Builder = struct {
             return;
         }
 
+        // Pre-resolve the scrutinee's union TypeInfo (if any) so we
+        // can mark by-value pointer-payload captures as is_pointer.
+        // Pattern: `switch (<local>) { .tag => |cap| ... }` where the
+        // union variant's declared type is `*T` — the capture is the
+        // pointer, and `&cap.field` is a borrow into the pointee
+        // (caller / heap), not a stack-frame escape.
+        const sw_union_ti: ?*const model_mod.TypeInfo = self.scrutineeUnionType(sw.ast.condition);
+
         for (sw.ast.cases) |case_node| {
             const case_full = tree.fullSwitchCase(case_node) orelse continue;
             const case_block = try self.newBlock();
             try self.addEdge(cur.*, case_block);
             // `.tag => |val| ...` capture binds inside this case only.
-            if (case_full.payload_token) |pt| try self.registerCaptures(pt);
+            if (case_full.payload_token) |pt| {
+                try self.registerCaptures(pt);
+                if (sw_union_ti) |un_ti| self.markPointerCapturesFromUnion(pt, un_ti, case_full.ast.values);
+            }
             var case_cur = case_block;
             try self.lowerStmt(case_full.ast.target_expr, &case_cur);
             try self.addEdge(case_cur, merge);
         }
 
         cur.* = merge;
+    }
+
+    /// If `scrut_node` is a single identifier naming a known local
+    /// whose declared type is a tagged-union (or plain union) in the
+    /// file model, return that union's TypeInfo.  Used by switch
+    /// lowering to type-check arm captures against the union's
+    /// variant fields.
+    fn scrutineeUnionType(self: *Builder, scrut_node: Ast.Node.Index) ?*const model_mod.TypeInfo {
+        const tree = self.tree;
+        if (tree.nodeTag(scrut_node) != .identifier) return null;
+        const name_tok = tree.nodeMainToken(scrut_node);
+        const name = tree.tokenSlice(name_tok);
+        const lid = self.name_to_local.get(name) orelse return null;
+        const local = self.locals.items[@intFromEnum(lid)];
+        const type_name = local.type_name orelse return null;
+        const cache = self.cache orelse return null;
+        const model = cache.fileModel() catch return null;
+        const ti = model.findType(type_name) orelse return null;
+        if (ti.kind != .union_) return null;
+        return ti;
+    }
+
+    /// For each case-prong `.<tag>` in `prong_values`, if the union's
+    /// `<tag>` field is declared as `*T`, mark the corresponding
+    /// payload capture's LocalInfo with `is_pointer = true`.
+    fn markPointerCapturesFromUnion(
+        self: *Builder,
+        payload_token: Ast.TokenIndex,
+        un_ti: *const model_mod.TypeInfo,
+        prong_values: []const Ast.Node.Index,
+    ) void {
+        const tree = self.tree;
+        // payload_token is the start of the payload region (first
+        // token AFTER the opening `|`, matching registerCapturesWith
+        // semantics).  Walk forward to the first `.identifier`,
+        // bailing on the closing `.pipe`.  Skip leading `*` for
+        // by-pointer capture form.
+        const tags = tree.tokens.items(.tag);
+        var t: Ast.TokenIndex = payload_token;
+        var cap_name: ?[]const u8 = null;
+        while (t < tags.len) : (t += 1) {
+            switch (tags[t]) {
+                .pipe => break,
+                .identifier => {
+                    cap_name = tree.tokenSlice(t);
+                    break;
+                },
+                else => {},
+            }
+        }
+        const name = cap_name orelse return;
+        if (std.mem.eql(u8, name, "_")) return;
+        const lid = self.name_to_local.get(name) orelse return;
+        // Walk each prong value `.<tag>` and check the union's
+        // field type starts with `*`.  All prongs in one arm must
+        // agree (same payload type), so checking ANY is enough.
+        for (prong_values) |v| {
+            if (tree.nodeTag(v) != .enum_literal) continue;
+            const tag_name_tok = tree.nodeMainToken(v);
+            if (tag_name_tok >= tags.len) continue;
+            if (tags[tag_name_tok] != .identifier) continue;
+            const tag_name = tree.tokenSlice(tag_name_tok);
+            const field = un_ti.findField(tag_name) orelse continue;
+            if (field.type_first > field.type_last) continue;
+            if (tags[field.type_first] == .asterisk) {
+                self.locals.items[@intFromEnum(lid)].is_pointer = true;
+                return;
+            }
+        }
     }
 
     /// `try expr` at statement position.  Lower `expr` on the success

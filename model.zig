@@ -1042,7 +1042,7 @@ fn collectTypesInRange(
         if (b > end or tags[b] != .l_brace) continue;
         const body_last = lexer.matchBrace(tags, b, end) orelse continue;
 
-        const fields_slice = if (kind == .struct_)
+        const fields_slice = if (kind == .struct_ or kind == .union_)
             try collectFields(a, tree, b + 1, body_last - 1)
         else
             &[_]FieldInfo{};
