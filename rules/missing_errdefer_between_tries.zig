@@ -198,6 +198,16 @@ fn checkFn(
                 },
                 .keyword_try => {
                     found_try = true;
+                    // Consumption-by-call skip: if the next `try`'s
+                    // call passes `<x_name>` (or `&<x_name>`) as an
+                    // arg, the call is the consumer.  The bound
+                    // resource is transferred into the called fn's
+                    // ownership; success or failure of the call is
+                    // the resource's transition point, not a leak
+                    // window the caller must defend.
+                    if (nextCallPassesArg(tree, tags, u, last, b.x_name)) {
+                        has_cleanup = true;
+                    }
                     break;
                 },
                 else => {},
@@ -207,6 +217,36 @@ fn checkFn(
             try report(gpa, problems, tree, b);
         }
     }
+}
+
+/// True iff the `try` at `try_tok` is followed by a CALL whose
+/// argument list mentions `<arg_name>` as a bare identifier
+/// (\`name\` or `&name`).  Walks the source from the next `(`
+/// matching paren-depth to find the call's args, then scans for
+/// the identifier with a word-boundary check.
+fn nextCallPassesArg(
+    tree: *const Ast,
+    tags: []const std.zig.Token.Tag,
+    try_tok: Ast.TokenIndex,
+    last: Ast.TokenIndex,
+    arg_name: []const u8,
+) bool {
+    // Find the first `(` after the try (within the next ~50 tokens).
+    var p: Ast.TokenIndex = try_tok + 1;
+    const scan_lim: Ast.TokenIndex = if (try_tok + 50 < last) try_tok + 50 else last;
+    while (p <= scan_lim and tags[p] != .l_paren) : (p += 1) {}
+    if (p > scan_lim or tags[p] != .l_paren) return false;
+    const close = lexer.matchParen(tags, p, last) orelse return false;
+    var k: Ast.TokenIndex = p + 1;
+    while (k < close) : (k += 1) {
+        if (tags[k] != .identifier) continue;
+        if (!std.mem.eql(u8, tree.tokenSlice(k), arg_name)) continue;
+        // Word-boundary check: no preceding `.` (field access) and
+        // not part of a longer identifier (already implied by .identifier).
+        if (k > 0 and tags[k - 1] == .period) continue;
+        return true;
+    }
+    return false;
 }
 
 const ParsedCall = struct {
