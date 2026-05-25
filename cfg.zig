@@ -6018,10 +6018,26 @@ const Builder = struct {
             chain_end += 2;
         }
         const ends_in_call = chain_end + 1 <= last and tags[chain_end + 1] == .l_paren;
+        // True when the chain terminates in `.len` or `.ptr`:
+        //   `obj.iter_state.directory.path.len`
+        // Reading `.len`/`.ptr` on a fixed-size array field (`[N]T`) does
+        // not access the field's memory — `.len` is a comptime constant.
+        // We stop the prefix chain two fields early to avoid spurious
+        // use-undefined on the parent.  (For slices, `slice.len` IS a
+        // runtime read; but firing on an undefined slice's `.len`-parent
+        // is rare enough that the false-positive reduction is worth it.)
+        const terminal = tree.tokenSlice(chain_end);
+        const ends_in_len_or_ptr = !ends_in_call and
+            (std.mem.eql(u8, terminal, "len") or std.mem.eql(u8, terminal, "ptr"));
         // Last ident to INCLUDE in the field portion.  If the chain
         // ends with `(`, the final ident is a method name — skip it.
+        // If the chain ends with `.len`/`.ptr`, skip both the terminal
+        // and its parent (two steps back) to suppress the common FP
+        // from `fixed_array_field.len` when the array is `undefined`.
         const last_field: ?Ast.TokenIndex = if (ends_in_call)
             (if (chain_end > first_field) chain_end - 2 else null)
+        else if (ends_in_len_or_ptr)
+            (if (chain_end > first_field + 2) chain_end - 4 else null)
         else
             chain_end;
         if (last_field == null) return;
