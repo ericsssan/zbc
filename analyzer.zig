@@ -9,6 +9,7 @@ const transfer = @import("transfer.zig");
 const problem_mod = @import("problem.zig");
 const config_mod = @import("config.zig");
 const file_cache_mod = @import("file_cache.zig");
+const zls_resolver_mod = @import("zls_resolver.zig");
 
 const Cfg = cfg_mod.Cfg;
 const BlockId = cfg_mod.BlockId;
@@ -177,8 +178,21 @@ fn analyze(gpa: std.mem.Allocator, src: []const u8) !std.ArrayListUnmanaged(Prob
     var tree = try Ast.parse(gpa, src_z, .zig);
     defer tree.deinit(gpa);
 
+    // Initialize ZLS for precise type resolution — same path as lib.zig.
+    // If the toolchain isn't discoverable (unusual in a working dev env),
+    // ZLS init fails silently and analysis proceeds without type-aware paths.
+    const tio = std.testing.io;
+    var zls_resolver: zls_resolver_mod.ZlsResolver = undefined;
+    const zls_ok = blk: {
+        zls_resolver.init(gpa, tio, "<test>", src_z) catch break :blk false;
+        break :blk true;
+    };
+    defer if (zls_ok) zls_resolver.deinit();
+    const zls_ptr: ?*zls_resolver_mod.ZlsResolver = if (zls_ok) &zls_resolver else null;
+
     var rule_cache = file_cache_mod.FileCache.init(gpa, &tree);
     defer rule_cache.deinit();
+    rule_cache.setZls(zls_ptr);
     try rule_cache.resolveTransitiveTakes();
 
     var problems: std.ArrayListUnmanaged(Problem) = .empty;

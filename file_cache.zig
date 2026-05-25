@@ -190,25 +190,24 @@ pub const FileCache = struct {
         return gop.value_ptr;
     }
 
-    /// Return the param's resolved container name (e.g. "T" for any
-    /// of `T`, `*T`, `*const T`, `?*T`, `*lib.T`, `Generic(K, V)`).
-    /// Prefers ZLS (handles cross-module + generics) and falls back
-    /// to a token-walk that strips `*`/`?`/`const`/`[]` wrappers and
-    /// returns the LAST identifier in a dotted chain.
+    /// Return the param's ZLS-resolved container name (e.g. "T" for
+    /// `*T`, `*const T`, `?*T`, `*lib.T`).  Returns null when ZLS is
+    /// not available or cannot resolve the type — callers handle null
+    /// conservatively (skip the typed lookup) rather than falling back
+    /// to a syntactic approximation that could return the wrong name
+    /// for aliases, comptime types, or cross-module re-exports.
     fn paramContainerName(
         self: *FileCache,
         proto: Ast.full.FnProto,
         idx: u32,
     ) !?[]const u8 {
+        const z = self.zls orelse return null;
         var i: u32 = 0;
         var it = proto.iterate(self.tree);
         while (it.next()) |p| : (i += 1) {
             if (i != idx) continue;
             const type_node = p.type_expr orelse return null;
-            if (self.zls) |z| {
-                if (z.typeNameOfNode(type_node) catch null) |name| return name;
-            }
-            return paramContainerNameFallback(self.tree, type_node);
+            return z.typeNameOfNode(type_node) catch null;
         }
         return null;
     }
@@ -937,30 +936,6 @@ pub const FileCache = struct {
 /// resolvable in the local model (cross-file intermediates that
 /// aren't loaded yet — uncommon, and the conservative answer is to
 /// drop the entry).
-/// Token-walk fallback for `paramContainerName` when ZLS is unavailable.
-/// Strips `*`/`?`/`const`/`[`/`]` wrappers, then returns the LAST
-/// identifier in a dotted chain — `*lib.T` → "T", `?[]u8` → null.
-fn paramContainerNameFallback(tree: *const Ast, type_node: Ast.Node.Index) ?[]const u8 {
-    const tags = tree.tokens.items(.tag);
-    const last = tree.lastToken(type_node);
-    var t = tree.firstToken(type_node);
-    while (t <= last) : (t += 1) {
-        switch (tags[t]) {
-            .asterisk, .question_mark, .keyword_const, .keyword_var => continue,
-            .l_bracket, .r_bracket => return null,
-            .identifier => break,
-            else => return null,
-        }
-    }
-    if (t > last or tags[t] != .identifier) return null;
-    // Walk the dotted chain; return the last identifier (so `*lib.T` → "T").
-    var last_id = tree.tokenSlice(t);
-    while (t + 2 <= last and tags[t + 1] == .period and tags[t + 2] == .identifier) : (t += 2) {
-        last_id = tree.tokenSlice(t + 2);
-    }
-    return last_id;
-}
-
 fn walkFieldPath(
     model: *const fmodel.FileModel,
     outer_type: []const u8,
