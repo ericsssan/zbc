@@ -1894,8 +1894,12 @@ const Builder = struct {
             const case_block = try self.newBlock();
             try self.addEdge(cur.*, case_block);
             // `.tag => |val| ...` capture binds inside this case only.
+            // Emit reset_capture into case_block so that stale field
+            // state from a prior iteration (when the switch is inside
+            // a loop) doesn't cause spurious double-free / UAF.
+            // Mirrors the reset_into=body approach used by while/for.
             if (case_full.payload_token) |pt| {
-                try self.registerCaptures(pt);
+                try self.registerCapturesWith(pt, case_block);
                 if (sw_union_ti) |un_ti| self.markPointerCapturesFromUnion(pt, un_ti, case_full.ast.values);
             }
             var case_cur = case_block;

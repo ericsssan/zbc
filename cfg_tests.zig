@@ -985,6 +985,43 @@ test "switch case payload `.tag => |val|` registers capture" {
     try std.testing.expect(copy_of_count >= 2);
 }
 
+test "switch case payload emits reset_capture to suppress back-edge double-free FPs" {
+    // When a switch is inside a while loop, stale field state from a
+    // prior iteration would fire spurious double-free/UAF on loop-local
+    // resources freed via defer inside the arm.  The fix: emit a
+    // reset_capture stmt at the start of each case block, just like
+    // while/for loops do for their payload captures.
+    const gpa = std.testing.allocator;
+    var result = try parseAndLower(gpa,
+        \\const Msg = union(enum) { item: struct { ptr: *u8 } };
+        \\pub fn drain(alloc: std.mem.Allocator) !void {
+        \\    while (nextMsg()) |msg| {
+        \\        switch (msg) {
+        \\            .item => |it| {
+        \\                defer alloc.destroy(it.ptr);
+        \\                try process(it.ptr);
+        \\            },
+        \\        }
+        \\    }
+        \\}
+        \\fn nextMsg() ?Msg { return null; }
+        \\fn process(_: *u8) !void {}
+        \\
+    );
+    defer result.deinit(gpa);
+    const cfg = result.cfg.?;
+
+    var reset_count: u32 = 0;
+    for (cfg.blocks) |b| {
+        for (b.stmts) |s| {
+            if (s.kind == .reset_capture) reset_count += 1;
+        }
+    }
+    // Expect at least one reset_capture — one for the switch arm payload `it`,
+    // plus one from the while-loop payload `msg`.
+    try std.testing.expect(reset_count >= 2);
+}
+
 test "catch payload `catch |err|` registers capture (stmt position)" {
     const gpa = std.testing.allocator;
     var result = try parseAndLower(gpa,
