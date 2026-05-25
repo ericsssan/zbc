@@ -11,7 +11,28 @@ Concurrent dispatch is identified by:
   `spawn` / `dispatch`.
 - Receiver chain containing `queue`, `pool`, `thread`,
   `cross_thread`, `concurrent`, `dispatcher`, `scheduler`,
-  `work_pool` / `workPool` / `thread_pool` / `threadPool`.
+  `work_pool` / `workPool` / `thread_pool` / `threadPool`, OR
+  any compound identifier containing `"queue"` (e.g. `task_queue`,
+  `patch_task_queue`, `async_network_task_queue`) or ending in
+  `_pool` / `Pool`.
+
+A **deferred use** that appears before the publish in source text is
+also flagged — `defer this.X` fires at function exit, which is AFTER
+the publish, making it an equivalent hazard:
+
+```zig
+// BUGGY — the deferred wake fires AFTER push:
+pub fn notify(this: *Task) void {
+    defer this.manager.wake();                     // ← fires at fn exit
+    this.manager.patch_task_queue.push(this);      // ← publish
+}
+// Fix: hoist manager before publish, use local in defer
+pub fn notify(this: *Task) void {
+    const mgr = this.manager;
+    this.manager.patch_task_queue.push(this);
+    mgr.wake();
+}
+```
 
 ## Why this matters
 
@@ -54,12 +75,16 @@ vm.eventLoop().enqueueTaskConcurrent(jsc.ConcurrentTask.createFrom(transpiler_st
 - Use-after detection is scope-bounded — past the enclosing `}`
   the rule doesn't continue.  No false positives from same-name
   identifiers in sibling scopes.
+- Deferred-use check scans backward from the publish for `defer
+  this.X` / `defer { this.X; }` patterns that fire after function
+  exit — i.e., after the publish.
 
 Limitations (deliberate):
 - Doesn't track aliased publishes (`const x = this; queue.push(x);
   this.field;` — `this` aliased through `x`).
 - Doesn't distinguish "publish that may not actually run on another
   thread" (e.g., synchronous deferred callbacks).
-- Concurrency-receiver allowlist is narrow; project-specific
-  channel/queue names won't match unless they contain one of the
-  recognized tokens.
+- Compound queue/pool name matching uses substring search, so
+  a pathological `notARealQueue.push(this)` might match; the
+  requirement for an explicit publish method (`push`/`send`/etc.)
+  still applies and keeps FPs low in practice.

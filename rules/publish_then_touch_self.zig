@@ -85,11 +85,67 @@ fn checkBody(
         // concurrent dispatch.
         const chain_start = walkBackChain(tags, method_tok);
         if (!isConcurrentDispatch(tree, method, chain_start, method_tok)) continue;
+        // Check for a `defer arg.X` statement appearing BEFORE the publish
+        // in token order — it fires AFTER publish at function exit, creating
+        // the same use-after-publish hazard.
+        //   pub fn notify(this: *T) void {
+        //       defer this.manager.wake();           // ← fires AFTER push
+        //       this.queue.push(this);               // ← publish
+        //   }
+        if (findDeferredArgUseBefore(tree, tags, first, m.start, arg)) |tok| {
+            try report(gpa, problems, tree, tok, method, arg);
+            continue;
+        }
         // Find next use of `arg` (this/self) in the same scope.
         const sc = findStmtSemicolon(tags, m.end + 1, last) orelse continue;
         const use_tok = scope.findIdentUseInEnclosingScope(tree, sc + 1, last, arg) orelse continue;
         try report(gpa, problems, tree, use_tok, method, arg);
     }
+}
+
+/// Scan backward from `before` (the publish call start) looking for a
+/// `defer <arg>.<field>` statement.  A registered defer fires at function
+/// exit — i.e., AFTER the publish — so it's a use-after-publish hazard
+/// even though it appears earlier in the source text.
+fn findDeferredArgUseBefore(
+    tree: *const Ast,
+    tags: []const std.zig.Token.Tag,
+    from: Ast.TokenIndex,
+    before: Ast.TokenIndex,
+    arg: []const u8,
+) ?Ast.TokenIndex {
+    if (before == 0 or from >= before) return null;
+    var t: Ast.TokenIndex = from;
+    while (t + 2 < before) : (t += 1) {
+        if (tags[t] != .keyword_defer) continue;
+        // Inline form: `defer <arg>.<field>...`
+        if (t + 2 < before and
+            tags[t + 1] == .identifier and
+            std.mem.eql(u8, tree.tokenSlice(t + 1), arg) and
+            tags[t + 2] == .period)
+        {
+            return t + 1;
+        }
+        // Block form: `defer { ... <arg>. ... }`
+        if (t + 1 < before and tags[t + 1] == .l_brace) {
+            var u: Ast.TokenIndex = t + 2;
+            var depth: u32 = 1;
+            while (u < before and depth > 0) : (u += 1) {
+                switch (tags[u]) {
+                    .l_brace => depth += 1,
+                    .r_brace => depth -= 1,
+                    .identifier => if (depth == 1 and
+                        std.mem.eql(u8, tree.tokenSlice(u), arg) and
+                        u + 1 < before and tags[u + 1] == .period)
+                    {
+                        return u;
+                    },
+                    else => {},
+                }
+            }
+        }
+    }
+    return null;
 }
 
 /// Walk backward from the `.method` to find the chain's start token.
@@ -182,7 +238,8 @@ fn isExactConcurrentMethod(name: []const u8) bool {
 }
 
 fn isConcurrencyChainToken(name: []const u8) bool {
-    return std.mem.eql(u8, name, "queue") or
+    // Exact short keywords
+    if (std.mem.eql(u8, name, "queue") or
         std.mem.eql(u8, name, "pool") or
         std.mem.eql(u8, name, "thread") or
         std.mem.eql(u8, name, "cross_thread") or
@@ -192,7 +249,15 @@ fn isConcurrencyChainToken(name: []const u8) bool {
         std.mem.eql(u8, name, "work_pool") or
         std.mem.eql(u8, name, "workPool") or
         std.mem.eql(u8, name, "thread_pool") or
-        std.mem.eql(u8, name, "threadPool");
+        std.mem.eql(u8, name, "threadPool")) return true;
+    // Compound names: `*_queue` / `*Queue` (task_queue, patch_task_queue,
+    // async_network_task_queue, …) are clearly concurrent queues even though
+    // they don't match the short exact form above.
+    if (std.mem.indexOf(u8, name, "queue") != null) return true;
+    // Compound pool names: `*_pool` / `*Pool`
+    if (std.mem.endsWith(u8, name, "_pool") or
+        std.mem.endsWith(u8, name, "Pool")) return true;
+    return false;
 }
 
 fn report(
@@ -307,4 +372,91 @@ test "publish-then-touch-self: thread_pool.dispatch(this) caught" {
     );
     defer freeProblems(gpa, &problems);
     try std.testing.expectEqual(@as(usize, 1), problems.items.len);
+}
+
+test "publish-then-touch-self: compound queue name (task_queue) caught" {
+    const gpa = std.testing.allocator;
+    var problems = try runOn(gpa,
+        // Mirrors Installer.zig: push(this) then this.installer.manager.wake()
+        \\const Self = struct {
+        \\    installer: anytype,
+        \\    pub fn complete(this: *Self) void {
+        \\        this.installer.task_queue.push(this);
+        \\        this.installer.manager.wake();
+        \\    }
+        \\};
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 1), problems.items.len);
+    try std.testing.expectEqualStrings("publish-then-touch-self", problems.items[0].rule_id);
+}
+
+test "publish-then-touch-self: patch_task_queue (compound name) caught" {
+    const gpa = std.testing.allocator;
+    var problems = try runOn(gpa,
+        // Mirrors patch_install.zig: push on compound queue name
+        \\const Self = struct {
+        \\    manager: anytype,
+        \\    pub fn complete(this: *Self) void {
+        \\        this.manager.patch_task_queue.push(this);
+        \\        this.manager.wake();
+        \\    }
+        \\};
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 1), problems.items.len);
+}
+
+test "publish-then-touch-self: defer this.X before push fires after (inline)" {
+    const gpa = std.testing.allocator;
+    var problems = try runOn(gpa,
+        // Mirrors patch_install.zig notify(): defer fires AFTER push at fn exit
+        \\const Self = struct {
+        \\    manager: anytype,
+        \\    pub fn notify(this: *Self) void {
+        \\        defer this.manager.wake();
+        \\        this.manager.patch_task_queue.push(this);
+        \\    }
+        \\};
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 1), problems.items.len);
+    try std.testing.expectEqualStrings("publish-then-touch-self", problems.items[0].rule_id);
+}
+
+test "publish-then-touch-self: defer this.X before push fires after (block)" {
+    const gpa = std.testing.allocator;
+    var problems = try runOn(gpa,
+        // Block-form defer — same hazard
+        \\const Self = struct {
+        \\    manager: anytype,
+        \\    pub fn notify(this: *Self) void {
+        \\        defer { this.manager.wake(); }
+        \\        this.manager.task_queue.push(this);
+        \\    }
+        \\};
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 1), problems.items.len);
+}
+
+test "publish-then-touch-self: non-self defer before push doesn't fire" {
+    const gpa = std.testing.allocator;
+    var problems = try runOn(gpa,
+        // `defer other.cleanup()` — not `this`/`self`, safe
+        \\const Self = struct {
+        \\    manager: anytype,
+        \\    pub fn notify(this: *Self, other: anytype) void {
+        \\        defer other.cleanup();
+        \\        this.manager.task_queue.push(this);
+        \\    }
+        \\};
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
 }
