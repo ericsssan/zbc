@@ -3779,6 +3779,32 @@ const Builder = struct {
         // like `alloc.free(backing_memory, slice)` (custom allocators) pass the
         // backing store as arg[0] — treating it as the freed thing is wrong.
         if (call_full.ast.params.len != 1) return null;
+        // The callee must be a field-access call.  Guard against `obj.destroy(alloc)`
+        // (receiver-freed pattern) falling through here when destroyReceiverFreed
+        // can't resolve `obj` — without this check we'd wrongly mark the allocator
+        // arg as the freed thing.  Same allocator-name / type_name logic as heapFreedField.
+        const callee = call_full.ast.fn_expr;
+        if (tree.nodeTag(callee) != .field_access) return null;
+        const recv = tree.nodeData(callee).node_and_token[0];
+        if (!self.exprLooksLikeAllocator(recv)) {
+            const should_suppress: bool = if (tree.nodeTag(recv) == .identifier) blk: {
+                const recv_name = tree.tokenSlice(tree.nodeMainToken(recv));
+                if (self.name_to_local.get(recv_name)) |lid| {
+                    const tn = self.locals.items[@intFromEnum(lid)].type_name;
+                    if (tn) |t| {
+                        break :blk !std.mem.endsWith(u8, t, "Allocator");
+                    }
+                    // Inferred type, non-allocator name: almost certainly not an
+                    // allocator call — suppress to avoid false positives.
+                    break :blk true;
+                }
+                // Receiver identifier not in scope (e.g. an if-capture that
+                // destroyReceiverFreed couldn't resolve): don't treat the arg
+                // as the freed value — the receiver is more likely the freed thing.
+                break :blk true;
+            } else false;
+            if (should_suppress) return null;
+        }
         const arg = call_full.ast.params[0];
         if (tree.nodeTag(arg) != .identifier) return null;
         const name = tree.tokenSlice(tree.nodeMainToken(arg));

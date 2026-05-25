@@ -384,6 +384,15 @@ fn returnIsAllocCall(
     return false;
 }
 
+fn isAllocatorName(name: []const u8) bool {
+    if (std.mem.eql(u8, name, "allocator")) return true;
+    if (std.mem.eql(u8, name, "alloc")) return true;
+    if (std.mem.eql(u8, name, "gpa")) return true;
+    if (std.mem.endsWith(u8, name, "_allocator")) return true;
+    if (std.mem.endsWith(u8, name, "_gpa")) return true;
+    return false;
+}
+
 fn paramIndex(tree: *const Ast, proto: Ast.full.FnProto, name: []const u8) ?u32 {
     var idx: u32 = 0;
     var it = proto.iterate(tree);
@@ -440,6 +449,17 @@ pub fn inferDirectTakes(
             // arg — the param itself isn't being freed.
             if (t + 4 <= last and tags[t + 4] == .period) continue;
             const arg = tree.tokenSlice(t + 3);
+            // Guard: `obj.destroy(alloc)` receiver-freed pattern.
+            // When the token just before `.` is a plain (non-allocator-
+            // named) identifier AND the arg IS allocator-named, the arg
+            // is the allocator being passed to the destructor — not the
+            // value being freed.  Marking it as "taken" here would
+            // produce a false takes_ownership_of for any caller that
+            // passes its own allocator param through.
+            if (t > first and tags[t - 1] == .identifier) {
+                const recv = tree.tokenSlice(t - 1);
+                if (!isAllocatorName(recv) and isAllocatorName(arg)) continue;
+            }
             if (paramIndex(tree, proto, arg)) |pi| return pi;
         }
     }
@@ -945,6 +965,21 @@ test "inferDirectTakes: gpa.free(<param>) returns param index" {
     var buf: [1]Ast.Node.Index = undefined;
     const pb = firstFnProtoAndBody(&tree, &buf);
     try testing.expectEqual(@as(?u32, 1), inferDirectTakes(&tree, pb[0], pb[1]));
+}
+
+test "inferDirectTakes: obj.destroy(alloc) receiver-freed — does NOT mark alloc as taken" {
+    // `loading.destroy(alloc)` is a receiver-freed pattern: `loading` is what
+    // gets destroyed, `alloc` is the allocator passed to the destructor.
+    // inferDirectTakes must NOT infer takes_ownership_of = alloc_index here.
+    var tree = try parse(
+        \\fn deinit(self: *ImageStorage, alloc: std.mem.Allocator) void {
+        \\    if (self.loading) |loading| loading.destroy(alloc);
+        \\}
+    );
+    defer tree.deinit(testing.allocator);
+    var buf: [1]Ast.Node.Index = undefined;
+    const pb = firstFnProtoAndBody(&tree, &buf);
+    try testing.expectEqual(@as(?u32, null), inferDirectTakes(&tree, pb[0], pb[1]));
 }
 
 test "inferDirectTakes: no .free/.destroy returns null" {
