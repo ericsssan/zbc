@@ -3775,7 +3775,10 @@ const Builder = struct {
         const tree = self.tree;
         var buf: [1]Ast.Node.Index = undefined;
         const call_full = tree.fullCall(&buf, call_node) orelse return null;
-        if (call_full.ast.params.len == 0) return null;
+        // Standard allocator.free(ptr) has exactly one argument.  Two-arg forms
+        // like `alloc.free(backing_memory, slice)` (custom allocators) pass the
+        // backing store as arg[0] — treating it as the freed thing is wrong.
+        if (call_full.ast.params.len != 1) return null;
         const arg = call_full.ast.params[0];
         if (tree.nodeTag(arg) != .identifier) return null;
         const name = tree.tokenSlice(tree.nodeMainToken(arg));
@@ -3787,7 +3790,38 @@ const Builder = struct {
         const tree = self.tree;
         var buf: [1]Ast.Node.Index = undefined;
         const call_full = tree.fullCall(&buf, call_node) orelse return null;
-        if (call_full.ast.params.len == 0) return null;
+        // Standard allocator.free(ptr) has exactly one argument.  Two-arg forms
+        // like `alloc.free(backing_memory, slice)` (custom allocators) pass the
+        // backing store as arg[0] — treating it as the freed thing is wrong.
+        if (call_full.ast.params.len != 1) return null;
+        // The callee must be a field access (receiver.method).  Only treat
+        // arg as the freed field when the receiver looks like an allocator.
+        // Check by name first (fast); then by type_name ("Allocator" suffix) for
+        // locals with known types (e.g. `g: std.mem.Allocator` where name is `g`).
+        // When neither matches AND type is known → likely `obj.free(backing_store)`,
+        // not an allocator free; suppress.  Unknown type → conservative, allow.
+        const callee = call_full.ast.fn_expr;
+        if (tree.nodeTag(callee) != .field_access) return null;
+        const recv = tree.nodeData(callee).node_and_token[0];
+        if (!self.exprLooksLikeAllocator(recv)) {
+            const should_suppress: bool = if (tree.nodeTag(recv) == .identifier) blk: {
+                const recv_name = tree.tokenSlice(tree.nodeMainToken(recv));
+                if (self.name_to_local.get(recv_name)) |lid| {
+                    const tn = self.locals.items[@intFromEnum(lid)].type_name;
+                    if (tn) |t| {
+                        // Known type: suppress unless it ends with "Allocator".
+                        break :blk !std.mem.endsWith(u8, t, "Allocator");
+                    }
+                    // Unknown type AND non-allocator name: the pattern
+                    // `obj.free(field)` where obj is an inferred-type
+                    // value is more likely `obj` is freed (custom .free
+                    // method) than an allocator — suppress to avoid FP.
+                    break :blk true;
+                }
+                break :blk false; // local not found — conservative, allow
+            } else false;
+            if (should_suppress) return null;
+        }
         const arg = call_full.ast.params[0];
         return self.fieldLhsFor(arg);
     }
