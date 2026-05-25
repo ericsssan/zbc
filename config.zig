@@ -242,6 +242,14 @@ pub const Invariant = enum {
     /// which fires on `const X = list.items;` + later mutate +
     /// later use of X; this rule fires on the loop SHAPE directly.
     iterator_invalidation_mutation,
+    /// `Thread.spawn(.{}, fn, .{ &<local> })` /
+    /// `<pool>.spawn(fn, .{ &<local> })` — passing the address of
+    /// a function-LOCAL into a spawned thread.  The thread out-
+    /// lives the spawning fn's frame, so the local pointer dangles
+    /// once the fn returns.  Skips `&<param>` (caller-supplied
+    /// pointer, not a stack-frame leak from this frame) and
+    /// `&<heap-local>` (when the local was heap-allocated).
+    thread_spawn_local_pointer,
     /// `const|var <X> = try <dir>.<opener>(...);` binds an OS file
     /// handle; `<X>.close();` invalidates it; any subsequent use of
     /// `<X>` (method call or field access) reads/writes through a
@@ -411,7 +419,7 @@ pub const Invariant = enum {
     borrowed_slice_into_stack_buffer_returned,
 };
 
-pub const all_invariants: [46]Invariant = .{
+pub const all_invariants: [47]Invariant = .{
     .arena_escape,
     .stack_escape,
     .use_undefined,
@@ -458,6 +466,7 @@ pub const all_invariants: [46]Invariant = .{
     .deinit_order_violates_construction_dep,
     .borrowed_slice_into_stack_buffer_returned,
     .iterator_invalidation_mutation,
+    .thread_spawn_local_pointer,
 };
 
 pub const Default: Config = .{};
