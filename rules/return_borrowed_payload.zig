@@ -164,23 +164,7 @@ fn resolveLocalTypeAsUnion(
     return null;
 }
 
-fn enclosingFnDecl(tree: *const Ast, tok: Ast.TokenIndex) ?Ast.Node.Index {
-    var idx: u32 = 1;
-    var best: ?Ast.Node.Index = null;
-    var best_first: Ast.TokenIndex = 0;
-    while (idx < tree.nodes.len) : (idx += 1) {
-        const node: Ast.Node.Index = @enumFromInt(idx);
-        if (tree.nodeTag(node) != .fn_decl) continue;
-        const f = tree.firstToken(node);
-        const l = tree.lastToken(node);
-        if (tok < f or tok > l) continue;
-        if (best == null or f > best_first) {
-            best = node;
-            best_first = f;
-        }
-    }
-    return best;
-}
+const enclosingFnDecl = lexer.enclosingFnDecl;
 
 fn baseTypeNameOfNode(tree: *const Ast, type_node: Ast.Node.Index) ?[]const u8 {
     const tags = tree.tokens.items(.tag);

@@ -367,6 +367,28 @@ pub fn forEachFnCached(
     }
 }
 
+/// Find the innermost `fn_decl` node that contains `tok`.
+/// Returns null when no fn_decl covers the token (e.g. top-level code).
+/// When nested fns are present, returns the one with the largest
+/// firstToken (the deepest match).
+pub fn enclosingFnDecl(tree: *const Ast, tok: TokenIndex) ?Ast.Node.Index {
+    var idx: u32 = 1;
+    var best: ?Ast.Node.Index = null;
+    var best_first: TokenIndex = 0;
+    while (idx < tree.nodes.len) : (idx += 1) {
+        const node: Ast.Node.Index = @enumFromInt(idx);
+        if (tree.nodeTag(node) != .fn_decl) continue;
+        const f = tree.firstToken(node);
+        const l = tree.lastToken(node);
+        if (tok < f or tok > l) continue;
+        if (best == null or f > best_first) {
+            best = node;
+            best_first = f;
+        }
+    }
+    return best;
+}
+
 // ── Tests ──────────────────────────────────────────────────
 
 test "matchBrace pairs simple braces" {

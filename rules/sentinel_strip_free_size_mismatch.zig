@@ -136,25 +136,7 @@ fn xPtrFieldIsNonSentinel(
 
 /// Find the fn_decl AST node enclosing a given token by walking
 /// the file model's fn list / type methods.
-fn enclosingFnDecl(tree: *const Ast, tok: Ast.TokenIndex) ?Ast.Node.Index {
-    var idx: u32 = 1;
-    var best: ?Ast.Node.Index = null;
-    var best_first: Ast.TokenIndex = 0;
-    while (idx < tree.nodes.len) : (idx += 1) {
-        const node: Ast.Node.Index = @enumFromInt(idx);
-        if (tree.nodeTag(node) != .fn_decl) continue;
-        const f = tree.firstToken(node);
-        const l = tree.lastToken(node);
-        if (tok < f or tok > l) continue;
-        // Prefer the INNERMOST (largest firstToken) match — handles
-        // nested fns.
-        if (best == null or f > best_first) {
-            best = node;
-            best_first = f;
-        }
-    }
-    return best;
-}
+const enclosingFnDecl = lexer.enclosingFnDecl;
 
 /// Return the type identifier of the local named `name` inside
 /// `fn_decl`.  Resolves method receivers (`this`/`self` typed as
