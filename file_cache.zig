@@ -459,12 +459,13 @@ pub const FileCache = struct {
         if (k > last or tags[k] != .l_paren) return null;
 
         const method_name = tree.tokenSlice(method_tok);
-        var target_idx = try self.lookupBorrowedFromSameFile(method_name);
-        // Typed same-file lookup: if param has a known local type,
-        // search method on that type.  Catches methods that aren't
-        // top-level fns (lookupBorrowedFromSameFile only sees those).
+        // Typed lookup first (precise — ZLS resolves the param's type).
+        // Bare-name fallback only when the param type is unresolvable:
+        // that path finds top-level fns with the same name, which can
+        // fire on the wrong type if names collide.
+        var target_idx = try self.lookupBorrowedFromParamTypeSameFile(proto, param_idx, method_name);
         if (target_idx == null) {
-            target_idx = try self.lookupBorrowedFromParamTypeSameFile(proto, param_idx, method_name);
+            target_idx = try self.lookupBorrowedFromSameFile(method_name);
         }
         if ((target_idx orelse return null) == 0) return param_idx;
         return null;
@@ -635,10 +636,13 @@ pub const FileCache = struct {
             const method = tree.tokenSlice(t + 2);
 
             // Look up callee summary on PARAM's declared type — that's
-            // the receiver of `<param>.<method>(`.  Tries the
-            // ZLS-resolved container name first, then falls back to
-            // the outer fn's containing type and bare-name lookup.
-            // Same-file paths first; cross-file fallback last.
+            // the receiver of `<param>.<method>(`.  Typed paths only:
+            // bare-name lookup is omitted because it can match the same
+            // method name on a completely different type and propagate
+            // ownership where none exists.  ZLS-resolved type first
+            // (precise), then the enclosing struct's type (provably
+            // correct for self-receiver), then cross-file variants of
+            // both.
             const callee_takes: ?u32 = blk: {
                 if (try self.paramContainerName(proto, pi)) |type_name| {
                     if (try self.summaryByMethod(type_name, method)) |s| {
@@ -649,9 +653,6 @@ pub const FileCache = struct {
                     if (try self.summaryByMethod(rt, method)) |s| {
                         break :blk s.takes_ownership_of;
                     }
-                }
-                if (try self.summaryByName(method)) |s| {
-                    break :blk s.takes_ownership_of;
                 }
                 // Cross-file fallback: callee lives in an @import'd file.
                 // Direct-takes inference only — no transitive resolution
