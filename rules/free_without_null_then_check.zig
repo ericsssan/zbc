@@ -41,6 +41,7 @@ const config_mod = @import("../config.zig");
 const file_cache_mod = @import("../file_cache.zig");
 
 const lexer = @import("../lexer.zig");
+const receiver = @import("../receiver.zig");
 const testing = @import("../testing.zig");
 const skipDeferStmt = lexer.skipDeferStmt;
 const matchBrace = lexer.matchBrace;
@@ -86,20 +87,7 @@ pub fn check(
 /// substring patterns rather than an exact list to handle
 /// project-specific allocator names like `string_alloc`,
 /// `grapheme_alloc`, `default_allocator`, etc.
-fn isAllocatorishName(name: []const u8) bool {
-    if (name.len == 0) return false;
-    if (std.mem.eql(u8, name, "gpa")) return true;
-    if (std.mem.eql(u8, name, "alloc")) return true;
-    if (std.mem.eql(u8, name, "allocator")) return true;
-    if (std.mem.eql(u8, name, "a")) return true;
-    // Suffix `_alloc` / `_allocator` (common in codebases with
-    // multiple typed allocators).
-    if (std.mem.endsWith(u8, name, "_alloc")) return true;
-    if (std.mem.endsWith(u8, name, "_allocator")) return true;
-    if (std.mem.endsWith(u8, name, "Alloc")) return true;
-    if (std.mem.endsWith(u8, name, "Allocator")) return true;
-    return false;
-}
+const isAllocatorishName = receiver.isAllocatorishName;
 
 fn isDestructorName(name: []const u8) bool {
     // Prefix match: catches `deinit_slice`, `deinitInternal`,

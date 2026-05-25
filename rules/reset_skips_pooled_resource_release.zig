@@ -29,6 +29,7 @@ const config_mod = @import("../config.zig");
 const file_cache_mod = @import("../file_cache.zig");
 
 const lexer = @import("../lexer.zig");
+const receiver = @import("../receiver.zig");
 const testing = @import("../testing.zig");
 const matchBrace = lexer.matchBrace;
 
@@ -261,17 +262,7 @@ fn collectCleanups(
     }
 }
 
-fn isAllocatorishName(name: []const u8) bool {
-    if (std.mem.eql(u8, name, "gpa")) return true;
-    if (std.mem.eql(u8, name, "alloc")) return true;
-    if (std.mem.eql(u8, name, "allocator")) return true;
-    if (std.mem.eql(u8, name, "a")) return true;
-    if (std.mem.endsWith(u8, name, "_alloc")) return true;
-    if (std.mem.endsWith(u8, name, "_allocator")) return true;
-    if (std.mem.endsWith(u8, name, "Alloc")) return true;
-    if (std.mem.endsWith(u8, name, "Allocator")) return true;
-    return false;
-}
+const isAllocatorishName = receiver.isAllocatorishName;
 
 fn isCleanupMethodName(name: []const u8) bool {
     return std.mem.eql(u8, name, "release") or
