@@ -467,9 +467,6 @@ pub const FileCache = struct {
         if (target_idx == null) {
             target_idx = try self.lookupBorrowedFromParamTypeSameFile(proto, param_idx, method_name);
         }
-        if (target_idx == null) {
-            target_idx = try self.lookupBorrowedFromParamType(proto, param_idx, method_name);
-        }
         if ((target_idx orelse return null) == 0) return param_idx;
         return null;
     }
@@ -542,22 +539,6 @@ pub const FileCache = struct {
             .borrowed_from => |idx| idx,
             else => null,
         };
-    }
-
-    /// Cross-file param-type / namespace lookup retired with
-    /// remote_resolver.  Always null — same-file lookups in the
-    /// caller short-circuit before reaching here.
-    fn lookupBorrowedFromParamType(
-        self: *FileCache,
-        proto: Ast.full.FnProto,
-        param_idx: u32,
-        method_name: []const u8,
-    ) !?u32 {
-        _ = self;
-        _ = proto;
-        _ = param_idx;
-        _ = method_name;
-        return null;
     }
 
     /// Multi-return-stmt variant: walk every `return EXPR;` whose

@@ -51,7 +51,7 @@ pub fn lookupMethod(name: []const u8) ?FnSummary {
         "free",
         "destroy",
     })) {
-        return .{ .takes_ownership_of = 0, .deallocates = true };
+        return .{ .takes_ownership_of = 0 };
     }
 
     // Cleanup family — receiver consumes itself (self).
@@ -66,7 +66,7 @@ pub fn lookupMethod(name: []const u8) ?FnSummary {
         "dispose",
     })) {
         // Receiver is the implicit arg 0 for method-call style.
-        return .{ .takes_ownership_of = 0, .deallocates = true };
+        return .{ .takes_ownership_of = 0 };
     }
 
     // Acquire family — increments a refcount.  Doesn't return owned;
@@ -105,7 +105,6 @@ test "vocabulary: alloc family returns heap" {
 test "vocabulary: free family takes ownership of arg 0" {
     const s = lookupMethod("free").?;
     try testing.expectEqual(@as(?u32, 0), s.takes_ownership_of);
-    try testing.expect(s.deallocates);
 }
 
 test "vocabulary: cleanup methods take ownership of receiver" {

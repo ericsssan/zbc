@@ -10,7 +10,6 @@
 //!   takes_ownership_of     — "does the call invalidate one of its args?"
 //!   is_noreturn            — "does the call terminate the basic block?"
 //!   allocates              — "does the body call into an allocator?"
-//!   deallocates            — "does the body call .free / .destroy / etc.?"
 //!
 //! Anything inference can't reach is `.unknown` / null / false.
 //! Consumers MUST treat `.unknown` as "assume nothing" — same as
@@ -68,9 +67,6 @@ pub const FnSummary = struct {
     /// Body invokes an alloc-class call somewhere.  Coarse — doesn't
     /// distinguish allocator identities.
     allocates: bool = false,
-    /// Body invokes a free / destroy / cleanup call.  Coarse — same
-    /// caveat as `allocates`.
-    deallocates: bool = false,
     /// `<param>.<field>.<destroy_method>()` chains in the body — one
     /// entry per chain.  Lets call sites emit a `.field_heap_free`
     /// per chain.  Slice is owned by the FnSummaryCache arena.
@@ -134,7 +130,7 @@ pub fn inferFromBody(
         }
     }
 
-    // ── Body-wide effects (allocates / deallocates) ────────────
+    // ── Body-wide effects (allocates) ──────────────────────────
     // Scan for `.<method>(` shapes where method is alloc / free / etc.
     // Skips nested fns so a helper-fn-decl inside the body doesn't
     // leak its own classification upward.
@@ -150,7 +146,6 @@ pub fn inferFromBody(
         const method = tree.tokenSlice(t + 1);
         if (vocabulary.lookupMethod(method)) |vs| {
             if (vs.allocates) out.allocates = true;
-            if (vs.deallocates) out.deallocates = true;
         }
     }
 
@@ -850,17 +845,6 @@ test "infer: body with .alloc() sets allocates" {
     try testing.expect(s.returns == .heap);
 }
 
-test "infer: body with .free() sets deallocates" {
-    var tree = try parse(
-        \\fn f(gpa: std.mem.Allocator, p: []u8) void {
-        \\    gpa.free(p);
-        \\}
-    );
-    defer tree.deinit(testing.allocator);
-    var buf: [1]Ast.Node.Index = undefined;
-    const s = inferFirstFn(&tree, &buf);
-    try testing.expect(s.deallocates);
-}
 
 test "infer: return self.x classifies as borrowed_from(self)" {
     var tree = try parse(
