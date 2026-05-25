@@ -61,13 +61,14 @@ pub fn check(
     problems: *std.ArrayListUnmanaged(Problem),
 ) !void {
     if (!config_mod.isEnabled(config, .publish_then_touch_self)) return;
-    _ = cache;
-    try lexer.forEachFnBody(gpa, tree, problems, checkBody);
+    try lexer.forEachFnCached(gpa, tree, cache, problems, checkBody);
 }
 
 fn checkBody(
     gpa: std.mem.Allocator,
     tree: *const Ast,
+    cache: *file_cache_mod.FileCache,
+    proto: Ast.full.FnProto,
     body: Ast.Node.Index,
     problems: *std.ArrayListUnmanaged(Problem),
 ) !void {
@@ -85,6 +86,27 @@ fn checkBody(
         // concurrent dispatch.
         const chain_start = walkBackChain(tags, method_tok);
         if (!isConcurrentDispatch(tree, method, chain_start, method_tok)) continue;
+        // Type-inference suppression: if we can prove `this` is NOT
+        // individually heap-managed, the UAF hazard cannot materialise.
+        //
+        // Tier-1 (specific): resolve arg's param type → look for any
+        // method on that type with takes_ownership_of == 0.
+        //   false  → type known, no self-destructor → suppress
+        //   true   → type known, has self-destructor → keep
+        //   null   → type unknown (file-level struct, @fieldParentPtr
+        //             local, cross-file type) → fall to tier-2
+        //
+        // Tier-2 (file-level fallback): if NO function anywhere in this
+        // file self-destructs its first param, nothing in the file is
+        // individually heap-managed → suppress.
+        const type_inference_suppress = blk: {
+            if (try cache.receiverTypeHasSelfDestructor(proto, arg)) |has_destructor| {
+                break :blk !has_destructor;
+            }
+            // null → tier-2
+            break :blk !(try cache.fileHasDirectSelfDestructor());
+        };
+        if (type_inference_suppress) continue;
         // Check for a `defer arg.X` statement appearing BEFORE the publish
         // in token order — it fires AFTER publish at function exit, creating
         // the same use-after-publish hazard.
@@ -295,12 +317,14 @@ const freeProblems = testing.freeProblems;
 test "publish-then-touch-self: queue.push(this) then this.field fires" {
     const gpa = std.testing.allocator;
     var problems = try runOn(gpa,
+        \\const bun = struct { pub fn destroy(x: anytype) void { _ = x; } };
         \\const Self = struct {
         \\    vm: usize,
         \\    pub fn dispatch(this: *Self, store: anytype) void {
         \\        store.queue.push(this);
         \\        _ = this.vm;
         \\    }
+        \\    pub fn deinit(this: *Self) void { bun.destroy(this); }
         \\};
         \\
     );
@@ -312,12 +336,14 @@ test "publish-then-touch-self: queue.push(this) then this.field fires" {
 test "publish-then-touch-self: Concurrent-named method also caught" {
     const gpa = std.testing.allocator;
     var problems = try runOn(gpa,
+        \\const bun = struct { pub fn destroy(x: anytype) void { _ = x; } };
         \\const Self = struct {
         \\    x: u32,
         \\    pub fn work(self: *Self, loop: anytype) void {
         \\        loop.enqueueTaskConcurrent(self);
         \\        _ = self.x;
         \\    }
+        \\    pub fn deinit(self: *Self) void { bun.destroy(self); }
         \\};
         \\
     );
@@ -361,12 +387,14 @@ test "publish-then-touch-self: non-concurrent receiver/method doesn't fire" {
 test "publish-then-touch-self: thread_pool.dispatch(this) caught" {
     const gpa = std.testing.allocator;
     var problems = try runOn(gpa,
+        \\const bun = struct { pub fn destroy(x: anytype) void { _ = x; } };
         \\const Self = struct {
         \\    x: u32,
         \\    pub fn work(this: *Self, ctx: anytype) void {
         \\        ctx.thread_pool.dispatch(this);
         \\        _ = this.x;
         \\    }
+        \\    pub fn deinit(this: *Self) void { bun.destroy(this); }
         \\};
         \\
     );
@@ -377,13 +405,15 @@ test "publish-then-touch-self: thread_pool.dispatch(this) caught" {
 test "publish-then-touch-self: compound queue name (task_queue) caught" {
     const gpa = std.testing.allocator;
     var problems = try runOn(gpa,
-        // Mirrors Installer.zig: push(this) then this.installer.manager.wake()
+        // heap-managed Self with task_queue publish then access
+        \\const bun = struct { pub fn destroy(x: anytype) void { _ = x; } };
         \\const Self = struct {
         \\    installer: anytype,
         \\    pub fn complete(this: *Self) void {
         \\        this.installer.task_queue.push(this);
         \\        this.installer.manager.wake();
         \\    }
+        \\    pub fn deinit(this: *Self) void { bun.destroy(this); }
         \\};
         \\
     );
@@ -396,12 +426,14 @@ test "publish-then-touch-self: patch_task_queue (compound name) caught" {
     const gpa = std.testing.allocator;
     var problems = try runOn(gpa,
         // Mirrors patch_install.zig: push on compound queue name
+        \\const bun = struct { pub fn destroy(x: anytype) void { _ = x; } };
         \\const Self = struct {
         \\    manager: anytype,
         \\    pub fn complete(this: *Self) void {
         \\        this.manager.patch_task_queue.push(this);
         \\        this.manager.wake();
         \\    }
+        \\    pub fn deinit(this: *Self) void { bun.destroy(this); }
         \\};
         \\
     );
@@ -413,12 +445,14 @@ test "publish-then-touch-self: defer this.X before push fires after (inline)" {
     const gpa = std.testing.allocator;
     var problems = try runOn(gpa,
         // Mirrors patch_install.zig notify(): defer fires AFTER push at fn exit
+        \\const bun = struct { pub fn destroy(x: anytype) void { _ = x; } };
         \\const Self = struct {
         \\    manager: anytype,
         \\    pub fn notify(this: *Self) void {
         \\        defer this.manager.wake();
         \\        this.manager.patch_task_queue.push(this);
         \\    }
+        \\    pub fn deinit(this: *Self) void { bun.destroy(this); }
         \\};
         \\
     );
@@ -431,12 +465,14 @@ test "publish-then-touch-self: defer this.X before push fires after (block)" {
     const gpa = std.testing.allocator;
     var problems = try runOn(gpa,
         // Block-form defer — same hazard
+        \\const bun = struct { pub fn destroy(x: anytype) void { _ = x; } };
         \\const Self = struct {
         \\    manager: anytype,
         \\    pub fn notify(this: *Self) void {
         \\        defer { this.manager.wake(); }
         \\        this.manager.task_queue.push(this);
         \\    }
+        \\    pub fn deinit(this: *Self) void { bun.destroy(this); }
         \\};
         \\
     );
@@ -459,4 +495,45 @@ test "publish-then-touch-self: non-self defer before push doesn't fire" {
     );
     defer freeProblems(gpa, &problems);
     try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
+test "publish-then-touch-self: type with no self-destructor suppressed (Installer.Task FP)" {
+    const gpa = std.testing.allocator;
+    var problems = try runOn(gpa,
+        // Mirrors Installer.zig: Task lives in `tasks: []Task` (slice element,
+        // never bun.destroy'd).  No self-freeing method → suppress.
+        \\const Task = struct {
+        \\    installer: anytype,
+        \\    pub fn complete(this: *Task) void {
+        \\        this.installer.task_queue.push(this);
+        \\        this.installer.manager.wake();
+        \\    }
+        \\};
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
+test "publish-then-touch-self: type with bun.destroy(this) kept (PatchTask TP)" {
+    const gpa = std.testing.allocator;
+    var problems = try runOn(gpa,
+        // Mirrors patch_install.zig: PatchTask is bun.new'd and bun.destroy'd
+        // in deinit() — self-freeing destructor → keep the finding.
+        \\const bun = struct { pub fn destroy(x: anytype) void { _ = x; } };
+        \\const PatchTask = struct {
+        \\    manager: anytype,
+        \\    pub fn notify(this: *PatchTask) void {
+        \\        this.manager.patch_task_queue.push(this);
+        \\        this.manager.wake();
+        \\    }
+        \\    pub fn deinit(this: *PatchTask) void {
+        \\        bun.destroy(this);
+        \\    }
+        \\};
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 1), problems.items.len);
+    try std.testing.expectEqualStrings("publish-then-touch-self", problems.items[0].rule_id);
 }

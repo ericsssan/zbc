@@ -78,6 +78,17 @@ vm.eventLoop().enqueueTaskConcurrent(jsc.ConcurrentTask.createFrom(transpiler_st
 - Deferred-use check scans backward from the publish for `defer
   this.X` / `defer { this.X; }` patterns that fire after function
   exit — i.e., after the publish.
+- **Type-inference suppression** eliminates false positives on
+  slice-element and pool-managed objects.  Two-tier check:
+  - *Tier-1*: resolve the receiver param's declared type in the
+    current file (via `FileCache.paramContainerName`); if that type
+    has no method with `takes_ownership_of == 0` (no direct
+    `.destroy(this)` / `.free(this)`) the object isn't individually
+    heap-managed → suppress.
+  - *Tier-2 fallback* (for file-level structs and `@fieldParentPtr`
+    locals where the type can't be resolved): if NO function in the
+    entire file directly calls `.destroy(param0)` / `.free(param0)`,
+    nothing in the file is heap-managed → suppress.
 
 Limitations (deliberate):
 - Doesn't track aliased publishes (`const x = this; queue.push(x);
@@ -88,3 +99,6 @@ Limitations (deliberate):
   a pathological `notARealQueue.push(this)` might match; the
   requirement for an explicit publish method (`push`/`send`/etc.)
   still applies and keeps FPs low in practice.
+- Type inference is file-local only: if a type's destructor lives
+  in a different file (e.g. `bun.destroy` wrapping a cross-file
+  `deinit`), tier-2 conservatively keeps the finding.

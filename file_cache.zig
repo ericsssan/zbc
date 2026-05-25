@@ -768,6 +768,73 @@ pub const FileCache = struct {
         return false;
     }
 
+    /// For the named receiver param in `proto`, determine whether its
+    /// declared type (in this file) has any method that self-destructs —
+    /// i.e. `takes_ownership_of == 0` (calls `.destroy(this)` /
+    /// `.free(self)` etc. on the receiver itself).
+    ///
+    /// Returns:
+    ///   null  — type name unresolvable or declared outside this file;
+    ///           caller should be conservative (don't suppress).
+    ///   true  — type IS locally declared AND has a self-freeing method.
+    ///   false — type IS locally declared AND has NO self-freeing method
+    ///           (safe to suppress publish-then-touch-self findings).
+    pub fn receiverTypeHasSelfDestructor(
+        self: *FileCache,
+        proto: Ast.full.FnProto,
+        param_name: []const u8,
+    ) !?bool {
+        const idx = paramIndexFor(self.tree, proto, param_name) orelse return null;
+        const type_name = (try self.paramContainerName(proto, idx)) orelse return null;
+        const model = try self.fileModel();
+        const ti = model.findType(type_name) orelse return null;
+        for (ti.methods) |m| {
+            const s = try self.summaryOfFn(m.fn_decl);
+            if (s.takes_ownership_of) |tidx| {
+                if (tidx == 0) return true;
+            }
+        }
+        return false;
+    }
+
+    /// True iff any function (top-level or method) in this file
+    /// DIRECTLY calls `.destroy(param0)` or `.free(param0)` —
+    /// i.e. inferDirectTakes returns 0 for its body.
+    ///
+    /// Deliberately bypasses the cached summaries (which may carry
+    /// transitive takes_ownership_of from resolveTransitiveTakes) to
+    /// check only for literal single-hop self-destruction.
+    ///
+    /// Used as a file-level fallback when the receiver type can't be
+    /// resolved (file-level struct, or `this` bound via `@fieldParentPtr`
+    /// rather than as a direct parameter): if NO function in the whole
+    /// file directly self-destructs its first param, nothing in the
+    /// file is individually heap-managed, so publish-then-touch-self
+    /// findings are safe to suppress.
+    pub fn fileHasDirectSelfDestructor(self: *FileCache) !bool {
+        const model = try self.fileModel();
+        const lex = @import("lexer.zig");
+        var buf: [1]Ast.Node.Index = undefined;
+
+        for (model.fns) |fi| {
+            const proto = lex.fnProto(self.tree, &buf, fi.fn_decl) orelse continue;
+            const body = lex.bodyOf(self.tree, fi.fn_decl) orelse continue;
+            if (fn_summary.inferDirectTakes(self.tree, proto, body)) |idx| {
+                if (idx == 0) return true;
+            }
+        }
+        for (model.types) |ti| {
+            for (ti.methods) |m| {
+                const proto = lex.fnProto(self.tree, &buf, m.fn_decl) orelse continue;
+                const body = lex.bodyOf(self.tree, m.fn_decl) orelse continue;
+                if (fn_summary.inferDirectTakes(self.tree, proto, body)) |idx| {
+                    if (idx == 0) return true;
+                }
+            }
+        }
+        return false;
+    }
+
     /// Like summaryOf but also fills the deep inference fields that
     /// require allocation (`may_free_fields`, `result_heap_fields`)
     /// and the contextual field (`heap_allocates_self`).  Slice
