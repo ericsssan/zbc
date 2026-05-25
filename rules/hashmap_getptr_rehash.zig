@@ -214,28 +214,7 @@ fn stmtEndAfter(
 /// loop capture / different binding sharing the name.  Allows the
 /// use to be inside nested blocks within the binding's scope (a
 /// common shape: `try map.put(...); for (...) p.* += 1;`).
-fn findIdentUse(
-    tree: *const Ast,
-    start: Ast.TokenIndex,
-    last: Ast.TokenIndex,
-    name: []const u8,
-) ?Ast.TokenIndex {
-    const tags = tree.tokens.items(.tag);
-    if (start > last) return null;
-    var depth: u32 = 0;
-    var t: Ast.TokenIndex = start;
-    while (t <= last) : (t += 1) {
-        switch (tags[t]) {
-            .l_brace => depth += 1,
-            .r_brace => if (depth == 0) return null else {
-                depth -= 1;
-            },
-            .identifier => if (std.mem.eql(u8, tree.tokenSlice(t), name)) return t,
-            else => {},
-        }
-    }
-    return null;
-}
+const findIdentUse = lexer.findIdentInScope;
 
 fn report(
     gpa: std.mem.Allocator,

@@ -178,6 +178,34 @@ pub fn hasIdentInRange(
     return false;
 }
 
+/// Scan `[start, last]` for the first occurrence of identifier `name`
+/// at brace depth 0 relative to start.  Returns null when the name
+/// isn't found or when a `}` closes the current scope before any match.
+/// Useful for "does this stmt block use <ident>?" checks that must not
+/// look inside nested blocks.
+pub fn findIdentInScope(
+    tree: *const Ast,
+    start: TokenIndex,
+    last: TokenIndex,
+    name: []const u8,
+) ?TokenIndex {
+    const tags = tree.tokens.items(.tag);
+    if (start > last) return null;
+    var depth: u32 = 0;
+    var t: TokenIndex = start;
+    while (t <= last) : (t += 1) {
+        switch (tags[t]) {
+            .l_brace => depth += 1,
+            .r_brace => if (depth == 0) return null else {
+                depth -= 1;
+            },
+            .identifier => if (std.mem.eql(u8, tree.tokenSlice(t), name)) return t,
+            else => {},
+        }
+    }
+    return null;
+}
+
 /// One argument's token span — inclusive on both ends.
 pub const ArgRange = struct { start: TokenIndex, end: TokenIndex };
 

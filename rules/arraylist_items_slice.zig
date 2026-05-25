@@ -173,28 +173,7 @@ fn findReceiverMutate(
 
 /// Find the first identifier whose text equals `name` within the
 /// binding's enclosing scope (bounded by the scope's closing `}`).
-fn findIdentUse(
-    tree: *const Ast,
-    start: Ast.TokenIndex,
-    last: Ast.TokenIndex,
-    name: []const u8,
-) ?Ast.TokenIndex {
-    const tags = tree.tokens.items(.tag);
-    if (start > last) return null;
-    var depth: u32 = 0;
-    var t: Ast.TokenIndex = start;
-    while (t <= last) : (t += 1) {
-        switch (tags[t]) {
-            .l_brace => depth += 1,
-            .r_brace => if (depth == 0) return null else {
-                depth -= 1;
-            },
-            .identifier => if (std.mem.eql(u8, tree.tokenSlice(t), name)) return t,
-            else => {},
-        }
-    }
-    return null;
-}
+const findIdentUse = lexer.findIdentInScope;
 
 fn report(
     gpa: std.mem.Allocator,
