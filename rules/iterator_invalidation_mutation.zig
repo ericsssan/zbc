@@ -85,15 +85,26 @@ fn checkBody(
         // Walk the first paren's contents for `<recv> . items`.
         const lp = t + 1;
         const cp = matchParen(tags, lp, last) orelse continue;
-        const recv_name = receiverOfItemsBorrow(tree, lp + 1, cp - 1) orelse continue;
+        const recv_range = receiverPathRange(tree, lp + 1, cp - 1) orelse continue;
         // Find the loop body — after the optional `|...|` capture.
+        // Track capture names so we can skip if the receiver's last
+        // segment is shadowed by a capture (`for (this.x.items) |*x|`
+        // makes `x` the capture, not the field).
         var k: Ast.TokenIndex = cp + 1;
+        var capture_shadows: bool = false;
         if (k <= last and tags[k] == .pipe) {
+            const recv_last_seg = tree.tokenSlice(recv_range.last);
             k += 1;
-            while (k <= last and tags[k] != .pipe) : (k += 1) {}
+            while (k <= last and tags[k] != .pipe) : (k += 1) {
+                if (tags[k] != .identifier) continue;
+                if (std.mem.eql(u8, tree.tokenSlice(k), recv_last_seg)) {
+                    capture_shadows = true;
+                }
+            }
             if (k > last) continue;
             k += 1;
         }
+        if (capture_shadows) continue;
         if (k > last) continue;
         const body_first: Ast.TokenIndex = k;
         const body_last: Ast.TokenIndex = if (tags[body_first] == .l_brace)
@@ -102,35 +113,42 @@ fn checkBody(
             // Inline body — single statement to next `;`.
             break :blk lexer.findStmtSemicolon(tags, body_first, last) orelse continue;
         };
-        // Search for `<recv>.<mutator>(` inside [body_first, body_last].
-        const mutate_tok = findReceiverMutate(tree, body_first, body_last, recv_name) orelse continue;
-        try report(gpa, problems, tree, t, recv_name, mutate_tok);
+        // Search for `<recv-path>.<mutator>(` inside [body_first,
+        // body_last].  recv_range is a token range that may be
+        // multi-segment (`this.ltr` → 3 tokens: `this . ltr`).
+        const mutate_tok = findReceiverMutate(tree, body_first, body_last, recv_range) orelse continue;
+        const recv_display = displayReceiver(tree, recv_range);
+        try report(gpa, problems, tree, t, recv_display, mutate_tok);
         // Skip past this loop's body so we don't re-find the same
         // mutate from an outer loop scan.
         t = body_last;
     }
 }
 
-/// Return the receiver name when the for-scrutinee range
-/// `[start, end]` is exactly `<ident> . <projector>` where
-/// projector ∈ {items, values, keys} AND `<ident>` is a
-/// SINGLE identifier (no dotted chain).  Returns null
-/// otherwise — multi-input for loops, multi-segment
-/// receivers (`this.ltr.items`), projector via call (`.iterator()`),
-/// etc.  The single-ident restriction avoids capture-name
-/// shadowing FPs: `for (this.ltr.items) |*ltr|` makes `ltr`
-/// (inside the body) the LOOP CAPTURE, not the field — so
-/// `ltr.deinit(...)` in the body is element cleanup, not list
-/// mutation.
-fn receiverOfItemsBorrow(
+/// Token range covering the RECEIVER portion of `for (<recv>.<proj>)`
+/// — i.e. all the tokens BEFORE the `.<projector>` suffix.  The
+/// range starts at the first identifier of the receiver chain and
+/// ends at the LAST identifier (caller uses this for last-segment
+/// lookup and full-path matching).
+const ReceiverRange = struct {
+    first: Ast.TokenIndex,
+    last: Ast.TokenIndex,
+};
+
+/// Resolve the for-scrutinee range `[start, end]` to a receiver
+/// token range when the shape is `<ident-chain> . <projector>`
+/// where projector ∈ {items, values, keys}.  Receiver chains may
+/// be multi-segment (`this.ltr` → tokens `this . ltr`).  Returns
+/// null on multi-input loops, projector-via-call (\`.iterator()\`),
+/// or unrecognised shapes.
+fn receiverPathRange(
     tree: *const Ast,
     start: Ast.TokenIndex,
     end: Ast.TokenIndex,
-) ?[]const u8 {
+) ?ReceiverRange {
     const tags = tree.tokens.items(.tag);
     if (end < start + 2) return null;
-    // Multi-input for loops: `for (a, b)` has a comma at the same
-    // paren depth.  We require a single input.
+    // Multi-input check: comma at paren depth 0.
     {
         var depth: u32 = 0;
         var t: Ast.TokenIndex = start;
@@ -145,16 +163,39 @@ fn receiverOfItemsBorrow(
             }
         }
     }
-    // Expect EXACTLY `<ident> . <projector>` — 3 tokens.
-    if (end != start + 2) return null;
-    if (tags[start] != .identifier) return null;
-    if (tags[start + 1] != .period) return null;
-    if (tags[start + 2] != .identifier) return null;
-    const proj = tree.tokenSlice(start + 2);
+    // Trailing projector: `. <projector>` at the end.
+    if (tags[end - 1] != .period) return null;
+    if (tags[end] != .identifier) return null;
+    const proj = tree.tokenSlice(end);
     if (!std.mem.eql(u8, proj, "items") and
         !std.mem.eql(u8, proj, "values") and
         !std.mem.eql(u8, proj, "keys")) return null;
-    return tree.tokenSlice(start);
+    // Receiver is `[start, end - 2]`.  Must be an `<id>(.<id>)*`
+    // chain — no parens/brackets/calls.
+    const recv_end: Ast.TokenIndex = end - 2;
+    if (recv_end < start) return null;
+    var t: Ast.TokenIndex = start;
+    var expecting_ident: bool = true;
+    while (t <= recv_end) : (t += 1) {
+        if (expecting_ident) {
+            if (tags[t] != .identifier) return null;
+            expecting_ident = false;
+        } else {
+            if (tags[t] != .period) return null;
+            expecting_ident = true;
+        }
+    }
+    if (expecting_ident) return null; // ends on a period
+    return .{ .first = start, .last = recv_end };
+}
+
+/// Render the receiver token range as a string for the diagnostic.
+fn displayReceiver(tree: *const Ast, range: ReceiverRange) []const u8 {
+    const starts = tree.tokens.items(.start);
+    const start_byte = starts[range.first];
+    const last_tok_slice = tree.tokenSlice(range.last);
+    const end_byte = starts[range.last] + last_tok_slice.len;
+    return tree.source[start_byte..end_byte];
 }
 
 fn isInvalidatingMutateName(name: []const u8) bool {
@@ -190,15 +231,19 @@ fn isInvalidatingMutateName(name: []const u8) bool {
         std.mem.eql(u8, name, "getOrPutValue");
 }
 
-/// Scan `[start, end]` for the first `<recv>.<mutator>(` at any
-/// depth.  Skips nested fn declarations.
+/// Scan `[start, end]` for the first `<recv-path>.<mutator>(` at
+/// any depth, where the path matches the token sequence
+/// `[recv_range.first, recv_range.last]` token-by-token.  Skips
+/// nested fn declarations and the recv-path's own occurrence
+/// inside the for-loop header.
 fn findReceiverMutate(
     tree: *const Ast,
     start: Ast.TokenIndex,
     end: Ast.TokenIndex,
-    recv: []const u8,
+    recv_range: ReceiverRange,
 ) ?Ast.TokenIndex {
     const tags = tree.tokens.items(.tag);
+    const recv_first_slice = tree.tokenSlice(recv_range.first);
     var t: Ast.TokenIndex = start;
     while (t + 3 <= end) : (t += 1) {
         if (tags[t] == .keyword_fn) {
@@ -206,13 +251,38 @@ fn findReceiverMutate(
             continue;
         }
         if (tags[t] != .identifier) continue;
-        // Word-boundary: not a continuation of a dotted chain.
+        // Word-boundary at start of the chain.
         if (t > 0 and tags[t - 1] == .period) continue;
-        if (!std.mem.eql(u8, tree.tokenSlice(t), recv)) continue;
-        if (tags[t + 1] != .period) continue;
-        if (tags[t + 2] != .identifier) continue;
-        if (tags[t + 3] != .l_paren) continue;
-        if (isInvalidatingMutateName(tree.tokenSlice(t + 2))) return t + 2;
+        if (!std.mem.eql(u8, tree.tokenSlice(t), recv_first_slice)) continue;
+        // Match each subsequent token of the receiver chain.
+        const recv_len: u32 = @intCast(recv_range.last - recv_range.first);
+        var ok: bool = true;
+        var i: u32 = 1;
+        while (i <= recv_len) : (i += 1) {
+            const cur = t + i;
+            const ref = recv_range.first + i;
+            if (cur > end) {
+                ok = false;
+                break;
+            }
+            if (tags[cur] != tags[ref]) {
+                ok = false;
+                break;
+            }
+            if (tags[cur] == .identifier and
+                !std.mem.eql(u8, tree.tokenSlice(cur), tree.tokenSlice(ref)))
+            {
+                ok = false;
+                break;
+            }
+        }
+        if (!ok) continue;
+        const after_recv = t + recv_len + 1;
+        if (after_recv + 2 > end) continue;
+        if (tags[after_recv] != .period) continue;
+        if (tags[after_recv + 1] != .identifier) continue;
+        if (tags[after_recv + 2] != .l_paren) continue;
+        if (isInvalidatingMutateName(tree.tokenSlice(after_recv + 1))) return after_recv + 1;
     }
     return null;
 }
