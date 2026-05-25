@@ -574,15 +574,14 @@ pub fn resolveParamIndex(tree: *const Ast, proto: Ast.full.FnProto, name: []cons
     return paramIndex(tree, proto, name);
 }
 
+/// Cleanup methods whose RECEIVER is the destroyed value.
+/// A strict subset of receiver_mod.isCleanupMethodName — excludes
+/// `.free` and `.destroy` which take their target as an explicit ARG
+/// (the allocator is the receiver, not the freed thing).
 pub fn isReceiverCleanupMethodName(name: []const u8) bool {
-    return std.mem.eql(u8, name, "deinit") or
-        std.mem.eql(u8, name, "close") or
-        std.mem.eql(u8, name, "release") or
-        std.mem.eql(u8, name, "deref") or
-        std.mem.eql(u8, name, "unref") or
-        std.mem.eql(u8, name, "removeRef") or
-        std.mem.eql(u8, name, "finalize") or
-        std.mem.eql(u8, name, "dispose");
+    return receiver_mod.isCleanupMethodName(name) and
+        !std.mem.eql(u8, name, "free") and
+        !std.mem.eql(u8, name, "destroy");
 }
 
 pub fn inferMayFreeFields(
