@@ -91,12 +91,14 @@ pub fn isReleaseMethodName(name: []const u8) bool {
 pub fn isAllocMethodName(name: []const u8) bool {
     return std.mem.eql(u8, name, "alloc") or
         std.mem.eql(u8, name, "allocSentinel") or
+        std.mem.eql(u8, name, "allocAdvanced") or
         std.mem.eql(u8, name, "dupe") or
         std.mem.eql(u8, name, "dupeZ") or
         std.mem.eql(u8, name, "create") or
         std.mem.eql(u8, name, "allocPrint") or
         std.mem.eql(u8, name, "allocPrintZ") or
-        std.mem.eql(u8, name, "allocPrintSentinel");
+        std.mem.eql(u8, name, "allocPrintSentinel") or
+        std.mem.eql(u8, name, "realloc");
 }
 
 /// Container-mutation methods that STORE the caller's data into the
@@ -116,38 +118,6 @@ pub fn isContainerStoreMethodName(name: []const u8) bool {
         std.mem.eql(u8, name, "addManyAsSlice");
 }
 
-/// Destructor-style fn names — used to skip the `<recv>.<field>`
-/// reset-check in rules where the receiver is about to be
-/// discarded anyway.  Prefix-match catches `deinit_slice` /
-/// `destroyInternal` / etc.  `take*` / `consume*` / `into*` are
-/// convention for consume-the-receiver methods.
-pub fn isDestructorFnName(name: []const u8) bool {
-    return std.mem.startsWith(u8, name, "deinit") or
-        std.mem.startsWith(u8, name, "destroy") or
-        std.mem.startsWith(u8, name, "finalize") or
-        std.mem.startsWith(u8, name, "dispose") or
-        std.mem.startsWith(u8, name, "take") or
-        std.mem.startsWith(u8, name, "consume") or
-        std.mem.startsWith(u8, name, "into") or
-        std.mem.eql(u8, name, "free") or
-        std.mem.eql(u8, name, "close");
-}
-
-/// Fn names matching the idempotent reset/clear/end family —
-/// the canonical pattern for state-machine reset methods that
-/// may be invoked many times across an object's lifetime.
-pub fn isIdempotentResetFnName(name: []const u8) bool {
-    return std.mem.eql(u8, name, "reset") or
-        std.mem.eql(u8, name, "clear") or
-        std.mem.eql(u8, name, "clearRetainingCapacity") or
-        std.mem.eql(u8, name, "end") or
-        std.mem.eql(u8, name, "endCommand") or
-        std.mem.eql(u8, name, "endOperation") or
-        std.mem.eql(u8, name, "finish") or
-        std.mem.startsWith(u8, name, "reset") or
-        std.mem.startsWith(u8, name, "clear") or
-        std.mem.startsWith(u8, name, "end_");
-}
 
 // ── Tests ──────────────────────────────────────────────────
 
@@ -167,6 +137,20 @@ test "isSelfReceiverName" {
     try t.expect(isSelfReceiverName("this"));
     try t.expect(!isSelfReceiverName("it"));
     try t.expect(!isSelfReceiverName("inspector"));
+}
+
+test "isAllocMethodName" {
+    const t = std.testing;
+    try t.expect(isAllocMethodName("alloc"));
+    try t.expect(isAllocMethodName("create"));
+    try t.expect(isAllocMethodName("dupe"));
+    try t.expect(isAllocMethodName("realloc"));
+    try t.expect(isAllocMethodName("allocPrint"));
+    try t.expect(isAllocMethodName("allocAdvanced"));
+    try t.expect(!isAllocMethodName("free"));
+    try t.expect(!isAllocMethodName("destroy"));
+    try t.expect(!isAllocMethodName("deinit"));
+    try t.expect(!isAllocMethodName("totally_made_up_method"));
 }
 
 test "method classifiers don't overlap incorrectly" {

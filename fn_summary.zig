@@ -19,7 +19,7 @@ const std = @import("std");
 const Ast = std.zig.Ast;
 
 const lexer = @import("lexer.zig");
-const vocabulary = @import("vocabulary.zig");
+const receiver_mod = @import("receiver.zig");
 
 /// Result-shape classification.
 pub const Returns = union(enum) {
@@ -144,9 +144,7 @@ pub fn inferFromBody(
         if (tags[t + 1] != .identifier) continue;
         if (tags[t + 2] != .l_paren) continue;
         const method = tree.tokenSlice(t + 1);
-        if (vocabulary.lookupMethod(method)) |vs| {
-            if (vs.allocates) out.allocates = true;
-        }
+        if (receiver_mod.isAllocMethodName(method)) out.allocates = true;
     }
 
     // ── returns: scan the FIRST `return <expr>` shape ──────────
@@ -280,8 +278,7 @@ pub fn inferReturnsHeap(tree: *const Ast, body_node: Ast.Node.Index) bool {
         last_method = t + 1;
     }
     const m = last_method orelse return false;
-    if (vocabulary.lookupMethod(tree.tokenSlice(m))) |vs| return vs.allocates;
-    return false;
+    return receiver_mod.isAllocMethodName(tree.tokenSlice(m));
 }
 
 /// Token range of a `return <expr>;` body, if the body has one at
@@ -373,10 +370,7 @@ fn returnIsAllocCall(
         }
     }
     const m = last_method orelse return false;
-    if (vocabulary.lookupMethod(tree.tokenSlice(m))) |vs| {
-        return vs.allocates;
-    }
-    return false;
+    return receiver_mod.isAllocMethodName(tree.tokenSlice(m));
 }
 
 fn isAllocatorName(name: []const u8) bool {

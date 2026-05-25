@@ -270,7 +270,6 @@ test {
     _ = suppressions_mod;
     _ = @import("fn_summary.zig");
     _ = @import("zls_resolver.zig");
-    _ = @import("vocabulary.zig");
     _ = @import("lexer.zig");
     _ = @import("scope.zig");
     _ = @import("receiver.zig");

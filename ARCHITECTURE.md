@@ -164,8 +164,6 @@ Classifiers:
 - `isAcquireMethodName` (reference, retain, addRef, …; ref excluded)
 - `isReleaseMethodName` (release, deref, unref, …)
 - `isAllocMethodName` (alloc, allocSentinel, dupe, dupeZ, create, …)
-- `isDestructorFnName` (deinit*, destroy*, take*, consume*, …)
-- `isIdempotentResetFnName` (reset, clear, end, …)
 
 ### `model.zig` — FileModel (TypeTable + FnTable)
 
