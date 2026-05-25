@@ -250,6 +250,13 @@ pub const Invariant = enum {
     /// pointer, not a stack-frame leak from this frame) and
     /// `&<heap-local>` (when the local was heap-allocated).
     thread_spawn_local_pointer,
+    /// `<local>.<field> = &<local>;` then `return <local>;` — the
+    /// self-referential struct is COPIED on return; the field
+    /// still holds the original stack address, which is invalid
+    /// both during and after the copy.  Catches the "self-pointer
+    /// in returned-by-value struct" footgun common when porting
+    /// C / Rust code that uses intrusive self-references.
+    self_pointer_in_returned_value,
     /// `const|var <X> = try <dir>.<opener>(...);` binds an OS file
     /// handle; `<X>.close();` invalidates it; any subsequent use of
     /// `<X>` (method call or field access) reads/writes through a
@@ -419,7 +426,7 @@ pub const Invariant = enum {
     borrowed_slice_into_stack_buffer_returned,
 };
 
-pub const all_invariants: [47]Invariant = .{
+pub const all_invariants: [48]Invariant = .{
     .arena_escape,
     .stack_escape,
     .use_undefined,
@@ -467,6 +474,7 @@ pub const all_invariants: [47]Invariant = .{
     .borrowed_slice_into_stack_buffer_returned,
     .iterator_invalidation_mutation,
     .thread_spawn_local_pointer,
+    .self_pointer_in_returned_value,
 };
 
 pub const Default: Config = .{};

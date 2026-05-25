@@ -49,6 +49,7 @@ const free_without_null_then_check_mod = @import("rules/free_without_null_then_c
 const hashmap_getptr_rehash_mod = @import("rules/hashmap_getptr_rehash.zig");
 const iterator_invalidation_mutation_mod = @import("rules/iterator_invalidation_mutation.zig");
 const thread_spawn_local_pointer_mod = @import("rules/thread_spawn_local_pointer.zig");
+const self_pointer_in_returned_value_mod = @import("rules/self_pointer_in_returned_value.zig");
 const memset_undef_after_len_truncation_mod = @import("rules/memset_undef_after_len_truncation.zig");
 const missing_deinit_on_composed_owner_mod = @import("rules/missing_deinit_on_composed_owner.zig");
 const missing_errdefer_between_tries_mod = @import("rules/missing_errdefer_between_tries.zig");
@@ -112,6 +113,7 @@ pub const escape_rules = [_]Rule{
     .{ .id = "borrowed-slice-into-stack-buffer-returned",  .check = borrowed_slice_into_stack_buffer_returned_mod.check },
     .{ .id = "iterator-invalidation-mutation",             .check = iterator_invalidation_mutation_mod.check },
     .{ .id = "thread-spawn-local-pointer",                 .check = thread_spawn_local_pointer_mod.check },
+    .{ .id = "self-pointer-in-returned-value",             .check = self_pointer_in_returned_value_mod.check },
 };
 
 /// Dispatch all registered escape rules against `tree`.  `cache` is
@@ -163,6 +165,7 @@ test "registry: pull in every rule module so inline tests run" {
     _ = duplicate_errdefer_mod;
     _ = iterator_invalidation_mutation_mod;
     _ = thread_spawn_local_pointer_mod;
+    _ = self_pointer_in_returned_value_mod;
     _ = fd_write_after_close_mod;
     _ = free_then_try_realloc_mod;
     _ = free_without_null_then_check_mod;
