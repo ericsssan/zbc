@@ -152,6 +152,13 @@ pub fn check(
             // initialised from `create(allocator, command, promise)`).
             if (fieldIsCallerSupplied(tree, outer, field.name)) continue;
 
+            // File-as-struct borrow skip: when the field's type IS the
+            // file's root struct (`const T = @This()`), any nested
+            // struct holding a VALUE of type T is borrowing the file's
+            // primary resource, not owning it.  The file manages its
+            // own lifetime; the nested struct is a view/slice of it.
+            if (model.fileIsTypeNamed(inner_ti.name)) continue;
+
             // Externally-cleaned-up skip: when `<this>.<field>.<cleanup>(...)`
             // is invoked in OTHER methods of the same outer type
             // (multiple lifecycle stages — request setup, async

@@ -179,6 +179,20 @@ fn checkBody(
             t = sc;
             continue;
         }
+        // For optional fields (`?T`) without an explicit null default:
+        // when the assignment is inside ANY orelse block AND no prior
+        // real (non-null) write has occurred in this fn, the orelse
+        // semantics guarantee the tested value was null — lazy-init.
+        // Null-sentinel clears (`self.field = null`) are NOT counted
+        // as real writes, so a clear-then-orelse-init sequence
+        // still suppresses correctly.
+        if (fieldTypeIsOptional(tree, ct_ti, field_name) and
+            insideAnyOrelseBlock(tree, first, t) and
+            !priorRealWriteInFn(tree, first, t, this_name, field_name))
+        {
+            t = sc;
+            continue;
+        }
         // Skip when the assignment is inside `if (!<X>) { ... }` —
         // the negation guard means the write runs on the FALSE
         // path, i.e. when the prior state was empty/uninitialized
@@ -1422,6 +1436,78 @@ fn report(
     });
 }
 
+/// Like `priorWriteInFn` but excludes writes where the RHS is a bare
+/// `null` or `undefined` token — those are sentinel-clears, not real
+/// value assignments.  Used so that `self.field = null; … orelse { self.field = v; }`
+/// is still recognised as lazy-init.
+fn priorRealWriteInFn(
+    tree: *const Ast,
+    body_first: Ast.TokenIndex,
+    assign_tok: Ast.TokenIndex,
+    this_name: []const u8,
+    field_name: []const u8,
+) bool {
+    const tags = tree.tokens.items(.tag);
+    if (assign_tok < body_first + 4) return false;
+    var t: Ast.TokenIndex = body_first;
+    while (t + 4 <= assign_tok - 1) : (t += 1) {
+        if (tags[t] != .identifier) continue;
+        if (!std.mem.eql(u8, tree.tokenSlice(t), this_name)) continue;
+        if (tags[t + 1] != .period) continue;
+        if (tags[t + 2] != .identifier) continue;
+        if (!std.mem.eql(u8, tree.tokenSlice(t + 2), field_name)) continue;
+        if (tags[t + 3] != .equal) continue;
+        // RHS: skip if bare `null` or `undefined`.
+        const rhs = t + 4;
+        if (rhs < assign_tok and tags[rhs] == .identifier) {
+            const s = tree.tokenSlice(rhs);
+            if (std.mem.eql(u8, s, "null") or std.mem.eql(u8, s, "undefined")) continue;
+        }
+        return true;
+    }
+    return false;
+}
+
+/// True when the field's declared type begins with `?` — i.e. it is
+/// an optional type regardless of whether it has an explicit null default.
+fn fieldTypeIsOptional(
+    tree: *const Ast,
+    ct_ti: *const fmodel.TypeInfo,
+    field_name: []const u8,
+) bool {
+    const f = ct_ti.findField(field_name) orelse return false;
+    return tree.tokens.items(.tag)[f.type_first] == .question_mark;
+}
+
+/// True when `assign_tok` is directly enclosed by the body of an
+/// `orelse { … }` block — regardless of what expression precedes
+/// the `orelse`.  Walks backward tracking brace depth; the first
+/// depth-0 `{` that is immediately preceded by `orelse` returns true.
+fn insideAnyOrelseBlock(
+    tree: *const Ast,
+    start: Ast.TokenIndex,
+    assign_tok: Ast.TokenIndex,
+) bool {
+    const tags = tree.tokens.items(.tag);
+    var depth: i32 = 0;
+    var t: Ast.TokenIndex = assign_tok;
+    while (t > start) {
+        t -= 1;
+        switch (tags[t]) {
+            .r_brace => depth += 1,
+            .l_brace => {
+                if (depth == 0) {
+                    if (t < 1) return false;
+                    return tags[t - 1] == .keyword_orelse;
+                }
+                depth -= 1;
+            },
+            else => {},
+        }
+    }
+    return false;
+}
+
 // ── Tests ──────────────────────────────────────────────────
 
 fn runOn(gpa: std.mem.Allocator, src: []const u8) !std.ArrayListUnmanaged(Problem) {
@@ -1627,6 +1713,29 @@ test "overwrite-without-deinit: assert(this.field == default) gates the write �
         \\    }
         \\};
         \\const bun = struct { pub fn assert(_: bool) void {} };
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
+test "overwrite-without-deinit: optional field first write inside orelse block — no fire" {
+    const gpa = std.testing.allocator;
+    var problems = try runOn(gpa,
+        \\const Owned = struct {
+        \\    buf: []u8,
+        \\    pub fn deinit(self: *Owned) void { self.buf.len = 0; }
+        \\};
+        \\const Owner = struct {
+        \\    item: ?Owned,
+        \\    pub fn lazyEnsure(this: *Owner) void {
+        \\        const existing: ?*Owned = if (this.item) |*v| v else null;
+        \\        const _ = existing orelse {
+        \\            this.item = .{ .buf = &[_]u8{} };
+        \\            return;
+        \\        };
+        \\    }
+        \\};
         \\
     );
     defer freeProblems(gpa, &problems);
