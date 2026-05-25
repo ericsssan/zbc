@@ -35,6 +35,7 @@ pub fn analyzeEscape(
     path: []const u8,
     config: *const Config,
 ) ![]Problem {
+    trace.setFile(path);
     const src_bytes = try std.Io.Dir.cwd().readFileAlloc(
         io,
         path,

@@ -155,11 +155,12 @@ Rules approximate types via heuristics (`isAllocatorishName`,
 type system (with comptime-resolved types) isn't accessible at
 syntactic-rule level.  Inherent to "purely syntactic" rules.
 
-### T3. Position info in trace.zig is rudimentary
+### ~~T3. Position info in trace.zig is rudimentary~~ — FIXED
 
-Trace events show `line:col` but not the source file path.  In
-corpus sweeps, every trace event looks alike.  Easy fix
-(pass tree's filename into trace context).
+Trace events now show `file:line:col`.  A `threadlocal` `current_file`
+is set in `lib.analyzeEscape` before each file is processed; `printNote`
+includes it in every trace line.  Thread-local so concurrent workers
+don't clobber each other's context.
 
 ## Status
 
@@ -174,6 +175,5 @@ corpus sweeps, every trace event looks alike.  Easy fix
 | G7 (try distinction) | **fixed** | Binding.wasTryWrapped helper; missing_errdefer_between_tries cleaned |
 | G8 (classifier naming) | **fixed** | renamed isAddrefMethodName / isFreeOrDestroyName |
 
-All 8 hit-during-migration gaps closed.  Remaining items in this
-doc (T1-T3) are theoretical / out-of-scope for the pattern detector
+All 8 hit-during-migration gaps closed.  T3 also closed.  Remaining items (T1-T2) are theoretical / out-of-scope for the pattern detector
 infrastructure.

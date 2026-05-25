@@ -37,6 +37,16 @@ pub var active_rule: ?[]const u8 = null;
 /// If true, traces from ALL rules print.  Set via `--trace=*`.
 pub var all_rules: bool = false;
 
+/// Current file being analysed — included in trace output so corpus
+/// sweeps identify which file each event came from.  Thread-local so
+/// concurrent workers don't clobber each other's context.
+pub threadlocal var current_file: ?[]const u8 = null;
+
+/// Set before analysing a file; cleared on `reset()`.
+pub fn setFile(path: []const u8) void {
+    current_file = path;
+}
+
 /// True iff the rule's traces should print right now.  Rules can
 /// guard expensive trace-construction work with this:
 ///
@@ -87,14 +97,15 @@ fn printNote(
     tok: TokenIndex,
     msg: []const u8,
 ) void {
+    const file = current_file orelse "<unknown>";
     if (tok >= tree.tokens.len) {
-        std.debug.print("[trace:{s}] {s}: <oob-token> {s}\n", .{ rule_id, kind, msg });
+        std.debug.print("[trace:{s}] {s}: {s}:<oob-token> {s}\n", .{ rule_id, kind, file, msg });
         return;
     }
     const loc = tree.tokenLocation(0, tok);
     std.debug.print(
-        "[trace:{s}] {s} @ {d}:{d}: {s}\n",
-        .{ rule_id, kind, loc.line + 1, loc.column + 1, msg },
+        "[trace:{s}] {s} @ {s}:{d}:{d}: {s}\n",
+        .{ rule_id, kind, file, loc.line + 1, loc.column + 1, msg },
     );
 }
 
@@ -102,6 +113,7 @@ fn printNote(
 pub fn reset() void {
     active_rule = null;
     all_rules = false;
+    current_file = null;
 }
 
 // ── Tests ──────────────────────────────────────────────────
