@@ -93,8 +93,15 @@ fn checkBody(
     const first = tree.firstToken(body);
     const last = tree.lastToken(body);
 
+    // Track open-brace depth so iterator bindings inside nested blocks
+    // (`if`/`errdefer`/etc.) only trigger searches within that block,
+    // preventing cross-boundary matches when a same-named variable in
+    // an outer scope is mutated after the inner block closes.
+    var brace_depth: u32 = 0;
     var t: Ast.TokenIndex = first;
     while (t + 5 <= last) : (t += 1) {
+        if (tags[t] == .l_brace) { brace_depth += 1; continue; }
+        if (tags[t] == .r_brace) { if (brace_depth > 0) brace_depth -= 1; continue; }
         if (tags[t] == .keyword_fn) {
             t = skipNestedFn(tags, t, last);
             continue;
@@ -116,11 +123,24 @@ fn checkBody(
         // The receiver is the identifier at `t-2`.
         if (tags[t - 2] != .identifier) continue;
         const recv_name = tree.tokenSlice(t - 2);
+        // Check for a compound receiver `prefix.recv_name.iter()`.
+        // When the token at t-3 is `.` and t-4 is an identifier, the iterator
+        // source is `prefix.recv_name`, not just `recv_name`.  Storing the prefix
+        // allows findReceiverMutate to distinguish `self.map.iterator()` from a
+        // bare `map.iterator()`, preventing false-positive fires when a different
+        // variable named `map` is mutated inside the loop body.
+        const recv_prefix: ?[]const u8 = if (t >= 4 and
+            tags[t - 3] == .period and
+            tags[t - 4] == .identifier)
+            tree.tokenSlice(t - 4)
+        else
+            null;
 
-        // Walk backward from `t-3` to find `= recv .` and then `const/var iter =`.
-        // Simple check: `t-2` is `recv`, `t-1` is `.`, `t` is method, so the `=` is
-        // before `recv`. Walk backward from `t-3`.
-        var i: Ast.TokenIndex = t - 3;
+        // Walk backward from after the recv to find `= [try] recv_prefix?.recv .` and
+        // then `const/var iter =`.  Adjust starting position based on prefix presence.
+        const assign_search_start: Ast.TokenIndex = if (recv_prefix != null) t - 5 else t - 3;
+        if (assign_search_start == 0) continue;
+        var i: Ast.TokenIndex = assign_search_start;
         // Walk past any `try` keyword.
         if (tags[i] == .keyword_try) {
             if (i == 0) continue;
@@ -136,12 +156,31 @@ fn checkBody(
         const before_iter = tags[j - 1];
         if (before_iter != .keyword_const and before_iter != .keyword_var) continue;
 
-        // `iter_name` is the iterator variable, `recv_name` is the map.
+        // `iter_name` is the iterator variable, `recv_name`/`recv_prefix` identify the map.
         // Find the `;` that ends the iterator binding statement.
         const semi = findStmtSemicolon(tags, t, last) orelse continue;
 
-        // Scan from `semi+1` to `last` for `while (<iter_name>.next())`.
-        try scanForWhileLoop(gpa, tree, tags, iter_name, recv_name, semi + 1, last, problems);
+        // Determine the scope boundary for the iterator.  When the binding is
+        // inside a nested block (brace_depth > 0), the search must not cross
+        // the block's closing `}` — otherwise an outer variable with the same
+        // name would be flagged.
+        const scope_end: Ast.TokenIndex = blk: {
+            if (brace_depth == 0) break :blk last;
+            // Find the `}` that closes the current block.
+            var depth_left = brace_depth;
+            var s = semi + 1;
+            while (s <= last) : (s += 1) {
+                if (tags[s] == .l_brace) depth_left += 1
+                else if (tags[s] == .r_brace) {
+                    depth_left -= 1;
+                    if (depth_left < brace_depth) break :blk s - 1;
+                }
+            }
+            break :blk last;
+        };
+
+        // Scan from `semi+1` to `scope_end` for `while (<iter_name>.next())`.
+        try scanForWhileLoop(gpa, tree, tags, iter_name, recv_prefix, recv_name, semi + 1, scope_end, problems);
     }
 }
 
@@ -151,6 +190,7 @@ fn scanForWhileLoop(
     tree: *const Ast,
     tags: []const std.zig.Token.Tag,
     iter_name: []const u8,
+    recv_prefix: ?[]const u8,
     recv_name: []const u8,
     scan_start: Ast.TokenIndex,
     last: Ast.TokenIndex,
@@ -198,13 +238,21 @@ fn scanForWhileLoop(
         const body_end = matchBrace(tags, body_start, last) orelse continue;
 
         // Scan the while body for `<recv>.<mutate>(` at depth 0.
-        const mutate_tok = findReceiverMutate(tree, tags, body_start + 1, body_end - 1, recv_name) orelse continue;
+        const mutate_tok = findReceiverMutate(tree, tags, body_start + 1, body_end - 1, recv_prefix, recv_name) orelse continue;
 
         // Fire.
+        const display_recv = if (recv_prefix) |pfx| blk: {
+            const buf = try gpa.alloc(u8, pfx.len + 1 + recv_name.len);
+            @memcpy(buf[0..pfx.len], pfx);
+            buf[pfx.len] = '.';
+            @memcpy(buf[pfx.len + 1 ..], recv_name);
+            break :blk buf;
+        } else try gpa.dupe(u8, recv_name);
+        defer gpa.free(display_recv);
         const msg = try std.fmt.allocPrint(
             gpa,
             "`{s}.{s}(...)` modifies the map while `{s}` is iterating over it — the iterator cursor is now undefined.  Collect items to change into a separate list first.",
-            .{ recv_name, tree.tokenSlice(mutate_tok), iter_name },
+            .{ display_recv, tree.tokenSlice(mutate_tok), iter_name },
         );
         errdefer gpa.free(msg);
         try problems.append(gpa, .{
@@ -228,6 +276,7 @@ fn findReceiverMutate(
     tags: []const std.zig.Token.Tag,
     start: Ast.TokenIndex,
     last: Ast.TokenIndex,
+    recv_prefix: ?[]const u8,
     recv: []const u8,
 ) ?Ast.TokenIndex {
     if (start > last) return null;
@@ -248,6 +297,15 @@ fn findReceiverMutate(
         }
         if (tags[t] != .identifier) continue;
         if (!std.mem.eql(u8, tree.tokenSlice(t), recv)) continue;
+        // For a compound receiver (prefix.recv), the token before `recv` must
+        // be `.` and the token before that must be `prefix`.  Without this check,
+        // a bare `recv.mutate(...)` would match `prefix.recv.iterator()`, producing
+        // a false positive when `recv` is a distinct variable.
+        if (recv_prefix) |pfx| {
+            if (t < 2 or tags[t - 1] != .period) continue;
+            if (tags[t - 2] != .identifier) continue;
+            if (!std.mem.eql(u8, tree.tokenSlice(t - 2), pfx)) continue;
+        }
         if (tags[t + 1] != .period) continue;
         if (tags[t + 2] != .identifier) continue;
         if (tags[t + 3] != .l_paren) continue;
@@ -326,6 +384,69 @@ test "hashmap-iter-mutation: mutation on different map does NOT fire" {
     );
     defer freeProblems(gpa, &problems);
     try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
+test "hashmap-iter-mutation: errdefer-scoped iterator + outer map mutation — does NOT fire" {
+    // `var it = map.iterator()` inside errdefer block; outer code mutates `map`
+    // via a DIFFERENT while loop — must not fire because the iterator's scope
+    // is limited to the errdefer block.
+    const gpa = std.testing.allocator;
+    var problems = try runOn(gpa,
+        \\pub fn clone(self: anytype, alloc: anytype) !@TypeOf(self.map) {
+        \\    var map = @TypeOf(self.map){};
+        \\    errdefer {
+        \\        var it = map.iterator();
+        \\        while (it.next()) |entry| {
+        \\            alloc.free(entry.key_ptr.*);
+        \\        }
+        \\        map.deinit(alloc);
+        \\    }
+        \\    var it = self.map.iterator();
+        \\    while (it.next()) |entry| {
+        \\        map.putAssumeCapacity(entry.key_ptr.*, entry.value_ptr.*);
+        \\    }
+        \\    return map;
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
+test "hashmap-iter-mutation: self.map iterator + map mutation — different vars, does NOT fire" {
+    // Iterator on self.map, but body mutates a bare `map` variable (different object).
+    // This is the copy-into-new-map pattern; it must NOT fire.
+    const gpa = std.testing.allocator;
+    var problems = try runOn(gpa,
+        \\pub fn clone(self: anytype, alloc: anytype) !@TypeOf(self.map) {
+        \\    var map = @TypeOf(self.map){};
+        \\    try map.ensureTotalCapacity(alloc, self.map.count());
+        \\    var it = self.map.iterator();
+        \\    while (it.next()) |entry| {
+        \\        map.putAssumeCapacity(entry.key_ptr.*, entry.value_ptr.*);
+        \\    }
+        \\    return map;
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
+test "hashmap-iter-mutation: self.map iterator + self.map mutation — same field, fires" {
+    // Iterator on self.map AND mutation of self.map — real bug.
+    const gpa = std.testing.allocator;
+    var problems = try runOn(gpa,
+        \\pub fn foo(self: anytype, k: anytype, v: anytype) void {
+        \\    var it = self.map.iterator();
+        \\    while (it.next()) |_| {
+        \\        self.map.putAssumeCapacity(k, v);
+        \\    }
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 1), problems.items.len);
 }
 
 test "hashmap-iter-mutation: clearAndFree during iteration fires" {
