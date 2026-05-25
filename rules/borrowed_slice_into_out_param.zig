@@ -467,6 +467,9 @@ fn structOnlyHoldsPrimitivesOrPointers(tree: *const Ast, ti: *const fmodel.TypeI
     const tags = tree.tokens.items(.tag);
     if (ti.fields.len == 0) return false;
     for (ti.fields) |f| {
+        // TypeInfo may have been built from a foreign tree — token indices
+        // out of range for this tree means we can't inspect safely.
+        if (f.type_first >= tags.len or f.type_last >= tags.len) return false;
         var t = f.type_first;
         while (t <= f.type_last and tags[t] == .question_mark) : (t += 1) {}
         if (t > f.type_last) return false;

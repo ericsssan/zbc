@@ -24,6 +24,14 @@ const model_mod = @import("model.zig");
 pub const ProjectCache = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
+    /// Coarse-grained spinlock protecting entries/type_index/module_paths.
+    /// Public methods acquire it; private `*Locked` helpers assume it is
+    /// already held.  The spinlock is NOT recursive — callers must never
+    /// call a public method from within a locked section.
+    /// `std.atomic.Mutex` is a CAS spinlock (tryLock-only); we wrap it
+    /// with a busy-wait in `muLock`.  Cross-file cache misses are
+    /// infrequent so busy-wait overhead is negligible.
+    mu: std.atomic.Mutex = .unlocked,
     /// abs_path → owned entry (source, tree, model).
     entries: std.StringHashMapUnmanaged(*Entry) = .empty,
     /// module-name → absolute path of the module's root .zig file.
@@ -72,6 +80,16 @@ pub const ProjectCache = struct {
         return .{ .gpa = gpa, .io = io };
     }
 
+    /// Blocking acquire via busy-wait (CAS spin).  Cross-file misses
+    /// are infrequent so busy-wait overhead is negligible.
+    inline fn muLock(self: *ProjectCache) void {
+        while (!self.mu.tryLock()) std.atomic.spinLoopHint();
+    }
+
+    inline fn muUnlock(self: *ProjectCache) void {
+        self.mu.unlock();
+    }
+
     pub fn deinit(self: *ProjectCache) void {
         var it = self.entries.iterator();
         while (it.next()) |kv| {
@@ -112,13 +130,15 @@ pub const ProjectCache = struct {
         from_file_path: []const u8,
         name: []const u8,
     ) ![]const TypeEntry {
+        self.muLock();
+        defer self.muUnlock();
         if (!self.type_index_built) try self.buildTypeIndex(from_file_path);
         return self.type_index.get(name) orelse &.{};
     }
 
     fn buildTypeIndex(self: *ProjectCache, from_file_path: []const u8) !void {
         self.type_index_built = true; // latch first so failures don't retry
-        const root = (try self.findProjectRoot(from_file_path)) orelse return;
+        const root = (try self.findProjectRootLocked(from_file_path)) orelse return;
         // Collect candidate file paths.
         var paths: std.ArrayListUnmanaged([]u8) = .empty;
         defer {
@@ -138,7 +158,7 @@ pub const ProjectCache = struct {
         }
         for (paths.items) |abs_path_owned| {
             const dup = try self.gpa.dupe(u8, abs_path_owned);
-            const fm_opt = self.modelForAbsolutePath(dup) catch null;
+            const fm_opt = self.modelForAbsolutePathLocked(dup) catch null;
             const _fm = fm_opt orelse continue;
             _ = _fm;
             // Walk the entry's types.  The Entry pointer is stable
@@ -180,7 +200,9 @@ pub const ProjectCache = struct {
         // else a normalised relative path.
         const abs = try std.fs.path.resolve(self.gpa, &.{joined});
         // `abs` is owned by us.  Stash it in the cache key.
-        return try self.modelForAbsolutePath(abs);
+        self.muLock();
+        defer self.muUnlock();
+        return try self.modelForAbsolutePathLocked(abs);
     }
 
     /// Resolve a module-name @import (e.g. `@import("bun")`,
@@ -206,25 +228,37 @@ pub const ProjectCache = struct {
     ) !?*const model_mod.FileModel {
         if (module_name.len == 0) return null;
         if (containsBadChar(module_name)) return null;
+        self.muLock();
+        defer self.muUnlock();
         if (self.module_paths.get(module_name)) |cached| {
             const path = cached orelse return null;
             const dup = try self.gpa.dupe(u8, path);
-            return try self.modelForAbsolutePath(dup);
+            return try self.modelForAbsolutePathLocked(dup);
         }
-        const root = (try self.findProjectRoot(from_file_path)) orelse {
+        const root = (try self.findProjectRootLocked(from_file_path)) orelse {
             const name_dup = try self.gpa.dupe(u8, module_name);
             try self.module_paths.put(self.gpa, name_dup, null);
             return null;
         };
-        const resolved = try self.discoverModulePath(root, module_name);
+        const resolved = self.discoverModulePath(root, module_name) catch null;
         // Cache the result (positive or negative).
         const name_dup = try self.gpa.dupe(u8, module_name);
         try self.module_paths.put(self.gpa, name_dup, resolved);
         if (resolved) |p| {
             const dup = try self.gpa.dupe(u8, p);
-            return try self.modelForAbsolutePath(dup);
+            return try self.modelForAbsolutePathLocked(dup);
         }
         return null;
+    }
+
+    /// Public wrapper — acquires mutex then calls the locked impl.
+    pub fn findProjectRoot(
+        self: *ProjectCache,
+        from_file_path: []const u8,
+    ) !?[]const u8 {
+        self.muLock();
+        defer self.muUnlock();
+        return self.findProjectRootLocked(from_file_path);
     }
 
     /// Walk ancestors of `from_file_path` to find the project root.
@@ -234,8 +268,8 @@ pub const ProjectCache = struct {
     /// workspaces commonly nest `Cargo.toml` files in subprojects
     /// (e.g. bun's `src/resolver/Cargo.toml`), so picking the FIRST
     /// one gives a too-deep root that misses the real module layout.
-    /// Cached after first invocation.
-    pub fn findProjectRoot(
+    /// Cached after first invocation.  Caller MUST hold `mu`.
+    fn findProjectRootLocked(
         self: *ProjectCache,
         from_file_path: []const u8,
     ) !?[]const u8 {
@@ -332,9 +366,20 @@ pub const ProjectCache = struct {
         return null;
     }
 
+    /// Public wrapper — acquires mutex then calls the locked impl.
+    pub fn modelForAbsolutePath(
+        self: *ProjectCache,
+        abs_path: []u8,
+    ) !?*const model_mod.FileModel {
+        self.muLock();
+        defer self.muUnlock();
+        return self.modelForAbsolutePathLocked(abs_path);
+    }
+
     /// Resolve via absolute path; takes ownership of `abs_path`
     /// (frees it on cache hit or duplicates it on miss + stores).
-    pub fn modelForAbsolutePath(
+    /// Caller MUST hold `mu`.
+    fn modelForAbsolutePathLocked(
         self: *ProjectCache,
         abs_path: []u8,
     ) !?*const model_mod.FileModel {
