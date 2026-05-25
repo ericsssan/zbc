@@ -14,3 +14,5 @@ HANDOFF.md
 
 # Local gh wrapper — machine-specific, never track.
 bin/
+main
+poc/
