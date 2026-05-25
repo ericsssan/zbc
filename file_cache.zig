@@ -24,6 +24,7 @@ const Ast = std.zig.Ast;
 const fmodel = @import("model.zig");
 const local = @import("local.zig");
 const fn_summary = @import("fn_summary.zig");
+const lexer = @import("lexer.zig");
 const zls_resolver_mod = @import("zls_resolver.zig");
 const project_cache_mod = @import("project_cache.zig");
 
@@ -289,8 +290,6 @@ pub const FileCache = struct {
     /// summaries that depend on transitive ownership.
     pub fn resolveTransitiveTakes(self: *FileCache) !void {
         const model = try self.fileModel();
-        const lexer = @import("lexer.zig");
-
         // Phase 1a: pre-warm summaries for every fn.
         for (model.fns) |fi| _ = try self.summaryOfFn(fi.fn_decl);
         for (model.types) |ti| {
@@ -304,10 +303,9 @@ pub const FileCache = struct {
         // conservative .unknown / null defaults.
         const seedFn = struct {
             fn run(self2: *FileCache, fn_decl: Ast.Node.Index) !void {
-                const lex = @import("lexer.zig");
                 var pbuf: [1]Ast.Node.Index = undefined;
-                const proto = lex.fnProto(self2.tree, &pbuf, fn_decl) orelse return;
-                const body = lex.bodyOf(self2.tree, fn_decl) orelse return;
+                const proto = lexer.fnProto(self2.tree, &pbuf, fn_decl) orelse return;
+                const body = lexer.bodyOf(self2.tree, fn_decl) orelse return;
                 if (fn_summary.inferDirectTakes(self2.tree, proto, body)) |idx| {
                     const key = @intFromEnum(body);
                     if (self2.summaries.getPtr(key)) |entry| {
@@ -322,8 +320,6 @@ pub const FileCache = struct {
         for (model.types) |ti| {
             for (ti.methods) |m| try seedFn(self, m.fn_decl);
         }
-        _ = lexer; // imported for nested fn (above)
-
         // Phase 2: fixed-point R10 Case A propagation.
         var iters: u32 = 0;
         while (iters < 16) : (iters += 1) {
@@ -374,7 +370,6 @@ pub const FileCache = struct {
     /// Apply R7 delegator-borrow inference to one fn.  Returns true
     /// iff this call set/updated the fn's `returns` field.
     fn inferDelegatorBorrowOne(self: *FileCache, fn_decl: Ast.Node.Index) !bool {
-        const lexer = @import("lexer.zig");
         var buf: [1]Ast.Node.Index = undefined;
         const proto = lexer.fnProto(self.tree, &buf, fn_decl) orelse return false;
         const body = lexer.bodyOf(self.tree, fn_decl) orelse return false;
@@ -580,7 +575,6 @@ pub const FileCache = struct {
 
     /// Apply filterMayFreeFields to one fn's summary in-place.
     fn filterMayFreeFieldsOne(self: *FileCache, fn_decl: Ast.Node.Index) !void {
-        const lexer = @import("lexer.zig");
         var buf: [1]Ast.Node.Index = undefined;
         const proto = lexer.fnProto(self.tree, &buf, fn_decl) orelse return;
         const body = lexer.bodyOf(self.tree, fn_decl) orelse return;
@@ -604,7 +598,6 @@ pub const FileCache = struct {
         fn_decl: Ast.Node.Index,
         receiver_type: ?[]const u8,
     ) !bool {
-        const lexer = @import("lexer.zig");
         var buf: [1]Ast.Node.Index = undefined;
         const proto = lexer.fnProto(self.tree, &buf, fn_decl) orelse return false;
         const body = lexer.bodyOf(self.tree, fn_decl) orelse return false;
@@ -728,10 +721,9 @@ pub const FileCache = struct {
         method_name: []const u8,
     ) !?fn_summary.FnSummary {
         const rm = self.findMethodAcrossImports(type_name, method_name) orelse return null;
-        const lex = @import("lexer.zig");
         var buf: [1]Ast.Node.Index = undefined;
-        const proto = lex.fnProto(rm.tree, &buf, rm.method.fn_decl) orelse return null;
-        const body = lex.bodyOf(rm.tree, rm.method.fn_decl) orelse return null;
+        const proto = lexer.fnProto(rm.tree, &buf, rm.method.fn_decl) orelse return null;
+        const body = lexer.bodyOf(rm.tree, rm.method.fn_decl) orelse return null;
         var summary: fn_summary.FnSummary = .{};
         summary.takes_ownership_of = fn_summary.inferDirectTakes(rm.tree, proto, body);
         return summary;
@@ -841,20 +833,19 @@ pub const FileCache = struct {
     /// findings are safe to suppress.
     pub fn fileHasDirectSelfDestructor(self: *FileCache) !bool {
         const model = try self.fileModel();
-        const lex = @import("lexer.zig");
         var buf: [1]Ast.Node.Index = undefined;
 
         for (model.fns) |fi| {
-            const proto = lex.fnProto(self.tree, &buf, fi.fn_decl) orelse continue;
-            const body = lex.bodyOf(self.tree, fi.fn_decl) orelse continue;
+            const proto = lexer.fnProto(self.tree, &buf, fi.fn_decl) orelse continue;
+            const body = lexer.bodyOf(self.tree, fi.fn_decl) orelse continue;
             if (fn_summary.inferDirectTakes(self.tree, proto, body)) |idx| {
                 if (idx == 0) return true;
             }
         }
         for (model.types) |ti| {
             for (ti.methods) |m| {
-                const proto = lex.fnProto(self.tree, &buf, m.fn_decl) orelse continue;
-                const body = lex.bodyOf(self.tree, m.fn_decl) orelse continue;
+                const proto = lexer.fnProto(self.tree, &buf, m.fn_decl) orelse continue;
+                const body = lexer.bodyOf(self.tree, m.fn_decl) orelse continue;
                 if (fn_summary.inferDirectTakes(self.tree, proto, body)) |idx| {
                     if (idx == 0) return true;
                 }
@@ -873,7 +864,6 @@ pub const FileCache = struct {
     ) !*const fn_summary.FnSummary {
         // Resolve proto + body via lexer helpers.
         var proto_buf: [1]Ast.Node.Index = undefined;
-        const lexer = @import("lexer.zig");
         const proto = lexer.fnProto(self.tree, &proto_buf, fn_decl) orelse {
             // Caller passed a non-fn_decl node — return a sentinel
             // .unknown summary.  Cache by fn_decl index so we don't
@@ -1133,7 +1123,7 @@ test "FileCache: localBindings caches per body" {
 
     // Find the two fn bodies.
     var proto_buf: [1]Ast.Node.Index = undefined;
-    var fns = @import("lexer.zig").iterFnDecls(&tree);
+    var fns = lexer.iterFnDecls(&tree);
     const foo = fns.next(&proto_buf).?;
     const bar = fns.next(&proto_buf).?;
 
@@ -1246,7 +1236,7 @@ test "FileCache: summaryOf caches per body, classifies alloc as heap" {
     defer cache.deinit();
 
     var proto_buf: [1]Ast.Node.Index = undefined;
-    var fns = @import("lexer.zig").iterFnDecls(&tree);
+    var fns = lexer.iterFnDecls(&tree);
     const f = fns.next(&proto_buf).?;
     const a = try cache.summaryOf(f.proto, f.body);
     const b = try cache.summaryOf(f.proto, f.body);
