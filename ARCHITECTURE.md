@@ -374,9 +374,9 @@ A clean diff that adds a new rule without trace calls is fine.
    ```
 
    For rules that walk per-fn AND need LocalBindings, use
-   `lexer.forEachFnCached(gpa, tree, cache, problems, checkFn)`
-   instead of `lexer.forEachFn` — the helper threads cache to the
-   per-fn callback so you can call `cache.localBindings(proto, body)`.
+   `lexer.forEachFnCached(gpa, tree, cache, problems, checkFn)` — the
+   helper threads cache to the per-fn callback so you can call
+   `cache.localBindings(proto, body)`.
 
 4. **Add inline tests** at the bottom of the rule file using
    `testing.expectFires` / `testing.expectNoFire`.  Cover the

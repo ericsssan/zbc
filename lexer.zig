@@ -378,24 +378,10 @@ pub fn forEachFnBody(
     }
 }
 
-/// As `forEachFnBody` but also passes the fn's `FnProto` to the
-/// callback — for rules that inspect parameter lists / return type.
-pub fn forEachFn(
-    gpa: std.mem.Allocator,
-    tree: *const Ast,
-    problems: anytype,
-    comptime callback: anytype,
-) !void {
-    var proto_buf: [1]Ast.Node.Index = undefined;
-    var fns = iterFnDecls(tree);
-    while (fns.next(&proto_buf)) |fn_entry| {
-        try callback(gpa, tree, fn_entry.proto, fn_entry.body, problems);
-    }
-}
-
-/// As `forEachFn` but threads a per-file `cache` to the callback.
-/// Use when the rule wants amortized LocalBindings via
-/// `cache.localBindings(proto, body)`.
+/// Like `forEachFnBody` but also passes the fn's `FnProto` AND a
+/// per-file `cache` to the callback — for rules that inspect
+/// parameter lists / return type and want amortized LocalBindings
+/// via `cache.localBindings(proto, body)`.
 pub fn forEachFnCached(
     gpa: std.mem.Allocator,
     tree: *const Ast,

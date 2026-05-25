@@ -621,48 +621,8 @@ fn deferredOnlyInSwitchScrutinee(
     return saw_in_scrut;
 }
 
-/// Given a `{` token position, return the matching `}`.
-fn matchBraceEnd(
-    tags: []const std.zig.Token.Tag,
-    lbrace: Ast.TokenIndex,
-    end: Ast.TokenIndex,
-) ?Ast.TokenIndex {
-    var depth: u32 = 1;
-    var t: Ast.TokenIndex = lbrace + 1;
-    while (t <= end) : (t += 1) {
-        switch (tags[t]) {
-            .l_brace => depth += 1,
-            .r_brace => {
-                depth -= 1;
-                if (depth == 0) return t;
-            },
-            else => {},
-        }
-    }
-    return null;
-}
-
-/// Given an `(` token position, return the position of the matching
-/// `)` (1-paren-depth balanced scan).  Returns null when unmatched.
-fn matchParenEnd(
-    tags: []const std.zig.Token.Tag,
-    lparen: Ast.TokenIndex,
-    end: Ast.TokenIndex,
-) ?Ast.TokenIndex {
-    var depth: u32 = 1;
-    var t: Ast.TokenIndex = lparen + 1;
-    while (t <= end) : (t += 1) {
-        switch (tags[t]) {
-            .l_paren => depth += 1,
-            .r_paren => {
-                depth -= 1;
-                if (depth == 0) return t;
-            },
-            else => {},
-        }
-    }
-    return null;
-}
+const matchBraceEnd = lexer.matchBrace;
+const matchParenEnd = lexer.matchParen;
 
 /// Find a fn_decl AST node by name — top-level OR a method of
 /// any type.  Conservative: returns null on the FIRST match;

@@ -1086,33 +1086,7 @@ fn hasNonTrivialDeinit(tree: *const Ast, ti: *const fmodel.TypeInfo) bool {
     return false;
 }
 
-fn isTrivialBody(tree: *const Ast, body_first: Ast.TokenIndex, body_last: Ast.TokenIndex) bool {
-    const tags = tree.tokens.items(.tag);
-    if (body_first >= body_last) return true;
-    if (body_first + 1 == body_last) return true;
-    var t: Ast.TokenIndex = body_first + 1;
-    while (t < body_last) {
-        if (tags[t] != .identifier) return false;
-        if (!std.mem.eql(u8, tree.tokenSlice(t), "_")) return false;
-        if (t + 1 >= body_last or tags[t + 1] != .equal) return false;
-        var depth: u32 = 0;
-        var k = t + 2;
-        while (k < body_last) : (k += 1) {
-            switch (tags[k]) {
-                .l_paren, .l_brace, .l_bracket => depth += 1,
-                .r_paren, .r_brace, .r_bracket => {
-                    if (depth == 0) return false;
-                    depth -= 1;
-                },
-                .semicolon => if (depth == 0) break,
-                else => {},
-            }
-        }
-        if (k >= body_last or tags[k] != .semicolon) return false;
-        t = k + 1;
-    }
-    return true;
-}
+const isTrivialBody = lexer.isTrivialBody;
 
 /// True iff `assign_tok` (the `<this>` ident in `<this>.<field> = …`)
 /// is the body of an inline `defer` / `errdefer` statement.  Matches:
