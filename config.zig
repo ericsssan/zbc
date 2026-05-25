@@ -257,6 +257,13 @@ pub const Invariant = enum {
     /// in returned-by-value struct" footgun common when porting
     /// C / Rust code that uses intrusive self-references.
     self_pointer_in_returned_value,
+    /// `@panic("TODO ...")` / `@panic("unimplemented")` /
+    /// `@panic("FIXME ...")` / etc. left in code that may run
+    /// in release builds.  TODO-panics are a development
+    /// scaffold; reaching them in production crashes the user's
+    /// process.  Either return an explicit error or gate the
+    /// branch out at compile time.
+    todo_panic_in_production,
     /// `const|var <X> = try <dir>.<opener>(...);` binds an OS file
     /// handle; `<X>.close();` invalidates it; any subsequent use of
     /// `<X>` (method call or field access) reads/writes through a
@@ -426,7 +433,7 @@ pub const Invariant = enum {
     borrowed_slice_into_stack_buffer_returned,
 };
 
-pub const all_invariants: [48]Invariant = .{
+pub const all_invariants: [49]Invariant = .{
     .arena_escape,
     .stack_escape,
     .use_undefined,
@@ -475,6 +482,7 @@ pub const all_invariants: [48]Invariant = .{
     .iterator_invalidation_mutation,
     .thread_spawn_local_pointer,
     .self_pointer_in_returned_value,
+    .todo_panic_in_production,
 };
 
 pub const Default: Config = .{};
