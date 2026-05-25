@@ -274,14 +274,20 @@ fn innerIsRefCounted(tree: *const Ast, inner_ti: *const fmodel.TypeInfo) bool {
     return false;
 }
 
-/// True iff the inner type has a `deinit` (or `close`/`destroy`/
-/// `finalize`/`dispose`) method whose body contains
+/// True iff ANY method of the inner type contains
 /// `@fieldParentPtr("<field_name>", ...)` — the canonical
 /// embedded-view pattern where the inner navigates back to its
-/// enclosing outer struct.  Such a cleanup is meant to be invoked
-/// from outside the outer's deinit chain (calling it from inside
-/// would recurse); the inner is a view of the outer's own storage
-/// and gets freed when the outer is freed.
+/// enclosing outer struct.  When any method (not just cleanup-named
+/// ones) uses `@fieldParentPtr` with the field name, the inner is
+/// an embedded view of the outer's storage.  Its cleanup is meant
+/// to be invoked from outside the outer's deinit chain; the inner
+/// gets freed when the outer is freed.
+///
+/// We intentionally check ALL methods, not just cleanup-named ones,
+/// because the `@fieldParentPtr` call is often in a non-cleanup
+/// accessor (`parent()`/`owner()`/`ctx()`) that the inner's `deinit`
+/// then calls.  Following the call chain is out of scope; the
+/// presence of any such accessor is sufficient signal.
 fn innerDeinitUsesFieldParentPtr(
     tree: *const Ast,
     inner_ti: *const fmodel.TypeInfo,
@@ -289,7 +295,6 @@ fn innerDeinitUsesFieldParentPtr(
 ) bool {
     const tags = tree.tokens.items(.tag);
     for (inner_ti.methods) |m| {
-        if (!isCleanupName(m.name)) continue;
         var t: Ast.TokenIndex = m.body_first;
         while (t + 3 <= m.body_last) : (t += 1) {
             if (tags[t] != .builtin) continue;
@@ -593,6 +598,29 @@ test "optional field unwrap with mismatched capture cleanup still recognized" {
         \\    inner: ?Inner,
         \\    pub fn deinit(self: *Outer) void {
         \\        if (self.inner) |inner| inner.deinit();
+        \\    }
+        \\};
+    );
+}
+
+test "embedded-view: @fieldParentPtr in non-cleanup helper suppresses — no fire" {
+    // Mimics the js_valkey.zig pattern: SubscriptionCtx is embedded in
+    // JSValkeyClient and navigates back via @fieldParentPtr in its `parent()`
+    // helper method.  The outer's deinit legitimately doesn't call the inner's
+    // deinit because the inner is a view that manages its own lifecycle.
+    try testing.expectNoFire(check,
+        \\const Client = struct {
+        \\    ctx: Ctx,
+        \\    pub fn deinit(this: *Client) void {
+        \\        _ = this;
+        \\    }
+        \\};
+        \\const Ctx = struct {
+        \\    pub fn parent(this: *Ctx) *Client {
+        \\        return @fieldParentPtr("ctx", this);
+        \\    }
+        \\    pub fn deinit(this: *Ctx) void {
+        \\        _ = this.parent().someField;
         \\    }
         \\};
     );
