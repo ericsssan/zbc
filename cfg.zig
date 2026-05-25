@@ -4365,7 +4365,8 @@ const Builder = struct {
                 if (tags[t] == .ampersand and t + 1 <= last and tags[t + 1] == .identifier) {
                     if (t + 2 <= last) {
                         const next = tags[t + 2];
-                        if (next == .period or next == .l_bracket) break :blk null;
+                        if (next == .period or next == .l_bracket or
+                            next == .period_asterisk) break :blk null;
                     }
                     const name = tree.tokenSlice(t + 1);
                     break :blk self.name_to_local.get(name);
@@ -4424,7 +4425,12 @@ const Builder = struct {
             if (tags[t] == .ampersand and t + 1 <= last and tags[t + 1] == .identifier) {
                 if (t + 2 <= last) {
                     const next = tags[t + 2];
-                    if (next == .period or next == .l_bracket) continue;
+                    // Skip `&local.field`, `&local[i]`, `&local.*`
+                    // (period_asterisk is the single `.*` deref token),
+                    // and `&local.?` — those address memory the local
+                    // merely points INTO, typically caller-owned storage.
+                    if (next == .period or next == .l_bracket or
+                        next == .period_asterisk) continue;
                 }
                 const name = tree.tokenSlice(t + 1);
                 if (self.name_to_local.get(name)) |local| {

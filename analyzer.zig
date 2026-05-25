@@ -839,6 +839,24 @@ test "stack_escape: composite — return .{ .s = local_array[0..] } is flagged" 
     try std.testing.expect(found);
 }
 
+test "stack_escape: composite with &local.* (period_asterisk token) is NOT flagged" {
+    // `.*` is the single `period_asterisk` token in Zig's lexer.
+    // `&new.*` must be treated as a field-chain borrow (into caller
+    // storage), not a bare `&local` stack borrow — fixing osc.zig:463 FP.
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const Backing = struct { x: u32 = 0 };
+        \\pub inline fn fixed(new: **Backing) void {
+        \\    new.*.x = new.*.*.x;
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    for (problems.items) |p| {
+        try std.testing.expect(!std.mem.eql(u8, p.rule_id, "stack-escape"));
+    }
+}
+
 test "stack_escape: plain value return is OK" {
     const gpa = std.testing.allocator;
     var problems = try analyze(gpa,
