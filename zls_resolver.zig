@@ -162,6 +162,20 @@ pub const ZlsResolver = struct {
             else => return null,
         }
     }
+
+    /// Returns true iff `node` resolves to a pointer type at the
+    /// outermost level (before any unwrapping).  Used by `lowerVarDecl`
+    /// to detect opaque-pointer-returning calls like
+    /// `b.addUpdateSourceFiles()` where the return type is `*T` but
+    /// `T` isn't syntactically visible at the call site.
+    pub fn resolvedTypeIsPointer(self: *ZlsResolver, node: Ast.Node.Index) !bool {
+        const ty_maybe = try self.analyser.resolveTypeOfNode(.of(node, self.handle));
+        const ty = ty_maybe orelse return false;
+        return switch (ty.data) {
+            .pointer => true,
+            else => false,
+        };
+    }
 };
 
 /// Best-effort container-name extraction.  ZLS represents containers
@@ -354,3 +368,48 @@ test "ZlsResolver: init + deinit + resolves simple identifier" {
     try std.testing.expect(type_name != null);
     try std.testing.expectEqualStrings("ClientPool", type_name.?);
 }
+
+test "ZlsResolver.resolvedTypeIsPointer: pointer-returning factory fn" {
+    const gpa = std.testing.allocator;
+    const tio = std.testing.io;
+
+    const src: [:0]const u8 =
+        \\const Widget = struct { x: u32 = 0 };
+        \\
+        \\fn makeWidget() *Widget {
+        \\    return undefined;
+        \\}
+        \\
+        \\pub fn foo() void {
+        \\    const w = makeWidget();
+        \\    _ = w;
+        \\}
+    ;
+
+    var resolver: ZlsResolver = undefined;
+    try resolver.init(gpa, tio, "/tmp/zls_resolver_test_ptr.zig", src);
+    defer resolver.deinit();
+
+    // Find the call node `makeWidget()` — it's the init of `const w = makeWidget()`
+    const tree = resolver.handle.tree;
+    var node_idx: u32 = 1;
+    var call_node: ?Ast.Node.Index = null;
+    while (node_idx < tree.nodes.len) : (node_idx += 1) {
+        const n: Ast.Node.Index = @enumFromInt(node_idx);
+        switch (tree.nodeTag(n)) {
+            .call, .call_comma, .call_one, .call_one_comma => {
+                const first_tok = tree.firstToken(n);
+                const slice = tree.tokenSlice(first_tok);
+                if (std.mem.eql(u8, slice, "makeWidget")) {
+                    call_node = n;
+                    break;
+                }
+            },
+            else => {},
+        }
+    }
+    const cn = call_node orelse return error.CallNodeNotFound;
+    const is_ptr = try resolver.resolvedTypeIsPointer(cn);
+    try std.testing.expect(is_ptr);
+}
+

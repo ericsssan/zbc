@@ -436,6 +436,13 @@ pub fn lowerFunctionFullWithZls(
     const fn_proto = (try fnProto(tree, &buf, fn_decl)) orelse return null;
     const body_node = bodyOf(tree, fn_decl) orelse return null;
 
+    // Comptime-only functions (every parameter is `comptime`) are
+    // evaluated entirely at comptime — their stack locals are
+    // comptime constants embedded in the binary, not runtime stack
+    // frames.  Skip analysis to avoid FPs like `return &local_array`
+    // where the array is actually a comptime-known slice.
+    if (fnAllParamsAreComptime(tree, fn_proto)) return null;
+
     // Pre-classify the fn's return type.  Only borrowed-shape returns
     // (slice/pointer) can leak a borrowed origin to the caller; value
     // returns move the value and are exempt from the escape check.
@@ -551,6 +558,20 @@ fn bodyOf(tree: *const Ast, node: Ast.Node.Index) ?Ast.Node.Index {
     return tree.nodeData(node).node_and_node[1];
 }
 
+/// True iff every parameter in `fn_proto` is declared `comptime`.
+/// A function with all-comptime params is only callable at comptime
+/// (its body is evaluated by the compiler, not at runtime), so its
+/// "stack" locals are comptime constants — not real stack frames.
+fn fnAllParamsAreComptime(tree: *const Ast, fn_proto: Ast.full.FnProto) bool {
+    if (fn_proto.ast.params.len == 0) return false;
+    var it = fn_proto.iterate(tree);
+    while (it.next()) |param| {
+        const cn = param.comptime_noalias orelse return false;
+        if (tree.tokenTag(cn) != .keyword_comptime) return false;
+    }
+    return true;
+}
+
 /// True iff `path` (a dotted field chain like "value_ptr.field" or
 /// just "ptr") starts with a segment whose name ends in `_ptr` (or
 /// is exactly `ptr`).  Pointer-name convention — stdlib's
@@ -656,6 +677,28 @@ fn initCallNameIsPointerReturning(tree: *const Ast, init_node: Ast.Node.Index) b
         std.mem.eql(u8, name, "getPtr") or
         std.mem.eql(u8, name, "getParent") or
         std.mem.eql(u8, name, "parent");
+}
+
+/// True iff `init_node` is a method call on a known pointer local.
+/// Catches factory/builder patterns like `b.addUpdateSourceFiles()` where
+/// the receiver `b` is a `*std.Build` parameter — the call returns a
+/// `*Step.T` but ZLS can't resolve it cross-file.  Suppresses FPs like
+/// `return &usf.step` where `usf` is actually a pointer.
+fn initCallReceiverIsPointerLocal(builder: *const Builder, tree: *const Ast, init_node: Ast.Node.Index) bool {
+    const tag = tree.nodeTag(init_node);
+    switch (tag) {
+        .call, .call_comma, .call_one, .call_one_comma => {},
+        else => return false,
+    }
+    var buf: [1]Ast.Node.Index = undefined;
+    const call_full = tree.fullCall(&buf, init_node) orelse return false;
+    const callee = call_full.ast.fn_expr;
+    if (tree.nodeTag(callee) != .field_access) return false;
+    const recv = tree.nodeData(callee).node_and_token[0];
+    if (tree.nodeTag(recv) != .identifier) return false;
+    const recv_name = tree.tokenSlice(tree.nodeMainToken(recv));
+    const lid = builder.name_to_local.get(recv_name) orelse return false;
+    return builder.locals.items[@intFromEnum(lid)].is_pointer;
 }
 
 /// later in the body.  Used by `lowerVarDecl` to infer `is_pointer`
@@ -2374,6 +2417,28 @@ const Builder = struct {
             if (!is_pointer and init_kind == .unknown) {
                 if (init_opt) |init| {
                     if (initCallNameIsPointerReturning(tree, init)) is_pointer = true;
+                }
+            }
+            // ZLS fallback: if the init expression resolves to a
+            // pointer type at the outermost level, the local is a
+            // pointer.  Catches opaque-pointer-returning calls like
+            // `b.addUpdateSourceFiles()` that return `*T` but whose
+            // name isn't in the heuristic name list above.
+            if (!is_pointer and init_kind == .unknown) {
+                if (init_opt) |init| {
+                    if (self.zls) |z| {
+                        if (z.resolvedTypeIsPointer(init) catch false) is_pointer = true;
+                    }
+                }
+            }
+            // Receiver-pointer heuristic: if the init call's direct
+            // receiver is a known pointer local, the factory/builder
+            // call likely returns a pointer too — e.g. `b.addStep()`
+            // where `b: *std.Build` → result is `*Step.*`.  ZLS can't
+            // resolve cross-stdlib calls, so this bridges the gap.
+            if (!is_pointer and init_kind == .unknown) {
+                if (init_opt) |init| {
+                    if (initCallReceiverIsPointerLocal(self, tree, init)) is_pointer = true;
                 }
             }
         }
@@ -6140,7 +6205,7 @@ const Builder = struct {
         const last_field: ?Ast.TokenIndex = if (ends_in_call)
             (if (chain_end > first_field) chain_end - 2 else null)
         else if (ends_in_len_or_ptr)
-            (if (chain_end > first_field + 2) chain_end - 4 else null)
+            (if (chain_end > first_field + 4) chain_end - 4 else null)
         else
             chain_end;
         if (last_field == null) return;
