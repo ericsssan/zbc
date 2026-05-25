@@ -382,14 +382,18 @@ fn transferRetValueChecks(
     switch (origin) {
         .arena, .arena_borrow => |aid| {
             if (!config_mod.isEnabled(ctx.config, .arena_escape)) return;
-            if (state.arenas.contains(aid)) {
-                if (is_composite) {
-                    try report(ctx, "arena-escape", pos, end_pos, .@"error",
-                        "returning a value that holds a borrow from function-local arena (escapes its lifetime)", .{});
-                } else {
-                    try report(ctx, "arena-escape", pos, end_pos, .@"error",
-                        "returning a value borrowed from a function-local arena (escapes its lifetime)", .{});
-                }
+            const ast = state.arenas.get(aid) orelse return;
+            // Arena moved into returned struct ("object owns its own
+            // arena" pattern): when the arena was stored as a field of
+            // the heap-allocated return value, its lifetime transfers
+            // to the heap — the struct manages its own cleanup.
+            if (ast.is_heap_allocated) return;
+            if (is_composite) {
+                try report(ctx, "arena-escape", pos, end_pos, .@"error",
+                    "returning a value that holds a borrow from function-local arena (escapes its lifetime)", .{});
+            } else {
+                try report(ctx, "arena-escape", pos, end_pos, .@"error",
+                    "returning a value borrowed from a function-local arena (escapes its lifetime)", .{});
             }
         },
         .heap => |hid| {
@@ -417,6 +421,37 @@ fn transferFieldAssign(
     const origin = try originOfInit(ctx, state, a.rhs_kind, pos);
     const key: state_mod.FieldKey = .{ .parent = a.parent, .name = a.name };
     try state.fields.putContext(ctx.gpa, key, origin, .{});
+
+    // "Object owns its own arena" pattern: when the arena ITSELF is
+    // stored into a field of a HEAP-allocated struct (`ptr.*.arena =
+    // arena` where ptr is heap/arena-allocated), the arena is moved
+    // into the heap struct.  Its lifetime is now tied to the struct,
+    // not the stack frame — mark it heap-allocated so the arena-escape
+    // check knows the arena won't die with the frame.
+    // Only applies when the parent local is heap/arena-origin; when the
+    // parent is a plain stack local (`var ma = W{ .inner = arena }`),
+    // the arena stays stack-bound and the escape check still fires.
+    blk: {
+        const aid = switch (origin) {
+            .arena_borrow => |id| id,
+            else => break :blk,
+        };
+        // Only suppress when the parent is a heap/arena-allocated
+        // POINTER local — i.e. the struct was allocated on the heap.
+        // Stack locals like `var ma = W{ .inner = arena }` have
+        // is_pointer=false; a pointer to a heap allocation has
+        // is_pointer=true.  Both may have .arena_borrow origin when
+        // the arena is wrapped; the pointer check distinguishes them.
+        if (!ctx.locals[@intFromEnum(a.parent)].is_pointer) break :blk;
+        const parent_origin = state.locals.get(a.parent) orelse break :blk;
+        switch (parent_origin) {
+            .heap, .arena, .arena_borrow => {},
+            else => break :blk,
+        }
+        if (state.arenas.getPtr(aid)) |st| {
+            if (!st.is_heap_allocated) st.is_heap_allocated = true;
+        }
+    }
 
     // Field assignment initializes the parent (partially).  Clear
     // the parent's .undef so `var x = undefined; x.field = val;

@@ -1933,3 +1933,29 @@ test "return error.X without prior explicit free — clean (errdefer is the SOLE
     try std.testing.expectEqual(@as(usize, 0), problems.items.len);
 }
 
+test "arena_escape: object-owns-its-own-arena pattern NOT flagged (ptr.* = .{ .arena = arena })" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const std = @import("std");
+        \\const ArenaAllocator = std.heap.ArenaAllocator;
+        \\const Allocator = std.mem.Allocator;
+        \\const S = struct {
+        \\    arena: ArenaAllocator,
+        \\    pub fn destroy(self: *S) void { self.arena.deinit(); }
+        \\};
+        \\pub fn create(alloc: Allocator) !*S {
+        \\    var arena = ArenaAllocator.init(alloc);
+        \\    errdefer arena.deinit();
+        \\    const arena_alloc = arena.allocator();
+        \\    const ptr = try arena_alloc.create(S);
+        \\    ptr.* = .{ .arena = arena };
+        \\    return ptr;
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    for (problems.items) |p| {
+        try std.testing.expect(!std.mem.eql(u8, p.rule_id, "arena-escape"));
+    }
+}
+

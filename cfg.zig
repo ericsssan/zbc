@@ -1577,6 +1577,35 @@ const Builder = struct {
         return false;
     }
 
+    /// True iff the destructor body contains `<param0>.* = undefined;`
+    /// — the canonical Zig value-type deinit pattern.  Such structs are
+    /// not heap-allocated by their caller; the heap-leak rule's
+    /// `allocator.destroy(self)` requirement doesn't apply.
+    fn destructorHasSelfUndefined(self: *const Builder) bool {
+        const proto = self.fn_proto orelse return false;
+        const first = self.fn_body_first;
+        const last = self.fn_body_last;
+        if (first == 0 or last == 0) return false;
+        var it = proto.iterate(self.tree);
+        const p0 = it.next() orelse return false;
+        const name_tok = p0.name_token orelse return false;
+        const param_name = self.tree.tokenSlice(name_tok);
+        const tags = self.tree.tokens.items(.tag);
+        // Scan for: <param_name> .* = undefined
+        // `.*` is a SINGLE period_asterisk token in the Zig tokenizer.
+        var t = first;
+        while (t + 4 <= last) : (t += 1) {
+            if (tags[t] != .identifier) continue;
+            if (!std.mem.eql(u8, self.tree.tokenSlice(t), param_name)) continue;
+            if (tags[t + 1] != .period_asterisk) continue;
+            if (tags[t + 2] != .equal) continue;
+            if (tags[t + 3] != .identifier) continue;
+            if (!std.mem.eql(u8, self.tree.tokenSlice(t + 3), "undefined")) continue;
+            return true;
+        }
+        return false;
+    }
+
     /// True iff `type_name`'s body declares a bun refcount mixin
     /// — `RefCount(...)` or `ThreadSafeRefCount(...)`.  Used by
     /// `leakyDestructorTypeName` to suppress the leak fire on
@@ -1727,6 +1756,15 @@ const Builder = struct {
                 if (s.takes_ownership_of) |idx| if (idx == 0) return null;
             }
         }
+        // Value-type deinit: `self.* = undefined;` (or `this.* =
+        // undefined;`) at any point in the body is the canonical Zig
+        // idiom for a stack-allocated (or externally-owned) struct that
+        // zeroes itself in debug builds.  Such types are never freed via
+        // `allocator.destroy(self)` — deallocation happens at the call
+        // site or not at all.  The heap-leak rule fires because another
+        // method uses `alloc.create(T)` for sub-instances (like Set's
+        // leader sub-sets), but the outer struct is a value type.
+        if (self.destructorHasSelfUndefined()) return null;
         // Summary lookup misses comptime-generated types (anonymous
         // structs returned from type-factory fns).  Fall back to a
         // direct body scan: if the body calls `.destroy(first-param)`
@@ -2401,7 +2439,16 @@ const Builder = struct {
             // init decl; many decls get short-circuited by the
             // cheaper checks above.  Scan bounded to the fn body's
             // last token (the closing `}` of the fn).
-            if (!is_pointer and init_kind == .unknown) {
+            // Also runs for `copy_of(arena_src)` — `arena_alloc.create(T)`
+            // produces a copy_of the arena local, but the result IS a
+            // pointer (*T); the deref scan catches it correctly.
+            if (!is_pointer and (init_kind == .unknown or
+                (init_kind == .copy_of and blk: {
+                    const src = init_kind.copy_of;
+                    const h = self.locals.items[@intFromEnum(src)].init_hint;
+                    break :blk h == .arena_local or h == .arena_allocator;
+                })))
+            {
                 if (localIsDereferencedAfter(self.tree, name, name_tok, self.fn_body_last)) {
                     is_pointer = true;
                 }
@@ -2784,6 +2831,13 @@ const Builder = struct {
                 try self.maybePartialUnionWrite(cur.*, rhs, out_local, null,
                     self.posOf(assign_node), self.endPosOf(assign_node));
             }
+            // Unpack struct-literal fields so arena/heap-field origins
+            // are tracked per-field.  Needed for the "object owns its
+            // own arena" pattern (`ptr.* = .{ .arena = arena, ... }`) —
+            // the arena field_assign marks the arena as heap-moved,
+            // suppressing the spurious arena-escape on `return ptr`.
+            try self.unpackStructInitFields(cur.*, out_local, null, rhs,
+                self.posOf(assign_node), self.endPosOf(assign_node));
         } else if (tree.nodeTag(lhs) == .identifier and
             std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(lhs)), "_"))
         {
@@ -5894,7 +5948,9 @@ const Builder = struct {
             // the same expression spuriously sees .undef.  Emit
             // .assign(.unknown) — rhs origin is opaque from a token
             // walk, but clearing undef is what matters.
-            if (t + 1 <= last and tags[t + 1] == .equal) {
+            if (t + 1 <= last and tags[t + 1] == .equal and
+                (t == 0 or tags[t - 1] != .period))
+            {
                 const lhs_name = tree.tokenSlice(t);
                 if (self.name_to_local.get(lhs_name)) |lid| {
                     if (skip_local == null or skip_local.? != lid) {
