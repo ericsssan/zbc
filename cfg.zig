@@ -33,6 +33,7 @@ const config_mod = @import("config.zig");
 const file_cache = @import("file_cache.zig");
 const fn_summary = @import("fn_summary.zig");
 const lexer = @import("lexer.zig");
+const receiver_mod = @import("receiver.zig");
 const model_mod = @import("model.zig");
 const zls_resolver_mod = @import("zls_resolver.zig");
 
@@ -3982,17 +3983,7 @@ const Builder = struct {
         return self.fieldLhsFor(arg);
     }
 
-    /// True iff `name` is conventionally an allocator binding:
-    /// `allocator`, `gpa`, `alloc`, or a suffixed form
-    /// (`child_allocator`, `arena_allocator`, etc.).
-    fn looksLikeAllocatorName(name: []const u8) bool {
-        if (std.mem.eql(u8, name, "allocator")) return true;
-        if (std.mem.eql(u8, name, "alloc")) return true;
-        if (std.mem.eql(u8, name, "gpa")) return true;
-        if (std.mem.endsWith(u8, name, "_allocator")) return true;
-        if (std.mem.endsWith(u8, name, "_gpa")) return true;
-        return false;
-    }
+    const looksLikeAllocatorName = receiver_mod.isAllocatorishName;
 
     /// True iff `node` is an expression whose surface name suggests an
     /// allocator: bare identifier with an allocator-looking name, or a

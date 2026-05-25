@@ -35,6 +35,7 @@ const problem_mod = @import("../problem.zig");
 const testing = @import("../testing.zig");
 const config_mod = @import("../config.zig");
 const file_cache_mod = @import("../file_cache.zig");
+const receiver = @import("../receiver.zig");
 
 const Problem = problem_mod.Problem;
 const Pos = problem_mod.Pos;
@@ -166,11 +167,7 @@ fn bodyHasErrdeferOn(tree: *const Ast, first: Ast.TokenIndex, last: Ast.TokenInd
     return false;
 }
 
-fn isCanonicalOutName(name: []const u8) bool {
-    return std.mem.eql(u8, name, "result") or
-        std.mem.eql(u8, name, "out") or
-        std.mem.eql(u8, name, "r");
-}
+const isCanonicalOutName = receiver.isCanonicalOutName;
 
 fn isAcquireMethodName(name: []const u8) bool {
     return std.mem.eql(u8, name, "ensureTotalCapacity") or

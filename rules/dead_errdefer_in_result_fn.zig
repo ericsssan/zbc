@@ -23,6 +23,7 @@ const lexer = @import("../lexer.zig");
 const testing = @import("../testing.zig");
 const fnProto = lexer.fnProto;
 const bodyOf = lexer.bodyOf;
+const skipFnDecl = lexer.skipFnDecl;
 
 const Problem = problem_mod.Problem;
 const Pos = problem_mod.Pos;
@@ -154,50 +155,12 @@ fn walkBodyForErrdefer(
         // otherwise fire on the same errdefer once per containing
         // fn.
         if (tags[t] == .keyword_fn) {
-            t = skipNestedFn(tags, t, last);
+            t = skipFnDecl(tags, t, last);
             continue;
         }
         if (tags[t] != .keyword_errdefer) continue;
         try report(gpa, problems, tree, t);
     }
-}
-
-/// Walk forward from a `keyword_fn` token past the proto's params
-/// `(...)` and the body's `{...}`, returning the index of the
-/// closing `}` (or `last` if not found).
-fn skipNestedFn(tags: []const std.zig.Token.Tag, kw_fn: Ast.TokenIndex, last: Ast.TokenIndex) Ast.TokenIndex {
-    var t: Ast.TokenIndex = kw_fn + 1;
-    // Skip optional name + `(`.
-    while (t <= last and tags[t] != .l_paren) : (t += 1) {}
-    if (t > last) return last;
-    // Match params' `)`.
-    var depth: u32 = 1;
-    t += 1;
-    while (t <= last and depth > 0) : (t += 1) {
-        switch (tags[t]) {
-            .l_paren => depth += 1,
-            .r_paren => depth -= 1,
-            else => {},
-        }
-    }
-    // Walk to body `{`.
-    while (t <= last and tags[t] != .l_brace) : (t += 1) {
-        // If we hit a `;` or `,`, this is a fn proto without body
-        // (extern decl or struct field) — stop here.
-        if (tags[t] == .semicolon or tags[t] == .comma or tags[t] == .keyword_fn) return t;
-    }
-    if (t > last or tags[t] != .l_brace) return @min(t, last);
-    // Match body `}`.
-    depth = 1;
-    t += 1;
-    while (t <= last and depth > 0) : (t += 1) {
-        switch (tags[t]) {
-            .l_brace => depth += 1,
-            .r_brace => depth -= 1,
-            else => {},
-        }
-    }
-    return @min(t -| 1, last);
 }
 
 fn report(
@@ -334,6 +297,6 @@ test "dead-errdefer-in-result-fn: nested fn errdefer attributed to inner fn only
     );
     defer freeProblems(gpa, &problems);
     // Inner fn fires once; outer fn returns `void` so its scan skips
-    // past the inner fn's body via skipNestedFn.
+    // past the inner fn via skipFnDecl.
     try std.testing.expectEqual(@as(usize, 1), problems.items.len);
 }

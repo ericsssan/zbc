@@ -516,19 +516,6 @@ pub fn matchExact(
     return m;
 }
 
-/// True iff `atoms` matches ANYWHERE in `[start, last]` at SAME
-/// block depth as start (with same skipping rules as
-/// findInSameScope).  Used for "is there a defer/errdefer doing X
-/// somewhere in this scope".
-pub fn anyMatchInSameScope(
-    tree: *const Ast,
-    atoms: []const Atom,
-    start: TokenIndex,
-    last: TokenIndex,
-    bound: ?*const Match,
-) bool {
-    return findInSameScope(tree, atoms, start, last, bound) != null;
-}
 
 /// True iff `atoms` matches anywhere in `[start, last]`, INCLUDING
 /// inside defer/errdefer (which findInSameScope skips).  Used for

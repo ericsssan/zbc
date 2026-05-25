@@ -30,6 +30,7 @@ pub fn isAllocatorishName(name: []const u8) bool {
     if (std.mem.eql(u8, name, "a")) return true;
     if (std.mem.endsWith(u8, name, "_alloc")) return true;
     if (std.mem.endsWith(u8, name, "_allocator")) return true;
+    if (std.mem.endsWith(u8, name, "_gpa")) return true;
     if (std.mem.endsWith(u8, name, "Alloc")) return true;
     if (std.mem.endsWith(u8, name, "Allocator")) return true;
     return false;
@@ -57,6 +58,7 @@ pub fn isCleanupMethodName(name: []const u8) bool {
         std.mem.eql(u8, name, "free") or
         std.mem.eql(u8, name, "destroy") or
         std.mem.eql(u8, name, "close") or
+        std.mem.eql(u8, name, "stop") or
         std.mem.eql(u8, name, "release") or
         std.mem.eql(u8, name, "deref") or
         std.mem.eql(u8, name, "unref") or

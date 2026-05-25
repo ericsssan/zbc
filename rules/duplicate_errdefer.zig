@@ -27,6 +27,7 @@ const lexer = @import("../lexer.zig");
 const testing = @import("../testing.zig");
 const returnsType = lexer.returnsType;
 const fnProto = lexer.fnProto;
+const skipFnDecl = lexer.skipFnDecl;
 const bodyOf = lexer.bodyOf;
 
 const Problem = problem_mod.Problem;
@@ -90,7 +91,7 @@ fn checkBody(
     while (t <= last) : (t += 1) {
         // Skip past nested fns so their errdefers stay scoped.
         if (tags[t] == .keyword_fn) {
-            t = skipNestedFn(tags, t, last);
+            t = skipFnDecl(tags, t, last);
             continue;
         }
         if (tags[t] != .keyword_errdefer) continue;
@@ -214,35 +215,6 @@ fn callsEqual(tree: *const Ast, a: Cleanup, b: Cleanup) bool {
         if (!std.mem.eql(u8, tree.tokenSlice(ai), tree.tokenSlice(bi))) return false;
     }
     return true;
-}
-
-fn skipNestedFn(tags: []const std.zig.Token.Tag, kw_fn: Ast.TokenIndex, last: Ast.TokenIndex) Ast.TokenIndex {
-    var t: Ast.TokenIndex = kw_fn + 1;
-    while (t <= last and tags[t] != .l_paren) : (t += 1) {}
-    if (t > last) return last;
-    var depth: u32 = 1;
-    t += 1;
-    while (t <= last and depth > 0) : (t += 1) {
-        switch (tags[t]) {
-            .l_paren => depth += 1,
-            .r_paren => depth -= 1,
-            else => {},
-        }
-    }
-    while (t <= last and tags[t] != .l_brace) : (t += 1) {
-        if (tags[t] == .semicolon or tags[t] == .comma or tags[t] == .keyword_fn) return t;
-    }
-    if (t > last or tags[t] != .l_brace) return @min(t, last);
-    depth = 1;
-    t += 1;
-    while (t <= last and depth > 0) : (t += 1) {
-        switch (tags[t]) {
-            .l_brace => depth += 1,
-            .r_brace => depth -= 1,
-            else => {},
-        }
-    }
-    return @min(t -| 1, last);
 }
 
 fn report(

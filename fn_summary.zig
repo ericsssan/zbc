@@ -250,7 +250,7 @@ fn inferResultIndependentOfArgs(
 /// allocator-vocabulary method.  The matched pattern is:
 /// with the vocabulary-based "is alloc method" check instead of
 /// string-pattern matching.
-pub fn inferReturnsHeap(tree: *const Ast, body_node: Ast.Node.Index) bool {
+fn inferReturnsHeap(tree: *const Ast, body_node: Ast.Node.Index) bool {
     var expr = singleReturnExpr(tree, body_node) orelse return false;
     while (true) {
         switch (tree.nodeTag(expr)) {
@@ -373,14 +373,7 @@ fn returnIsAllocCall(
     return receiver_mod.isAllocMethodName(tree.tokenSlice(m));
 }
 
-fn isAllocatorName(name: []const u8) bool {
-    if (std.mem.eql(u8, name, "allocator")) return true;
-    if (std.mem.eql(u8, name, "alloc")) return true;
-    if (std.mem.eql(u8, name, "gpa")) return true;
-    if (std.mem.endsWith(u8, name, "_allocator")) return true;
-    if (std.mem.endsWith(u8, name, "_gpa")) return true;
-    return false;
-}
+const isAllocatorName = receiver_mod.isAllocatorishName;
 
 fn paramIndex(tree: *const Ast, proto: Ast.full.FnProto, name: []const u8) ?u32 {
     var idx: u32 = 0;

@@ -35,6 +35,7 @@ const lexer = @import("../lexer.zig");
 const receiver = @import("../receiver.zig");
 const testing = @import("../testing.zig");
 const findStmtSemicolon = lexer.findStmtSemicolon;
+const skipFnDecl = lexer.skipFnDecl;
 const fnProto = lexer.fnProto;
 const bodyOf = lexer.bodyOf;
 
@@ -84,7 +85,7 @@ fn checkBody(
     while (t + 3 < last) : (t += 1) {
         // Skip past nested fns.
         if (tags[t] == .keyword_fn) {
-            t = skipNestedFn(tags, t, last);
+            t = skipFnDecl(tags, t, last);
             continue;
         }
         // Match `<this>.<field> = …;` at statement position.
@@ -1373,35 +1374,6 @@ fn returnsType(tree: *const Ast, fp: Ast.full.FnProto) bool {
     if (first != last) return false;
     return tree.tokens.items(.tag)[first] == .identifier and
         std.mem.eql(u8, tree.tokenSlice(first), "type");
-}
-
-fn skipNestedFn(tags: []const std.zig.Token.Tag, kw_fn: Ast.TokenIndex, last: Ast.TokenIndex) Ast.TokenIndex {
-    var t: Ast.TokenIndex = kw_fn + 1;
-    while (t <= last and tags[t] != .l_paren) : (t += 1) {}
-    if (t > last) return last;
-    var depth: u32 = 1;
-    t += 1;
-    while (t <= last and depth > 0) : (t += 1) {
-        switch (tags[t]) {
-            .l_paren => depth += 1,
-            .r_paren => depth -= 1,
-            else => {},
-        }
-    }
-    while (t <= last and tags[t] != .l_brace) : (t += 1) {
-        if (tags[t] == .semicolon or tags[t] == .comma or tags[t] == .keyword_fn) return t;
-    }
-    if (t > last or tags[t] != .l_brace) return @min(t, last);
-    depth = 1;
-    t += 1;
-    while (t <= last and depth > 0) : (t += 1) {
-        switch (tags[t]) {
-            .l_brace => depth += 1,
-            .r_brace => depth -= 1,
-            else => {},
-        }
-    }
-    return @min(t -| 1, last);
 }
 
 fn report(

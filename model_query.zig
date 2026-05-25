@@ -98,7 +98,7 @@ pub const MethodPred = struct {
 
 // ── Predicate matchers ───────────────────────────────────────
 
-pub fn typeMatches(ti: *const fmodel.TypeInfo, pred: TypePred) bool {
+fn typeMatches(ti: *const fmodel.TypeInfo, pred: TypePred) bool {
     if (pred.kind) |k| if (ti.kind != k) return false;
     if (pred.name_eq) |n| if (!std.mem.eql(u8, ti.name, n)) return false;
     if (pred.name_pred) |p| if (!p(ti.name)) return false;
@@ -107,7 +107,7 @@ pub fn typeMatches(ti: *const fmodel.TypeInfo, pred: TypePred) bool {
     return true;
 }
 
-pub fn fieldMatches(
+fn fieldMatches(
     tree: *const Ast,
     model: *const fmodel.FileModel,
     ti_owner: *const fmodel.TypeInfo,
@@ -126,7 +126,7 @@ pub fn fieldMatches(
     return true;
 }
 
-pub fn methodMatches(m: *const fmodel.MethodInfo, pred: MethodPred) bool {
+fn methodMatches(m: *const fmodel.MethodInfo, pred: MethodPred) bool {
     if (pred.name_eq) |n| if (!std.mem.eql(u8, m.name, n)) return false;
     if (pred.name_pred) |p| if (!p(m.name)) return false;
     if (pred.is_cleanup and !receiver.isCleanupMethodName(m.name)) return false;
@@ -175,8 +175,7 @@ pub fn findFields(
     return out.toOwnedSlice(gpa);
 }
 
-/// All methods of `ti` matching `pred`.  Caller owns the slice.
-pub fn findMethods(
+fn findMethods(
     gpa: std.mem.Allocator,
     ti: *const fmodel.TypeInfo,
     pred: MethodPred,
@@ -192,7 +191,7 @@ pub fn findMethods(
 
 /// True iff the field's type is a bare identifier (peel one `?`),
 /// not a pointer/slice/array — the conservative "I own this" signal.
-pub fn isValueTyped(tree: *const Ast, field: *const fmodel.FieldInfo) bool {
+fn isValueTyped(tree: *const Ast, field: *const fmodel.FieldInfo) bool {
     const tags = tree.tokens.items(.tag);
     var t: TokenIndex = field.type_first;
     if (t > field.type_last) return false;
@@ -205,7 +204,7 @@ pub fn isValueTyped(tree: *const Ast, field: *const fmodel.FieldInfo) bool {
 /// the type's first identifier-token (after peeling `?`) names a
 /// type declared in this file.  Returns null otherwise (e.g.
 /// `*T`, `[]T`, foreign types, generics, etc.).
-pub fn resolveFieldType(
+fn resolveFieldType(
     tree: *const Ast,
     model: *const fmodel.FileModel,
     field: *const fmodel.FieldInfo,
@@ -259,25 +258,6 @@ pub fn methodBodyContains(
     atoms: []const query.Atom,
 ) bool {
     return query.anyMatchAnywhere(tree, atoms, method.body_first, method.body_last, null);
-}
-
-/// True iff the method's body contains a match for `atoms`, IGNORING
-/// matches inside defer/errdefer statements.
-pub fn methodBodyContainsSkippingDefer(
-    gpa: std.mem.Allocator,
-    tree: *const Ast,
-    method: *const fmodel.MethodInfo,
-    atoms: []const query.Atom,
-) !bool {
-    const matches = try query.findAllInBodySkippingDefer(
-        gpa,
-        tree,
-        atoms,
-        method.body_first,
-        method.body_last,
-    );
-    defer gpa.free(matches);
-    return matches.len > 0;
 }
 
 // ── Tests ──────────────────────────────────────────────────

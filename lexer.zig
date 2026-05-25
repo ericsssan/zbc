@@ -132,20 +132,35 @@ pub fn skipNestedFn(tags: []const TokenTag, start: TokenIndex, last: TokenIndex)
 }
 
 /// Given a `fn` keyword at `start`, skip past the proto's `(...)`
-/// AND the body's `{...}`.  Used by rules that walk struct bodies
-/// and need to entirely skip fn decls (proto + body) to avoid
-/// misreading fn parameters as struct fields.
-pub fn skipNestedFnProtoAndBody(tags: []const TokenTag, start: TokenIndex, last: TokenIndex) TokenIndex {
-    // Walk to proto's `(`.
-    var u: TokenIndex = start + 1;
-    while (u <= last and tags[u] != .l_paren) : (u += 1) {}
-    if (u > last) return last;
-    const cp = matchParen(tags, u, last) orelse return last;
-    // Walk to body's `{`.
-    var b: TokenIndex = cp + 1;
-    while (b <= last and tags[b] != .l_brace) : (b += 1) {}
-    if (b > last) return cp;
-    return matchBrace(tags, b, last) orelse last;
+/// AND the body's `{...}`.  Handles extern / proto-only fn decls
+/// (no body) by bailing on `;`, `,`, or nested `fn` between `)` and `{`.
+pub fn skipFnDecl(tags: []const TokenTag, start: TokenIndex, last: TokenIndex) TokenIndex {
+    var t: TokenIndex = start + 1;
+    while (t <= last and tags[t] != .l_paren) : (t += 1) {}
+    if (t > last) return last;
+    var depth: u32 = 1;
+    t += 1;
+    while (t <= last and depth > 0) : (t += 1) {
+        switch (tags[t]) {
+            .l_paren => depth += 1,
+            .r_paren => depth -= 1,
+            else => {},
+        }
+    }
+    while (t <= last and tags[t] != .l_brace) : (t += 1) {
+        if (tags[t] == .semicolon or tags[t] == .comma or tags[t] == .keyword_fn) return t;
+    }
+    if (t > last or tags[t] != .l_brace) return @min(t, last);
+    depth = 1;
+    t += 1;
+    while (t <= last and depth > 0) : (t += 1) {
+        switch (tags[t]) {
+            .l_brace => depth += 1,
+            .r_brace => depth -= 1,
+            else => {},
+        }
+    }
+    return @min(t -| 1, last);
 }
 
 /// True iff any token in `[start, end]` has tag `needle`.
@@ -415,6 +430,36 @@ pub fn enclosingFnDecl(tree: *const Ast, tok: TokenIndex) ?Ast.Node.Index {
         }
     }
     return best;
+}
+
+/// True iff the body `[body_first..body_last]` (inclusive `{` ... `}`)
+/// is empty or contains only `_ = <expr>;` discard statements.
+pub fn isTrivialBody(tree: *const Ast, body_first: TokenIndex, body_last: TokenIndex) bool {
+    const tags = tree.tokens.items(.tag);
+    if (body_first >= body_last) return true;
+    if (body_first + 1 == body_last) return true;
+    var t: TokenIndex = body_first + 1;
+    while (t < body_last) {
+        if (tags[t] != .identifier) return false;
+        if (!std.mem.eql(u8, tree.tokenSlice(t), "_")) return false;
+        if (t + 1 >= body_last or tags[t + 1] != .equal) return false;
+        var depth: u32 = 0;
+        var k = t + 2;
+        while (k < body_last) : (k += 1) {
+            switch (tags[k]) {
+                .l_paren, .l_brace, .l_bracket => depth += 1,
+                .r_paren, .r_brace, .r_bracket => {
+                    if (depth == 0) return false;
+                    depth -= 1;
+                },
+                .semicolon => if (depth == 0) break,
+                else => {},
+            }
+        }
+        if (k >= body_last or tags[k] != .semicolon) return false;
+        t = k + 1;
+    }
+    return true;
 }
 
 // ── Tests ──────────────────────────────────────────────────

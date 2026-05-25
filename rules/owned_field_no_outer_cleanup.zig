@@ -23,6 +23,8 @@ const testing = @import("../testing.zig");
 const trace = @import("../trace.zig");
 const config_mod = @import("../config.zig");
 const file_cache_mod = @import("../file_cache.zig");
+const lexer = @import("../lexer.zig");
+const receiver = @import("../receiver.zig");
 
 const R = "owned-field-no-outer-cleanup";
 
@@ -559,49 +561,9 @@ fn anyNonTrivialCleanup(tree: *const Ast, ti: *const fmodel.TypeInfo) bool {
     return false;
 }
 
-/// True iff the body `[body_first..body_last]` (inclusive `{` ... `}`)
-/// is empty or contains only `_ = <expr>;` discard statements.
-fn isTrivialBody(tree: *const Ast, body_first: Ast.TokenIndex, body_last: Ast.TokenIndex) bool {
-    const tags = tree.tokens.items(.tag);
-    if (body_first >= body_last) return true;
-    // body_first is `{`, body_last is `}`.  Empty body: nothing between.
-    if (body_first + 1 == body_last) return true;
-    // Walk statements; require each to be a discard.
-    var t: Ast.TokenIndex = body_first + 1;
-    while (t < body_last) {
-        // Allowed start: `_` identifier followed by `=`.
-        if (tags[t] != .identifier) return false;
-        if (!std.mem.eql(u8, tree.tokenSlice(t), "_")) return false;
-        if (t + 1 >= body_last or tags[t + 1] != .equal) return false;
-        // Skip to the statement-terminating `;` at depth 0.
-        var depth: u32 = 0;
-        var k = t + 2;
-        while (k < body_last) : (k += 1) {
-            switch (tags[k]) {
-                .l_paren, .l_brace, .l_bracket => depth += 1,
-                .r_paren, .r_brace, .r_bracket => {
-                    if (depth == 0) return false;
-                    depth -= 1;
-                },
-                .semicolon => if (depth == 0) break,
-                else => {},
-            }
-        }
-        if (k >= body_last or tags[k] != .semicolon) return false;
-        t = k + 1;
-    }
-    return true;
-}
+const isTrivialBody = lexer.isTrivialBody;
 
-fn isCleanupName(name: []const u8) bool {
-    return std.mem.eql(u8, name, "deinit") or
-        std.mem.eql(u8, name, "close") or
-        std.mem.eql(u8, name, "destroy") or
-        std.mem.eql(u8, name, "free") or
-        std.mem.eql(u8, name, "stop") or
-        std.mem.eql(u8, name, "finalize") or
-        std.mem.eql(u8, name, "dispose");
-}
+const isCleanupName = receiver.isCleanupMethodName;
 
 fn report(
     gpa: std.mem.Allocator,

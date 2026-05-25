@@ -1351,7 +1351,7 @@ fn collectFields(
         }
         // Skip fn declarations (proto + body).
         if (tags[t] == .keyword_fn) {
-            t = lexer.skipNestedFnProtoAndBody(tags, t, end);
+            t = lexer.skipFnDecl(tags, t, end);
             continue;
         }
         // Skip nested decls — `[pub] const/var Name ...;` — the
@@ -1786,7 +1786,7 @@ test "containingTypeOf: method's fn_decl resolves to its struct" {
         const n: Ast.Node.Index = @enumFromInt(idx);
         if (tree.nodeTag(n) != .fn_decl) continue;
         var buf: [1]Ast.Node.Index = undefined;
-        const fp = @import("lexer.zig").fnProto(&tree, &buf, n).?;
+        const fp = lexer.fnProto(&tree, &buf, n).?;
         const name_tok = fp.name_token.?;
         if (std.mem.eql(u8, tree.tokenSlice(name_tok), "deinit")) deinit_node = n;
         if (std.mem.eql(u8, tree.tokenSlice(name_tok), "top_level")) top_node = n;

@@ -32,7 +32,7 @@ zbc/
 ├── file_cache.zig            — per-file shared state (FileModel + LocalBindings)
 │
 ├── lexer.zig                 — token primitives (matchBrace, FnDeclIter, …)
-├── scope.zig                 — scope-aware iterators (BodyWalk, …)
+├── scope.zig                 — scope-aware iterators (findIdentUseInEnclosingScope)
 ├── receiver.zig              — name classifiers (isAllocatorishName, …)
 ├── model.zig                 — FileModel: per-file TypeTable + FnTable
 ├── model_query.zig           — AST-level DSL: find types/fields/methods
@@ -115,10 +115,18 @@ Key fns:
 - `findStmtSemicolon` — next `;` at paren/brace/bracket depth 0.
 - `skipDeferStmt` — given `defer` / `errdefer` keyword, jump past
   the entire deferred statement.
-- `skipNestedFn` / `skipNestedFnProtoAndBody` — skip nested fn
-  bodies to avoid re-scanning them through their enclosing fn.
+- `skipNestedFn` — given any token before a fn body, skip the
+  body `{...}`.
+- `skipFnDecl` — given the `fn` keyword, skip the proto `(...)`
+  and body `{...}`; bails early on `;`/`,`/`fn` for extern /
+  proto-only fn decls.
 - `hasTokenInRange` — true iff any token in `[start, end]` has a
   given tag.
+- `findIdentInScope` — find first use of a named identifier at
+  brace depth 0 within a bounded scope.
+- `enclosingFnDecl` — innermost fn_decl node containing a token.
+- `isTrivialBody` — true iff a fn body is empty or contains only
+  `_ = <expr>;` discard statements.
 - `returnsType` — true iff a fn returns the literal `type` (a
   type-builder fn; skip to avoid double-scanning its inner body).
 - `fnProto` / `bodyOf` — extract proto / body of an `fn_decl`
@@ -136,18 +144,9 @@ Conventions:
 
 ### `scope.zig` — scope-aware iteration
 
-Three reusable iterators that encode the three patterns every
-precision-tightened rule needs:
-
 - `findIdentUseInEnclosingScope` — bounded by the enclosing `}`;
   allows nested blocks inside the scope; sibling scopes with the
   same name don't match (shadow-aware).
-- `findReceiverCallSameDepth(tree, start, last, recv, methodPred)`
-  — find a `<recv>.<method>(` call at the SAME block depth as
-  `start`.  Skips nested blocks (deeper-scope mutates don't always
-  execute) and `defer` / `errdefer` (deferred, not inline).
-- `BodyWalk` — cursor over a fn body with `atNestedFn` /
-  `skipNestedFn` / `atDeferKeyword` / `skipDeferStmt` helpers.
 
 ### `receiver.zig` — name classifiers
 
@@ -160,7 +159,7 @@ Classifiers:
 - `isAllocatorishName` (gpa, alloc, allocator, *_alloc, *Allocator, …)
 - `isSelfReceiverName` (self, this)
 - `isCanonicalOutName` (result, out, r)
-- `isCleanupMethodName` (deinit, free, destroy, close, …)
+- `isCleanupMethodName` (deinit, free, destroy, close, stop, release, deref, unref, removeRef, finalize, dispose)
 - `isAcquireMethodName` (reference, retain, addRef, …; ref excluded)
 - `isReleaseMethodName` (release, deref, unref, …)
 - `isAllocMethodName` (alloc, allocSentinel, dupe, dupeZ, create, …)
