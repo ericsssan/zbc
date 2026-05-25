@@ -48,6 +48,7 @@ const free_then_try_realloc_mod = @import("rules/free_then_try_realloc.zig");
 const free_without_null_then_check_mod = @import("rules/free_without_null_then_check.zig");
 const hashmap_getptr_rehash_mod = @import("rules/hashmap_getptr_rehash.zig");
 const getorput_unguarded_value_read_mod = @import("rules/getorput_unguarded_value_read.zig");
+const hashmap_iter_mutation_mod = @import("rules/hashmap_iter_mutation.zig");
 const iterator_invalidation_mutation_mod = @import("rules/iterator_invalidation_mutation.zig");
 const thread_spawn_local_pointer_mod = @import("rules/thread_spawn_local_pointer.zig");
 const self_pointer_in_returned_value_mod = @import("rules/self_pointer_in_returned_value.zig");
@@ -114,6 +115,7 @@ pub const escape_rules = [_]Rule{
     .{ .id = "deinit-order-violates-construction-dep",     .check = deinit_order_violates_construction_dep_mod.check },
     .{ .id = "borrowed-slice-into-stack-buffer-returned",  .check = borrowed_slice_into_stack_buffer_returned_mod.check },
     .{ .id = "getorput-unguarded-value-read",               .check = getorput_unguarded_value_read_mod.check },
+    .{ .id = "hashmap-iter-mutation",                      .check = hashmap_iter_mutation_mod.check },
     .{ .id = "iterator-invalidation-mutation",             .check = iterator_invalidation_mutation_mod.check },
     .{ .id = "thread-spawn-local-pointer",                 .check = thread_spawn_local_pointer_mod.check },
     .{ .id = "self-pointer-in-returned-value",             .check = self_pointer_in_returned_value_mod.check },
@@ -168,6 +170,7 @@ test "registry: pull in every rule module so inline tests run" {
     _ = destroy_after_deinit_in_loop_mod;
     _ = duplicate_errdefer_mod;
     _ = getorput_unguarded_value_read_mod;
+    _ = hashmap_iter_mutation_mod;
     _ = iterator_invalidation_mutation_mod;
     _ = thread_spawn_local_pointer_mod;
     _ = self_pointer_in_returned_value_mod;

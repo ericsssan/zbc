@@ -438,9 +438,16 @@ pub const Invariant = enum {
     /// struct whose `.pre`/`.build`-style fields point at the
     /// now-dead stack buffer.  Catches ziglang/zig#25713 class.
     borrowed_slice_into_stack_buffer_returned,
+    /// `var iter = <map>.<iter-method>();` followed by
+    /// `while (iter.next()) |...| { ... <map>.<mutate>(...) ... }` —
+    /// modifying a HashMap (put / remove / clear / etc.) while
+    /// iterating it via `iterator()` / `keyIterator()` /
+    /// `valueIterator()` invalidates the iterator's internal cursor.
+    /// Subsequent calls to `iter.next()` have undefined behaviour.
+    hashmap_iter_mutation,
 };
 
-pub const all_invariants: [50]Invariant = .{
+pub const all_invariants: [51]Invariant = .{
     .arena_escape,
     .stack_escape,
     .use_undefined,
@@ -491,6 +498,7 @@ pub const all_invariants: [50]Invariant = .{
     .self_pointer_in_returned_value,
     .todo_panic_in_production,
     .getorput_unguarded_value_read,
+    .hashmap_iter_mutation,
 };
 
 pub const Default: Config = .{};
