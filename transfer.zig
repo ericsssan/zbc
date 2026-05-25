@@ -635,6 +635,15 @@ fn transferOutParamWrite(
             // intended install protocol, scoped to this fn.
             const out_info = ctx.locals[@intFromEnum(w.out)];
             if (out_info.init_hint == .heap_local) return;
+            // Stack-derived pointer: when `out` itself was initialized
+            // as `&local.field` (a borrow into this fn's stack frame),
+            // both `out` and the value written through it are scoped
+            // to this fn.  Writing `&src` through a stack-field pointer
+            // is an in-frame self-referential install, not an escape.
+            // Canonical: `const packet = &request.packet; packet.user_data = &request;`
+            if (state.locals.get(w.out)) |out_origin| {
+                if (out_origin == .stack) return;
+            }
             const src_name = ctx.locals[@intFromEnum(src_local)].name;
             try report(ctx, "stack-escape", pos, end_pos, .@"error",
                 "writing a pointer to function-local stack variable `{s}` through `{s}` (escapes its frame)",

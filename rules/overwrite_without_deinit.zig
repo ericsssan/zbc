@@ -871,8 +871,27 @@ fn priorVariantInFn(
     const tags = tree.tokens.items(.tag);
     if (assign_tok < body_first + 5) return null;
     var t: Ast.TokenIndex = assign_tok;
+    // Track brace depth going backward: `}` enters a block (+1),
+    // `{` exits a block (-1).  When depth drops below 0 we have
+    // crossed the opening brace of the assignment's own enclosing
+    // block — anything further back is either in the parent scope
+    // or a sibling arm of a switch/if statement, neither of which
+    // is guaranteed to have run before the current assignment.
+    // Restricting to depth 0 means we only return unconditional
+    // prior writes at the same nesting level.
+    var depth: i32 = 0;
     while (t > body_first + 4) {
         t -= 1;
+        switch (tags[t]) {
+            .r_brace => { depth += 1; continue; },
+            .l_brace => {
+                depth -= 1;
+                if (depth < 0) break; // exited enclosing block — stop
+                continue;
+            },
+            else => {},
+        }
+        if (depth != 0) continue; // skip writes inside nested blocks
         // Look for `<this> . <field> = . <tag>` at this position.
         if (tags[t] != .identifier) continue;
         if (!std.mem.eql(u8, tree.tokenSlice(t), this_name)) continue;
@@ -1552,6 +1571,48 @@ test "overwrite-without-deinit: inline `defer this.field = saved;` (save/restore
     // The unguarded `this.inner = new_inner` IS a real overwrite
     // without prior cleanup → should fire exactly once.
     try std.testing.expectEqual(@as(usize, 1), problems.items.len);
+}
+
+test "overwrite-without-deinit: sibling switch arms are mutually exclusive — no FP" {
+    // Mimics the HTMLBundle.zig:433 pattern: a completion callback
+    // that transitions `this.state` from `.building` in one arm to
+    // `.done` in another arm of `switch (result)`.  The two arms are
+    // mutually exclusive so `priorVariantInFn` must NOT pick up the
+    // assignment in the `.err` arm as the "prior state" for the
+    // `.ok` arm — that would produce a false positive.
+    const gpa = std.testing.allocator;
+    var problems = try runOn(gpa,
+        \\const Task = struct { pub fn deref(_: *Task) void {} };
+        \\const State = union(enum) {
+        \\    pending,
+        \\    building: ?*Task,
+        \\    err: u32,
+        \\    done: u32,
+        \\    pub fn deinit(this: *State) void {
+        \\        switch (this.*) {
+        \\            .building => |t| if (t) |c| c.deref(),
+        \\            else => {},
+        \\        }
+        \\    }
+        \\};
+        \\const Owner = struct {
+        \\    state: State = .pending,
+        \\    pub fn init(this: *Owner) void { this.state = .pending; }
+        \\    pub fn onComplete(this: *Owner, result: union(enum) { ok: u32, fail: u32 }) void {
+        \\        switch (result) {
+        \\            .fail => |e| {
+        \\                this.state = .{ .err = e };
+        \\            },
+        \\            .ok => |v| {
+        \\                this.state = .{ .done = v };
+        \\            },
+        \\        }
+        \\    }
+        \\};
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
 }
 
 test "overwrite-without-deinit: assert(this.field == default) gates the write — no fire" {
