@@ -354,7 +354,6 @@ fn isFileHandleOpenerMethod(name: []const u8) bool {
         std.mem.eql(u8, name, "openDirZ") or
         std.mem.eql(u8, name, "openat") or
         std.mem.eql(u8, name, "openatZ") or
-        std.mem.eql(u8, name, "open") or
         std.mem.eql(u8, name, "socket") or
         std.mem.eql(u8, name, "accept");
 }

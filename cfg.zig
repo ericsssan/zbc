@@ -1684,7 +1684,46 @@ const Builder = struct {
                 if (s.takes_ownership_of) |idx| if (idx == 0) return null;
             }
         }
+        // Summary lookup misses comptime-generated types (anonymous
+        // structs returned from type-factory fns).  Fall back to a
+        // direct body scan: if the body calls `.destroy(first-param)`
+        // or `.free(first-param)`, the destructor does free self.
+        if (self.bodyFreesFirstParam()) return null;
         return ct;
+    }
+
+    /// Returns true iff the fn body contains a direct
+    /// `.free(<p0>)` / `.destroy(<p0>)` call where `p0` is the
+    /// first parameter's name.  Used as a fallback when the
+    /// summary-lookup path can't find the type (comptime-generated
+    /// types not present in the file model).
+    fn bodyFreesFirstParam(self: *Builder) bool {
+        const proto = self.fn_proto orelse return false;
+        const first = self.fn_body_first;
+        const last = self.fn_body_last;
+        if (first == 0 or last == 0) return false;
+        // Get the first parameter's name.
+        var it = proto.iterate(self.tree);
+        const p0 = it.next() orelse return false;
+        const name_tok = p0.name_token orelse return false;
+        const param_name = self.tree.tokenSlice(name_tok);
+        const tags = self.tree.tokens.items(.tag);
+        var t = first;
+        while (t + 3 <= last) : (t += 1) {
+            if (tags[t] != .period) continue;
+            if (tags[t + 1] != .identifier) continue;
+            const method = self.tree.tokenSlice(t + 1);
+            const is_free = std.mem.eql(u8, method, "free") or
+                std.mem.eql(u8, method, "destroy");
+            if (!is_free) continue;
+            if (tags[t + 2] != .l_paren) continue;
+            if (tags[t + 3] != .identifier) continue;
+            // Guard: arg followed by `.` means it's a field access —
+            // not freeing the param itself.
+            if (t + 4 <= last and tags[t + 4] == .period) continue;
+            if (std.mem.eql(u8, self.tree.tokenSlice(t + 3), param_name)) return true;
+        }
+        return false;
     }
 
     /// For each `for (input_i) |capture_i|` pair, if input_i is
