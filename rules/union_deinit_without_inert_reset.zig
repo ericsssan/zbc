@@ -44,6 +44,7 @@ const config_mod = @import("../config.zig");
 const file_cache_mod = @import("../file_cache.zig");
 
 const lexer = @import("../lexer.zig");
+const receiver = @import("../receiver.zig");
 const testing = @import("../testing.zig");
 const matchBrace = lexer.matchBrace;
 const skipNestedFn = lexer.skipNestedFn;
@@ -200,14 +201,7 @@ fn checkSwitchBody(
     }
 }
 
-fn isCleanupMethodName(name: []const u8) bool {
-    return std.mem.eql(u8, name, "deinit") or
-        std.mem.eql(u8, name, "free") or
-        std.mem.eql(u8, name, "release") or
-        std.mem.eql(u8, name, "deref") or
-        std.mem.eql(u8, name, "destroy") or
-        std.mem.eql(u8, name, "close");
-}
+const isCleanupMethodName = receiver.isCleanupMethodName;
 
 /// True iff `[start, end]` contains a `<cap>.<cleanup>(...)` or
 /// `<cap>.<sub>.<cleanup>(...)` call.
