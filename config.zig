@@ -264,6 +264,13 @@ pub const Invariant = enum {
     /// process.  Either return an explicit error or gate the
     /// branch out at compile time.
     todo_panic_in_production,
+    /// `const gop = try map.getOrPut(key);` followed by
+    /// `gop.value_ptr.*` used as a READ without a prior check of
+    /// `gop.found_existing`.  When `found_existing == false` the map
+    /// inserted a new slot; `value_ptr.*` is uninitialised and reading
+    /// it is undefined behaviour.  Write-only access (`gop.value_ptr.*
+    /// = value;`) is safe without the check.
+    getorput_unguarded_value_read,
     /// `const|var <X> = try <dir>.<opener>(...);` binds an OS file
     /// handle; `<X>.close();` invalidates it; any subsequent use of
     /// `<X>` (method call or field access) reads/writes through a
@@ -433,7 +440,7 @@ pub const Invariant = enum {
     borrowed_slice_into_stack_buffer_returned,
 };
 
-pub const all_invariants: [49]Invariant = .{
+pub const all_invariants: [50]Invariant = .{
     .arena_escape,
     .stack_escape,
     .use_undefined,
@@ -483,6 +490,7 @@ pub const all_invariants: [49]Invariant = .{
     .thread_spawn_local_pointer,
     .self_pointer_in_returned_value,
     .todo_panic_in_production,
+    .getorput_unguarded_value_read,
 };
 
 pub const Default: Config = .{};
