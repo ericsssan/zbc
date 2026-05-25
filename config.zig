@@ -232,6 +232,16 @@ pub const Invariant = enum {
     /// `*AssumeCapacity` variants are deliberately excluded (no
     /// realloc by contract).
     arraylist_items_slice,
+    /// `for (<list>.items) |...| { ... <list>.<mutate>(...); ... }`
+    /// — the loop iterates over a snapshot of `.items` while the
+    /// body calls a method on the SAME list that reallocates or
+    /// reorders the backing storage (append/resize/insert/
+    /// swapRemove/etc., plus hashmap put/remove that rehash).
+    /// The loop's slice borrow may dangle, skip elements, or
+    /// double-visit elements.  Sibling of [[arraylist-items-slice]]
+    /// which fires on `const X = list.items;` + later mutate +
+    /// later use of X; this rule fires on the loop SHAPE directly.
+    iterator_invalidation_mutation,
     /// `const|var <X> = try <dir>.<opener>(...);` binds an OS file
     /// handle; `<X>.close();` invalidates it; any subsequent use of
     /// `<X>` (method call or field access) reads/writes through a
@@ -401,7 +411,7 @@ pub const Invariant = enum {
     borrowed_slice_into_stack_buffer_returned,
 };
 
-pub const all_invariants: [45]Invariant = .{
+pub const all_invariants: [46]Invariant = .{
     .arena_escape,
     .stack_escape,
     .use_undefined,
@@ -447,6 +457,7 @@ pub const all_invariants: [45]Invariant = .{
     .move_out_without_restore,
     .deinit_order_violates_construction_dep,
     .borrowed_slice_into_stack_buffer_returned,
+    .iterator_invalidation_mutation,
 };
 
 pub const Default: Config = .{};

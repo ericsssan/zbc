@@ -47,6 +47,7 @@ const fd_write_after_close_mod = @import("rules/fd_write_after_close.zig");
 const free_then_try_realloc_mod = @import("rules/free_then_try_realloc.zig");
 const free_without_null_then_check_mod = @import("rules/free_without_null_then_check.zig");
 const hashmap_getptr_rehash_mod = @import("rules/hashmap_getptr_rehash.zig");
+const iterator_invalidation_mutation_mod = @import("rules/iterator_invalidation_mutation.zig");
 const memset_undef_after_len_truncation_mod = @import("rules/memset_undef_after_len_truncation.zig");
 const missing_deinit_on_composed_owner_mod = @import("rules/missing_deinit_on_composed_owner.zig");
 const missing_errdefer_between_tries_mod = @import("rules/missing_errdefer_between_tries.zig");
@@ -108,6 +109,7 @@ pub const escape_rules = [_]Rule{
     .{ .id = "move-out-without-restore",                   .check = move_out_without_restore_mod.check },
     .{ .id = "deinit-order-violates-construction-dep",     .check = deinit_order_violates_construction_dep_mod.check },
     .{ .id = "borrowed-slice-into-stack-buffer-returned",  .check = borrowed_slice_into_stack_buffer_returned_mod.check },
+    .{ .id = "iterator-invalidation-mutation",             .check = iterator_invalidation_mutation_mod.check },
 };
 
 /// Dispatch all registered escape rules against `tree`.  `cache` is
@@ -157,6 +159,7 @@ test "registry: pull in every rule module so inline tests run" {
     _ = deinit_order_violates_construction_dep_mod;
     _ = destroy_after_deinit_in_loop_mod;
     _ = duplicate_errdefer_mod;
+    _ = iterator_invalidation_mutation_mod;
     _ = fd_write_after_close_mod;
     _ = free_then_try_realloc_mod;
     _ = free_without_null_then_check_mod;
