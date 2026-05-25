@@ -3673,6 +3673,15 @@ const Builder = struct {
                         if (s.takes_ownership_of) |i| break :blk i;
                     }
                 }
+                // Cross-file fallback: callee is defined in an @import'd
+                // file.  Direct-takes inference only — resolveTransitiveTakes
+                // has already propagated intra-file chains; what's left are
+                // callees whose destructor lives in a foreign file.
+                if (recv_ty) |ty| {
+                    if (c.summaryByMethodCrossFile(ty, callee_name) catch null) |xf| {
+                        if (xf.takes_ownership_of) |i| break :blk i;
+                    }
+                }
             }
             return null;
         };
