@@ -3746,14 +3746,16 @@ const Builder = struct {
             break :blk model.fieldType(parent_ty, field_name);
         };
 
-        // Resolve method's @takes: cache (typed only) -> db -> cross-file.
-        // See takesOwnershipFreedLocal for why bare-name fallback is
-        // excluded.
+        // Resolve method's @takes: same-file typed -> cross-file typed.
+        // No bare-name fallback — see takesOwnershipFreedLocal for rationale.
         const takes_idx: u32 = blk: {
             if (recv_ty) |ty| {
                 if (self.cache) |c| {
                     if (c.summaryByMethod(ty, method_name) catch null) |s| {
                         if (s.takes_ownership_of) |i| break :blk i;
+                    }
+                    if (c.summaryByMethodCrossFile(ty, method_name) catch null) |xf| {
+                        if (xf.takes_ownership_of) |i| break :blk i;
                     }
                 }
             }
