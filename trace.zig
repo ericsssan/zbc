@@ -55,7 +55,7 @@ pub fn setFile(path: []const u8) void {
 ///         defer gpa.free(label);
 ///         trace.note(R, tree, t, label);
 ///     }
-pub fn isActive(rule_id: []const u8) bool {
+fn isActive(rule_id: []const u8) bool {
     if (all_rules) return true;
     const want = active_rule orelse return false;
     return std.mem.eql(u8, want, rule_id);

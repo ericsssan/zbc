@@ -252,7 +252,7 @@ pub const ProjectCache = struct {
     }
 
     /// Public wrapper — acquires mutex then calls the locked impl.
-    pub fn findProjectRoot(
+    fn findProjectRoot(
         self: *ProjectCache,
         from_file_path: []const u8,
     ) !?[]const u8 {
@@ -367,7 +367,7 @@ pub const ProjectCache = struct {
     }
 
     /// Public wrapper — acquires mutex then calls the locked impl.
-    pub fn modelForAbsolutePath(
+    fn modelForAbsolutePath(
         self: *ProjectCache,
         abs_path: []u8,
     ) !?*const model_mod.FileModel {

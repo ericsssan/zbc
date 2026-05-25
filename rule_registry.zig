@@ -78,7 +78,7 @@ const unreleased_refs_on_error_mod = @import("rules/unreleased_refs_on_error.zig
 // Order matches the original dispatch sequence in lib.zig.
 // Rules that need Db run after CFG analysis populates it.
 
-pub const escape_rules = [_]Rule{
+const escape_rules = [_]Rule{
     .{ .id = "aliased-heap-dupe",                          .check = aliased_heap_dupe_mod.check },
     .{ .id = "clobbered-by-struct-reset",                  .check = clobbered_by_struct_reset_mod.check },
     .{ .id = "realloc-byte-count",                         .check = realloc_byte_count_mod.check },
