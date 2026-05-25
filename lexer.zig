@@ -525,3 +525,55 @@ test "returnsType detects fn Wrap(T) type" {
     }
     try std.testing.expect(false); // no fn_decl found
 }
+
+test "isTrivialBody: empty and discard-only bodies are trivial" {
+    const gpa = std.testing.allocator;
+    const cases = [_]struct { src: [:0]const u8, want: bool }{
+        .{ .src = "fn f() void {}", .want = true },
+        .{ .src = "fn f() void { _ = 1; }", .want = true },
+        .{ .src = "fn f() void { _ = foo(); _ = bar; }", .want = true },
+        .{ .src = "fn f() void { x = 1; }", .want = false },
+        .{ .src = "fn f() void { foo(); }", .want = false },
+    };
+    for (cases) |c| {
+        var tree = try Ast.parse(gpa, c.src, .zig);
+        defer tree.deinit(gpa);
+        var idx: u32 = 1;
+        while (idx < tree.nodes.len) : (idx += 1) {
+            const node: Ast.Node.Index = @enumFromInt(idx);
+            if (tree.nodeTag(node) != .fn_decl) continue;
+            const body = bodyOf(&tree, node).?;
+            const bf = tree.firstToken(body);
+            const bl = tree.lastToken(body);
+            try std.testing.expectEqual(c.want, isTrivialBody(&tree, bf, bl));
+            break;
+        }
+    }
+}
+
+test "skipFnDecl: skips proto+body and handles extern protos" {
+    const gpa = std.testing.allocator;
+    {
+        const src: [:0]const u8 = "const S = struct { fn f(x: u32) void { _ = x; } };";
+        var tree = try Ast.parse(gpa, src, .zig);
+        defer tree.deinit(gpa);
+        const tags = tree.tokens.items(.tag);
+        const last: TokenIndex = @intCast(tree.tokens.len - 1);
+        var t: TokenIndex = 0;
+        while (tags[t] != .keyword_fn) : (t += 1) {}
+        const end = skipFnDecl(tags, t, last);
+        try std.testing.expectEqual(TokenTag.r_brace, tags[end]);
+    }
+    {
+        // extern fn: no body — should stop at `;`
+        const src: [:0]const u8 = "extern fn malloc(n: usize) ?*anyopaque;";
+        var tree = try Ast.parse(gpa, src, .zig);
+        defer tree.deinit(gpa);
+        const tags = tree.tokens.items(.tag);
+        const last: TokenIndex = @intCast(tree.tokens.len - 1);
+        var t: TokenIndex = 0;
+        while (tags[t] != .keyword_fn) : (t += 1) {}
+        const end = skipFnDecl(tags, t, last);
+        try std.testing.expectEqual(TokenTag.semicolon, tags[end]);
+    }
+}

@@ -129,6 +129,8 @@ test "isAllocatorishName" {
     try t.expect(isAllocatorishName("allocator"));
     try t.expect(isAllocatorishName("string_alloc"));
     try t.expect(isAllocatorishName("graphemeAllocator"));
+    try t.expect(isAllocatorishName("test_gpa"));
+    try t.expect(isAllocatorishName("arena_gpa"));
     try t.expect(!isAllocatorishName("self"));
     try t.expect(!isAllocatorishName("buffer"));
 }
@@ -158,6 +160,7 @@ test "isAllocMethodName" {
 test "method classifiers don't overlap incorrectly" {
     const t = std.testing;
     try t.expect(isCleanupMethodName("deinit"));
+    try t.expect(isCleanupMethodName("stop"));
     try t.expect(isAcquireMethodName("reference"));
     try t.expect(!isAcquireMethodName("ref")); // too generic
     try t.expect(isReleaseMethodName("release"));
