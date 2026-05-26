@@ -1217,6 +1217,29 @@ const Builder = struct {
         return false;
     }
 
+    /// True iff the first parameter of this fn is a `*const T` receiver
+    /// (possibly with a leading `?`).  Such a receiver CANNOT call
+    /// `alloc.destroy(self)` — the function only cleans up owned fields;
+    /// the caller must call `alloc.destroy(instance)` itself.
+    fn destructorIsConstReceiver(self: *const Builder) bool {
+        const proto = self.fn_proto orelse return false;
+        var it = proto.iterate(self.tree);
+        const p0 = it.next() orelse return false;
+        const te = p0.type_expr orelse return false;
+        const tags = self.tree.tokens.items(.tag);
+        const first = self.tree.firstToken(te);
+        const last = self.tree.lastToken(te);
+        var t: Ast.TokenIndex = first;
+        while (t + 1 <= last) : (t += 1) {
+            switch (tags[t]) {
+                .question_mark => continue,
+                .asterisk => return t + 1 <= last and tags[t + 1] == .keyword_const,
+                else => return false,
+            }
+        }
+        return false;
+    }
+
     /// True iff the destructor body contains `<param0>.* = undefined;`
     /// — the canonical Zig value-type deinit pattern.  Such structs are
     /// not heap-allocated by their caller; the heap-leak rule's
@@ -1378,6 +1401,13 @@ const Builder = struct {
         // anything; the rule firing is shoutness without
         // value.
         if (self.destructorBodyIsTrivial()) return null;
+        // Const-receiver pattern: `pub fn deinit(self: *const T, …)`.
+        // A `*const` receiver cannot call `alloc.destroy(self)` in the
+        // conventional way — such destructors only clean up owned FIELDS;
+        // the caller is expected to call `alloc.destroy(instance)` itself.
+        // This is the two-step cleanup pattern (deinit fields → caller
+        // destroys allocation).  The heap-leak diagnostic does not apply.
+        if (self.destructorIsConstReceiver()) return null;
         // Singleton-accessor pattern: types with `pub [inline] fn
         // get() *Self` (or `instance()` / `getOrNull()`) returning a
         // pointer to the type are conventional process-global

@@ -2089,3 +2089,54 @@ test "partial-union-write: no errdefer in same fn — no FP even if other fns ha
     try std.testing.expectEqual(@as(usize, 1), count);
 }
 
+test "heap-leak: *const T receiver — two-step cleanup pattern — does NOT fire" {
+    // A `*const T` deinit can only free fields, not `self`.  The type uses
+    // the caller-owned two-step pattern: callers call `deinit(alloc)` to
+    // release fields, then `alloc.destroy(instance)` to release the struct.
+    // The rule must NOT fire on such destructors.
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\pub const Data = struct {
+        \\    buf: []const u8,
+        \\    pub fn init(alloc: anytype, text: []const u8) !*Data {
+        \\        const d = try alloc.create(Data);
+        \\        d.buf = try alloc.dupe(u8, text);
+        \\        return d;
+        \\    }
+        \\    pub fn deinit(self: *const Data, alloc: anytype) void {
+        \\        alloc.free(self.buf);
+        \\    }
+        \\};
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    for (problems.items) |p| {
+        try std.testing.expect(!std.mem.eql(u8, p.rule_id, "heap-leak"));
+    }
+}
+
+test "heap-leak: *T receiver without destroy — fires" {
+    // Non-const receiver, has a heap-creator, no destroy call → fires.
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\pub const Data = struct {
+        \\    buf: []const u8,
+        \\    pub fn init(alloc: anytype, text: []const u8) !*Data {
+        \\        const d = try alloc.create(Data);
+        \\        d.buf = try alloc.dupe(u8, text);
+        \\        return d;
+        \\    }
+        \\    pub fn deinit(self: *Data, alloc: anytype) void {
+        \\        alloc.free(self.buf);
+        \\    }
+        \\};
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    var found = false;
+    for (problems.items) |p| {
+        if (std.mem.eql(u8, p.rule_id, "heap-leak")) found = true;
+    }
+    try std.testing.expect(found);
+}
+
