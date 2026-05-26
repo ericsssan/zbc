@@ -18,8 +18,8 @@
 const std = @import("std");
 const Ast = std.zig.Ast;
 
-const lexer = @import("lexer.zig");
-const receiver_mod = @import("receiver.zig");
+const lexer = @import("tokens.zig");
+const receiver_mod = @import("method_names.zig");
 
 /// Result-shape classification.
 pub const Returns = union(enum) {

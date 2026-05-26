@@ -16,14 +16,14 @@
 const std = @import("std");
 const Ast = std.zig.Ast;
 
-const fmodel = @import("../model.zig");
+const fmodel = @import("../file_model.zig");
 const mq = @import("../model_query.zig");
 const problem = @import("../problem.zig");
 const testing = @import("../testing.zig");
 const trace = @import("../trace.zig");
 const config_mod = @import("../config.zig");
 const file_cache_mod = @import("../file_cache.zig");
-const receiver = @import("../receiver.zig");
+const receiver = @import("../method_names.zig");
 
 const R = "owned-field-no-outer-cleanup";
 

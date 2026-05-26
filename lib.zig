@@ -4,7 +4,7 @@ const std = @import("std");
 const Ast = std.zig.Ast;
 
 const cfg_mod = @import("cfg.zig");
-const analyzer_mod = @import("analyzer.zig");
+const analyzer_mod = @import("worklist.zig");
 const config_mod = @import("config.zig");
 const problem_mod = @import("problem.zig");
 const rule_registry = @import("rule_registry.zig");
@@ -261,7 +261,7 @@ test {
     _ = config_mod;
     _ = problem_mod;
     _ = @import("abstract_state.zig");
-    _ = @import("transfer.zig");
+    _ = @import("cfg_transfer.zig");
     _ = rule_catalog_mod;
     // Pattern rules — registered in rule_registry; pulling it in
     // refAllDecls'es every rule module so inline tests run.
@@ -270,14 +270,14 @@ test {
     _ = suppressions_mod;
     _ = @import("fn_summary.zig");
     _ = @import("zls_resolver.zig");
-    _ = @import("lexer.zig");
-    _ = @import("scope.zig");
-    _ = @import("receiver.zig");
+    _ = @import("tokens.zig");
+    _ = @import("scope_iter.zig");
+    _ = @import("method_names.zig");
     _ = @import("testing.zig");
-    _ = @import("model.zig");
+    _ = @import("file_model.zig");
     _ = @import("trace.zig");
-    _ = @import("local.zig");
-    _ = @import("query.zig");
+    _ = @import("local_bindings.zig");
+    _ = @import("token_query.zig");
     _ = @import("model_query.zig");
     _ = @import("project_cache.zig");
     std.testing.refAllDecls(@This());

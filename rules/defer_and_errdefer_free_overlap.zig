@@ -27,7 +27,7 @@
 const std = @import("std");
 const Ast = std.zig.Ast;
 
-const lexer = @import("../lexer.zig");
+const lexer = @import("../tokens.zig");
 const problem_mod = @import("../problem.zig");
 const config_mod = @import("../config.zig");
 const file_cache_mod = @import("../file_cache.zig");
@@ -40,7 +40,7 @@ const hasTokenInRange = lexer.hasTokenInRange;
 const matchBrace = lexer.matchBrace;
 const skipNestedFn = lexer.skipNestedFn;
 
-const query = @import("../query.zig");
+const query = @import("../token_query.zig");
 const Atom = query.Atom;
 
 // `defer <alloc>.free(<X>...)` — captures the freed arg into slot 0.

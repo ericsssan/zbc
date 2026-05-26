@@ -10,8 +10,8 @@
 const std = @import("std");
 const Ast = std.zig.Ast;
 
-const lexer = @import("../lexer.zig");
-const query = @import("../query.zig");
+const lexer = @import("../tokens.zig");
+const query = @import("../token_query.zig");
 const problem = @import("../problem.zig");
 const testing = @import("../testing.zig");
 const trace = @import("../trace.zig");

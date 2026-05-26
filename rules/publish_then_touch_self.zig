@@ -32,10 +32,10 @@ const problem_mod = @import("../problem.zig");
 const config_mod = @import("../config.zig");
 const file_cache_mod = @import("../file_cache.zig");
 
-const lexer = @import("../lexer.zig");
-const query = @import("../query.zig");
-const scope = @import("../scope.zig");
-const receiver = @import("../receiver.zig");
+const lexer = @import("../tokens.zig");
+const query = @import("../token_query.zig");
+const scope = @import("../scope_iter.zig");
+const receiver = @import("../method_names.zig");
 const testing = @import("../testing.zig");
 const findStmtSemicolon = lexer.findStmtSemicolon;
 

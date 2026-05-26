@@ -43,8 +43,8 @@ const problem_mod = @import("../problem.zig");
 const config_mod = @import("../config.zig");
 const file_cache_mod = @import("../file_cache.zig");
 
-const lexer = @import("../lexer.zig");
-const receiver = @import("../receiver.zig");
+const lexer = @import("../tokens.zig");
+const receiver = @import("../method_names.zig");
 const testing = @import("../testing.zig");
 const matchBrace = lexer.matchBrace;
 const skipNestedFn = lexer.skipNestedFn;

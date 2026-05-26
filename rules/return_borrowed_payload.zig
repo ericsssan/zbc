@@ -31,7 +31,7 @@ const problem_mod = @import("../problem.zig");
 const config_mod = @import("../config.zig");
 const file_cache_mod = @import("../file_cache.zig");
 
-const lexer = @import("../lexer.zig");
+const lexer = @import("../tokens.zig");
 const testing = @import("../testing.zig");
 const matchBrace = lexer.matchBrace;
 const matchParen = lexer.matchParen;
@@ -116,7 +116,7 @@ fn scrutineeUnionType(
     cache: *file_cache_mod.FileCache,
     start: Ast.TokenIndex,
     end: Ast.TokenIndex,
-) ?*const @import("../model.zig").TypeInfo {
+) ?*const @import("../file_model.zig").TypeInfo {
     const tags = tree.tokens.items(.tag);
     if (start > end) return null;
     // Handle `<ident>.*` (deref).  Zig lexes `.*` as one token,
@@ -144,7 +144,7 @@ fn resolveLocalTypeAsUnion(
     cache: *file_cache_mod.FileCache,
     ident_tok: Ast.TokenIndex,
     ident: []const u8,
-) ?*const @import("../model.zig").TypeInfo {
+) ?*const @import("../file_model.zig").TypeInfo {
     const fn_decl = enclosingFnDecl(tree, ident_tok) orelse return null;
     var proto_buf: [1]Ast.Node.Index = undefined;
     const proto = lexer.fnProto(tree, &proto_buf, fn_decl) orelse return null;
@@ -212,7 +212,7 @@ fn baseTypeNameOfNode(tree: *const Ast, type_node: Ast.Node.Index) ?[]const u8 {
 /// doesn't borrow from any caller input.
 fn unionVariantHasPointerPayload(
     tree: *const Ast,
-    un_ti: *const @import("../model.zig").TypeInfo,
+    un_ti: *const @import("../file_model.zig").TypeInfo,
     tag_name: []const u8,
 ) bool {
     const field = un_ti.findField(tag_name) orelse return false;
@@ -228,7 +228,7 @@ fn unionVariantHasPointerPayload(
 fn checkSwitchArms(
     gpa: std.mem.Allocator,
     tree: *const Ast,
-    scrut_union: ?*const @import("../model.zig").TypeInfo,
+    scrut_union: ?*const @import("../file_model.zig").TypeInfo,
     start: Ast.TokenIndex,
     end: Ast.TokenIndex,
     problems: *std.ArrayListUnmanaged(Problem),

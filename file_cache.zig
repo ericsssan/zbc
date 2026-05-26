@@ -21,10 +21,10 @@
 const std = @import("std");
 const Ast = std.zig.Ast;
 
-const fmodel = @import("model.zig");
-const local = @import("local.zig");
+const fmodel = @import("file_model.zig");
+const local = @import("local_bindings.zig");
 const fn_summary = @import("fn_summary.zig");
-const lexer = @import("lexer.zig");
+const lexer = @import("tokens.zig");
 const zls_resolver_mod = @import("zls_resolver.zig");
 const project_cache_mod = @import("project_cache.zig");
 

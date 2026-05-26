@@ -43,10 +43,10 @@
 const std = @import("std");
 const Ast = std.zig.Ast;
 
-const fmodel = @import("model.zig");
-const lexer = @import("lexer.zig");
-const query = @import("query.zig");
-const receiver = @import("receiver.zig");
+const fmodel = @import("file_model.zig");
+const lexer = @import("tokens.zig");
+const query = @import("token_query.zig");
+const receiver = @import("method_names.zig");
 
 const TokenIndex = lexer.TokenIndex;
 

@@ -17,9 +17,9 @@
 const std = @import("std");
 const Ast = std.zig.Ast;
 
-const lexer = @import("../lexer.zig");
-const local = @import("../local.zig");
-const fmodel = @import("../model.zig");
+const lexer = @import("../tokens.zig");
+const local = @import("../local_bindings.zig");
+const fmodel = @import("../file_model.zig");
 const problem_mod = @import("../problem.zig");
 const testing = @import("../testing.zig");
 const config_mod = @import("../config.zig");

@@ -31,7 +31,7 @@
 const std = @import("std");
 const Ast = std.zig.Ast;
 
-const lexer = @import("lexer.zig");
+const lexer = @import("tokens.zig");
 
 const TokenIndex = lexer.TokenIndex;
 const TokenTag = lexer.TokenTag;

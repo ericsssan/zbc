@@ -10,8 +10,8 @@
 const std = @import("std");
 const Ast = std.zig.Ast;
 
-const lexer = @import("../lexer.zig");
-const query = @import("../query.zig");
+const lexer = @import("../tokens.zig");
+const query = @import("../token_query.zig");
 const problem_mod = @import("../problem.zig");
 const config_mod = @import("../config.zig");
 const file_cache_mod = @import("../file_cache.zig");
