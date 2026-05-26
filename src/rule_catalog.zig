@@ -323,6 +323,7 @@ pub const Detector = struct {
 // ── Rule imports ─────────────────────────────────────────────
 
 const aliased_heap_dupe_mod = @import("rules/heap/aliased_heap_dupe.zig");
+const arraylist_element_ptr_mod = @import("rules/collection/arraylist_element_ptr.zig");
 const arraylist_items_slice_mod = @import("rules/collection/arraylist_items_slice.zig");
 const assert_on_untrusted_input_mod = @import("rules/misc/assert_on_untrusted_input.zig");
 const asymmetric_field_free_mod = @import("rules/cleanup/asymmetric_field_free.zig");
@@ -379,6 +380,7 @@ const escape_detectors = [_]Detector{
     .{ .id = "unreleased-refs-on-error",                   .check = unreleased_refs_on_error_mod.check },
     .{ .id = "hashmap-getptr-rehash",                      .check = hashmap_getptr_rehash_mod.check },
     .{ .id = "arraylist-items-slice",                      .check = arraylist_items_slice_mod.check },
+    .{ .id = "arraylist-element-ptr",                      .check = arraylist_element_ptr_mod.check },
     .{ .id = "fd-write-after-close",                       .check = fd_write_after_close_mod.check },
     .{ .id = "slice-of-arena-into-heap",                   .check = slice_of_arena_into_heap_mod.check },
     .{ .id = "free-without-null-then-check",               .check = free_without_null_then_check_mod.check },
@@ -468,6 +470,7 @@ test "registry: ids are kebab-case (lowercase + hyphen)" {
 
 test "registry: pull in every rule module so inline tests run" {
     _ = aliased_heap_dupe_mod;
+    _ = arraylist_element_ptr_mod;
     _ = arraylist_items_slice_mod;
     _ = assert_on_untrusted_input_mod;
     _ = asymmetric_field_free_mod;

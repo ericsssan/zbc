@@ -232,6 +232,12 @@ pub const Invariant = enum {
     /// `*AssumeCapacity` variants are deliberately excluded (no
     /// realloc by contract).
     arraylist_items_slice,
+    /// `const <X> = &<list>.items[<idx>];` borrows a pointer to a
+    /// specific element.  A subsequent grow call on the SAME list
+    /// (append/insert/resize/etc.) may reallocate the backing buffer —
+    /// `<X>` then dangles.  Sibling of [[arraylist-items-slice]];
+    /// element-pointer variant.  oven-sh/bun#29483.
+    arraylist_element_ptr,
     /// `for (<list>.items) |...| { ... <list>.<mutate>(...); ... }`
     /// — the loop iterates over a snapshot of `.items` while the
     /// body calls a method on the SAME list that reallocates or
@@ -447,7 +453,7 @@ pub const Invariant = enum {
     hashmap_iter_mutation,
 };
 
-pub const all_invariants: [51]Invariant = .{
+pub const all_invariants: [52]Invariant = .{
     .arena_escape,
     .stack_escape,
     .use_undefined,
@@ -472,6 +478,7 @@ pub const all_invariants: [51]Invariant = .{
     .unreleased_refs_on_error,
     .hashmap_getptr_rehash,
     .arraylist_items_slice,
+    .arraylist_element_ptr,
     .fd_write_after_close,
     .slice_of_arena_into_heap,
     .free_without_null_then_check,
