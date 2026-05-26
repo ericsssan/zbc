@@ -8,7 +8,6 @@ const cfg_builder = @import("cfg_builder.zig");
 const worklist = @import("worklist.zig");
 const config_mod = @import("config.zig");
 const problem_mod = @import("problem.zig");
-const rule_registry = @import("rule_registry.zig");
 const rule_catalog_mod = @import("rule_catalog.zig");
 const file_cache_mod = @import("file_cache.zig");
 const suppressions_mod = @import("suppressions.zig");
@@ -109,8 +108,8 @@ pub fn analyzeEscape(
     }
 
     // Pattern detectors — dispatched via the comptime registry so
-    // adding a rule is a one-file change (see rule_registry.zig).
-    try rule_registry.runEscape(gpa, &tree, &rule_cache, config, &problems);
+    // adding a rule is a one-file change (see rule_catalog.zig).
+    try rule_catalog_mod.runEscape(gpa, &tree, &rule_cache, config, &problems);
 
     // Apply per-line suppressions parsed from `// zbc-disable-line` /
     // `// zbc-disable-next-line` source comments.  Filter happens at
@@ -263,10 +262,10 @@ test {
     _ = problem_mod;
     _ = @import("abstract_state.zig");
     _ = @import("cfg_transfer.zig");
+    // Pattern rules are registered in rule_catalog_mod alongside the
+    // catalog metadata; pulling it in refAllDecls'es every rule
+    // module so inline tests run.
     _ = rule_catalog_mod;
-    // Pattern rules — registered in rule_registry; pulling it in
-    // refAllDecls'es every rule module so inline tests run.
-    _ = rule_registry;
     _ = file_cache_mod;
     _ = suppressions_mod;
     _ = @import("fn_summary.zig");
