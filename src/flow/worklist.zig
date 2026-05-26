@@ -2002,3 +2002,36 @@ test "arena_escape: object-owns-its-own-arena pattern NOT flagged (ptr.* = .{ .a
     }
 }
 
+test "use_undefined: &@field(undefined_struct, name) is address-of, not a read — no FP" {
+    // Taking the address of a sub-field through @field does not read the
+    // value: `&@field(s, "f")` computes a pointer into s without
+    // observing any bits.  This is the pattern tigerbeetle uses for
+    // partial-init errdefer guards and initialisation loops.
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const std = @import("std");
+        \\const Slot = struct { val: u32 };
+        \\const Slots = struct { a: Slot, b: Slot };
+        \\pub fn init(alloc: std.mem.Allocator) !void {
+        \\    var slots: Slots = undefined;
+        \\    var n: usize = 0;
+        \\    errdefer inline for (std.meta.fields(Slots), 0..) |field, i| {
+        \\        if (n >= i + 1) {
+        \\            const s: *Slot = &@field(slots, field.name);
+        \\            _ = alloc.destroy(s);
+        \\        }
+        \\    };
+        \\    inline for (std.meta.fields(Slots)) |field| {
+        \\        const s: *Slot = &@field(slots, field.name);
+        \\        s.val = @intCast(n);
+        \\        n += 1;
+        \\    }
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    for (problems.items) |p| {
+        try std.testing.expect(!std.mem.eql(u8, p.rule_id, "use-undefined"));
+    }
+}
+

@@ -5626,7 +5626,18 @@ const Builder = struct {
             // re-bind the underlying allocator), so clearing would
             // mask real escape findings — e.g. `return wrap(&arena)`
             // depends on arena's .arena origin surviving to the .ret.
-            if (t > 0 and tags[t - 1] == .ampersand) {
+            //
+            // Also handles `&@field(id.f, "name")` — the `&` is three
+            // tokens back (through `@field(`).  Taking the address of a
+            // field through the comptime lookup builtin does not read
+            // the value: the same "possible write, clear .undef"
+            // treatment applies.
+            const is_addr_of_field_arg = t >= 3 and
+                tags[t - 1] == .l_paren and
+                tags[t - 2] == .builtin and
+                tags[t - 3] == .ampersand and
+                std.mem.eql(u8, tree.tokenSlice(t - 2), "@field");
+            if ((t > 0 and tags[t - 1] == .ampersand) or is_addr_of_field_arg) {
                 const name = tree.tokenSlice(t);
                 const id = self.name_to_local.get(name) orelse continue;
                 if (skip_local) |s| if (id == s) continue;
