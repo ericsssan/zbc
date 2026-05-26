@@ -5302,7 +5302,10 @@ const Builder = struct {
         const tags = tree.tokens.items(.tag);
         const last = self.fn_body_last;
         if (last == 0) return false;
-        var t: Ast.TokenIndex = 0;
+        // Start at fn_body_first, not 0 — scanning from the file start
+        // would pick up errdefers from other functions defined earlier
+        // in the same file and produce false positives.
+        var t: Ast.TokenIndex = self.fn_body_first;
         while (t <= last) : (t += 1) {
             if (tags[t] != .keyword_errdefer) continue;
             var b = t + 1;

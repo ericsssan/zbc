@@ -2035,3 +2035,57 @@ test "use_undefined: &@field(undefined_struct, name) is address-of, not a read �
     }
 }
 
+test "partial-union-write: errdefer in SAME fn observing x.* fires" {
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const std = @import("std");
+        \\const U = union(enum) { a: u32, b: []u8 };
+        \\pub fn alloc(out: *U, allocator: std.mem.Allocator) !void {
+        \\    errdefer out.* = .{ .a = 0 };
+        \\    out.* = .{ .b = try allocator.alloc(u8, 16) };
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    var found = false;
+    for (problems.items) |p| {
+        if (std.mem.eql(u8, p.rule_id, "partial-union-write")) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "partial-union-write: no errdefer in same fn — no FP even if other fns have errdefers" {
+    // Regression: anyErrdeferObservesField was scanning from token 0, so an
+    // errdefer in a PREVIOUS function that mentions `self` would cause a false
+    // positive for a later function that has no errdefer.  The scan must start
+    // at fn_body_first, not at 0.
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const std = @import("std");
+        \\const U = union(enum) { a: u32, b: []u8 };
+        \\const S = struct {
+        \\    v: U,
+        \\    // This fn has an errdefer that mentions `self`.
+        \\    pub fn setup(self: *S, allocator: std.mem.Allocator) !void {
+        \\        errdefer self.v = .{ .a = 0 };
+        \\        self.v = .{ .b = try allocator.alloc(u8, 8) };
+        \\    }
+        \\    // This fn has NO errdefer — partial-union-write must NOT fire here.
+        \\    pub fn parseCLI(self: *S, input: u32) !void {
+        \\        self.v = .{ .b = std.mem.span(
+        \\            @as([*:0]u8, @ptrFromInt(input))
+        \\        ) catch return error.InvalidValue };
+        \\    }
+        \\};
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    // `setup` fires because it has an errdefer that observes `self.v`.
+    // `parseCLI` must NOT fire.  Count total findings: expect exactly 1.
+    var count: usize = 0;
+    for (problems.items) |p| {
+        if (std.mem.eql(u8, p.rule_id, "partial-union-write")) count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), count);
+}
+
