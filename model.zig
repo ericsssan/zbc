@@ -43,6 +43,7 @@ const std = @import("std");
 const Ast = std.zig.Ast;
 
 const lexer = @import("lexer.zig");
+const receiver = @import("receiver.zig");
 
 pub const TokenIndex = lexer.TokenIndex;
 const TokenTag = lexer.TokenTag;
@@ -129,13 +130,10 @@ pub const TypeInfo = struct {
     /// destroy/free/stop/finalize/dispose) — the canonical
     /// "this type owns something that needs releasing" signal.
     fn hasCleanupMethod(self: TypeInfo) bool {
-        return self.hasMethod("deinit") or
-            self.hasMethod("close") or
-            self.hasMethod("destroy") or
-            self.hasMethod("free") or
-            self.hasMethod("stop") or
-            self.hasMethod("finalize") or
-            self.hasMethod("dispose");
+        for (self.methods) |m| {
+            if (receiver.isCleanupMethodName(m.name)) return true;
+        }
+        return false;
     }
 
     pub fn findField(self: TypeInfo, name: []const u8) ?*const FieldInfo {
