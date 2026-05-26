@@ -1283,6 +1283,35 @@ test "heap_double_free: branch-specific double-free caught by join" {
     try std.testing.expect(found);
 }
 
+test "heap_double_free: drain-loop + outer cleanup defer with same capture name — no FP" {
+    // Pattern: outer defer iterates remaining items and frees their fields;
+    // inner while loop pops and defers-frees each item's field.  Both use
+    // the name `item`.  The for-loop capture in the outer defer must NOT
+    // pollute name_to_local for the inner defer's field resolution.
+    const gpa = std.testing.allocator;
+    var problems = try analyze(gpa,
+        \\const std = @import("std");
+        \\const Entry = struct { path: []const u8 };
+        \\pub fn walk(alloc: std.mem.Allocator, list: *std.ArrayList([]const u8)) !void {
+        \\    var stack: std.ArrayList(Entry) = .empty;
+        \\    defer {
+        \\        for (stack.items) |item| alloc.free(item.path);
+        \\        stack.deinit(alloc);
+        \\    }
+        \\    while (stack.items.len > 0) {
+        \\        const item = stack.pop().?;
+        \\        defer alloc.free(item.path);
+        \\        try list.append(alloc, try alloc.dupe(u8, item.path));
+        \\    }
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    for (problems.items) |p| {
+        try std.testing.expect(std.mem.indexOf(u8, p.message, "double-free") == null);
+    }
+}
+
 test "heap_use_after_free: read after free in arbitrary call args is flagged" {
     const gpa = std.testing.allocator;
     var problems = try analyze(gpa,

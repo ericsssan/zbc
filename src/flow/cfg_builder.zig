@@ -716,6 +716,41 @@ const Builder = struct {
     /// with a fresh .plain origin for the capture (back-edge state
     /// would otherwise propagate across iterations — the capture
     /// refers to a different element each time).
+    /// After lowering a for/while loop body whose captures were registered
+    /// starting at `pre_len`, restore any `name_to_local` entries that were
+    /// overwritten by the capture registration.  Capture variables are
+    /// scoped to the loop body — they must NOT pollute the outer scope's
+    /// name resolution.  Without this, a for-loop inside a `defer` body
+    /// clobbers the binding of the same name in the enclosing scope: when
+    /// `flushErrAndNormalDefers` replays defers in sequence, the first
+    /// defer's for-loop capture overwrites `name_to_local`, and subsequent
+    /// defer bodies resolve the same name to the wrong LocalId.  That
+    /// causes double-free FPs: the inner defer's `free(item.path)` emits
+    /// `field_heap_free {L_capture, "path"}` instead of `{L_item, "path"}`,
+    /// so `transferDecl` for `const item = pop()` clears the wrong local's
+    /// field state and the dead-field persists across loop iterations.
+    fn restoreCaptureNames(self: *Builder, pre_len: u32) !void {
+        var j = pre_len;
+        while (j < self.locals.items.len) : (j += 1) {
+            const name = self.locals.items[j].name;
+            const current = self.name_to_local.get(name) orelse continue;
+            if (@intFromEnum(current) < pre_len) continue; // not overwritten by this capture
+            // Find the most-recent prior binding for this name.
+            var prev: ?LocalId = null;
+            var k: u32 = 0;
+            while (k < pre_len) : (k += 1) {
+                if (std.mem.eql(u8, self.locals.items[k].name, name)) {
+                    prev = @enumFromInt(k);
+                }
+            }
+            if (prev) |pl| {
+                try self.name_to_local.put(self.gpa, name, pl);
+            } else {
+                _ = self.name_to_local.remove(name);
+            }
+        }
+    }
+
     fn registerCapturesWith(self: *Builder, payload_token: Ast.TokenIndex, reset_into: ?BlockId) !void {
         const tree = self.tree;
         const tags = tree.tokens.items(.tag);
@@ -1085,11 +1120,13 @@ const Builder = struct {
         // and emit reset stmts at body entry so back-edges don't
         // propagate one iteration's state (e.g. .heap.dead from
         // `free(x)`) into the next iteration's view of the capture.
+        const pre_capture_len: u32 = @intCast(self.locals.items.len);
         if (while_data.payload_token) |pt| try self.registerCapturesWith(pt, body);
         var body_cur = body;
         try self.lowerStmt(while_data.ast.then_expr, &body_cur);
         _ = self.loop_stack.pop();
         try self.addEdge(body_cur, header);
+        try self.restoreCaptureNames(pre_capture_len);
 
         // Optional else block (runs once when cond becomes false).
         // We don't model the "runs only on natural exit, not on break" —
@@ -1516,6 +1553,9 @@ const Builder = struct {
         });
         // For-loops always have a payload (`|x|` or `|x, idx|`).
         // Reset on iteration entry — see lowerWhile for rationale.
+        // Save locals count before capture registration so we can restore
+        // name_to_local after the body — see restoreCaptureNames.
+        const pre_capture_len: u32 = @intCast(self.locals.items.len);
         try self.registerCapturesWith(for_data.payload_token, body);
         // Detect interior-pointer captures: when input N is a
         // `<container>.<field>` access AND capture N is `|*p|`
@@ -1527,6 +1567,11 @@ const Builder = struct {
         try self.lowerStmt(for_data.ast.then_expr, &body_cur);
         _ = self.loop_stack.pop();
         try self.addEdge(body_cur, header); // back-edge for fixed-point iteration
+        // Restore name_to_local for capture names now that the body is done.
+        // Captures are scoped to the loop body; leaving them in name_to_local
+        // after this point causes subsequent defer replays (or code after the
+        // loop) to resolve the capture name to the wrong LocalId.
+        try self.restoreCaptureNames(pre_capture_len);
 
         if (for_data.ast.else_expr.unwrap()) |else_expr| {
             const else_block = try self.newBlock();
