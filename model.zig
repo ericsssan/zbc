@@ -128,7 +128,7 @@ pub const TypeInfo = struct {
     /// True iff the type has any cleanup method (deinit/close/
     /// destroy/free/stop/finalize/dispose) — the canonical
     /// "this type owns something that needs releasing" signal.
-    pub fn hasCleanupMethod(self: TypeInfo) bool {
+    fn hasCleanupMethod(self: TypeInfo) bool {
         return self.hasMethod("deinit") or
             self.hasMethod("close") or
             self.hasMethod("destroy") or
@@ -277,7 +277,7 @@ pub const FileModel = struct {
     /// verify the chain's names match the path's earlier segments
     /// (right-to-left).  Returns the first candidate whose chain
     /// matches.
-    pub fn findQualifiedType(
+    fn findQualifiedType(
         self: *const FileModel,
         path: []const []const u8,
     ) ?*const TypeInfo {
@@ -718,7 +718,7 @@ pub const FileModel = struct {
     /// `<field_name>_allocated: bool` exists on the same struct.
     /// Inference-equivalent of the old `Db.flag_owned_fields` set —
     /// pure syntactic pairing, no annotation needed.
-    pub fn isFlagOwnedField(self: *const FileModel, struct_name: []const u8, field_name: []const u8) bool {
+    fn isFlagOwnedField(self: *const FileModel, struct_name: []const u8, field_name: []const u8) bool {
         const ti = self.findType(struct_name) orelse return false;
         if (ti.findField(field_name) == null) return false;
         // Look for the sibling `<field>_allocated: bool` field.
