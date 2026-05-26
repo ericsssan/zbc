@@ -509,26 +509,6 @@ fn anyPatternMatches(text: []const u8, patterns: []const []const u8) bool {
     return false;
 }
 
-/// Heuristic: does the type expression's text contain a standalone
-/// `config.ast_type_name` identifier token?  Matches `<Name>`, `*<Name>`,
-/// `*const <Name>`, `?<Name>`, `[]const <Name>`, etc.  Identifier-token
-/// boundary check, so e.g. `FooAst` wouldn't match a Name="Ast" config
-/// but `Ast.Node` would.  False positives are bounded — extra params
-/// tagged as Origin.ast inflate the AstId counter but don't cause
-/// false-positive invariant findings.
-/// True if the param's type mentions the ast_type_name OR any
-fn typeMentionsAst(tree: *const Ast, type_node: Ast.Node.Index, name: []const u8) bool {
-    const first = tree.firstToken(type_node);
-    const last = tree.lastToken(type_node);
-    var t: Ast.TokenIndex = first;
-    while (t <= last) : (t += 1) {
-        if (tree.tokens.items(.tag)[t] == .identifier and
-            std.mem.eql(u8, tree.tokenSlice(t), name))
-            return true;
-    }
-    return false;
-}
-
 /// True iff every parameter in `fn_proto` is declared `comptime`.
 /// A function with all-comptime params is only callable at comptime
 /// (its body is evaluated by the compiler, not at runtime), so its
