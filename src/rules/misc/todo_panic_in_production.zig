@@ -107,10 +107,17 @@ fn checkBody(
                 last_closed_was_suppressed = false;
             },
             .keyword_else => {
-                // `} else {` after a suppressed block — the else (or else-if)
-                // is transitively dead on the platforms where the prior branch
-                // was taken.  Propagate suppression into the next block.
-                if (last_closed_was_suppressed) pending_suppress = true;
+                // `} else {` or `} else if (comptime ...) {` after a suppressed
+                // block — the else/else-if is transitively dead on the platforms
+                // where the prior branch was taken.  Propagate suppression into
+                // the next block, BUT not for `else switch (...)`: the switch
+                // arms are independent dispatch and can be individually live even
+                // when the preceding if-branch was comptime-guarded.
+                if (last_closed_was_suppressed and
+                    (t + 1 > last or tags[t + 1] != .keyword_switch))
+                {
+                    pending_suppress = true;
+                }
                 last_closed_was_suppressed = false;
             },
             .l_brace => {
@@ -408,6 +415,22 @@ test "todo-panic-in-production: comptime if-else chain, bare else @panic — doe
         \\        _ = 2;
         \\    } else {
         \\        @panic("TODO on this platform");
+        \\    }
+        \\}
+    );
+}
+
+test "todo-panic-in-production: else-switch arm after comptime-if still fires" {
+    // Pattern: Cmd.zig:594 — `if (comptime in_cmd_subst) { ... } else switch (x) { ... @panic }`
+    // The else-switch is the live branch (in_cmd_subst = false), so the panic IS reachable.
+    try testing.expectFires(check, "todo-panic-in-production",
+        \\pub fn foo(x: u8) void {
+        \\    const in_cmd_subst = false;
+        \\    if (comptime in_cmd_subst) {
+        \\        _ = x;
+        \\    } else switch (x) {
+        \\        0 => {},
+        \\        else => @panic("TODO handle other cases"),
         \\    }
         \\}
     );
