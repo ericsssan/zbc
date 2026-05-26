@@ -41,7 +41,7 @@ pub fn build(b: *std.Build) void {
     // ── Public library module ───────────────────────────────
     // Importable by downstream consumers as `@import("zbc")`.
     const lib_mod = b.addModule("zbc", .{
-        .root_source_file = b.path("lib.zig"),
+        .root_source_file = b.path("src/lib.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -51,7 +51,7 @@ pub fn build(b: *std.Build) void {
     // Standalone binary; useful for one-off sweeps without
     // integrating into a host build.zig.
     const exe_mod = b.createModule(.{
-        .root_source_file = b.path("main.zig"),
+        .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -76,7 +76,7 @@ pub fn build(b: *std.Build) void {
 
     // CLI tests (argparse + invariant-list parsing).
     const cli_test_mod = b.createModule(.{
-        .root_source_file = b.path("main.zig"),
+        .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
     });
