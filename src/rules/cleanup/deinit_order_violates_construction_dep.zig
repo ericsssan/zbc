@@ -250,6 +250,55 @@ test "deinit-order-violates-construction-dep: LIFO violation fires" {
     try std.testing.expectEqualStrings("deinit-order-violates-construction-dep", problems.items[0].rule_id);
 }
 
+test "deinit-order-violates-construction-dep: field receiver chains fire" {
+    const gpa = std.testing.allocator;
+    var problems = try testing.runRule(gpa, check,
+        \\const Grid = struct {
+        \\    pub fn init() Grid { return .{}; }
+        \\    pub fn deinit(_: *Grid) void {}
+        \\};
+        \\const ManifestLog = struct {
+        \\    pub fn init(_: *Grid) ManifestLog { return .{}; }
+        \\    pub fn deinit(_: *ManifestLog) void {}
+        \\};
+        \\const Env = struct { grid: Grid, log: ManifestLog };
+        \\pub fn run() void {
+        \\    var env: Env = undefined;
+        \\    env.grid = Grid.init();
+        \\    env.log = ManifestLog.init(&env.grid);
+        \\    env.grid.deinit();
+        \\    env.log.deinit();
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expect(problems.items.len >= 1);
+    try std.testing.expectEqualStrings("deinit-order-violates-construction-dep", problems.items[0].rule_id);
+}
+
+test "deinit-order-violates-construction-dep: independent types no fire" {
+    const gpa = std.testing.allocator;
+    var problems = try testing.runRule(gpa, check,
+        \\const A = struct {
+        \\    pub fn init() A { return .{}; }
+        \\    pub fn deinit(_: *A) void {}
+        \\};
+        \\const B = struct {
+        \\    pub fn init() B { return .{}; }
+        \\    pub fn deinit(_: *B) void {}
+        \\};
+        \\pub fn run() void {
+        \\    var a = A.init();
+        \\    var b = B.init();
+        \\    a.deinit();
+        \\    b.deinit();
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
 test "deinit-order-violates-construction-dep: correct LIFO order doesn't fire" {
     const gpa = std.testing.allocator;
     var problems = try testing.runRule(gpa, check,

@@ -202,8 +202,6 @@ fn isInvalidatingMutateName(name: []const u8) bool {
     return std.mem.eql(u8, name, "append") or
         std.mem.eql(u8, name, "appendSlice") or
         std.mem.eql(u8, name, "appendNTimes") or
-        std.mem.eql(u8, name, "appendAssumeCapacity") or
-        std.mem.eql(u8, name, "appendSliceAssumeCapacity") or
         std.mem.eql(u8, name, "insert") or
         std.mem.eql(u8, name, "insertSlice") or
         std.mem.eql(u8, name, "addOne") or

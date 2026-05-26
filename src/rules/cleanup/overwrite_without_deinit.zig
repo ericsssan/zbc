@@ -122,16 +122,13 @@ fn checkBody(
             t = sc;
             continue;
         }
-        // Constructor-undef skip: when a constructor (init / create
-        // / new / from*) initialises this field to `undefined` —
-        // either via a struct-literal `.<field> = undefined,` in a
-        // return shape or via an imperative `<self>.<field> =
-        // undefined;` — the field starts life with no owned value.
-        // The FIRST write in some other method (typically a setter
-        // / loader) overwrites the undef sentinel; nothing to leak.
-        // Gate on `priorWriteInFn` returning false so subsequent
-        // writes in the same fn still fire (those DO need cleanup).
-        if (initFnSetsFieldToUndefined(tree, ct_ti, field_name) and
+        // Undef-sentinel skip: when ANY method on this type sets the
+        // field to `undefined` (constructors, thread-entry fns, reset
+        // fns, etc.), `undefined` is a valid sentinel for the field.
+        // The FIRST write in another method overwrites that sentinel;
+        // nothing to leak.  Gate on `priorWriteInFn` returning false
+        // so subsequent writes in the same fn still fire.
+        if (anyMethodSetsFieldToUndefined(tree, ct_ti, field_name) and
             !priorWriteInFn(tree, first, t, this_name, field_name))
         {
             t = sc;
@@ -783,18 +780,19 @@ fn initFnDefaultUnionTag(
 /// its body — typically inside the returned struct literal:
 ///   `return Self{ ..., .<field> = undefined, ... };`
 /// or imperatively `<self>.<field> = undefined;`.  In either case
-/// the field starts life undef, so the FIRST overwrite in some
-/// other method (a setter / load step) has no prior owned value to
-/// deinit.  Subsequent writes WOULD leak — gate the skip on
-/// `priorWriteInFn` returning false.
-fn initFnSetsFieldToUndefined(
+/// True iff ANY method on the type sets `.<field> = undefined` or
+/// `<recv>.<field> = undefined`.  Name-agnostic: constructors, thread-
+/// entry fns, reset helpers, etc. all count.  When this is true,
+/// `undefined` is a documented sentinel for the field — the FIRST
+/// overwrite in another method has no prior owned value to deinit.
+/// Subsequent writes WOULD leak — gate the skip on `priorWriteInFn`.
+fn anyMethodSetsFieldToUndefined(
     tree: *const Ast,
     ti: *const file_model.TypeInfo,
     field_name: []const u8,
 ) bool {
     const tags = tree.tokens.items(.tag);
     for (ti.methods) |m| {
-        if (!isConstructorName(m.name)) continue;
         var t: Ast.TokenIndex = m.body_first;
         const last = m.body_last;
         while (t + 4 <= last) : (t += 1) {
@@ -1603,6 +1601,35 @@ test "overwrite-without-deinit: assert(this.field == default) gates the write �
         \\    }
         \\};
         \\const bun = struct { pub fn assert(_: bool) void {} };
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
+test "overwrite-without-deinit: non-constructor fn sets field=undefined → first write in thread entry no fire" {
+    const gpa = std.testing.allocator;
+    var problems = try testing.runRule(gpa, check,
+        \\const std = @import("std");
+        \\const CfgPart = struct {
+        \\    data: []u8,
+        \\    pub fn deinit(self: *CfgPart, alloc: std.mem.Allocator) void { alloc.free(self.data); }
+        \\};
+        \\const ScopeCfgParallel = struct {
+        \\    thread: std.Thread,
+        \\    result: CfgPart,
+        \\    err: ?anyerror,
+        \\    fn entry(self: *ScopeCfgParallel) void {
+        \\        self.result = compute() catch return;
+        \\    }
+        \\    pub fn start(allocator: std.mem.Allocator) !*ScopeCfgParallel {
+        \\        const self = try allocator.create(ScopeCfgParallel);
+        \\        self.* = .{ .thread = undefined, .result = undefined, .err = null };
+        \\        self.thread = try std.Thread.spawn(.{}, entry, .{self});
+        \\        return self;
+        \\    }
+        \\};
+        \\fn compute() !CfgPart { return .{ .data = &[_]u8{} }; }
         \\
     );
     defer freeProblems(gpa, &problems);

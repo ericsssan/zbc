@@ -106,9 +106,8 @@ fn isRestoreMethod(name: []const u8) bool {
         std.mem.eql(u8, name, "acquire");
 }
 
-/// True iff `[start, last]` contains `defer <obj>.<restore>(<x>)`
-/// OR `defer <obj>.* = ...` (whole-struct restore).  Both patterns
-/// are built at runtime since `<obj>` and `<x>` are dynamic.
+/// True iff `[start, last]` contains `defer`/`errdefer <obj>.<restore>(<x>)`
+/// OR `defer`/`errdefer <obj>.* = ...` (whole-struct restore).
 fn hasRestoreOf(
     tree: *const Ast,
     start: Ast.TokenIndex,
@@ -116,25 +115,26 @@ fn hasRestoreOf(
     obj: []const u8,
     x: []const u8,
 ) bool {
-    // `defer <obj>.* = ...` — whole-struct assignment restore.
-    const restore_assign = [_]Atom{
-        .{ .tok = .keyword_defer },
-        .{ .text = obj },
-        .{ .tok = .period_asterisk },
-        .{ .tok = .equal },
-    };
-    if (query.anyMatchAnywhere(tree, &restore_assign, start, last, null)) return true;
+    inline for ([_]std.zig.Token.Tag{ .keyword_defer, .keyword_errdefer }) |kw| {
+        const restore_assign = [_]Atom{
+            .{ .tok = kw },
+            .{ .text = obj },
+            .{ .tok = .period_asterisk },
+            .{ .tok = .equal },
+        };
+        if (query.anyMatchAnywhere(tree, &restore_assign, start, last, null)) return true;
 
-    // `defer <obj>.<restoreMethod>(<x>...)`.
-    const restore_call = [_]Atom{
-        .{ .tok = .keyword_defer },
-        .{ .text = obj },
-        .{ .tok = .period },
-        .{ .pred = isRestoreMethod },
-        .{ .tok = .l_paren },
-        .{ .text = x },
-    };
-    return query.anyMatchAnywhere(tree, &restore_call, start, last, null);
+        const restore_call = [_]Atom{
+            .{ .tok = kw },
+            .{ .text = obj },
+            .{ .tok = .period },
+            .{ .pred = isRestoreMethod },
+            .{ .tok = .l_paren },
+            .{ .text = x },
+        };
+        if (query.anyMatchAnywhere(tree, &restore_call, start, last, null)) return true;
+    }
+    return false;
 }
 
 /// True iff `[start, last]` contains `try <x>` — any fallible op on X.
@@ -203,6 +203,40 @@ test "with defer restore doesn't fire" {
         \\pub fn take(a: *Allocating, gpa: anytype) ![]u8 {
         \\    var list = a.toArrayList();
         \\    defer a.setArrayList(list);
+        \\    return try list.toOwnedSlice(gpa);
+        \\}
+    );
+}
+
+test "errdefer restore also suppresses" {
+    try testing.expectNoFire(check,
+        \\const Allocating = struct {
+        \\    pub fn toArrayList(_: *Allocating) ArrayList { return undefined; }
+        \\    pub fn setArrayList(_: *Allocating, _: ArrayList) void {}
+        \\};
+        \\const ArrayList = struct {
+        \\    pub fn toOwnedSlice(_: *ArrayList, _: anytype) ![]u8 { return undefined; }
+        \\};
+        \\pub fn take(a: *Allocating, gpa: anytype) ![]u8 {
+        \\    var list = a.toArrayList();
+        \\    errdefer a.setArrayList(list);
+        \\    return try list.toOwnedSlice(gpa);
+        \\}
+    );
+}
+
+test "method not in move-out list doesn't fire" {
+    try testing.expectNoFire(check,
+        \\const Allocating = struct {
+        \\    pub fn getSlice(_: *Allocating) []u8 { return undefined; }
+        \\};
+        \\const ArrayList = struct {
+        \\    pub fn toOwnedSlice(_: *ArrayList, _: anytype) ![]u8 { return undefined; }
+        \\};
+        \\pub fn take(a: *Allocating, gpa: anytype) ![]u8 {
+        \\    const s = a.getSlice();
+        \\    _ = s;
+        \\    var list: ArrayList = undefined;
         \\    return try list.toOwnedSlice(gpa);
         \\}
     );

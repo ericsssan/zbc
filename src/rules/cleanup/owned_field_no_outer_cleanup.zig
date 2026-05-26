@@ -401,7 +401,8 @@ fn hasPointerReturningInit(tree: *const Ast, ti: *const file_model.TypeInfo) boo
     for (ti.methods) |m| {
         if (!std.mem.eql(u8, m.name, "init") and
             !std.mem.eql(u8, m.name, "create") and
-            !std.mem.eql(u8, m.name, "new")) continue;
+            !std.mem.eql(u8, m.name, "new") and
+            !std.mem.eql(u8, m.name, "start")) continue;
         var buf: [1]Ast.Node.Index = undefined;
         const proto = tree.fullFnProto(&buf, m.fn_decl) orelse continue;
         const rt = proto.ast.return_type.unwrap() orelse continue;
