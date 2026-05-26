@@ -24,6 +24,7 @@ const problem_mod = @import("../../problem.zig");
 const testing = @import("../../testing.zig");
 const config_mod = @import("../../config.zig");
 const file_cache_mod = @import("../../cache/file_cache.zig");
+const fn_summary_mod = @import("../../model/fn_summary.zig");
 
 const Problem = problem_mod.Problem;
 const Pos = problem_mod.Pos;
@@ -263,6 +264,15 @@ fn scanWrites(
         // through the call), and the out-param holds independent
         // bytes (the unpacked Socket).
         if (deferredOnlyInSwitchScrutinee(tree, w.end + 1, sc - 1, dn)) continue;
+        // Per-arg suppression: the deferred variable appears in the
+        // RHS as an argument to some call, but the called function
+        // provably doesn't embed THAT SPECIFIC param in its returns
+        // (even if it embeds other params).  Handles the shape:
+        //   `ret.* = ok(transpileSourceCode(..., referrer_slice.slice(), ...))`
+        // where `input_specifier` (a different param) appears in
+        // transpileSourceCode's returns but `referrer` (param at the
+        // deferred-arg position) does not.
+        if (rhsCallArgNotEmbeddedInResult(tree, cache, w.end + 1, sc - 1, dn)) continue;
         try report(gpa, problems, tree, w.start, out_name, dn);
     }
 }
@@ -496,6 +506,94 @@ fn isCopyingMethodName(name: []const u8) bool {
         std.mem.eql(u8, name, "copyFrom") or
         std.mem.eql(u8, name, "copyForwards") or
         std.mem.eql(u8, name, "copyBackwards");
+}
+
+/// Find which 0-based argument index in a balanced call argument list
+/// (`arg_start..arg_end`, i.e. tokens between `(` and `)` exclusive)
+/// contains `deferred_name` as an unqualified identifier.  Commas at
+/// depth 0 delimit arguments; nested parens/brackets/braces are
+/// balanced.  Returns null when not found.
+fn findDeferredArgIdx(
+    tree: *const Ast,
+    tags: []const std.zig.Token.Tag,
+    arg_start: Ast.TokenIndex,
+    arg_end: Ast.TokenIndex,
+    deferred_name: []const u8,
+) ?u32 {
+    var arg_idx: u32 = 0;
+    var depth: i32 = 0;
+    var t: Ast.TokenIndex = arg_start;
+    while (t <= arg_end) : (t += 1) {
+        switch (tags[t]) {
+            .l_paren, .l_bracket, .l_brace => depth += 1,
+            .r_paren, .r_bracket, .r_brace => depth -= 1,
+            .comma => if (depth == 0) {
+                arg_idx += 1;
+            },
+            .identifier => if (depth == 0 and
+                std.mem.eql(u8, tree.tokenSlice(t), deferred_name))
+            {
+                return arg_idx;
+            },
+            else => {},
+        }
+    }
+    return null;
+}
+
+/// True iff the RHS at `[start, end]` is a call (or wrapper call)
+/// where `deferred_name` is passed as an argument at a position whose
+/// corresponding parameter is provably NOT embedded in any of the
+/// called function's non-recursive return expressions.  Uses the
+/// per-param `result_params_in_return` bitmask from FnSummary.
+///
+/// Handles the shape:
+///   `ret.* = ok(transpileSourceCode(..., referrer_slice.slice(), ...))`
+/// where `transpileSourceCode` stores `input_specifier` (a different
+/// param) in its returns but NOT `referrer` — the deferred arg's param.
+fn rhsCallArgNotEmbeddedInResult(
+    tree: *const Ast,
+    cache: *file_cache_mod.FileCache,
+    start: Ast.TokenIndex,
+    end: Ast.TokenIndex,
+    deferred_name: []const u8,
+) bool {
+    const tags = tree.tokens.items(.tag);
+    var t: Ast.TokenIndex = start;
+    if (t <= end and tags[t] == .keyword_try) t += 1;
+    if (t + 2 > end) return false;
+    var p: Ast.TokenIndex = t;
+    var last_ident: ?Ast.TokenIndex = null;
+    while (p <= end) : (p += 1) {
+        switch (tags[p]) {
+            .identifier => last_ident = p,
+            .period, .builtin => {},
+            .l_paren => break,
+            else => return false,
+        }
+    }
+    if (p > end or tags[p] != .l_paren) return false;
+    const name_tok = last_ident orelse return false;
+    const fn_name = tree.tokenSlice(name_tok);
+    // Wrapper passthrough: `ok(inner_call)` — recurse into the arg.
+    if (isWrapperCtorName(fn_name)) {
+        const arg_start = p + 1;
+        const arg_end = matchParenEnd(tags, p, end) orelse return false;
+        return rhsCallArgNotEmbeddedInResult(tree, cache, arg_start, arg_end - 1, deferred_name);
+    }
+    // Look up the called function's summary.
+    const model = cache.fileModel() catch return false;
+    const fn_decl = findFnDeclByName(model, fn_name) orelse return false;
+    const summary = cache.summaryOfFn(fn_decl) catch return false;
+    const mask = summary.result_params_in_return;
+    // If no return statements were seen, we can't confirm independence.
+    if ((mask & fn_summary_mod.SAW_RETURN_BIT) == 0) return false;
+    // Find which arg position contains deferred_name.
+    const paren_end = matchParenEnd(tags, p, end) orelse return false;
+    const arg_idx = findDeferredArgIdx(tree, tags, p + 1, paren_end - 1, deferred_name) orelse return false;
+    if (arg_idx >= 31) return false;
+    // True when the specific param's bit is clear (not in any return).
+    return (mask >> @intCast(arg_idx)) & 1 == 0;
 }
 
 /// True iff the RHS contains a `<X>.create(...)` or `<X>.init(...)`
@@ -936,5 +1034,94 @@ test "*@This() pointer param resolves field type via containing struct" {
         \\    }
         \\};
         \\fn copyFiles(_: std.fs.Dir, _: std.mem.Allocator) u32 { return 0; }
+    );
+}
+
+test "self-recursive fn: param only in recursive return — does NOT fire" {
+    // Mirrors the ghostty/bun pattern where a fn like `transpileSourceCode`
+    // tail-recurses passing `referrer` along:
+    //   `return transpileSourceCode(... referrer ...)`
+    // The non-recursive returns don't embed `referrer` in the result.
+    // `result_independent_of_args` used to return false because it saw
+    // `referrer` in the recursive-return expression; now self-recursive
+    // returns are skipped, so the rule correctly suppresses the finding.
+    try testing.expectNoFire(check,
+        \\const std = @import("std");
+        \\const Result = struct { code: []const u8 };
+        \\pub fn transpile(
+        \\    allocator: std.mem.Allocator,
+        \\    source: []const u8,
+        \\    referrer: []const u8,
+        \\    ret: *Result,
+        \\) error{Invalid}!void {
+        \\    var slice = std.ArrayList(u8).init(allocator);
+        \\    defer slice.deinit();
+        \\    if (source.len == 0) {
+        \\        return transpile(allocator, referrer, referrer, ret);
+        \\    }
+        \\    ret.* = Result{ .code = "ok" };
+        \\}
+    );
+}
+
+test "deferred arg not embedded even when other param is — does NOT fire" {
+    // Mirrors bun's Bun__transpileFile / Bun__transpileVirtualModule:
+    //   `referrer_slice` is passed as `referrer` to `transpileSourceCode`,
+    //   but `transpileSourceCode` embeds `other` (a different param) in its
+    //   returns, not `referrer`.  The old code misfired because
+    //   `result_independent_of_args` was false (because `other` appeared in
+    //   returns); the per-param bitmask now correctly distinguishes which
+    //   specific arg is embedded.
+    try testing.expectNoFire(check,
+        \\const std = @import("std");
+        \\const Result = struct { label: []const u8 };
+        \\fn transpile(
+        \\    referrer: []const u8,
+        \\    other: []const u8,
+        \\) Result {
+        \\    // `other` appears in the return — makes function NOT
+        \\    // result-independent overall — but `referrer` does NOT.
+        \\    return Result{ .label = other };
+        \\}
+        \\pub fn caller(
+        \\    alloc: std.mem.Allocator,
+        \\    raw: []const u8,
+        \\    other: []const u8,
+        \\    ret: *Result,
+        \\) void {
+        \\    var slice = std.ArrayList(u8).init(alloc);
+        \\    defer slice.deinit();
+        \\    // slice.items is passed as `referrer` — which is NOT embedded
+        \\    // in transpile's return (only `other` is).
+        \\    ret.* = transpile(slice.items, other);
+        \\}
+    );
+}
+
+test "deferred arg IS the embedded param — fires" {
+    // Sanity check: when the deferred arg maps to a param that IS
+    // embedded in the called function's return, we must still fire.
+    try testing.expectFires(check, R,
+        \\const std = @import("std");
+        \\const Result = struct { label: []const u8 };
+        \\fn transpile(
+        \\    referrer: []const u8,
+        \\    other: []const u8,
+        \\) Result {
+        \\    _ = other;
+        \\    // `referrer` IS embedded in the return.
+        \\    return Result{ .label = referrer };
+        \\}
+        \\pub fn caller(
+        \\    alloc: std.mem.Allocator,
+        \\    other: []const u8,
+        \\    ret: *Result,
+        \\) void {
+        \\    var slice = std.ArrayList(u8).init(alloc);
+        \\    defer slice.deinit();
+        \\    // slice.items is passed as `referrer` — which IS embedded
+        \\    // in transpile's return — so this must fire.
+        \\    ret.* = transpile(slice.items, other);
+        \\}
     );
 }

@@ -90,6 +90,18 @@ pub const FnSummary = struct {
     /// false when any return expression touches a param OR when the
     /// fn's body has a non-statement return path we can't see.
     result_independent_of_args: bool = false,
+    /// Per-param return-embedding bitmask.  Bit `i` is set when param
+    /// index `i` (0-based) appears as an unqualified identifier in at
+    /// least one non-recursive return expression.  Bit 31 (`SAW_RETURN_BIT`)
+    /// is set when the body has at least one `return` statement at all
+    /// — lets callers distinguish "no returns seen" from "saw returns,
+    /// no params embedded".  Only bits 0–30 track params; functions
+    /// with >30 params fall back to conservative (bit never cleared).
+    /// Zero means "no return statements found" (conservative, not
+    /// "independent").  Used by borrowed-slice analysis for per-arg
+    /// suppression when the overall `result_independent_of_args` is
+    /// false because a DIFFERENT param appears in returns.
+    result_params_in_return: u32 = 0,
     /// Internal flag: true iff FileCache.summaryOfFn has fully
     /// populated this entry (cheap + deep inference).  Distinct
     /// from "no fields detected" — without this flag, fns with
@@ -173,29 +185,39 @@ pub fn inferFromBody(
     // conservative rationale around <param>.deinit() being excluded.
     out.takes_ownership_of = inferDirectTakes(tree, proto, body);
 
-    // result_independent_of_args: scan all `return <expr>` statements;
-    // if no return expression mentions any param name, the fn's
-    // result can't carry a borrow back from any of its args.  Used
-    // by borrowed-slice analysis to suppress fires on call results
-    // that don't structurally borrow from <deferred>.
-    out.result_independent_of_args = inferResultIndependentOfArgs(tree, proto, first, last);
+    // result_params_in_return / result_independent_of_args:
+    // Scan all `return <expr>` statements; track which param names
+    // appear in them.  Used by borrowed-slice analysis.
+    const ret_mask = inferResultParamsInReturn(tree, proto, first, last);
+    out.result_params_in_return = ret_mask;
+    out.result_independent_of_args =
+        (ret_mask & SAW_RETURN_BIT) != 0 and
+        (ret_mask & ~SAW_RETURN_BIT) == 0;
 
     return out;
 }
 
-/// Walk every `return <expr>` statement in the fn body; if no return
-/// expression's token range contains any parameter name as an
-/// identifier, the result can't carry a borrow from any arg.  Conservative
-/// when in doubt (return statement we can't parse, body too small, etc.).
-fn inferResultIndependentOfArgs(
+/// Sentinel bit in `result_params_in_return`: set when the body has
+/// at least one `return` statement (distinguishes "saw returns, no
+/// params embedded" from "no returns found at all").
+pub const SAW_RETURN_BIT: u32 = 1 << 31;
+
+/// Walk every `return <expr>` statement in the fn body and record
+/// which parameter names (by 0-based index) appear in at least one
+/// non-recursive return expression.  Returns a bitmask:
+///   bit 31 (SAW_RETURN_BIT) — body has at least one return statement
+///   bits 0–30              — param i appears in some return expr
+/// Zero means no return statements were found (conservative).
+/// Self-recursive `return fn_name(...)` expressions are skipped;
+/// param appearances there don't mean the result embeds those args.
+fn inferResultParamsInReturn(
     tree: *const Ast,
     proto: Ast.full.FnProto,
     first: Ast.TokenIndex,
     last: Ast.TokenIndex,
-) bool {
+) u32 {
     const tags = tree.tokens.items(.tag);
-    // Collect param names.  Skip when fn has no params (trivially
-    // independent — no args to borrow from anyway).
+    const self_name: ?[]const u8 = if (proto.name_token) |nt| tree.tokenSlice(nt) else null;
     var param_buf: [16][]const u8 = undefined;
     var n_params: u32 = 0;
     var it = proto.iterate(tree);
@@ -207,12 +229,8 @@ fn inferResultIndependentOfArgs(
             }
         }
     }
-    if (n_params == 0) return false; // no args means nothing to borrow
-    // Walk for `return` tokens; each is followed by an expression
-    // up to a `;` at brace/paren depth 0.  Check the expr tokens
-    // for any param-name identifier (not post-period — `.field`
-    // accesses on unrelated receivers don't count).
-    var saw_any_return = false;
+    if (n_params == 0) return 0;
+    var result: u32 = 0;
     var t: Ast.TokenIndex = first;
     while (t <= last) : (t += 1) {
         if (tags[t] == .keyword_fn) {
@@ -220,8 +238,41 @@ fn inferResultIndependentOfArgs(
             continue;
         }
         if (tags[t] != .keyword_return) continue;
-        saw_any_return = true;
+        result |= SAW_RETURN_BIT;
         var u: Ast.TokenIndex = t + 1;
+        if (u <= last and tags[u] == .keyword_try) u += 1;
+        // Self-recursive tail call: `return [try] fn_name(...)`.
+        if (self_name) |sn| {
+            var v = u;
+            while (v + 1 <= last and (tags[v] == .identifier or tags[v] == .period)) : (v += 1) {}
+            if (v > u and tags[v] == .l_paren) {
+                var found_self = false;
+                var w = u;
+                while (w < v) : (w += 1) {
+                    if (tags[w] == .identifier and std.mem.eql(u8, tree.tokenSlice(w), sn)) {
+                        found_self = true;
+                        break;
+                    }
+                }
+                if (found_self) {
+                    var pd2: i32 = 0;
+                    var x = u;
+                    while (x <= last) : (x += 1) {
+                        switch (tags[x]) {
+                            .l_paren, .l_bracket, .l_brace => pd2 += 1,
+                            .r_paren, .r_bracket, .r_brace => {
+                                if (pd2 == 0) break;
+                                pd2 -= 1;
+                            },
+                            .semicolon => if (pd2 == 0) break,
+                            else => {},
+                        }
+                    }
+                    t = x;
+                    continue;
+                }
+            }
+        }
         var pd: i32 = 0;
         while (u <= last) : (u += 1) {
             switch (tags[u]) {
@@ -234,15 +285,17 @@ fn inferResultIndependentOfArgs(
                 .identifier => {
                     if (u > 0 and tags[u - 1] == .period) continue;
                     const name = tree.tokenSlice(u);
-                    for (param_buf[0..n_params]) |p| {
-                        if (std.mem.eql(u8, p, name)) return false;
+                    for (param_buf[0..n_params], 0..) |p, i| {
+                        if (std.mem.eql(u8, p, name) and i < 31) {
+                            result |= @as(u32, 1) << @intCast(i);
+                        }
                     }
                 },
                 else => {},
             }
         }
     }
-    return saw_any_return;
+    return result;
 }
 
 /// R8a: body is `{ return EXPR; }` or `{ var x = EXPR; return x; }`
