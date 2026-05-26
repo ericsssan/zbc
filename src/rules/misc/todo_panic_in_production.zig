@@ -64,23 +64,146 @@ fn checkBody(
     const first = tree.firstToken(body);
     const last = tree.lastToken(body);
 
+    // Track comptime-guarded brace levels.  When an `if (comptime ...)`
+    // or `if (Environment.isXxx)` block opens, the `@panic` inside is
+    // dead code on platforms where the condition is false — suppress it.
+    // The same logic extends through `} else {` chains: once a chain of
+    // comptime-guarded branches starts, even the bare `else { }` at the
+    // end is transitively dead on the platforms where earlier branches
+    // fire.
+    //
+    // Stack: brace_is_suppressed[d] = true iff the brace at depth d was
+    // opened by a comptime-guarded condition.  A @panic is suppressed
+    // when ANY ancestor depth is suppressed.
+    const MAX_DEPTH = 64;
+    var brace_is_suppressed: [MAX_DEPTH]bool = undefined;
+    @memset(&brace_is_suppressed, false);
+    var brace_depth: u8 = 0;
+    var pending_suppress: bool = false; // next `{` opens a suppressed block
+    var last_closed_was_suppressed: bool = false; // last `}` closed a suppressed block
+
     var t: Ast.TokenIndex = first;
     while (t + 3 <= last) : (t += 1) {
         if (tags[t] == .keyword_fn) {
             t = skipNestedFn(tags, t, last);
             continue;
         }
-        if (tags[t] != .builtin) continue;
-        if (!std.mem.eql(u8, tree.tokenSlice(t), "@panic")) continue;
-        if (tags[t + 1] != .l_paren) continue;
-        if (tags[t + 2] != .string_literal) continue;
-        // Strip surrounding quotes.
-        const lit = tree.tokenSlice(t + 2);
-        if (lit.len < 2) continue;
-        const inner = lit[1 .. lit.len - 1];
-        if (!isTodoMessage(inner)) continue;
-        try report(gpa, problems, tree, t, inner);
+
+        switch (tags[t]) {
+            .keyword_if => {
+                // `if (comptime ...)` — explicit comptime keyword in condition.
+                if (t + 2 <= last and tags[t + 1] == .l_paren and
+                    tags[t + 2] == .keyword_comptime)
+                {
+                    pending_suppress = true;
+                } else if (t + 1 <= last and tags[t + 1] == .l_paren) {
+                    // `if (Environment.isXxx)` / `if (Environment.isDebug)` —
+                    // bun-style comptime platform/build flag.  Check the
+                    // balanced condition for a known compile-time identifier.
+                    if (ifCondIsComptimeFlag(tree, tags, t + 1, last)) {
+                        pending_suppress = true;
+                    }
+                }
+                last_closed_was_suppressed = false;
+            },
+            .keyword_else => {
+                // `} else {` after a suppressed block — the else (or else-if)
+                // is transitively dead on the platforms where the prior branch
+                // was taken.  Propagate suppression into the next block.
+                if (last_closed_was_suppressed) pending_suppress = true;
+                last_closed_was_suppressed = false;
+            },
+            .l_brace => {
+                if (brace_depth < MAX_DEPTH) {
+                    brace_is_suppressed[brace_depth] = pending_suppress;
+                }
+                brace_depth +|= 1;
+                pending_suppress = false;
+                last_closed_was_suppressed = false;
+            },
+            .r_brace => {
+                if (brace_depth > 0) {
+                    brace_depth -= 1;
+                    last_closed_was_suppressed = brace_is_suppressed[brace_depth];
+                    brace_is_suppressed[brace_depth] = false;
+                } else {
+                    last_closed_was_suppressed = false;
+                }
+                pending_suppress = false;
+            },
+            .builtin => {
+                if (!std.mem.eql(u8, tree.tokenSlice(t), "@panic")) continue;
+                if (tags[t + 1] != .l_paren) continue;
+                if (tags[t + 2] != .string_literal) continue;
+                // Skip if inside any comptime-guarded brace level.
+                const depth = @min(brace_depth, MAX_DEPTH);
+                var suppressed = false;
+                for (brace_is_suppressed[0..depth]) |s| {
+                    if (s) { suppressed = true; break; }
+                }
+                if (suppressed) continue;
+                // Strip surrounding quotes.
+                const lit = tree.tokenSlice(t + 2);
+                if (lit.len < 2) continue;
+                const inner = lit[1 .. lit.len - 1];
+                if (!isTodoMessage(inner)) continue;
+                try report(gpa, problems, tree, t, inner);
+            },
+            else => {
+                last_closed_was_suppressed = false;
+            },
+        }
     }
+}
+
+/// True iff the `if` condition starting at `lparen` (the `(` token)
+/// looks like a compile-time-known flag expression, e.g.:
+///   `Environment.isWindows` / `Environment.isDebug` /
+///   `builtin.os.tag == .windows`
+/// Conservative: only matches the simple `<ident>.<ident>` shape (no
+/// `!`, `and`, `or`) where the RHS identifier is a known compile-time
+/// flag name.
+fn ifCondIsComptimeFlag(
+    tree: *const Ast,
+    tags: []const std.zig.Token.Tag,
+    lparen: Ast.TokenIndex,
+    last: Ast.TokenIndex,
+) bool {
+    // Walk the balanced condition looking for `<ident> . <comptime-flag>`.
+    var t = lparen + 1;
+    var depth: i32 = 1;
+    while (t <= last and depth > 0) : (t += 1) {
+        switch (tags[t]) {
+            .l_paren => depth += 1,
+            .r_paren => {
+                depth -= 1;
+                if (depth == 0) break;
+            },
+            .period => {
+                // Check the identifier that follows this `.`.
+                if (t + 1 <= last and tags[t + 1] == .identifier) {
+                    const name = tree.tokenSlice(t + 1);
+                    if (isComptimeFlagName(name)) return true;
+                }
+            },
+            else => {},
+        }
+    }
+    return false;
+}
+
+/// Known compile-time boolean flag names used as `if (Env.X)` guards.
+/// Covers bun's `Environment` fields and common Zig stdlib patterns.
+fn isComptimeFlagName(name: []const u8) bool {
+    const known = [_][]const u8{
+        "isWindows", "isLinux",  "isMac",     "isPosix",
+        "isKqueue",  "isBSD",    "isDebug",   "isRelease",
+        "allow_assert",          "isNative",
+    };
+    for (known) |k| {
+        if (std.mem.eql(u8, name, k)) return true;
+    }
+    return false;
 }
 
 /// True iff the panic message looks like a TODO marker.
@@ -229,4 +352,77 @@ test "todo-panic-in-production: case-insensitive TODO inside message fires" {
     );
     defer freeProblems(gpa, &problems);
     try std.testing.expectEqual(@as(usize, 1), problems.items.len);
+}
+
+test "todo-panic-in-production: if (comptime cond) { @panic } does NOT fire" {
+    // Pattern: bun.zig:639 `if (comptime Environment.isWindows) { @panic("TODO on Windows"); }`
+    // The block is dead code on non-Windows; no production crash possible.
+    try testing.expectNoFire(check,
+        \\const Env = struct { pub const isWindows: bool = false; };
+        \\pub fn foo() void {
+        \\    if (comptime Env.isWindows) {
+        \\        @panic("TODO on Windows");
+        \\    }
+        \\}
+    );
+}
+
+test "todo-panic-in-production: if (Environment.isDebug) { @panic } does NOT fire" {
+    // Pattern: sys/Error.zig:318 `if (Environment.isDebug) { @panic("Error.todo() was called"); }`
+    // Debug-only guard — never fires in a release build.
+    try testing.expectNoFire(check,
+        \\const Environment = struct { pub const isDebug: bool = false; };
+        \\pub fn todo() void {
+        \\    if (Environment.isDebug) {
+        \\        @panic("TODO: debug sentinel");
+        \\    }
+        \\}
+    );
+}
+
+test "todo-panic-in-production: if (Environment.isWindows) { @panic } does NOT fire" {
+    // Pattern: OutputFile.zig:308 — `Environment.isWindows` is a comptime constant.
+    try testing.expectNoFire(check,
+        \\const Environment = struct { pub const isWindows: bool = false; };
+        \\pub fn foo() void {
+        \\    if (Environment.isWindows) {
+        \\        @panic("TODO windows");
+        \\    }
+        \\}
+    );
+}
+
+test "todo-panic-in-production: comptime if-else chain, bare else @panic — does NOT fire" {
+    // Pattern: io/io.zig:106 — `} else { @panic("TODO on this platform") }`
+    // following a chain of `if (comptime isLinux) / else if (comptime isKqueue)`.
+    // On Linux/macOS the else is dead code (transitively suppressed).
+    try testing.expectNoFire(check,
+        \\const E = struct {
+        \\    pub const isLinux: bool = true;
+        \\    pub const isKqueue: bool = false;
+        \\};
+        \\pub fn tick() void {
+        \\    if (comptime E.isLinux) {
+        \\        _ = 1;
+        \\    } else if (comptime E.isKqueue) {
+        \\        _ = 2;
+        \\    } else {
+        \\        @panic("TODO on this platform");
+        \\    }
+        \\}
+    );
+}
+
+test "todo-panic-in-production: @panic after comptime-if (not inside it) still fires" {
+    // Pattern: bun.zig:1315 — panic is OUTSIDE the comptime block (at fn scope),
+    // not inside it.  On non-Windows the panic IS reachable.
+    try testing.expectFires(check, "todo-panic-in-production",
+        \\const Env = struct { pub const isWindows: bool = false; };
+        \\pub fn getFdPathW() void {
+        \\    if (comptime Env.isWindows) {
+        \\        return;
+        \\    }
+        \\    @panic("TODO unsupported platform");
+        \\}
+    );
 }
