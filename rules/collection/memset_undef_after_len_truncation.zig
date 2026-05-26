@@ -14,12 +14,12 @@
 const std = @import("std");
 const Ast = std.zig.Ast;
 
-const tokens = @import("../../tokens.zig");
-const query = @import("../../token_query.zig");
+const tokens = @import("../../ast/tokens.zig");
+const query = @import("../../ast/token_query.zig");
 const problem = @import("../../problem.zig");
 const testing = @import("../../testing.zig");
 const config_mod = @import("../../config.zig");
-const file_cache_mod = @import("../../file_cache.zig");
+const file_cache_mod = @import("../../cache/file_cache.zig");
 
 const Atom = query.Atom;
 const R = "memset-undef-after-len-truncation";

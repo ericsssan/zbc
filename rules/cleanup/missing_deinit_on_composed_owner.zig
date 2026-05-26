@@ -17,15 +17,15 @@
 const std = @import("std");
 const Ast = std.zig.Ast;
 
-const file_model = @import("../../file_model.zig");
-const mq = @import("../../model_query.zig");
-const query = @import("../../token_query.zig");
-const tokens = @import("../../tokens.zig");
+const file_model = @import("../../model/file_model.zig");
+const mq = @import("../../model/model_query.zig");
+const query = @import("../../ast/token_query.zig");
+const tokens = @import("../../ast/tokens.zig");
 const problem = @import("../../problem.zig");
 const testing = @import("../../testing.zig");
 const config_mod = @import("../../config.zig");
-const file_cache_mod = @import("../../file_cache.zig");
-const method_names = @import("../../method_names.zig");
+const file_cache_mod = @import("../../cache/file_cache.zig");
+const method_names = @import("../../model/method_names.zig");
 
 const R = "missing-deinit-on-composed-owner";
 

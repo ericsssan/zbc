@@ -27,10 +27,10 @@
 const std = @import("std");
 const Ast = std.zig.Ast;
 
-const tokens = @import("../../tokens.zig");
+const tokens = @import("../../ast/tokens.zig");
 const problem_mod = @import("../../problem.zig");
 const config_mod = @import("../../config.zig");
-const file_cache_mod = @import("../../file_cache.zig");
+const file_cache_mod = @import("../../cache/file_cache.zig");
 const testing = @import("../../testing.zig");
 
 const Problem = problem_mod.Problem;
@@ -40,7 +40,7 @@ const hasTokenInRange = tokens.hasTokenInRange;
 const matchBrace = tokens.matchBrace;
 const skipNestedFn = tokens.skipNestedFn;
 
-const query = @import("../../token_query.zig");
+const query = @import("../../ast/token_query.zig");
 const Atom = query.Atom;
 
 // `defer <alloc>.free(<X>...)` — captures the freed arg into slot 0.

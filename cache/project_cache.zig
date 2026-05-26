@@ -19,7 +19,7 @@
 
 const std = @import("std");
 const Ast = std.zig.Ast;
-const model_mod = @import("file_model.zig");
+const model_mod = @import("../model/file_model.zig");
 
 pub const ProjectCache = struct {
     gpa: std.mem.Allocator,

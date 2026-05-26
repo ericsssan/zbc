@@ -44,8 +44,8 @@ const std = @import("std");
 const Ast = std.zig.Ast;
 
 const file_model = @import("file_model.zig");
-const tokens = @import("tokens.zig");
-const query = @import("token_query.zig");
+const tokens = @import("../ast/tokens.zig");
+const query = @import("../ast/token_query.zig");
 const method_names = @import("method_names.zig");
 
 const TokenIndex = tokens.TokenIndex;

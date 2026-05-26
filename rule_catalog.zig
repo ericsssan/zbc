@@ -271,7 +271,7 @@ pub fn lookup(id: []const u8) ?*const Rule {
 const Ast = std.zig.Ast;
 const config_mod = @import("config.zig");
 const problem_mod = @import("problem.zig");
-const file_cache = @import("file_cache.zig");
+const file_cache = @import("cache/file_cache.zig");
 
 const Problem = problem_mod.Problem;
 const Config = config_mod.Config;

@@ -29,13 +29,13 @@
 const std = @import("std");
 const Ast = std.zig.Ast;
 const abstract_state = @import("abstract_state.zig");
-const config_mod = @import("config.zig");
-const file_cache = @import("file_cache.zig");
-const fn_summary = @import("fn_summary.zig");
-const tokens = @import("tokens.zig");
-const receiver_mod = @import("method_names.zig");
-const model_mod = @import("file_model.zig");
-const zls_resolver_mod = @import("zls_resolver.zig");
+const config_mod = @import("../config.zig");
+const file_cache = @import("../cache/file_cache.zig");
+const fn_summary = @import("../model/fn_summary.zig");
+const tokens = @import("../ast/tokens.zig");
+const receiver_mod = @import("../model/method_names.zig");
+const model_mod = @import("../model/file_model.zig");
+const zls_resolver_mod = @import("../zls_resolver.zig");
 
 pub const Config = config_mod.Config;
 

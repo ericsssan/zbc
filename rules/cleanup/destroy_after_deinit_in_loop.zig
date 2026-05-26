@@ -18,10 +18,10 @@
 const std = @import("std");
 const Ast = std.zig.Ast;
 
-const tokens = @import("../../tokens.zig");
+const tokens = @import("../../ast/tokens.zig");
 const problem_mod = @import("../../problem.zig");
 const config_mod = @import("../../config.zig");
-const file_cache_mod = @import("../../file_cache.zig");
+const file_cache_mod = @import("../../cache/file_cache.zig");
 const testing = @import("../../testing.zig");
 
 const Problem = problem_mod.Problem;
@@ -302,7 +302,7 @@ fn elementTypeNameOfField(tree: *const Ast, field_name: []const u8) ?[]const u8 
 /// where `<self>` is the method's receiver parameter name.
 fn methodBodyContainsSelfDestroy(
     tree: *const Ast,
-    method: *const @import("../../file_model.zig").MethodInfo,
+    method: *const @import("../../model/file_model.zig").MethodInfo,
 ) bool {
     const tags = tree.tokens.items(.tag);
     const recv = method.receiver orelse return false;

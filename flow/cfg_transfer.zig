@@ -7,10 +7,10 @@
 //! exotic syntax are preferred over false positives.
 
 const std = @import("std");
-const problem_mod = @import("problem.zig");
+const problem_mod = @import("../problem.zig");
 const cfg = @import("cfg.zig");
 const state_mod = @import("abstract_state.zig");
-const config_mod = @import("config.zig");
+const config_mod = @import("../config.zig");
 
 const Problem = problem_mod.Problem;
 const Severity = problem_mod.Severity;

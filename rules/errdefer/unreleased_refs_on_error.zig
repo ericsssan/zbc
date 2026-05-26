@@ -33,11 +33,11 @@ const Ast = std.zig.Ast;
 
 const problem_mod = @import("../../problem.zig");
 const config_mod = @import("../../config.zig");
-const file_cache_mod = @import("../../file_cache.zig");
+const file_cache_mod = @import("../../cache/file_cache.zig");
 
-const tokens = @import("../../tokens.zig");
-const query = @import("../../token_query.zig");
-const method_names = @import("../../method_names.zig");
+const tokens = @import("../../ast/tokens.zig");
+const query = @import("../../ast/token_query.zig");
+const method_names = @import("../../model/method_names.zig");
 const testing = @import("../../testing.zig");
 const matchBrace = tokens.matchBrace;
 const findStmtSemicolon = tokens.findStmtSemicolon;

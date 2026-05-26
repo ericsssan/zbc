@@ -26,13 +26,13 @@
 const std = @import("std");
 const Ast = std.zig.Ast;
 
-const file_model = @import("../../file_model.zig");
+const file_model = @import("../../model/file_model.zig");
 const problem_mod = @import("../../problem.zig");
 const config_mod = @import("../../config.zig");
-const file_cache_mod = @import("../../file_cache.zig");
+const file_cache_mod = @import("../../cache/file_cache.zig");
 
-const tokens = @import("../../tokens.zig");
-const method_names = @import("../../method_names.zig");
+const tokens = @import("../../ast/tokens.zig");
+const method_names = @import("../../model/method_names.zig");
 const testing = @import("../../testing.zig");
 const findStmtSemicolon = tokens.findStmtSemicolon;
 const skipFnDecl = tokens.skipFnDecl;

@@ -44,10 +44,10 @@ const Ast = std.zig.Ast;
 
 const problem_mod = @import("../../problem.zig");
 const config_mod = @import("../../config.zig");
-const file_cache_mod = @import("../../file_cache.zig");
+const file_cache_mod = @import("../../cache/file_cache.zig");
 
-const tokens = @import("../../tokens.zig");
-const local_bindings = @import("../../local_bindings.zig");
+const tokens = @import("../../ast/tokens.zig");
+const local_bindings = @import("../../model/local_bindings.zig");
 const testing = @import("../../testing.zig");
 const skipDeferStmt = tokens.skipDeferStmt;
 const matchBrace = tokens.matchBrace;

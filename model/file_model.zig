@@ -42,7 +42,7 @@
 const std = @import("std");
 const Ast = std.zig.Ast;
 
-const tokens = @import("tokens.zig");
+const tokens = @import("../ast/tokens.zig");
 const method_names = @import("method_names.zig");
 
 pub const TokenIndex = tokens.TokenIndex;

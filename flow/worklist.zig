@@ -7,10 +7,10 @@ const cfg_mod = @import("cfg.zig");
 const cfg_builder = @import("cfg_builder.zig");
 const state_mod = @import("abstract_state.zig");
 const transfer = @import("cfg_transfer.zig");
-const problem_mod = @import("problem.zig");
-const config_mod = @import("config.zig");
-const file_cache_mod = @import("file_cache.zig");
-const zls_resolver_mod = @import("zls_resolver.zig");
+const problem_mod = @import("../problem.zig");
+const config_mod = @import("../config.zig");
+const file_cache_mod = @import("../cache/file_cache.zig");
+const zls_resolver_mod = @import("../zls_resolver.zig");
 
 const Cfg = cfg_mod.Cfg;
 const BlockId = cfg_mod.BlockId;

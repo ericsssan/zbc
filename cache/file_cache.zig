@@ -21,11 +21,11 @@
 const std = @import("std");
 const Ast = std.zig.Ast;
 
-const file_model = @import("file_model.zig");
-const local_bindings = @import("local_bindings.zig");
-const fn_summary = @import("fn_summary.zig");
-const tokens = @import("tokens.zig");
-const zls_resolver_mod = @import("zls_resolver.zig");
+const file_model = @import("../model/file_model.zig");
+const local_bindings = @import("../model/local_bindings.zig");
+const fn_summary = @import("../model/fn_summary.zig");
+const tokens = @import("../ast/tokens.zig");
+const zls_resolver_mod = @import("../zls_resolver.zig");
 const project_cache_mod = @import("project_cache.zig");
 
 pub const FileCache = struct {

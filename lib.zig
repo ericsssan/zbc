@@ -3,16 +3,16 @@
 const std = @import("std");
 const Ast = std.zig.Ast;
 
-const cfg_mod = @import("cfg.zig");
-const cfg_builder = @import("cfg_builder.zig");
-const worklist = @import("worklist.zig");
+const cfg_mod = @import("flow/cfg.zig");
+const cfg_builder = @import("flow/cfg_builder.zig");
+const worklist = @import("flow/worklist.zig");
 const config_mod = @import("config.zig");
 const problem_mod = @import("problem.zig");
 const rule_catalog_mod = @import("rule_catalog.zig");
-const file_cache_mod = @import("file_cache.zig");
+const file_cache_mod = @import("cache/file_cache.zig");
 const suppressions_mod = @import("suppressions.zig");
 const zls_resolver_mod = @import("zls_resolver.zig");
-const project_cache_mod = @import("project_cache.zig");
+const project_cache_mod = @import("cache/project_cache.zig");
 
 pub const Config = config_mod.Config;
 pub const DefaultConfig = config_mod.Default;
@@ -260,25 +260,25 @@ test {
     _ = worklist;
     _ = config_mod;
     _ = problem_mod;
-    _ = @import("abstract_state.zig");
-    _ = @import("cfg_transfer.zig");
+    _ = @import("flow/abstract_state.zig");
+    _ = @import("flow/cfg_transfer.zig");
     // Pattern rules are registered in rule_catalog_mod alongside the
     // catalog metadata; pulling it in refAllDecls'es every rule
     // module so inline tests run.
     _ = rule_catalog_mod;
     _ = file_cache_mod;
     _ = suppressions_mod;
-    _ = @import("fn_summary.zig");
+    _ = @import("model/fn_summary.zig");
     _ = @import("zls_resolver.zig");
-    _ = @import("tokens.zig");
-    _ = @import("scope_iter.zig");
-    _ = @import("method_names.zig");
+    _ = @import("ast/tokens.zig");
+    _ = @import("ast/scope_iter.zig");
+    _ = @import("model/method_names.zig");
     _ = @import("testing.zig");
-    _ = @import("file_model.zig");
+    _ = @import("model/file_model.zig");
     _ = @import("trace.zig");
-    _ = @import("local_bindings.zig");
-    _ = @import("token_query.zig");
-    _ = @import("model_query.zig");
-    _ = @import("project_cache.zig");
+    _ = @import("model/local_bindings.zig");
+    _ = @import("ast/token_query.zig");
+    _ = @import("model/model_query.zig");
+    _ = @import("cache/project_cache.zig");
     std.testing.refAllDecls(@This());
 }

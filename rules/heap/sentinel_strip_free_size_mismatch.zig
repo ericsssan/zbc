@@ -27,10 +27,10 @@ const Ast = std.zig.Ast;
 
 const problem_mod = @import("../../problem.zig");
 const config_mod = @import("../../config.zig");
-const file_cache_mod = @import("../../file_cache.zig");
+const file_cache_mod = @import("../../cache/file_cache.zig");
 
-const tokens = @import("../../tokens.zig");
-const query = @import("../../token_query.zig");
+const tokens = @import("../../ast/tokens.zig");
+const query = @import("../../ast/token_query.zig");
 const testing = @import("../../testing.zig");
 
 const Problem = problem_mod.Problem;
@@ -145,7 +145,7 @@ const enclosingFnDecl = tokens.enclosingFnDecl;
 /// identifier.
 fn bindingTypeName(
     tree: *const Ast,
-    model: *const @import("../../file_model.zig").FileModel,
+    model: *const @import("../../model/file_model.zig").FileModel,
     fn_decl: Ast.Node.Index,
     name: []const u8,
 ) ?[]const u8 {
@@ -167,7 +167,7 @@ fn bindingTypeName(
 /// available).  Returns null when the chain can't be parsed.
 fn baseTypeNameOfNode(
     tree: *const Ast,
-    model: *const @import("../../file_model.zig").FileModel,
+    model: *const @import("../../model/file_model.zig").FileModel,
     type_node: Ast.Node.Index,
 ) ?[]const u8 {
     const tags = tree.tokens.items(.tag);

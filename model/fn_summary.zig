@@ -18,7 +18,7 @@
 const std = @import("std");
 const Ast = std.zig.Ast;
 
-const tokens = @import("tokens.zig");
+const tokens = @import("../ast/tokens.zig");
 const receiver_mod = @import("method_names.zig");
 
 /// Result-shape classification.
