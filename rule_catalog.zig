@@ -33,227 +33,227 @@ pub const all = [_]Rule{
     .{
         .id = "heap-use-after-free",
         .title = "reading or returning a heap pointer after free",
-        .body = @embedFile("rules/heap-use-after-free.md"),
+        .body = @embedFile("rules/invariants/heap-use-after-free.md"),
     },
     .{
         .id = "heap-double-free",
         .title = "freeing the same heap pointer twice",
-        .body = @embedFile("rules/heap-double-free.md"),
+        .body = @embedFile("rules/invariants/heap-double-free.md"),
     },
     .{
         .id = "arena-use-after-kill",
         .title = "reading a value borrowed from an arena after the arena's deinit",
-        .body = @embedFile("rules/arena-use-after-kill.md"),
+        .body = @embedFile("rules/invariants/arena-use-after-kill.md"),
     },
     .{
         .id = "arena-escape",
         .title = "returning a value borrowed from a function-local arena",
-        .body = @embedFile("rules/arena-escape.md"),
+        .body = @embedFile("rules/invariants/arena-escape.md"),
     },
     .{
         .id = "stack-escape",
         .title = "returning a pointer to a function-local stack variable",
-        .body = @embedFile("rules/stack-escape.md"),
+        .body = @embedFile("rules/invariants/stack-escape.md"),
     },
     .{
         .id = "use-undefined",
         .title = "reading a value that is still `undefined`",
-        .body = @embedFile("rules/use-undefined.md"),
+        .body = @embedFile("rules/invariants/use-undefined.md"),
     },
     .{
         .id = "allocator-mismatch",
         .title = "freeing with an allocator different from the one that allocated",
-        .body = @embedFile("rules/allocator-mismatch.md"),
+        .body = @embedFile("rules/invariants/allocator-mismatch.md"),
     },
     .{
         .id = "interior-pointer-destroy",
         .title = "calling a destructor on an interior pointer into a container's storage",
-        .body = @embedFile("rules/interior-pointer-destroy.md"),
+        .body = @embedFile("rules/invariants/interior-pointer-destroy.md"),
     },
     .{
         .id = "heap-leak",
         .title = "destructor of a heap-allocated type never frees `self`",
-        .body = @embedFile("rules/heap-leak.md"),
+        .body = @embedFile("rules/invariants/heap-leak.md"),
     },
     .{
         .id = "partial-union-write",
         .title = "tagged-union literal with `try`/`catch return` in payload — tag is written before payload",
-        .body = @embedFile("rules/partial-union-write.md"),
+        .body = @embedFile("rules/invariants/partial-union-write.md"),
     },
     .{
         .id = "aliased-heap-dupe",
         .title = "dupe returns `T` by value with `var dup = this.*;` — heap-owning fields alias the source",
-        .body = @embedFile("rules/aliased-heap-dupe.md"),
+        .body = @embedFile("rules/heap/aliased-heap-dupe.md"),
     },
     .{
         .id = "clobbered-by-struct-reset",
         .title = "`this.<X> = …;` then `this.* = StructLit{…}` without `.<X>` — heap pointer dropped to default",
-        .body = @embedFile("rules/clobbered-by-struct-reset.md"),
+        .body = @embedFile("rules/cleanup/clobbered-by-struct-reset.md"),
     },
     .{
         .id = "realloc-byte-count",
         .title = "`allocator.realloc(slice, n * @sizeOf(T))` — Zig's realloc takes ELEMENT count, not bytes",
-        .body = @embedFile("rules/realloc-byte-count.md"),
+        .body = @embedFile("rules/heap/realloc-byte-count.md"),
     },
     .{
         .id = "asymmetric-field-free",
         .title = "destructor handles some same-typed fields but omits others — the omitted ones leak",
-        .body = @embedFile("rules/asymmetric-field-free.md"),
+        .body = @embedFile("rules/cleanup/asymmetric-field-free.md"),
     },
     .{
         .id = "missing-errdefer-between-tries",
         .title = "`const X = try Type.method(…);` then another `try` with no `errdefer X.deinit();` — X leaks on the second error",
-        .body = @embedFile("rules/missing-errdefer-between-tries.md"),
+        .body = @embedFile("rules/errdefer/missing-errdefer-between-tries.md"),
     },
     .{
         .id = "free-then-try-realloc",
         .title = "`free(X); X = try alloc(…);` without clearing X first — X dangles on alloc failure → double-free in `deinit`",
-        .body = @embedFile("rules/free-then-try-realloc.md"),
+        .body = @embedFile("rules/heap/free-then-try-realloc.md"),
     },
     .{
         .id = "destroy-after-deinit-in-loop",
         .title = "destructor loops `<h>.deinit();` over pointer-list items without `<allocator>.destroy(<h>);` — heap descriptors leak",
-        .body = @embedFile("rules/destroy-after-deinit-in-loop.md"),
+        .body = @embedFile("rules/cleanup/destroy-after-deinit-in-loop.md"),
     },
     .{
         .id = "dead-errdefer-in-result-fn",
         .title = "`errdefer` in a fn returning a `Result(T)` tagged union (not `!T`) — never fires, cleanup silently leaks",
-        .body = @embedFile("rules/dead-errdefer-in-result-fn.md"),
+        .body = @embedFile("rules/errdefer/dead-errdefer-in-result-fn.md"),
     },
     .{
         .id = "duplicate-errdefer",
         .title = "two `errdefer X.<cleanup>();` for the same receiver — cleanup runs twice on error → double-free / assert",
-        .body = @embedFile("rules/duplicate-errdefer.md"),
+        .body = @embedFile("rules/errdefer/duplicate-errdefer.md"),
     },
     .{
         .id = "overwrite-without-deinit",
         .title = "`this.field = X;` for a deinit-able field without prior `this.field.deinit();` — old value leaks",
-        .body = @embedFile("rules/overwrite-without-deinit.md"),
+        .body = @embedFile("rules/cleanup/overwrite-without-deinit.md"),
     },
     .{
         .id = "stack-fallback-escape",
         .title = "value built on a `stackFallback(N, …)` allocator escapes the fn — points at caller's stack buffer",
-        .body = @embedFile("rules/stack-fallback-escape.md"),
+        .body = @embedFile("rules/borrow/stack-fallback-escape.md"),
     },
     .{
         .id = "unreleased-refs-on-error",
         .title = "loop calls `<obj>.<addref>()` then a later `try` runs with no `errdefer` releasing — refs leak on error",
-        .body = @embedFile("rules/unreleased-refs-on-error.md"),
+        .body = @embedFile("rules/errdefer/unreleased-refs-on-error.md"),
     },
     .{
         .id = "hashmap-getptr-rehash",
         .title = "use of `<X>` after `<map>.put/remove/...(...)` — the borrow from `<map>.getPtr/getOrPut(...)` was invalidated",
-        .body = @embedFile("rules/hashmap-getptr-rehash.md"),
+        .body = @embedFile("rules/collection/hashmap-getptr-rehash.md"),
     },
     .{
         .id = "arraylist-items-slice",
         .title = "use of `<X>` after `<list>.append/insert/...(...)` — the slice borrowed via `<list>.items` was invalidated by a realloc",
-        .body = @embedFile("rules/arraylist-items-slice.md"),
+        .body = @embedFile("rules/collection/arraylist-items-slice.md"),
     },
     .{
         .id = "fd-write-after-close",
         .title = "use of file handle `<X>` after `<X>.close()` — the fd is invalid; reads/writes go through a dangling fd",
-        .body = @embedFile("rules/fd-write-after-close.md"),
+        .body = @embedFile("rules/misc/fd-write-after-close.md"),
     },
     .{
         .id = "slice-of-arena-into-heap",
         .title = "arena-allocated slice stored into a non-arena container — dangles when the local arena's deinit fires",
-        .body = @embedFile("rules/slice-of-arena-into-heap.md"),
+        .body = @embedFile("rules/heap/slice-of-arena-into-heap.md"),
     },
     .{
         .id = "free-without-null-then-check",
         .title = "freed `<recv>.<field>` without reset — slot now dangles; later `if (<recv>.<field>) |h| use(h);` UAFs",
-        .body = @embedFile("rules/free-without-null-then-check.md"),
+        .body = @embedFile("rules/heap/free-without-null-then-check.md"),
     },
     .{
         .id = "tagged-union-retag-with-old-payload-read",
         .title = "reading `<path>.<OldTag>` while assigning `.{ .<NewTag> = ... }` to `<path>` — x86_64 backend may evaluate read after tag flip",
-        .body = @embedFile("rules/tagged-union-retag-with-old-payload-read.md"),
+        .body = @embedFile("rules/misc/tagged-union-retag-with-old-payload-read.md"),
     },
     .{
         .id = "union-deinit-without-inert-reset",
         .title = "switch arm deinit'd payload but didn't retag the union — idempotent reset/clear/end fn will double-free on next call",
-        .body = @embedFile("rules/union-deinit-without-inert-reset.md"),
+        .body = @embedFile("rules/cleanup/union-deinit-without-inert-reset.md"),
     },
     .{
         .id = "self-undefined-after-destroy",
         .title = "`<X>.* = ...` / `<X>.<field> = ...` after `<alloc>.destroy(<X>);` — write hits freed memory (TigerStyle order inverted)",
-        .body = @embedFile("rules/self-undefined-after-destroy.md"),
+        .body = @embedFile("rules/borrow/self-undefined-after-destroy.md"),
     },
     .{
         .id = "missing-errdefer-on-out-param",
         .title = "`try <out>.<field>.<acquire>(...)` then later `try` with no `errdefer <out>.<field>.deinit(...)` — out-param leaks on error",
-        .body = @embedFile("rules/missing-errdefer-on-out-param.md"),
+        .body = @embedFile("rules/errdefer/missing-errdefer-on-out-param.md"),
     },
     .{
         .id = "reset-skips-pooled-resource-release",
         .title = "`deinit` releases pool/handle resources but sibling `reset` doesn't — callers using `reset` leak slots",
-        .body = @embedFile("rules/reset-skips-pooled-resource-release.md"),
+        .body = @embedFile("rules/cleanup/reset-skips-pooled-resource-release.md"),
     },
     .{
         .id = "return-borrowed-payload",
         .title = "`return switch (...) { .<Tag> => |v| v, ... }` — bare payload return while sibling arm clones; borrowed value escapes caller's lifetime",
-        .body = @embedFile("rules/return-borrowed-payload.md"),
+        .body = @embedFile("rules/borrow/return-borrowed-payload.md"),
     },
     .{
         .id = "unreleased-factory-handle",
         .title = "`const <X> = device.create*()` without `defer <X>.release()` and `<X>` not returned/stored — refcounted handle leaks",
-        .body = @embedFile("rules/unreleased-factory-handle.md"),
+        .body = @embedFile("rules/cleanup/unreleased-factory-handle.md"),
     },
     .{
         .id = "memset-undef-after-len-truncation",
         .title = "`@memset(<X>.<field>..., undefined)` AFTER `<X>.<field>.len = ...` truncation — memset is a no-op on the now-empty slice",
-        .body = @embedFile("rules/memset-undef-after-len-truncation.md"),
+        .body = @embedFile("rules/collection/memset-undef-after-len-truncation.md"),
     },
     .{
         .id = "publish-then-touch-self",
         .title = "use of `this`/`self` after publishing it to a concurrent queue — consumer thread may have freed it",
-        .body = @embedFile("rules/publish-then-touch-self.md"),
+        .body = @embedFile("rules/misc/publish-then-touch-self.md"),
     },
     .{
         .id = "assert-on-untrusted-input",
         .title = "`assert(...)` in a parser/decoder against untrusted-input parameter — crafted bytes panic the process",
-        .body = @embedFile("rules/assert-on-untrusted-input.md"),
+        .body = @embedFile("rules/misc/assert-on-untrusted-input.md"),
     },
     .{
         .id = "missing-deinit-on-composed-owner",
         .title = "outer `deinit` doesn't call `<self>.<field>.deinit()` for a field whose type has a deinit — inner resources leak",
-        .body = @embedFile("rules/missing-deinit-on-composed-owner.md"),
+        .body = @embedFile("rules/cleanup/missing-deinit-on-composed-owner.md"),
     },
     .{
         .id = "owned-field-no-outer-cleanup",
         .title = "outer struct has a value-typed field whose type exposes `deinit`/`close`/etc., but outer has no cleanup method — dropped values silently leak",
-        .body = @embedFile("rules/owned-field-no-outer-cleanup.md"),
+        .body = @embedFile("rules/cleanup/owned-field-no-outer-cleanup.md"),
     },
     .{
         .id = "borrowed-slice-into-out-param",
         .title = "write into pointer out-param uses a `defer ... .deinit()`-bound local — out-param dangles after return",
-        .body = @embedFile("rules/borrowed-slice-into-out-param.md"),
+        .body = @embedFile("rules/borrow/borrowed-slice-into-out-param.md"),
     },
     .{
         .id = "defer-and-errdefer-free-overlap",
         .title = "`defer alloc.free(X)` + `errdefer { ...; <lhs> = X; }` — both fire on error, leaving field dangling",
-        .body = @embedFile("rules/defer-and-errdefer-free-overlap.md"),
+        .body = @embedFile("rules/errdefer/defer-and-errdefer-free-overlap.md"),
     },
     .{
         .id = "sentinel-strip-free-size-mismatch",
         .title = "`alloc.free(X.ptr[0..X.len])` — strips sentinel; allocator's free-size check fails on `[:0]` slices",
-        .body = @embedFile("rules/sentinel-strip-free-size-mismatch.md"),
+        .body = @embedFile("rules/heap/sentinel-strip-free-size-mismatch.md"),
     },
     .{
         .id = "move-out-without-restore",
         .title = "`var X = obj.toArrayList()` + fallible op on X with no `defer obj.setArrayList(X)` — leak on error",
-        .body = @embedFile("rules/move-out-without-restore.md"),
+        .body = @embedFile("rules/cleanup/move-out-without-restore.md"),
     },
     .{
         .id = "deinit-order-violates-construction-dep",
         .title = "`B.deinit()` before `A.deinit()` where `A` was init'd via `.init(&B, ...)` — LIFO violation; A's deinit may UAF",
-        .body = @embedFile("rules/deinit-order-violates-construction-dep.md"),
+        .body = @embedFile("rules/cleanup/deinit-order-violates-construction-dep.md"),
     },
     .{
         .id = "borrowed-slice-into-stack-buffer-returned",
         .title = "`<T>.parse(&stack_buf)` result returned — sub-slice fields point at the now-dead stack buffer",
-        .body = @embedFile("rules/borrowed-slice-into-stack-buffer-returned.md"),
+        .body = @embedFile("rules/borrow/borrowed-slice-into-stack-buffer-returned.md"),
     },
 };
 
@@ -292,47 +292,47 @@ pub const Detector = struct {
 
 // ── Rule imports ─────────────────────────────────────────────
 
-const aliased_heap_dupe_mod = @import("rules/aliased_heap_dupe.zig");
-const arraylist_items_slice_mod = @import("rules/arraylist_items_slice.zig");
-const assert_on_untrusted_input_mod = @import("rules/assert_on_untrusted_input.zig");
-const asymmetric_field_free_mod = @import("rules/asymmetric_field_free.zig");
-const borrowed_slice_into_out_param_mod = @import("rules/borrowed_slice_into_out_param.zig");
-const borrowed_slice_into_stack_buffer_returned_mod = @import("rules/borrowed_slice_into_stack_buffer_returned.zig");
-const clobbered_by_struct_reset_mod = @import("rules/clobbered_by_struct_reset.zig");
-const dead_errdefer_in_result_fn_mod = @import("rules/dead_errdefer_in_result_fn.zig");
-const defer_and_errdefer_free_overlap_mod = @import("rules/defer_and_errdefer_free_overlap.zig");
-const deinit_order_violates_construction_dep_mod = @import("rules/deinit_order_violates_construction_dep.zig");
-const destroy_after_deinit_in_loop_mod = @import("rules/destroy_after_deinit_in_loop.zig");
-const duplicate_errdefer_mod = @import("rules/duplicate_errdefer.zig");
-const fd_write_after_close_mod = @import("rules/fd_write_after_close.zig");
-const free_then_try_realloc_mod = @import("rules/free_then_try_realloc.zig");
-const free_without_null_then_check_mod = @import("rules/free_without_null_then_check.zig");
-const hashmap_getptr_rehash_mod = @import("rules/hashmap_getptr_rehash.zig");
-const getorput_unguarded_value_read_mod = @import("rules/getorput_unguarded_value_read.zig");
-const hashmap_iter_mutation_mod = @import("rules/hashmap_iter_mutation.zig");
-const iterator_invalidation_mutation_mod = @import("rules/iterator_invalidation_mutation.zig");
-const thread_spawn_local_pointer_mod = @import("rules/thread_spawn_local_pointer.zig");
-const self_pointer_in_returned_value_mod = @import("rules/self_pointer_in_returned_value.zig");
-const todo_panic_in_production_mod = @import("rules/todo_panic_in_production.zig");
-const memset_undef_after_len_truncation_mod = @import("rules/memset_undef_after_len_truncation.zig");
-const missing_deinit_on_composed_owner_mod = @import("rules/missing_deinit_on_composed_owner.zig");
-const missing_errdefer_between_tries_mod = @import("rules/missing_errdefer_between_tries.zig");
-const missing_errdefer_on_out_param_mod = @import("rules/missing_errdefer_on_out_param.zig");
-const move_out_without_restore_mod = @import("rules/move_out_without_restore.zig");
-const overwrite_without_deinit_mod = @import("rules/overwrite_without_deinit.zig");
-const owned_field_no_outer_cleanup_mod = @import("rules/owned_field_no_outer_cleanup.zig");
-const publish_then_touch_self_mod = @import("rules/publish_then_touch_self.zig");
-const realloc_byte_count_mod = @import("rules/realloc_byte_count.zig");
-const reset_skips_pooled_resource_release_mod = @import("rules/reset_skips_pooled_resource_release.zig");
-const return_borrowed_payload_mod = @import("rules/return_borrowed_payload.zig");
-const self_undefined_after_destroy_mod = @import("rules/self_undefined_after_destroy.zig");
-const sentinel_strip_free_size_mismatch_mod = @import("rules/sentinel_strip_free_size_mismatch.zig");
-const slice_of_arena_into_heap_mod = @import("rules/slice_of_arena_into_heap.zig");
-const stack_fallback_escape_mod = @import("rules/stack_fallback_escape.zig");
-const tagged_union_retag_with_old_payload_read_mod = @import("rules/tagged_union_retag_with_old_payload_read.zig");
-const union_deinit_without_inert_reset_mod = @import("rules/union_deinit_without_inert_reset.zig");
-const unreleased_factory_handle_mod = @import("rules/unreleased_factory_handle.zig");
-const unreleased_refs_on_error_mod = @import("rules/unreleased_refs_on_error.zig");
+const aliased_heap_dupe_mod = @import("rules/heap/aliased_heap_dupe.zig");
+const arraylist_items_slice_mod = @import("rules/collection/arraylist_items_slice.zig");
+const assert_on_untrusted_input_mod = @import("rules/misc/assert_on_untrusted_input.zig");
+const asymmetric_field_free_mod = @import("rules/cleanup/asymmetric_field_free.zig");
+const borrowed_slice_into_out_param_mod = @import("rules/borrow/borrowed_slice_into_out_param.zig");
+const borrowed_slice_into_stack_buffer_returned_mod = @import("rules/borrow/borrowed_slice_into_stack_buffer_returned.zig");
+const clobbered_by_struct_reset_mod = @import("rules/cleanup/clobbered_by_struct_reset.zig");
+const dead_errdefer_in_result_fn_mod = @import("rules/errdefer/dead_errdefer_in_result_fn.zig");
+const defer_and_errdefer_free_overlap_mod = @import("rules/errdefer/defer_and_errdefer_free_overlap.zig");
+const deinit_order_violates_construction_dep_mod = @import("rules/cleanup/deinit_order_violates_construction_dep.zig");
+const destroy_after_deinit_in_loop_mod = @import("rules/cleanup/destroy_after_deinit_in_loop.zig");
+const duplicate_errdefer_mod = @import("rules/errdefer/duplicate_errdefer.zig");
+const fd_write_after_close_mod = @import("rules/misc/fd_write_after_close.zig");
+const free_then_try_realloc_mod = @import("rules/heap/free_then_try_realloc.zig");
+const free_without_null_then_check_mod = @import("rules/heap/free_without_null_then_check.zig");
+const hashmap_getptr_rehash_mod = @import("rules/collection/hashmap_getptr_rehash.zig");
+const getorput_unguarded_value_read_mod = @import("rules/collection/getorput_unguarded_value_read.zig");
+const hashmap_iter_mutation_mod = @import("rules/collection/hashmap_iter_mutation.zig");
+const iterator_invalidation_mutation_mod = @import("rules/collection/iterator_invalidation_mutation.zig");
+const thread_spawn_local_pointer_mod = @import("rules/misc/thread_spawn_local_pointer.zig");
+const self_pointer_in_returned_value_mod = @import("rules/borrow/self_pointer_in_returned_value.zig");
+const todo_panic_in_production_mod = @import("rules/misc/todo_panic_in_production.zig");
+const memset_undef_after_len_truncation_mod = @import("rules/collection/memset_undef_after_len_truncation.zig");
+const missing_deinit_on_composed_owner_mod = @import("rules/cleanup/missing_deinit_on_composed_owner.zig");
+const missing_errdefer_between_tries_mod = @import("rules/errdefer/missing_errdefer_between_tries.zig");
+const missing_errdefer_on_out_param_mod = @import("rules/errdefer/missing_errdefer_on_out_param.zig");
+const move_out_without_restore_mod = @import("rules/cleanup/move_out_without_restore.zig");
+const overwrite_without_deinit_mod = @import("rules/cleanup/overwrite_without_deinit.zig");
+const owned_field_no_outer_cleanup_mod = @import("rules/cleanup/owned_field_no_outer_cleanup.zig");
+const publish_then_touch_self_mod = @import("rules/misc/publish_then_touch_self.zig");
+const realloc_byte_count_mod = @import("rules/heap/realloc_byte_count.zig");
+const reset_skips_pooled_resource_release_mod = @import("rules/cleanup/reset_skips_pooled_resource_release.zig");
+const return_borrowed_payload_mod = @import("rules/borrow/return_borrowed_payload.zig");
+const self_undefined_after_destroy_mod = @import("rules/borrow/self_undefined_after_destroy.zig");
+const sentinel_strip_free_size_mismatch_mod = @import("rules/heap/sentinel_strip_free_size_mismatch.zig");
+const slice_of_arena_into_heap_mod = @import("rules/heap/slice_of_arena_into_heap.zig");
+const stack_fallback_escape_mod = @import("rules/borrow/stack_fallback_escape.zig");
+const tagged_union_retag_with_old_payload_read_mod = @import("rules/misc/tagged_union_retag_with_old_payload_read.zig");
+const union_deinit_without_inert_reset_mod = @import("rules/cleanup/union_deinit_without_inert_reset.zig");
+const unreleased_factory_handle_mod = @import("rules/cleanup/unreleased_factory_handle.zig");
+const unreleased_refs_on_error_mod = @import("rules/errdefer/unreleased_refs_on_error.zig");
 
 const escape_detectors = [_]Detector{
     .{ .id = "aliased-heap-dupe",                          .check = aliased_heap_dupe_mod.check },
