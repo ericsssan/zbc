@@ -375,7 +375,7 @@ fn returnIsAllocCall(
 
 const isAllocatorName = receiver_mod.isAllocatorishName;
 
-fn paramIndex(tree: *const Ast, proto: Ast.full.FnProto, name: []const u8) ?u32 {
+pub fn paramIndex(tree: *const Ast, proto: Ast.full.FnProto, name: []const u8) ?u32 {
     var idx: u32 = 0;
     var it = proto.iterate(tree);
     while (it.next()) |p| : (idx += 1) {
@@ -557,14 +557,9 @@ pub fn inferReturnStructLiteralBorrowsParam(
     for (si.ast.fields) |field_value| {
         if (tree.nodeTag(field_value) != .identifier) continue;
         const name = tree.tokenSlice(tree.nodeMainToken(field_value));
-        if (resolveParamIndex(tree, proto, name)) |idx| return idx;
+        if (paramIndex(tree, proto, name)) |idx| return idx;
     }
     return null;
-}
-
-/// Public alias for paramIndex — used by R7 helpers in FileCache.
-pub fn resolveParamIndex(tree: *const Ast, proto: Ast.full.FnProto, name: []const u8) ?u32 {
-    return paramIndex(tree, proto, name);
 }
 
 /// Cleanup methods whose RECEIVER is the destroyed value.

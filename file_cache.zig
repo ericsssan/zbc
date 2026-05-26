@@ -178,7 +178,7 @@ pub const FileCache = struct {
     /// fn body.  Same caching contract as localBindings.  Body-only
     /// inference — for the deep fields (may_free_fields /
     /// result_heap_fields / heap_allocates_self), use `summaryOfFn`.
-    pub fn summaryOf(
+    fn summaryOf(
         self: *FileCache,
         proto: Ast.full.FnProto,
         body: Ast.Node.Index,
@@ -436,7 +436,7 @@ pub const FileCache = struct {
         if (first + 1 > last or tags[first + 1] != .period) return null;
 
         const head_name = tree.tokenSlice(first);
-        const param_idx = fn_summary.resolveParamIndex(tree, proto, head_name) orelse return null;
+        const param_idx = fn_summary.paramIndex(tree, proto, head_name) orelse return null;
 
         var k: Ast.TokenIndex = first + 1;
         var method_tok: Ast.TokenIndex = 0;
@@ -506,7 +506,7 @@ pub const FileCache = struct {
         const arg = args[idx_resolved];
         if (tree.nodeTag(arg) != .identifier) return null;
         const arg_name = tree.tokenSlice(tree.nodeMainToken(arg));
-        return fn_summary.resolveParamIndex(tree, proto, arg_name);
+        return fn_summary.paramIndex(tree, proto, arg_name);
     }
 
     /// Look up a top-level fn by name and return its `borrowed_from`

@@ -145,6 +145,15 @@ fn anyMethodOnType(ti: *const fmodel.TypeInfo, pred: MethodPred) bool {
     return false;
 }
 
+/// True iff `ti` has at least one cleanup method with a non-trivial body.
+pub fn anyNonTrivialCleanup(tree: *const Ast, ti: *const fmodel.TypeInfo) bool {
+    for (ti.methods) |m| {
+        if (!receiver.isCleanupMethodName(m.name)) continue;
+        if (!lexer.isTrivialBody(tree, m.body_first, m.body_last)) return true;
+    }
+    return false;
+}
+
 // ── Finders ──────────────────────────────────────────────────
 
 /// All TypeInfo in `model` matching `pred`.  Caller owns the slice.

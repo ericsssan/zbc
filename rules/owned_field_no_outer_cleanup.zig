@@ -553,15 +553,7 @@ fn cleanupTakesOnlySelf(tree: *const Ast, m: fmodel.MethodInfo) bool {
 /// non-trivial — i.e. contains something other than `_ = <expr>;`
 /// discards.  An empty `{}` or all-discards body means the method
 /// does nothing on drop, so a missing outer cleanup is harmless.
-fn anyNonTrivialCleanup(tree: *const Ast, ti: *const fmodel.TypeInfo) bool {
-    for (ti.methods) |m| {
-        if (!isCleanupName(m.name)) continue;
-        if (!isTrivialBody(tree, m.body_first, m.body_last)) return true;
-    }
-    return false;
-}
-
-const isTrivialBody = lexer.isTrivialBody;
+const anyNonTrivialCleanup = mq.anyNonTrivialCleanup;
 
 const isCleanupName = receiver.isCleanupMethodName;
 

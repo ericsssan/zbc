@@ -183,15 +183,7 @@ pub fn check(
 /// `_ = <expr>;` discards.  An empty `{}` or all-discards body
 /// means the method does nothing on drop, so a missing outer
 /// cleanup of the field is harmless.
-fn anyNonTrivialCleanup(tree: *const Ast, ti: *const fmodel.TypeInfo) bool {
-    for (ti.methods) |m| {
-        if (!isCleanupName(m.name)) continue;
-        if (!isTrivialBody(tree, m.body_first, m.body_last)) return true;
-    }
-    return false;
-}
-
-const isTrivialBody = lexer.isTrivialBody;
+const anyNonTrivialCleanup = mq.anyNonTrivialCleanup;
 
 /// True iff some method of `outer` OTHER than `deinit_method`
 /// contains a call `<X>.<field_name>.<cleanup>(...)` — evidence
