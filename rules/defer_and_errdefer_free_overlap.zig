@@ -184,15 +184,11 @@ fn report(
 
 // ── Tests ──────────────────────────────────────────────────
 
-fn runOn(gpa: std.mem.Allocator, src: []const u8) !std.ArrayListUnmanaged(Problem) {
-    return testing.runRule(gpa, check, src);
-}
-
 const freeProblems = testing.freeProblems;
 
 test "defer-and-errdefer-free-overlap: Atlas.grow pattern fires" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\const Self = struct {
         \\    data: []u8,
@@ -217,7 +213,7 @@ test "defer-and-errdefer-free-overlap: Atlas.grow pattern fires" {
 
 test "defer-and-errdefer-free-overlap: errdefer that doesn't restore doesn't fire" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\const Self = struct {
         \\    data: []u8,
@@ -238,7 +234,7 @@ test "defer-and-errdefer-free-overlap: errdefer that doesn't restore doesn't fir
 
 test "defer-and-errdefer-free-overlap: no subsequent try doesn't fire" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\const Self = struct {
         \\    data: []u8,

@@ -334,15 +334,11 @@ fn report(
 
 // ── Tests ──────────────────────────────────────────────────
 
-fn runOn(gpa: std.mem.Allocator, src: []const u8) !std.ArrayListUnmanaged(Problem) {
-    return testing.runRule(gpa, check, src);
-}
-
 const freeProblems = testing.freeProblems;
 
 test "union-deinit-without-inert-reset: ghostty osc.zig pattern fires" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\const List = struct { pub fn deinit(_: *List) void {} };
         \\const Command = union(enum) {
@@ -369,7 +365,7 @@ test "union-deinit-without-inert-reset: ghostty osc.zig pattern fires" {
 
 test "union-deinit-without-inert-reset: with retag doesn't fire" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\const List = struct { pub fn deinit(_: *List) void {} };
         \\const Command = union(enum) {
@@ -396,7 +392,7 @@ test "union-deinit-without-inert-reset: with retag doesn't fire" {
 
 test "union-deinit-without-inert-reset: deinit-named fn (single-shot) skipped" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\const List = struct { pub fn deinit(_: *List) void {} };
         \\const Command = union(enum) { kitty_color_protocol: struct { list: List }, hyperlink_end: void };
@@ -417,7 +413,7 @@ test "union-deinit-without-inert-reset: deinit-named fn (single-shot) skipped" {
 
 test "union-deinit-without-inert-reset: inline arm body works" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\const List = struct { pub fn deinit(_: *List) void {} };
         \\const Command = union(enum) { kitty: struct { list: List }, none: void };
@@ -438,7 +434,7 @@ test "union-deinit-without-inert-reset: inline arm body works" {
 
 test "union-deinit-without-inert-reset: arm with no capture skipped" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\const Command = union(enum) { x: u32, none: void };
         \\const Parser = struct {

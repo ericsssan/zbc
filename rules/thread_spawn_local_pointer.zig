@@ -221,15 +221,11 @@ fn report(
 
 // ── Tests ──────────────────────────────────────────────────────
 
-fn runOn(gpa: std.mem.Allocator, src: []const u8) !std.ArrayListUnmanaged(Problem) {
-    return testing.runRule(gpa, check, src);
-}
-
 const freeProblems = testing.freeProblems;
 
 test "thread-spawn-local-pointer: &local in spawn args fires" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\fn run(p: *u32) void { _ = p; }
         \\pub fn main() !void {
@@ -246,7 +242,7 @@ test "thread-spawn-local-pointer: &local in spawn args fires" {
 
 test "thread-spawn-local-pointer: &param does NOT fire" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\fn run(p: *u32) void { _ = p; }
         \\pub fn forward(caller_counter: *u32) !void {
@@ -261,7 +257,7 @@ test "thread-spawn-local-pointer: &param does NOT fire" {
 
 test "thread-spawn-local-pointer: heap-allocated arg does NOT fire" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\fn run(p: *u32) void { _ = p; }
         \\pub fn main(allocator: std.mem.Allocator) !void {
@@ -280,7 +276,7 @@ test "thread-spawn-local-pointer: heap-allocated arg does NOT fire" {
 
 test "thread-spawn-local-pointer: pool.spawn variant also fires" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\const Pool = struct {
         \\    pub fn spawn(self: *Pool, comptime f: anytype, args: anytype) !void {

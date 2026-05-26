@@ -308,15 +308,11 @@ fn report(
 
 // ── Tests ──────────────────────────────────────────────────
 
-fn runOn(gpa: std.mem.Allocator, src: []const u8) !std.ArrayListUnmanaged(Problem) {
-    return testing.runRule(gpa, check, src);
-}
-
 const freeProblems = testing.freeProblems;
 
 test "publish-then-touch-self: queue.push(this) then this.field fires" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const bun = struct { pub fn destroy(x: anytype) void { _ = x; } };
         \\const Self = struct {
         \\    vm: usize,
@@ -335,7 +331,7 @@ test "publish-then-touch-self: queue.push(this) then this.field fires" {
 
 test "publish-then-touch-self: Concurrent-named method also caught" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const bun = struct { pub fn destroy(x: anytype) void { _ = x; } };
         \\const Self = struct {
         \\    x: u32,
@@ -353,7 +349,7 @@ test "publish-then-touch-self: Concurrent-named method also caught" {
 
 test "publish-then-touch-self: hoisted reads before publish doesn't fire" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const Self = struct {
         \\    vm: usize,
         \\    pub fn dispatch(this: *Self, store: anytype) void {
@@ -370,7 +366,7 @@ test "publish-then-touch-self: hoisted reads before publish doesn't fire" {
 
 test "publish-then-touch-self: non-concurrent receiver/method doesn't fire" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const Self = struct {
         \\    x: u32,
         \\    pub fn work(self: *Self, list: anytype) void {
@@ -386,7 +382,7 @@ test "publish-then-touch-self: non-concurrent receiver/method doesn't fire" {
 
 test "publish-then-touch-self: thread_pool.dispatch(this) caught" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const bun = struct { pub fn destroy(x: anytype) void { _ = x; } };
         \\const Self = struct {
         \\    x: u32,
@@ -404,7 +400,7 @@ test "publish-then-touch-self: thread_pool.dispatch(this) caught" {
 
 test "publish-then-touch-self: compound queue name (task_queue) caught" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         // heap-managed Self with task_queue publish then access
         \\const bun = struct { pub fn destroy(x: anytype) void { _ = x; } };
         \\const Self = struct {
@@ -424,7 +420,7 @@ test "publish-then-touch-self: compound queue name (task_queue) caught" {
 
 test "publish-then-touch-self: patch_task_queue (compound name) caught" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         // Mirrors patch_install.zig: push on compound queue name
         \\const bun = struct { pub fn destroy(x: anytype) void { _ = x; } };
         \\const Self = struct {
@@ -443,7 +439,7 @@ test "publish-then-touch-self: patch_task_queue (compound name) caught" {
 
 test "publish-then-touch-self: defer this.X before push fires after (inline)" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         // Mirrors patch_install.zig notify(): defer fires AFTER push at fn exit
         \\const bun = struct { pub fn destroy(x: anytype) void { _ = x; } };
         \\const Self = struct {
@@ -463,7 +459,7 @@ test "publish-then-touch-self: defer this.X before push fires after (inline)" {
 
 test "publish-then-touch-self: defer this.X before push fires after (block)" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         // Block-form defer — same hazard
         \\const bun = struct { pub fn destroy(x: anytype) void { _ = x; } };
         \\const Self = struct {
@@ -482,7 +478,7 @@ test "publish-then-touch-self: defer this.X before push fires after (block)" {
 
 test "publish-then-touch-self: non-self defer before push doesn't fire" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         // `defer other.cleanup()` — not `this`/`self`, safe
         \\const Self = struct {
         \\    manager: anytype,
@@ -499,7 +495,7 @@ test "publish-then-touch-self: non-self defer before push doesn't fire" {
 
 test "publish-then-touch-self: type with no self-destructor suppressed (Installer.Task FP)" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         // Mirrors Installer.zig: Task lives in `tasks: []Task` (slice element,
         // never bun.destroy'd).  No self-freeing method → suppress.
         \\const Task = struct {
@@ -517,7 +513,7 @@ test "publish-then-touch-self: type with no self-destructor suppressed (Installe
 
 test "publish-then-touch-self: type with bun.destroy(this) kept (PatchTask TP)" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         // Mirrors patch_install.zig: PatchTask is bun.new'd and bun.destroy'd
         // in deinit() — self-freeing destructor → keep the finding.
         \\const bun = struct { pub fn destroy(x: anytype) void { _ = x; } };

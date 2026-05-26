@@ -252,15 +252,11 @@ fn report(
 
 // ── Tests ──────────────────────────────────────────────────
 
-fn runOn(gpa: std.mem.Allocator, src: []const u8) !std.ArrayListUnmanaged(Problem) {
-    return testing.runRule(gpa, check, src);
-}
-
 const freeProblems = testing.freeProblems;
 
 test "tagged-union-retag: TigerBeetle scan_tree.zig pattern fires" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\const State = union(enum) {
         \\    loading_index: struct { key_exclusive_next: u32 = 0 },
@@ -286,7 +282,7 @@ test "tagged-union-retag: TigerBeetle scan_tree.zig pattern fires" {
 
 test "tagged-union-retag: hoisted read into a local doesn't fire" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\const State = union(enum) {
         \\    loading_index: struct { key_exclusive_next: u32 = 0 },
@@ -307,7 +303,7 @@ test "tagged-union-retag: hoisted read into a local doesn't fire" {
 
 test "tagged-union-retag: same-tag retag doesn't fire" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\const State = union(enum) {
         \\    active: struct { count: u32 },
@@ -327,7 +323,7 @@ test "tagged-union-retag: same-tag retag doesn't fire" {
 
 test "tagged-union-retag: different LHS than RHS path doesn't fire" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\const State = union(enum) { a: u32, b: u32 };
         \\const Self = struct {
@@ -345,7 +341,7 @@ test "tagged-union-retag: different LHS than RHS path doesn't fire" {
 
 test "tagged-union-retag: slice-like fields (.len, .ptr) are not tag accesses" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\const Self = struct {
         \\    buf: []u8,

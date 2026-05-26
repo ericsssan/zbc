@@ -214,15 +214,11 @@ fn report(
 
 // ── Tests ──────────────────────────────────────────────────
 
-fn runOn(gpa: std.mem.Allocator, src: []const u8) !std.ArrayListUnmanaged(Problem) {
-    return testing.runRule(gpa, check, src);
-}
-
 const freeProblems = testing.freeProblems;
 
 test "arraylist-items-slice: items then append then use fires" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\pub fn buggy(list: *std.ArrayList(u32), gpa: std.mem.Allocator) !void {
         \\    const items = list.items;
@@ -238,7 +234,7 @@ test "arraylist-items-slice: items then append then use fires" {
 
 test "arraylist-items-slice: use before append doesn't fire" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\pub fn ok(list: *std.ArrayList(u32), gpa: std.mem.Allocator) !void {
         \\    const items = list.items;
@@ -253,7 +249,7 @@ test "arraylist-items-slice: use before append doesn't fire" {
 
 test "arraylist-items-slice: different receiver doesn't fire" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\pub fn ok(a: *std.ArrayList(u32), b: *std.ArrayList(u32), gpa: std.mem.Allocator) !void {
         \\    const items = a.items;
@@ -268,7 +264,7 @@ test "arraylist-items-slice: different receiver doesn't fire" {
 
 test "arraylist-items-slice: appendSlice / insert variants caught" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\pub fn buggy(list: *std.ArrayList(u32), gpa: std.mem.Allocator) !void {
         \\    const items = list.items;
@@ -288,7 +284,7 @@ test "arraylist-items-slice: appendSlice / insert variants caught" {
 
 test "arraylist-items-slice: appendAssumeCapacity does NOT fire (no realloc by contract)" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\pub fn ok(list: *std.ArrayList(u32)) void {
         \\    const items = list.items;
@@ -303,7 +299,7 @@ test "arraylist-items-slice: appendAssumeCapacity does NOT fire (no realloc by c
 
 test "arraylist-items-slice: ensureUnusedCapacity does NOT fire (pre-alloc idiom)" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\pub fn ok(list: *std.ArrayList(u32), gpa: std.mem.Allocator) !void {
         \\    const items = list.items;
@@ -318,7 +314,7 @@ test "arraylist-items-slice: ensureUnusedCapacity does NOT fire (pre-alloc idiom
 
 test "arraylist-items-slice: mutate inside errdefer is skipped" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\pub fn ok(list: *std.ArrayList(u32), gpa: std.mem.Allocator) !void {
         \\    const items = list.items;
@@ -333,7 +329,7 @@ test "arraylist-items-slice: mutate inside errdefer is skipped" {
 
 test "arraylist-items-slice: mutate inside catch block is skipped" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\pub fn ok(list: *std.ArrayList(u32), gpa: std.mem.Allocator) !void {
         \\    const items = list.items;
@@ -352,7 +348,7 @@ test "arraylist-items-slice: mutate inside catch block is skipped" {
 
 test "arraylist-items-slice: shadowed loop capture in sibling scope doesn't fire" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\pub fn ok(list: *std.ArrayList(u32), gpa: std.mem.Allocator) !void {
         \\    while (list.items.len > 0) {

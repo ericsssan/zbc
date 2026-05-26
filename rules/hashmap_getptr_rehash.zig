@@ -245,15 +245,11 @@ fn report(
 
 // ── Tests ──────────────────────────────────────────────────
 
-fn runOn(gpa: std.mem.Allocator, src: []const u8) !std.ArrayListUnmanaged(Problem) {
-    return testing.runRule(gpa, check, src);
-}
-
 const freeProblems = testing.freeProblems;
 
 test "hashmap-getptr-rehash: getPtr then put then use fires" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\pub fn buggy(map: *std.AutoHashMap(u32, u32)) !void {
         \\    const p = map.getPtr(1) orelse return;
@@ -269,7 +265,7 @@ test "hashmap-getptr-rehash: getPtr then put then use fires" {
 
 test "hashmap-getptr-rehash: use before put doesn't fire" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\pub fn ok(map: *std.AutoHashMap(u32, u32)) !void {
         \\    const p = map.getPtr(1) orelse return;
@@ -284,7 +280,7 @@ test "hashmap-getptr-rehash: use before put doesn't fire" {
 
 test "hashmap-getptr-rehash: different receiver doesn't fire" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\pub fn ok(a: *std.AutoHashMap(u32, u32), b: *std.AutoHashMap(u32, u32)) !void {
         \\    const p = a.getPtr(1) orelse return;
@@ -299,7 +295,7 @@ test "hashmap-getptr-rehash: different receiver doesn't fire" {
 
 test "hashmap-getptr-rehash: getOrPut then put then field use fires" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\pub fn buggy(map: *std.AutoHashMap(u32, u32)) !void {
         \\    const gop = try map.getOrPut(1);
@@ -314,7 +310,7 @@ test "hashmap-getptr-rehash: getOrPut then put then field use fires" {
 
 test "hashmap-getptr-rehash: remove also invalidates" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\pub fn buggy(map: *std.AutoHashMap(u32, u32)) !void {
         \\    const p = map.getPtr(1) orelse return;
@@ -329,7 +325,7 @@ test "hashmap-getptr-rehash: remove also invalidates" {
 
 test "hashmap-getptr-rehash: non-mutating get doesn't fire" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\pub fn ok(map: *std.AutoHashMap(u32, u32)) !void {
         \\    const p = map.getPtr(1) orelse return;
@@ -348,7 +344,7 @@ test "hashmap-getptr-rehash: ensureCapacity is NOT in the mutate list (deliberat
     // would cost more in FPs than the real-bug yield.  Document this
     // by asserting the call is left alone here.
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\pub fn ok(map: *std.AutoHashMap(u32, u32)) !void {
         \\    const p = map.getPtr(1) orelse return;
@@ -367,7 +363,7 @@ test "hashmap-getptr-rehash: mutate inside catch block (diverges) is skipped" {
     // subsequent `gop.value_ptr.* = ...` is only reached on the
     // SUCCESS path of the preceding op, where no mutate happened.
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\pub fn ok(map: *std.StringHashMap(u32), key: []const u8, dupe_ok: bool) []const u8 {
         \\    const gop = map.getOrPut(key) catch return key;
@@ -395,7 +391,7 @@ test "hashmap-getptr-rehash: use of same-name identifier in a SIBLING scope does
     // binding's enclosing `}` to avoid connecting the borrow to the
     // shadowed loop capture.
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\pub fn ok(map: *std.AutoHashMap(u32, u32)) !void {
         \\    while (map.count() > 0) {
@@ -421,7 +417,7 @@ test "hashmap-getptr-rehash: mutate inside errdefer (deferred) is skipped" {
     // lexical point.  The use of `gop.value_ptr.*` happens on the
     // success path before any errdefer fires.
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\pub fn ok(map: *std.AutoHashMap(u32, u32)) !void {
         \\    const gop = try map.getOrPut(1);
@@ -437,7 +433,7 @@ test "hashmap-getptr-rehash: mutate inside errdefer (deferred) is skipped" {
 
 test "hashmap-getptr-rehash: var binding (could be reassigned) is skipped" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\pub fn ok(map: *std.AutoHashMap(u32, u32)) !void {
         \\    var p = map.getPtr(1) orelse return;

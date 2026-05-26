@@ -187,15 +187,11 @@ fn report(
 
 // ── Tests ──────────────────────────────────────────────────
 
-fn runOn(gpa: std.mem.Allocator, src: []const u8) !std.ArrayListUnmanaged(Problem) {
-    return testing.runRule(gpa, check, src);
-}
-
 const freeProblems = testing.freeProblems;
 
 test "dead-errdefer-in-result-fn: errdefer in `Result(T)` fn fires" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\fn Result(comptime T: type) type {
         \\    return union(enum) { result: T, err: anyerror };
         \\}
@@ -214,7 +210,7 @@ test "dead-errdefer-in-result-fn: errdefer in `Result(T)` fn fires" {
 
 test "dead-errdefer-in-result-fn: errdefer in `!T` fn is OK (live)" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const V = struct { pub fn deinit(_: *V) void {} };
         \\pub fn parse(_: usize) !V {
         \\    var v: V = .{};
@@ -229,7 +225,7 @@ test "dead-errdefer-in-result-fn: errdefer in `!T` fn is OK (live)" {
 
 test "dead-errdefer-in-result-fn: errdefer in `E!T` fn is OK" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const E = error{X};
         \\const V = struct { pub fn deinit(_: *V) void {} };
         \\pub fn parse(_: usize) E!V {
@@ -245,7 +241,7 @@ test "dead-errdefer-in-result-fn: errdefer in `E!T` fn is OK" {
 
 test "dead-errdefer-in-result-fn: `?Result(T)` optional wrapper also fires" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\fn Result(comptime T: type) type {
         \\    return union(enum) { result: T, err: anyerror };
         \\}
@@ -263,7 +259,7 @@ test "dead-errdefer-in-result-fn: `?Result(T)` optional wrapper also fires" {
 
 test "dead-errdefer-in-result-fn: bare named return (no parens) doesn't fire" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const V = struct { pub fn deinit(_: *V) void {} };
         \\pub fn parse(_: usize) V {
         \\    var v: V = .{};
@@ -278,7 +274,7 @@ test "dead-errdefer-in-result-fn: bare named return (no parens) doesn't fire" {
 
 test "dead-errdefer-in-result-fn: nested fn errdefer attributed to inner fn only" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\fn Result(comptime T: type) type {
         \\    return union(enum) { result: T, err: anyerror };
         \\}

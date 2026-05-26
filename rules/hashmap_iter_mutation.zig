@@ -316,15 +316,11 @@ fn findReceiverMutate(
 
 // ── Tests ──────────────────────────────────────────────────────
 
-fn runOn(gpa: std.mem.Allocator, src: []const u8) !std.ArrayListUnmanaged(Problem) {
-    return testing.runRule(gpa, check, src);
-}
-
 const freeProblems = testing.freeProblems;
 
 test "hashmap-iter-mutation: remove during iteration fires" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\pub fn foo(map: anytype) void {
         \\    var iter = map.iterator();
         \\    while (iter.next()) |entry| {
@@ -341,7 +337,7 @@ test "hashmap-iter-mutation: remove during iteration fires" {
 
 test "hashmap-iter-mutation: put during iteration fires" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\pub fn foo(map: anytype) !void {
         \\    var iter = map.iterator();
         \\    while (iter.next()) |entry| {
@@ -356,7 +352,7 @@ test "hashmap-iter-mutation: put during iteration fires" {
 
 test "hashmap-iter-mutation: read-only iteration does NOT fire" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\pub fn foo(map: anytype) u32 {
         \\    var sum: u32 = 0;
         \\    var iter = map.iterator();
@@ -373,7 +369,7 @@ test "hashmap-iter-mutation: read-only iteration does NOT fire" {
 
 test "hashmap-iter-mutation: mutation on different map does NOT fire" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\pub fn foo(map: anytype, other: anytype) void {
         \\    var iter = map.iterator();
         \\    while (iter.next()) |entry| {
@@ -391,7 +387,7 @@ test "hashmap-iter-mutation: errdefer-scoped iterator + outer map mutation — d
     // via a DIFFERENT while loop — must not fire because the iterator's scope
     // is limited to the errdefer block.
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\pub fn clone(self: anytype, alloc: anytype) !@TypeOf(self.map) {
         \\    var map = @TypeOf(self.map){};
         \\    errdefer {
@@ -417,7 +413,7 @@ test "hashmap-iter-mutation: self.map iterator + map mutation — different vars
     // Iterator on self.map, but body mutates a bare `map` variable (different object).
     // This is the copy-into-new-map pattern; it must NOT fire.
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\pub fn clone(self: anytype, alloc: anytype) !@TypeOf(self.map) {
         \\    var map = @TypeOf(self.map){};
         \\    try map.ensureTotalCapacity(alloc, self.map.count());
@@ -436,7 +432,7 @@ test "hashmap-iter-mutation: self.map iterator + map mutation — different vars
 test "hashmap-iter-mutation: self.map iterator + self.map mutation — same field, fires" {
     // Iterator on self.map AND mutation of self.map — real bug.
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\pub fn foo(self: anytype, k: anytype, v: anytype) void {
         \\    var it = self.map.iterator();
         \\    while (it.next()) |_| {
@@ -451,7 +447,7 @@ test "hashmap-iter-mutation: self.map iterator + self.map mutation — same fiel
 
 test "hashmap-iter-mutation: clearAndFree during iteration fires" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\pub fn foo(map: anytype, alloc: anytype) void {
         \\    var iter = map.keyIterator();
         \\    while (iter.next()) |key| {

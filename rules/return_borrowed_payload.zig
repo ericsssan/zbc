@@ -417,15 +417,11 @@ fn report(
 
 // ── Tests ──────────────────────────────────────────────────
 
-fn runOn(gpa: std.mem.Allocator, src: []const u8) !std.ArrayListUnmanaged(Problem) {
-    return testing.runRule(gpa, check, src);
-}
-
 const freeProblems = testing.freeProblems;
 
 test "return-borrowed-payload: sibling-arm asymmetry fires on bare return" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\const Cmd = union(enum) {
         \\    direct: []const u8,
@@ -446,7 +442,7 @@ test "return-borrowed-payload: sibling-arm asymmetry fires on bare return" {
 
 test "return-borrowed-payload: all arms clone — no fire" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\const Cmd = union(enum) { a: []const u8, b: []const u8 };
         \\pub fn extract(cmd: Cmd, alloc: std.mem.Allocator) ![]const u8 {
@@ -463,7 +459,7 @@ test "return-borrowed-payload: all arms clone — no fire" {
 
 test "return-borrowed-payload: all arms bare — no fire (no sibling asymmetry signal)" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const Cmd = union(enum) { a: []const u8, b: []const u8 };
         \\pub fn extract(cmd: Cmd) []const u8 {
         \\    return switch (cmd) {
@@ -479,7 +475,7 @@ test "return-borrowed-payload: all arms bare — no fire (no sibling asymmetry s
 
 test "return-borrowed-payload: clone via .clone(alloc) also recognized" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\const Payload = struct {
         \\    pub fn clone(_: *const Payload, _: std.mem.Allocator) !Payload { return .{}; }

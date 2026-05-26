@@ -118,15 +118,11 @@ fn report(
 
 // ── Tests ──────────────────────────────────────────────────
 
-fn runOn(gpa: std.mem.Allocator, src: []const u8) !std.ArrayListUnmanaged(Problem) {
-    return testing.runRule(gpa, check, src);
-}
-
 const freeProblems = testing.freeProblems;
 
 test "free-then-try-realloc: adjacent free + try-alloc fires" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\const T = struct { x: u32 };
         \\const S = struct { columns: []T = &.{} };
@@ -143,7 +139,7 @@ test "free-then-try-realloc: adjacent free + try-alloc fires" {
 
 test "free-then-try-realloc: clearing between free and try is OK" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\const T = struct { x: u32 };
         \\const S = struct { columns: []T = &.{} };
@@ -160,7 +156,7 @@ test "free-then-try-realloc: clearing between free and try is OK" {
 
 test "free-then-try-realloc: `catch unreachable` instead of `try` is OK" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\const T = struct { x: u32 };
         \\const S = struct { columns: []T = &.{} };
@@ -176,7 +172,7 @@ test "free-then-try-realloc: `catch unreachable` instead of `try` is OK" {
 
 test "free-then-try-realloc: free in inner `if`, try in outer scope still fires" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\const T = struct { x: u32 };
         \\const S = struct { columns: []T = &.{} };
@@ -194,7 +190,7 @@ test "free-then-try-realloc: free in inner `if`, try in outer scope still fires"
 
 test "free-then-try-realloc: free followed by unrelated stmt then try doesn't fire" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\const T = struct { x: u32 };
         \\const S = struct { columns: []T = &.{} };

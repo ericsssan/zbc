@@ -684,15 +684,11 @@ fn report(
 
 // ── Tests ──────────────────────────────────────────────────
 
-fn runOn(gpa: std.mem.Allocator, src: []const u8) !std.ArrayListUnmanaged(Problem) {
-    return testing.runRule(gpa, check, src);
-}
-
 const freeProblems = testing.freeProblems;
 
 test "fromJS binding without errdefer fires" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\const PathLike = struct {
         \\    pub fn fromJS(_: usize, _: usize) !?PathLike { return null; }
@@ -711,7 +707,7 @@ test "fromJS binding without errdefer fires" {
 
 test "errdefer between tries is OK" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\const PathLike = struct {
         \\    pub fn fromJS(_: usize, _: usize) !?PathLike { return null; }
@@ -731,7 +727,7 @@ test "errdefer between tries is OK" {
 
 test "defer X.deref() is also accepted as protection" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const Str = struct {
         \\    pub fn fromJS(_: usize, _: usize) !?Str { return null; }
         \\    pub fn deref(_: *const Str) void {}
@@ -750,7 +746,7 @@ test "defer X.deref() is also accepted as protection" {
 
 test "lowercase receiver (gpa.dupe) doesn't fire" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\pub fn foo(a: std.mem.Allocator) !void {
         \\    const buf = try a.dupe(u8, "abc");
@@ -765,7 +761,7 @@ test "lowercase receiver (gpa.dupe) doesn't fire" {
 
 test "file-handle open (createFile/openFile) without errdefer fires" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\pub fn writeAof(dir: std.fs.Dir, path: []const u8) !void {
         \\    const file = try dir.createFile(path, .{});
@@ -780,7 +776,7 @@ test "file-handle open (createFile/openFile) without errdefer fires" {
 
 test "file open with errdefer file.close() is OK" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\pub fn writeAof(dir: std.fs.Dir, path: []const u8) !void {
         \\    const file = try dir.createFile(path, .{});
@@ -797,7 +793,7 @@ test "if-let capture: binding scope ends at body brace; outer try doesn't fire" 
     // if-body braces.  A try AFTER the closing `}` is in an unrelated
     // scope; the binding is already gone, no leak possible.
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const Target = struct {
         \\    pub fn fromJS(_: i32) ?Target { return .{}; }
         \\    pub fn deinit(_: *Target) void {}
@@ -816,7 +812,7 @@ test "if-let capture: binding scope ends at body brace; outer try doesn't fire" 
 
 test "if-let capture: try INSIDE the body without errdefer still fires" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const Target = struct {
         \\    pub fn fromJS(_: i32) ?Target { return .{}; }
         \\    pub fn deinit(_: *Target) void {}
@@ -836,7 +832,7 @@ test "if-let capture: try INSIDE the body without errdefer still fires" {
 
 test "binding in `brk:` block: outer try doesn't fire" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const T = struct {
         \\    pub fn fromJS(_: i32) ?T { return .{}; }
         \\    pub fn deinit(_: *T) void {}
@@ -859,7 +855,7 @@ test "binding in `brk:` block: outer try doesn't fire" {
 
 test "non-fromJS method doesn't fire" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const T = struct {
         \\    pub fn create() !T { return .{}; }
         \\    pub fn deinit(_: *T) void {}

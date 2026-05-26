@@ -343,15 +343,11 @@ fn report(
 
 // ── Tests ──────────────────────────────────────────────────
 
-fn runOn(gpa: std.mem.Allocator, src: []const u8) !std.ArrayListUnmanaged(Problem) {
-    return testing.runRule(gpa, check, src);
-}
-
 const freeProblems = testing.freeProblems;
 
 test "clobbered-by-struct-reset: assignment then struct-reset omitting the field fires" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const Watcher = struct {
         \\    path: []const u8 = "",
         \\    callback: usize = 0,
@@ -371,7 +367,7 @@ test "clobbered-by-struct-reset: assignment then struct-reset omitting the field
 
 test "clobbered-by-struct-reset: literal carries the field forward — OK" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const Watcher = struct {
         \\    path: []const u8 = "",
         \\    resolved_path: ?[:0]const u8 = null,
@@ -389,7 +385,7 @@ test "clobbered-by-struct-reset: literal carries the field forward — OK" {
 
 test "clobbered-by-struct-reset: prior RHS is `null` sentinel — OK" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const Watcher = struct {
         \\    path: []const u8 = "",
         \\    resolved_path: ?[:0]const u8 = null,
@@ -406,7 +402,7 @@ test "clobbered-by-struct-reset: prior RHS is `null` sentinel — OK" {
 
 test "clobbered-by-struct-reset: empty `.{}` reset (defer-clear pattern) is OK" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const Progress = struct {
         \\    supports_ansi_escape_codes: bool = false,
         \\    pub fn run(this: *Progress) void {
@@ -422,7 +418,7 @@ test "clobbered-by-struct-reset: empty `.{}` reset (defer-clear pattern) is OK" 
 
 test "clobbered-by-struct-reset: intervening `var <obj>` shadowing is OK" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const Watcher = struct {
         \\    path: []const u8 = "",
         \\    resolved_path: ?[:0]const u8 = null,
@@ -443,7 +439,7 @@ test "clobbered-by-struct-reset: intervening `var <obj>` shadowing is OK" {
 
 test "clobbered-by-struct-reset: comptime type-builder fn is skipped" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\pub fn Builder(comptime T: type) type {
         \\    return struct {
         \\        val: T,

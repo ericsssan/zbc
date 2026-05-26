@@ -243,10 +243,6 @@ fn report(
 
 // ── Tests ──────────────────────────────────────────────────
 
-fn runOn(gpa: std.mem.Allocator, src: []const u8) !std.ArrayListUnmanaged(Problem) {
-    return testing.runRule(gpa, check, src);
-}
-
 const freeProblems = testing.freeProblems;
 
 test "sentinel-strip-free-size-mismatch: ghostty_string_free pattern fires" {
@@ -255,7 +251,7 @@ test "sentinel-strip-free-size-mismatch: ghostty_string_free pattern fires" {
     // ghostty#8886.  `[*:0]const u8` means the allocation is
     // len+1 bytes; freeing `[0..len]` trips the allocator's
     // size check.
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\const Str = struct { ptr: ?[*:0]const u8, len: usize };
         \\pub fn ghostty_string_free(str: Str, alloc: std.mem.Allocator) void {
@@ -270,7 +266,7 @@ test "sentinel-strip-free-size-mismatch: ghostty_string_free pattern fires" {
 
 test "sentinel-strip-free-size-mismatch: bare .ptr[0..len] variant also fires" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\const Str = struct { ptr: [*:0]u8, len: usize };
         \\pub fn release(str: Str, alloc: std.mem.Allocator) void {
@@ -288,7 +284,7 @@ test "sentinel-strip-free-size-mismatch: non-sentinel [*]u8 ptr does NOT fire" {
     // is the canonical way to free a manually-managed slice (no
     // sentinel byte = allocation is exactly len bytes).  Bun's
     // RefCountedStr uses this shape.
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\const Str = struct { ptr: [*]u8, len: usize };
         \\pub fn release(str: Str, alloc: std.mem.Allocator) void {
@@ -302,7 +298,7 @@ test "sentinel-strip-free-size-mismatch: non-sentinel [*]u8 ptr does NOT fire" {
 
 test "sentinel-strip-free-size-mismatch: alloc.free(slice) directly doesn't fire" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\pub fn release(slice: []u8, alloc: std.mem.Allocator) void {
         \\    alloc.free(slice);
@@ -315,7 +311,7 @@ test "sentinel-strip-free-size-mismatch: alloc.free(slice) directly doesn't fire
 
 test "sentinel-strip-free-size-mismatch: alloc.free(slice[0..N]) doesn't fire (not .ptr-based)" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\pub fn release(slice: []u8, alloc: std.mem.Allocator) void {
         \\    alloc.free(slice[0..10]);

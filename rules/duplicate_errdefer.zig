@@ -249,15 +249,11 @@ fn report(
 
 // ── Tests ──────────────────────────────────────────────────
 
-fn runOn(gpa: std.mem.Allocator, src: []const u8) !std.ArrayListUnmanaged(Problem) {
-    return testing.runRule(gpa, check, src);
-}
-
 const freeProblems = testing.freeProblems;
 
 test "duplicate-errdefer: two identical `errdefer X.deinit()` fires once" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const IO = struct { pub fn init() !IO { return .{}; } pub fn deinit(_: *IO) void {} };
         \\const Cmd = struct {
         \\    io: IO = .{},
@@ -277,7 +273,7 @@ test "duplicate-errdefer: two identical `errdefer X.deinit()` fires once" {
 
 test "duplicate-errdefer: distinct receivers don't fire" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const T = struct { pub fn deinit(_: *T) void {} };
         \\const S = struct {
         \\    a: T = .{},
@@ -295,7 +291,7 @@ test "duplicate-errdefer: distinct receivers don't fire" {
 
 test "duplicate-errdefer: same receiver, different methods don't fire" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const T = struct {
         \\    pub fn deinit(_: *T) void {}
         \\    pub fn close(_: *T) void {}
@@ -315,7 +311,7 @@ test "duplicate-errdefer: same receiver, different methods don't fire" {
 
 test "duplicate-errdefer: bare local receiver fires" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const T = struct { pub fn deinit(_: *T) void {} };
         \\pub fn doStuff() !void {
         \\    var x: T = .{};
@@ -330,7 +326,7 @@ test "duplicate-errdefer: bare local receiver fires" {
 
 test "duplicate-errdefer: mutually exclusive if/else if branches don't fire" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const T = struct { pub fn deinit(_: *T, _: anytype) void {} };
         \\pub fn parse(allocator: anytype, a: ?u32, b: ?u32) !void {
         \\    if (a) |_| {
@@ -351,7 +347,7 @@ test "duplicate-errdefer: mutually exclusive if/else if branches don't fire" {
 
 test "duplicate-errdefer: nested fn errdefers don't bleed into outer scan" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const T = struct { pub fn deinit(_: *T) void {} };
         \\pub fn outer() void {
         \\    const Inner = struct {

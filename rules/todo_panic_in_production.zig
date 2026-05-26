@@ -152,15 +152,11 @@ fn report(
 
 // ── Tests ──────────────────────────────────────────────────────
 
-fn runOn(gpa: std.mem.Allocator, src: []const u8) !std.ArrayListUnmanaged(Problem) {
-    return testing.runRule(gpa, check, src);
-}
-
 const freeProblems = testing.freeProblems;
 
 test "todo-panic-in-production: @panic(\"TODO\") fires" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\pub fn foo() void {
         \\    @panic("TODO: implement this");
         \\}
@@ -173,7 +169,7 @@ test "todo-panic-in-production: @panic(\"TODO\") fires" {
 
 test "todo-panic-in-production: @panic(\"unimplemented\") fires" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\pub fn foo() void {
         \\    @panic("unimplemented");
         \\}
@@ -185,7 +181,7 @@ test "todo-panic-in-production: @panic(\"unimplemented\") fires" {
 
 test "todo-panic-in-production: @panic(\"FIXME ...\") fires" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\pub fn foo() void {
         \\    @panic("FIXME: handle the edge case");
         \\}
@@ -197,7 +193,7 @@ test "todo-panic-in-production: @panic(\"FIXME ...\") fires" {
 
 test "todo-panic-in-production: regular @panic does NOT fire" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\pub fn foo() void {
         \\    @panic("internal assertion failure");
         \\}
@@ -209,7 +205,7 @@ test "todo-panic-in-production: regular @panic does NOT fire" {
 
 test "todo-panic-in-production: unreachable does NOT fire" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\pub fn foo(x: u8) u8 {
         \\    return switch (x) {
         \\        0 => 1,
@@ -225,7 +221,7 @@ test "todo-panic-in-production: unreachable does NOT fire" {
 
 test "todo-panic-in-production: case-insensitive TODO inside message fires" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\pub fn foo() void {
         \\    @panic("internal: todo handle this");
         \\}

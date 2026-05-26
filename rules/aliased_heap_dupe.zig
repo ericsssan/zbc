@@ -321,15 +321,11 @@ fn report(
 
 // ── Tests ──────────────────────────────────────────────────
 
-fn runOn(gpa: std.mem.Allocator, src: []const u8) !std.ArrayListUnmanaged(Problem) {
-    return testing.runRule(gpa, check, src);
-}
-
 const freeProblems = testing.freeProblems;
 
 test "aliased-heap-dupe: shallow dupe of flag-paired struct fires" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const Blob = struct {
         \\    content_type: []const u8 = "",
         \\    content_type_allocated: bool = false,
@@ -347,7 +343,7 @@ test "aliased-heap-dupe: shallow dupe of flag-paired struct fires" {
 
 test "aliased-heap-dupe: clearing the flag is OK" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const Blob = struct {
         \\    content_type: []const u8 = "",
         \\    content_type_allocated: bool = false,
@@ -365,7 +361,7 @@ test "aliased-heap-dupe: clearing the flag is OK" {
 
 test "aliased-heap-dupe: re-allocating the field is OK" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\const Blob = struct {
         \\    content_type: []const u8 = "",
@@ -384,7 +380,7 @@ test "aliased-heap-dupe: re-allocating the field is OK" {
 
 test "aliased-heap-dupe: type without flag-pair fields doesn't fire" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const Plain = struct {
         \\    a: u32 = 0,
         \\    b: u32 = 0,
@@ -401,7 +397,7 @@ test "aliased-heap-dupe: type without flag-pair fields doesn't fire" {
 
 test "aliased-heap-dupe: `<src>.* = undefined` ownership transfer is OK" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const Blob = struct {
         \\    content_type: []const u8 = "",
         \\    content_type_allocated: bool = false,

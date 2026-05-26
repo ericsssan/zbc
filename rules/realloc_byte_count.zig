@@ -143,15 +143,11 @@ fn report(
 
 // ── Tests ──────────────────────────────────────────────────
 
-fn runOn(gpa: std.mem.Allocator, src: []const u8) !std.ArrayListUnmanaged(Problem) {
-    return testing.runRule(gpa, check, src);
-}
-
 const freeProblems = testing.freeProblems;
 
 test "realloc-byte-count: `n * @sizeOf(T)` fires" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\const T = struct { x: u32 };
         \\pub fn grow(a: std.mem.Allocator, p: [*]T, len: usize, n: usize) []T {
@@ -166,7 +162,7 @@ test "realloc-byte-count: `n * @sizeOf(T)` fires" {
 
 test "realloc-byte-count: `@sizeOf(T) * n` (left-side) also fires" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\const T = struct { x: u32 };
         \\pub fn grow(a: std.mem.Allocator, p: [*]T, len: usize, n: usize) []T {
@@ -180,7 +176,7 @@ test "realloc-byte-count: `@sizeOf(T) * n` (left-side) also fires" {
 
 test "realloc-byte-count: plain element count is OK" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\const T = struct { x: u32 };
         \\pub fn grow(a: std.mem.Allocator, p: [*]T, cap: usize, n: usize) []T {
@@ -194,7 +190,7 @@ test "realloc-byte-count: plain element count is OK" {
 
 test "realloc-byte-count: pre-bound byte count via local is OK" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\const T = struct { x: u32 };
         \\pub fn grow(a: std.mem.Allocator, p: [*]u8, cap: usize, n: usize) []u8 {
@@ -209,7 +205,7 @@ test "realloc-byte-count: pre-bound byte count via local is OK" {
 
 test "realloc-byte-count: @sizeOf inside a nested call doesn't fire" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\const T = struct { x: u32 };
         \\pub fn grow(a: std.mem.Allocator, p: [*]T, cap: usize) []T {

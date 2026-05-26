@@ -318,15 +318,11 @@ fn report(
 
 // ── Tests ──────────────────────────────────────────────────
 
-fn runOn(gpa: std.mem.Allocator, src: []const u8) !std.ArrayListUnmanaged(Problem) {
-    return testing.runRule(gpa, check, src);
-}
-
 const freeProblems = testing.freeProblems;
 
 test "assert-on-untrusted-input: assert on buffer param fires" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\fn assert(_: bool) void {}
         \\pub fn parse_header(buffer: []const u8) !void {
@@ -345,7 +341,7 @@ test "assert-on-untrusted-input: structured *Message param (NOT a slice) doesn't
     // reliably classified as untrusted.  Rule requires an EXPLICIT
     // slice parameter.
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\fn assert(_: bool) void {}
         \\const Message = struct { size: usize };
         \\pub fn decode(message: *Message) !void {
@@ -359,7 +355,7 @@ test "assert-on-untrusted-input: structured *Message param (NOT a slice) doesn't
 
 test "assert-on-untrusted-input: assert on self.field doesn't fire" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\fn assert(_: bool) void {}
         \\const Self = struct {
         \\    count: usize,
@@ -377,7 +373,7 @@ test "assert-on-untrusted-input: assert on self.field doesn't fire" {
 
 test "assert-on-untrusted-input: non-parser fn name + no byte-like params → no fire" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\fn assert(_: bool) void {}
         \\const Self = struct {
         \\    count: usize,
@@ -396,7 +392,7 @@ test "assert-on-untrusted-input: parser fn without slice param doesn't fire" {
     // Name-signal-only firing was too noisy; rule now requires
     // an explicit slice parameter as the untrusted-input signal.
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\fn assert(_: bool) void {}
         \\pub fn decode_command(cmd: u8) !void {
         \\    assert(cmd < 16);
@@ -409,7 +405,7 @@ test "assert-on-untrusted-input: parser fn without slice param doesn't fire" {
 
 test "assert-on-untrusted-input: assert with index-access on slice-typed param fires" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\fn assert(_: bool) void {}
         \\pub fn decode_frame(frame: []const u8) !void {
         \\    assert(frame[0] == 0xCA);
@@ -422,7 +418,7 @@ test "assert-on-untrusted-input: assert with index-access on slice-typed param f
 
 test "assert-on-untrusted-input: pure length precondition doesn't fire" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\fn assert(_: bool) void {}
         \\pub fn decode_frame(frame: []const u8) !void {
         \\    assert(frame.len > 8);

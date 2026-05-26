@@ -214,15 +214,11 @@ fn scanForUnguardedRead(
 
 // ── Tests ──────────────────────────────────────────────────────
 
-fn runOn(gpa: std.mem.Allocator, src: []const u8) !std.ArrayListUnmanaged(Problem) {
-    return testing.runRule(gpa, check, src);
-}
-
 const freeProblems = testing.freeProblems;
 
 test "getorput-unguarded-value-read: unguarded read fires" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\pub fn foo(map: anytype, key: u32) u32 {
         \\    const gop = map.getOrPut(key) catch unreachable;
         \\    return gop.value_ptr.*;
@@ -236,7 +232,7 @@ test "getorput-unguarded-value-read: unguarded read fires" {
 
 test "getorput-unguarded-value-read: guarded by found_existing does NOT fire" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\pub fn foo(map: anytype, key: u32) u32 {
         \\    const gop = map.getOrPut(key) catch unreachable;
         \\    if (gop.found_existing) return gop.value_ptr.*;
@@ -251,7 +247,7 @@ test "getorput-unguarded-value-read: guarded by found_existing does NOT fire" {
 
 test "getorput-unguarded-value-read: plain write does NOT fire" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\pub fn foo(map: anytype, key: u32) void {
         \\    const gop = map.getOrPut(key) catch unreachable;
         \\    gop.value_ptr.* = 42;
@@ -264,7 +260,7 @@ test "getorput-unguarded-value-read: plain write does NOT fire" {
 
 test "getorput-unguarded-value-read: compound assign fires (reads old value)" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\pub fn foo(map: anytype, key: u32) void {
         \\    const gop = map.getOrPut(key) catch unreachable;
         \\    gop.value_ptr.* += 1;
@@ -277,7 +273,7 @@ test "getorput-unguarded-value-read: compound assign fires (reads old value)" {
 
 test "getorput-unguarded-value-read: found_existing check before read suppresses" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\pub fn foo(map: anytype, key: u32) u32 {
         \\    const gop = map.getOrPut(key) catch unreachable;
         \\    if (!gop.found_existing) gop.value_ptr.* = 0;

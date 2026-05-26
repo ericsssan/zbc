@@ -310,15 +310,11 @@ fn report(
 
 // ── Tests ──────────────────────────────────────────────────
 
-fn runOn(gpa: std.mem.Allocator, src: []const u8) !std.ArrayListUnmanaged(Problem) {
-    return testing.runRule(gpa, check, src);
-}
-
 const freeProblems = testing.freeProblems;
 
 test "reset-skips: deinit releases pool, reset doesn't, AND per-cycle acquire elsewhere — fires" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\const NodePool = struct {
         \\    pub fn acquire(_: *NodePool) *u8 { return undefined; }
@@ -353,7 +349,7 @@ test "reset-skips: partial-clear (reset does some cleanup) suppresses non-touche
     // of ANY cleanup in reset signals the author was aware; the
     // fields they didn't touch are intentionally persistent.
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\const Pool = struct {
         \\    pub fn release(_: *Pool, _: anytype) void {}
@@ -393,7 +389,7 @@ test "reset-skips: pool-lifetime asymmetry (no non-init acquire) is suppressed" 
     // No other method re-acquires, so the asymmetry is intentional
     // and must NOT fire.
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\const Grid = struct { pub fn block_unref(_: *Grid, _: anytype) void {} };
         \\const ScanBuffer = struct {
@@ -428,7 +424,7 @@ test "reset-skips: pool-lifetime asymmetry (no non-init acquire) is suppressed" 
 
 test "reset-skips: deinit and reset both release — doesn't fire" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\const NodePool = struct {
         \\    pub fn release(_: *NodePool, _: anytype) void {}
@@ -453,7 +449,7 @@ test "reset-skips: deinit and reset both release — doesn't fire" {
 
 test "reset-skips: no deinit/reset pair doesn't fire" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\const T = struct {
         \\    pub fn deinit(_: *T) void {}
@@ -470,7 +466,7 @@ test "reset-skips: pool-release in deinit only — fires (allocator-only deinit 
     // backing storage.  Only POOL / EXTERNAL-resource releases
     // missing from reset count as bugs.
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\const T = struct {
         \\    pub fn deinit(self: *T, gpa: std.mem.Allocator) void {
@@ -491,7 +487,7 @@ test "reset-skips: pool-release in deinit with per-cycle reference() elsewhere �
     // Per-cycle: another method calls `rc.reference()`, so the
     // resource is acquired per-cycle and reset must release it.
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\const Refcount = struct {
         \\    pub fn reference(_: *Refcount) void {}

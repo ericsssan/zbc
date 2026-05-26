@@ -471,15 +471,11 @@ fn report(
 
 // ── Tests ──────────────────────────────────────────────────
 
-fn runOn(gpa: std.mem.Allocator, src: []const u8) !std.ArrayListUnmanaged(Problem) {
-    return testing.runRule(gpa, check, src);
-}
-
 const freeProblems = testing.freeProblems;
 
 test "asymmetric-field-free: one of two `?Type` siblings deinit'd, the other not — fires" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const Map = struct { pub fn deinit(_: *Map) void {} };
         \\const Route = struct {
         \\    a_map: ?Map = null,
@@ -497,7 +493,7 @@ test "asymmetric-field-free: one of two `?Type` siblings deinit'd, the other not
 
 test "asymmetric-field-free: both siblings deinit'd — OK" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const Map = struct { pub fn deinit(_: *Map) void {} };
         \\const Route = struct {
         \\    a_map: ?Map = null,
@@ -515,7 +511,7 @@ test "asymmetric-field-free: both siblings deinit'd — OK" {
 
 test "asymmetric-field-free: neither sibling mentioned (symmetric) — OK" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const Map = struct { pub fn deinit(_: *Map) void {} };
         \\const Route = struct {
         \\    a_map: ?Map = null,
@@ -530,7 +526,7 @@ test "asymmetric-field-free: neither sibling mentioned (symmetric) — OK" {
 
 test "asymmetric-field-free: scalar siblings (bool) — OK" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const T = struct {
         \\    a: bool = false,
         \\    b: bool = false,
@@ -546,7 +542,7 @@ test "asymmetric-field-free: scalar siblings (bool) — OK" {
 
 test "asymmetric-field-free: bare slice siblings (`[]const u8`) — OK" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const T = struct {
         \\    name: []const u8 = "",
         \\    message: []const u8 = "",

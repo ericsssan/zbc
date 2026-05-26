@@ -180,15 +180,11 @@ fn report(
 
 // ── Tests ──────────────────────────────────────────────────
 
-fn runOn(gpa: std.mem.Allocator, src: []const u8) !std.ArrayListUnmanaged(Problem) {
-    return testing.runRule(gpa, check, src);
-}
-
 const freeProblems = testing.freeProblems;
 
 test "unreleased-refs-on-error: loop with .reference() then try without errdefer fires" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\const BindGroupLayout = struct {
         \\    manager: Manager = .{},
@@ -216,7 +212,7 @@ test "unreleased-refs-on-error: loop with .reference() then try without errdefer
 
 test "unreleased-refs-on-error: with errdefer .release() loop is OK" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\const BindGroupLayout = struct {
         \\    manager: Manager = .{},
@@ -246,7 +242,7 @@ test "unreleased-refs-on-error: with errdefer .release() loop is OK" {
 
 test "unreleased-refs-on-error: no try after loop doesn't fire" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const Manager = struct { pub fn reference(_: *Manager) void {} };
         \\pub fn init(items: []*Manager) !void {
         \\    for (items) |m| m.reference();
@@ -259,7 +255,7 @@ test "unreleased-refs-on-error: no try after loop doesn't fire" {
 
 test "unreleased-refs-on-error: non-error-union fn (no try) doesn't fire" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const Manager = struct { pub fn reference(_: *Manager) void {} };
         \\pub fn init(items: []*Manager) void {
         \\    for (items) |m| m.reference();
@@ -272,7 +268,7 @@ test "unreleased-refs-on-error: non-error-union fn (no try) doesn't fire" {
 
 test "unreleased-refs-on-error: retain (ObjC-style) variant also caught" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const Obj = struct {
         \\    pub fn retain(_: *Obj) void {}
         \\    pub fn release(_: *Obj) void {}
@@ -292,7 +288,7 @@ test "unreleased-refs-on-error: retain (ObjC-style) variant also caught" {
 
 test "unreleased-refs-on-error: errdefer .deref() (Bun-style) also protects" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const Obj = struct {
         \\    pub fn retain(_: *Obj) void {}
         \\    pub fn deref(_: *Obj) void {}
@@ -314,7 +310,7 @@ test "unreleased-refs-on-error: single-addref (pendingActivityRef) shape fires" 
     // followed by a fallible try with no paired
     // `pendingActivityUnref` errdefer.  Loop body NOT required.
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const This = struct {
         \\    pub fn pendingActivityRef(_: *This) void {}
         \\    pub fn pendingActivityUnref(_: *This) void {}
@@ -332,7 +328,7 @@ test "unreleased-refs-on-error: single-addref (pendingActivityRef) shape fires" 
 
 test "unreleased-refs-on-error: single-addref WITH defer-release doesn't fire" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const This = struct {
         \\    pub fn pendingActivityRef(_: *This) void {}
         \\    pub fn pendingActivityUnref(_: *This) void {}
@@ -351,7 +347,7 @@ test "unreleased-refs-on-error: single-addref WITH defer-release doesn't fire" {
 
 test "unreleased-refs-on-error: comptime type-builder fn skipped" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const Manager = struct { pub fn reference(_: *Manager) void {} };
         \\pub fn Wrap(comptime _: type) type {
         \\    return struct {

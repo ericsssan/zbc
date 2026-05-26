@@ -417,23 +417,11 @@ fn report(
 
 // ── Tests ──────────────────────────────────────────────────
 
-fn runOn(gpa: std.mem.Allocator, src: []const u8) !std.ArrayListUnmanaged(Problem) {
-    const src_z = try gpa.dupeSentinel(u8, src, 0);
-    defer gpa.free(src_z);
-    var tree = try Ast.parse(gpa, src_z, .zig);
-    defer tree.deinit(gpa);
-    var problems: std.ArrayListUnmanaged(Problem) = .empty;
-    var cache = file_cache_mod.FileCache.init(gpa, &tree);
-    defer cache.deinit();
-    try check(gpa, &tree, &cache, &config_mod.Default, &problems);
-    return problems;
-}
-
 const freeProblems = testing.freeProblems;
 
 test "destroy-after-deinit-in-loop: pointer-list loop without destroy fires" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\const Handler = struct { pub fn deinit(_: *Handler) void {} };
         \\const Ctx = struct {
@@ -454,7 +442,7 @@ test "destroy-after-deinit-in-loop: pointer-list loop without destroy fires" {
 
 test "destroy-after-deinit-in-loop: loop body includes destroy is OK" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\const Handler = struct { pub fn deinit(_: *Handler) void {} };
         \\const Ctx = struct {
@@ -475,7 +463,7 @@ test "destroy-after-deinit-in-loop: loop body includes destroy is OK" {
 
 test "destroy-after-deinit-in-loop: value-typed list is OK (no `(*` in decl)" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\const Handler = struct { pub fn deinit(_: *Handler) void {} };
         \\const Ctx = struct {
@@ -495,7 +483,7 @@ test "destroy-after-deinit-in-loop: value-typed list is OK (no `(*` in decl)" {
 
 test "destroy-after-deinit-in-loop: non-destructor fn is OK" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\const Handler = struct { pub fn deinit(_: *Handler) void {} };
         \\const Ctx = struct {

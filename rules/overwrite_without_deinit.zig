@@ -1404,15 +1404,11 @@ fn insideAnyOrelseBlock(
 
 // ── Tests ──────────────────────────────────────────────────
 
-fn runOn(gpa: std.mem.Allocator, src: []const u8) !std.ArrayListUnmanaged(Problem) {
-    return testing.runRule(gpa, check, src);
-}
-
 const freeProblems = testing.freeProblems;
 
 test "overwrite-without-deinit: reassign deinit-able field without prior cleanup fires" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const Owned = struct {
         \\    buf: []u8,
         \\    pub fn deinit(self: *Owned) void { self.buf.len = 0; }
@@ -1438,7 +1434,7 @@ test "overwrite-without-deinit: reassign deinit-able field without prior cleanup
 
 test "overwrite-without-deinit: prior `.deinit()` is OK" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const NameOrIndex = union(enum) {
         \\    name: u32,
         \\    duplicate,
@@ -1459,7 +1455,7 @@ test "overwrite-without-deinit: prior `.deinit()` is OK" {
 
 test "overwrite-without-deinit: field type has no `deinit` method — skip" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const Plain = struct { a: u32 = 0 };
         \\const Owner = struct {
         \\    inner: Plain = .{},
@@ -1475,7 +1471,7 @@ test "overwrite-without-deinit: field type has no `deinit` method — skip" {
 
 test "overwrite-without-deinit: constructor fn (init/create/from*) is skipped" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const NameOrIndex = union(enum) {
         \\    name: u32,
         \\    duplicate,
@@ -1498,7 +1494,7 @@ test "overwrite-without-deinit: constructor fn (init/create/from*) is skipped" {
 
 test "overwrite-without-deinit: explicit `<allocator>.free(this.field)` cleanup is OK" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\const Inner = struct { pub fn deinit(self: *Inner) void { self.* = undefined; } };
         \\const Owner = struct {
@@ -1516,7 +1512,7 @@ test "overwrite-without-deinit: explicit `<allocator>.free(this.field)` cleanup 
 
 test "overwrite-without-deinit: `if (this.field) |…|` guard counts as cleanup" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const Inner = struct { pub fn deinit(self: *Inner) void { self.* = undefined; } };
         \\const Owner = struct {
         \\    inner: ?Inner = null,
@@ -1533,7 +1529,7 @@ test "overwrite-without-deinit: `if (this.field) |…|` guard counts as cleanup"
 
 test "overwrite-without-deinit: inline `defer this.field = saved;` (save/restore) doesn't fire" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const Inner = struct { pub fn deinit(self: *Inner) void { self.* = undefined; } };
         \\const Owner = struct {
         \\    inner: Inner,
@@ -1561,7 +1557,7 @@ test "overwrite-without-deinit: sibling switch arms are mutually exclusive — n
     // assignment in the `.err` arm as the "prior state" for the
     // `.ok` arm — that would produce a false positive.
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const Task = struct { pub fn deref(_: *Task) void {} };
         \\const State = union(enum) {
         \\    pending,
@@ -1597,7 +1593,7 @@ test "overwrite-without-deinit: sibling switch arms are mutually exclusive — n
 
 test "overwrite-without-deinit: assert(this.field == default) gates the write — no fire" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const Inner = struct { pub fn deinit(self: *Inner) void { self.* = undefined; } };
         \\const Owner = struct {
         \\    inner: Inner,
@@ -1615,7 +1611,7 @@ test "overwrite-without-deinit: assert(this.field == default) gates the write �
 
 test "overwrite-without-deinit: optional field first write inside orelse block — no fire" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const Owned = struct {
         \\    buf: []u8,
         \\    pub fn deinit(self: *Owned) void { self.buf.len = 0; }

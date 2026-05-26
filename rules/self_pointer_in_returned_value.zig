@@ -191,15 +191,11 @@ fn report(
 
 // ── Tests ──────────────────────────────────────────────────────
 
-fn runOn(gpa: std.mem.Allocator, src: []const u8) !std.ArrayListUnmanaged(Problem) {
-    return testing.runRule(gpa, check, src);
-}
-
 const freeProblems = testing.freeProblems;
 
 test "self-pointer-in-returned-value: canonical self-ref + return fires" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const Foo = struct { val: u32, self: ?*Foo = null };
         \\pub fn make() Foo {
         \\    var f = Foo{ .val = 5 };
@@ -215,7 +211,7 @@ test "self-pointer-in-returned-value: canonical self-ref + return fires" {
 
 test "self-pointer-in-returned-value: heap-allocated self-ref does NOT fire" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\const Foo = struct { val: u32, self: ?*Foo = null };
         \\pub fn make(alloc: std.mem.Allocator) !*Foo {
@@ -234,7 +230,7 @@ test "self-pointer-in-returned-value: heap-allocated self-ref does NOT fire" {
 
 test "self-pointer-in-returned-value: self-ref then no return does NOT fire" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const Foo = struct { val: u32, self: ?*Foo = null };
         \\pub fn configure(out: *Foo) void {
         \\    var f = Foo{ .val = 5 };
@@ -252,7 +248,7 @@ test "self-pointer-in-returned-value: self-ref then no return does NOT fire" {
 
 test "self-pointer-in-returned-value: different locals don't fire" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const Foo = struct { val: u32, other: ?*Foo = null };
         \\pub fn link(a: *Foo, b: *Foo) Foo {
         \\    var f = Foo{ .val = 5 };

@@ -320,15 +320,11 @@ fn report(
 
 // ── Tests ──────────────────────────────────────────────────────
 
-fn runOn(gpa: std.mem.Allocator, src: []const u8) !std.ArrayListUnmanaged(Problem) {
-    return testing.runRule(gpa, check, src);
-}
-
 const freeProblems = testing.freeProblems;
 
 test "iterator-invalidation: for + append fires" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\pub fn add(list: *std.ArrayList(u32)) !void {
         \\    for (list.items) |x| {
@@ -344,7 +340,7 @@ test "iterator-invalidation: for + append fires" {
 
 test "iterator-invalidation: for + swapRemove fires" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\pub fn purge(list: *std.ArrayList(u32)) void {
         \\    for (list.items, 0..) |x, i| {
@@ -361,7 +357,7 @@ test "iterator-invalidation: for + swapRemove fires" {
 
 test "iterator-invalidation: for + put on hashmap fires" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\pub fn rebuild(map: *std.StringHashMap(u32)) !void {
         \\    for (map.values()) |v| {
@@ -380,7 +376,7 @@ test "iterator-invalidation: for + put on hashmap fires" {
 
 test "iterator-invalidation: pure read loop doesn't fire" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\pub fn sum(list: *std.ArrayList(u32)) u32 {
         \\    var total: u32 = 0;
@@ -395,7 +391,7 @@ test "iterator-invalidation: pure read loop doesn't fire" {
 
 test "iterator-invalidation: mutate on DIFFERENT list doesn't fire" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\pub fn copy(src: *std.ArrayList(u32), dst: *std.ArrayList(u32)) !void {
         \\    for (src.items) |x| {

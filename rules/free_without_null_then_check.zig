@@ -319,15 +319,11 @@ fn report(
 
 // ── Tests ──────────────────────────────────────────────────
 
-fn runOn(gpa: std.mem.Allocator, src: []const u8) !std.ArrayListUnmanaged(Problem) {
-    return testing.runRule(gpa, check, src);
-}
-
 const freeProblems = testing.freeProblems;
 
 test "free-without-null-then-check: destroy then no reset fires" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\const Self = struct {
         \\    gpa: std.mem.Allocator,
@@ -346,7 +342,7 @@ test "free-without-null-then-check: destroy then no reset fires" {
 
 test "free-without-null-then-check: destroy followed by null reset doesn't fire" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\const Self = struct {
         \\    gpa: std.mem.Allocator,
@@ -365,7 +361,7 @@ test "free-without-null-then-check: destroy followed by null reset doesn't fire"
 
 test "free-without-null-then-check: free([]u8) then = &.{} doesn't fire" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\const Self = struct {
         \\    gpa: std.mem.Allocator,
@@ -383,7 +379,7 @@ test "free-without-null-then-check: free([]u8) then = &.{} doesn't fire" {
 
 test "free-without-null-then-check: destructor fn (deinit) is skipped" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\const Self = struct {
         \\    gpa: std.mem.Allocator,
@@ -400,7 +396,7 @@ test "free-without-null-then-check: destructor fn (deinit) is skipped" {
 
 test "free-without-null-then-check: free(local) doesn't fire (only <recv>.<field>)" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\pub fn foo(gpa: std.mem.Allocator) void {
         \\    const local = gpa.alloc(u8, 4) catch return;
@@ -417,7 +413,7 @@ test "free-without-null-then-check: sub-field reset (this.X.len = 0) doesn't fir
     // still stale but no in-bounds access is possible, so authors
     // who write this clearly intend it as a "clear".  Accept.
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\const Self = struct {
         \\    gpa: std.mem.Allocator,
@@ -435,7 +431,7 @@ test "free-without-null-then-check: sub-field reset (this.X.len = 0) doesn't fir
 
 test "free-without-null-then-check: take* fn name is treated as consumer (skipped)" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\const Self = struct {
         \\    pub fn takeLeftFreeRight(this: *Self, allocator: std.mem.Allocator) *u8 {
@@ -456,7 +452,7 @@ test "free-without-null-then-check: non-allocator receiver doesn't fire" {
     // PageEntry); `self.page` is just the allocator arg.  The
     // receiver name `link` isn't allocator-ish, so skip.
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\const Link = struct { pub fn free(_: *Link, _: usize) void {} };
         \\const Self = struct {
@@ -473,7 +469,7 @@ test "free-without-null-then-check: non-allocator receiver doesn't fire" {
 
 test "free-without-null-then-check: free inside errdefer is skipped" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\const Self = struct {
         \\    gpa: std.mem.Allocator,
@@ -493,7 +489,7 @@ test "free-without-null-then-check: free inside errdefer is skipped" {
 
 test "free-without-null-then-check: destructor-prefix fn names (deinit_slice) skipped" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\const Self = struct {
         \\    buf: []u8,
@@ -509,7 +505,7 @@ test "free-without-null-then-check: destructor-prefix fn names (deinit_slice) sk
 
 test "free-without-null-then-check: destructor of self (bun.destroy(this)) skipped" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\const bun = struct { pub fn destroy(_: anytype) void {} };
         \\const Self = struct {
@@ -531,7 +527,7 @@ test "free-without-null-then-check: reassign to a fresh allocation counts as res
     // try-realloc handles the fallible variant); here we just want to
     // verify a non-null reassignment suppresses the report.
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const std = @import("std");
         \\const Self = struct {
         \\    gpa: std.mem.Allocator,

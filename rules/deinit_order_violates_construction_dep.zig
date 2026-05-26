@@ -224,15 +224,11 @@ fn report(
 
 // ── Tests ──────────────────────────────────────────────────
 
-fn runOn(gpa: std.mem.Allocator, src: []const u8) !std.ArrayListUnmanaged(Problem) {
-    return testing.runRule(gpa, check, src);
-}
-
 const freeProblems = testing.freeProblems;
 
 test "deinit-order-violates-construction-dep: LIFO violation fires" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const Grid = struct {
         \\    pub fn init() Grid { return .{}; }
         \\    pub fn deinit(_: *Grid) void {}
@@ -256,7 +252,7 @@ test "deinit-order-violates-construction-dep: LIFO violation fires" {
 
 test "deinit-order-violates-construction-dep: correct LIFO order doesn't fire" {
     const gpa = std.testing.allocator;
-    var problems = try runOn(gpa,
+    var problems = try testing.runRule(gpa, check,
         \\const Grid = struct {
         \\    pub fn init() Grid { return .{}; }
         \\    pub fn deinit(_: *Grid) void {}
