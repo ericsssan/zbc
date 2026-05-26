@@ -14,7 +14,6 @@ const zls_resolver_mod = @import("zls_resolver.zig");
 const Cfg = cfg_mod.Cfg;
 const BlockId = cfg_mod.BlockId;
 const AbstractState = state_mod.AbstractState;
-const JoinResult = state_mod.JoinResult;
 const Problem = problem_mod.Problem;
 
 pub const Options = struct {
