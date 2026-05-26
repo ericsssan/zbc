@@ -255,6 +255,36 @@ pub const all = [_]Rule{
         .title = "`<T>.parse(&stack_buf)` result returned — sub-slice fields point at the now-dead stack buffer",
         .body = @embedFile("rules/borrow/borrowed-slice-into-stack-buffer-returned.md"),
     },
+    .{
+        .id = "getorput-unguarded-value-read",
+        .title = "use of `<gop>.value_ptr.*` before checking `<gop>.found_existing` — uninitialised read when the key is new",
+        .body = @embedFile("rules/invariants/getorput-unguarded-value-read.md"),
+    },
+    .{
+        .id = "hashmap-iter-mutation",
+        .title = "mutation of a HashMap while iterating it — iterator cursor is now undefined",
+        .body = @embedFile("rules/invariants/hashmap-iter-mutation.md"),
+    },
+    .{
+        .id = "iterator-invalidation-mutation",
+        .title = "`for (list.items)` loop body mutates the list — backing buffer may move or reorder under the iterator",
+        .body = @embedFile("rules/invariants/iterator-invalidation-mutation.md"),
+    },
+    .{
+        .id = "thread-spawn-local-pointer",
+        .title = "`Thread.spawn` receives `&<local>` — thread outlives the spawning frame; pointer dangles",
+        .body = @embedFile("rules/invariants/thread-spawn-local-pointer.md"),
+    },
+    .{
+        .id = "self-pointer-in-returned-value",
+        .title = "`<local>.<field> = &<local>; return <local>` — self-referential pointer in returned-by-value struct dangles",
+        .body = @embedFile("rules/invariants/self-pointer-in-returned-value.md"),
+    },
+    .{
+        .id = "todo-panic-in-production",
+        .title = "`@panic(\"TODO …\")` marker left in production code — crashes users when the branch is reached",
+        .body = @embedFile("rules/invariants/todo-panic-in-production.md"),
+    },
 };
 
 /// Look up a rule by id.  Returns null on unknown id so callers can
