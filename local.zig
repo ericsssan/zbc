@@ -102,13 +102,6 @@ pub const CallInfo = struct {
         return self.outermost_method orelse self.method;
     }
 
-    /// Convenience: the outermost `(` token if chained, else the
-    /// first.  Always non-null (callers know there's at least one
-    /// `(` since this is a Call origin).
-    pub fn lastParen(self: CallInfo) TokenIndex {
-        return self.outermost_paren_token orelse self.paren_token;
-    }
-
     /// True iff the RHS chains past the first call.
     pub fn isChained(self: CallInfo) bool {
         return self.outermost_method != null;
@@ -151,13 +144,6 @@ pub const Binding = struct {
     /// For params, the type's last token.
     rhs_last: TokenIndex,
     origin: Origin,
-
-    pub fn isCall(self: Binding) bool {
-        return switch (self.origin) {
-            .call, .method_call, .try_call, .try_method_call => true,
-            else => false,
-        };
-    }
 
     /// If the binding originated from a call (any form), return the
     /// call info; otherwise null.  Strips the `try` distinction.
@@ -213,13 +199,6 @@ pub const LocalBindings = struct {
         return null;
     }
 
-    /// Iterate all bindings (including params).  `find` returns
-    /// the first; this gives the full list for shadow-aware rules.
-    pub fn findAll(self: *const LocalBindings, name: []const u8, out: *std.ArrayListUnmanaged(*const Binding), gpa: std.mem.Allocator) !void {
-        for (self.items) |*b| {
-            if (std.mem.eql(u8, b.name, name)) try out.append(gpa, b);
-        }
-    }
 };
 
 /// Build a LocalBindings for a fn body.  `proto` provides the

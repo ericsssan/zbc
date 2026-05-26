@@ -198,16 +198,6 @@ fn findReceiverMutate(
 /// Skip past a `defer <expr>;` / `errdefer [|err|] <expr>;` /
 /// `defer { ... }` / `errdefer { ... }` statement.  Returns the
 /// index of the statement's terminating `;` or matching `}`.
-/// Find the end token of the statement containing `pos` — the next
-/// statement-depth `;` at or after `pos`.
-fn stmtEndAfter(
-    tags: []const std.zig.Token.Tag,
-    pos: Ast.TokenIndex,
-    last: Ast.TokenIndex,
-) ?Ast.TokenIndex {
-    return findStmtSemicolon(tags, pos, last);
-}
-
 /// Find the first identifier whose text equals `name` in the
 /// binding's enclosing scope.  Stops at the enclosing scope's
 /// closing `}` — references past that scope must be a shadowed
