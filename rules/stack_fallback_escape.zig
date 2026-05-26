@@ -18,8 +18,8 @@
 const std = @import("std");
 const Ast = std.zig.Ast;
 
-const lexer = @import("../tokens.zig");
-const local = @import("../local_bindings.zig");
+const tokens = @import("../tokens.zig");
+const local_bindings = @import("../local_bindings.zig");
 const query = @import("../token_query.zig");
 const problem_mod = @import("../problem.zig");
 const testing = @import("../testing.zig");
@@ -54,7 +54,7 @@ pub fn check(
     problems: *std.ArrayListUnmanaged(Problem),
 ) !void {
     if (!config_mod.isEnabled(config, .stack_fallback_escape)) return;
-    try lexer.forEachFnCached(gpa, tree, cache, problems, checkFn);
+    try tokens.forEachFnCached(gpa, tree, cache, problems, checkFn);
 }
 
 fn checkFn(
@@ -70,7 +70,7 @@ fn checkFn(
     const last = tree.lastToken(body);
 
     // Cheap pre-scan: skip fns that don't even mention stackFallback.
-    if (!lexer.hasIdentInRange(tree, first, last, "stackFallback")) return;
+    if (!tokens.hasIdentInRange(tree, first, last, "stackFallback")) return;
 
     const bindings = try cache.localBindings(proto, body);
 
@@ -104,7 +104,7 @@ fn checkFn(
     var t: Ast.TokenIndex = first;
     while (t <= last) : (t += 1) {
         if (tags[t] != .keyword_return) continue;
-        const sc = lexer.findStmtSemicolon(tags, t + 1, last) orelse continue;
+        const sc = tokens.findStmtSemicolon(tags, t + 1, last) orelse continue;
         if (sc <= t + 1) continue;
         const value_last = sc - 1;
         if (query.anyMatchAnywhere(tree, sanitizer_call_pattern, t + 1, value_last, null)) continue;
@@ -119,7 +119,7 @@ fn checkFn(
 /// identifier already in `tainted`.
 fn rhsIsTainted(
     tree: *const Ast,
-    b: local.Binding,
+    b: local_bindings.Binding,
     sf_names: []const []const u8,
     tainted: *const std.StringHashMapUnmanaged(void),
 ) bool {

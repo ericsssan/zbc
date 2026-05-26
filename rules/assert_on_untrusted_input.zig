@@ -34,10 +34,10 @@ const problem_mod = @import("../problem.zig");
 const config_mod = @import("../config.zig");
 const file_cache_mod = @import("../file_cache.zig");
 
-const lexer = @import("../tokens.zig");
+const tokens = @import("../tokens.zig");
 const testing = @import("../testing.zig");
-const matchParen = lexer.matchParen;
-const skipNestedFn = lexer.skipNestedFn;
+const matchParen = tokens.matchParen;
+const skipNestedFn = tokens.skipNestedFn;
 
 const Problem = problem_mod.Problem;
 const Pos = problem_mod.Pos;
@@ -52,7 +52,7 @@ pub fn check(
     if (!config_mod.isEnabled(config, .assert_on_untrusted_input)) return;
 
     var proto_buf: [1]Ast.Node.Index = undefined;
-    var fns = lexer.iterFnDecls(tree);
+    var fns = tokens.iterFnDecls(tree);
     while (fns.next(&proto_buf)) |fn_entry| {
         try checkFn(gpa, tree, cache, fn_entry.proto, fn_entry.name_token, fn_entry.body, problems);
     }

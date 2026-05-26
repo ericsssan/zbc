@@ -4,7 +4,7 @@ const std = @import("std");
 const Ast = std.zig.Ast;
 
 const cfg_mod = @import("cfg.zig");
-const analyzer_mod = @import("worklist.zig");
+const worklist = @import("worklist.zig");
 const config_mod = @import("config.zig");
 const problem_mod = @import("problem.zig");
 const rule_registry = @import("rule_registry.zig");
@@ -104,7 +104,7 @@ pub fn analyzeEscape(
             zls_ptr,
         )) orelse continue;
         defer cfg.deinit(gpa);
-        try analyzer_mod.check(gpa, &cfg, .{ .path = path, .config = config }, &problems);
+        try worklist.check(gpa, &cfg, .{ .path = path, .config = config }, &problems);
     }
 
     // Pattern detectors — dispatched via the comptime registry so
@@ -257,7 +257,7 @@ test "lib API: analyzeEscape end-to-end flags arena escape" {
 
 test {
     _ = cfg_mod;
-    _ = analyzer_mod;
+    _ = worklist;
     _ = config_mod;
     _ = problem_mod;
     _ = @import("abstract_state.zig");

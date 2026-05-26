@@ -17,9 +17,9 @@
 const std = @import("std");
 const Ast = std.zig.Ast;
 
-const lexer = @import("../tokens.zig");
-const local = @import("../local_bindings.zig");
-const fmodel = @import("../file_model.zig");
+const tokens = @import("../tokens.zig");
+const local_bindings = @import("../local_bindings.zig");
+const file_model = @import("../file_model.zig");
 const problem_mod = @import("../problem.zig");
 const testing = @import("../testing.zig");
 const config_mod = @import("../config.zig");
@@ -40,7 +40,7 @@ pub fn check(
 
     const model = try cache.fileModel();
     var proto_buf: [1]Ast.Node.Index = undefined;
-    var fns = lexer.iterFnDecls(tree);
+    var fns = tokens.iterFnDecls(tree);
     while (fns.next(&proto_buf)) |fn_entry| {
         try checkFn(gpa, tree, cache, model, fn_entry.proto, fn_entry.body, problems);
     }
@@ -65,7 +65,7 @@ fn checkFn(
     gpa: std.mem.Allocator,
     tree: *const Ast,
     cache: *file_cache_mod.FileCache,
-    model: *const fmodel.FileModel,
+    model: *const file_model.FileModel,
     proto: Ast.full.FnProto,
     body: Ast.Node.Index,
     problems: *std.ArrayListUnmanaged(Problem),
@@ -75,7 +75,7 @@ fn checkFn(
     // Cheap pre-scan: skip fns with no `try` at all.
     const first = tree.firstToken(body);
     const last = tree.lastToken(body);
-    if (!lexer.hasTokenInRange(tags, first, last, .keyword_try)) return;
+    if (!tokens.hasTokenInRange(tags, first, last, .keyword_try)) return;
 
     const bindings = try cache.localBindings(proto, body);
 
@@ -236,7 +236,7 @@ fn nextCallPassesArg(
     const scan_lim: Ast.TokenIndex = if (try_tok + 50 < last) try_tok + 50 else last;
     while (p <= scan_lim and tags[p] != .l_paren) : (p += 1) {}
     if (p > scan_lim or tags[p] != .l_paren) return false;
-    const close = lexer.matchParen(tags, p, last) orelse return false;
+    const close = tokens.matchParen(tags, p, last) orelse return false;
     var k: Ast.TokenIndex = p + 1;
     while (k < close) : (k += 1) {
         if (tags[k] != .identifier) continue;
@@ -367,7 +367,7 @@ fn isFileHandleOpenerMethod(name: []const u8) bool {
 fn typeAnnotationLacksDeinit(
     tree: *const Ast,
     b: anytype,
-    model: *const fmodel.FileModel,
+    model: *const file_model.FileModel,
 ) bool {
     const tags = tree.tokens.items(.tag);
     // Annotation sits between `name_token` and the binding's `=`.
@@ -560,7 +560,7 @@ fn consumedAsEnumSwitch(
 /// to `false` on unresolved types so the rule stays conservative.
 fn rhsTypeViaZlsLacksDeinit(
     cache: *file_cache_mod.FileCache,
-    model: *const fmodel.FileModel,
+    model: *const file_model.FileModel,
     tags: []const std.zig.Token.Tag,
     b: anytype,
 ) bool {
@@ -594,7 +594,7 @@ fn rhsTypeViaZlsLacksDeinit(
 /// Returns true conservatively when the type is unresolvable.
 fn typeHasDeinitProject(
     cache: *file_cache_mod.FileCache,
-    model: *const fmodel.FileModel,
+    model: *const file_model.FileModel,
     type_name: []const u8,
 ) bool {
     if (model.hasType(type_name)) {

@@ -31,14 +31,14 @@ const problem_mod = @import("../problem.zig");
 const config_mod = @import("../config.zig");
 const file_cache_mod = @import("../file_cache.zig");
 
-const lexer = @import("../tokens.zig");
+const tokens = @import("../tokens.zig");
 const testing = @import("../testing.zig");
-const matchBrace = lexer.matchBrace;
-const matchParen = lexer.matchParen;
-const skipNestedFn = lexer.skipNestedFn;
-const returnsType = lexer.returnsType;
-const fnProto = lexer.fnProto;
-const bodyOf = lexer.bodyOf;
+const matchBrace = tokens.matchBrace;
+const matchParen = tokens.matchParen;
+const skipNestedFn = tokens.skipNestedFn;
+const returnsType = tokens.returnsType;
+const fnProto = tokens.fnProto;
+const bodyOf = tokens.bodyOf;
 
 const Problem = problem_mod.Problem;
 const Pos = problem_mod.Pos;
@@ -147,7 +147,7 @@ fn resolveLocalTypeAsUnion(
 ) ?*const @import("../file_model.zig").TypeInfo {
     const fn_decl = enclosingFnDecl(tree, ident_tok) orelse return null;
     var proto_buf: [1]Ast.Node.Index = undefined;
-    const proto = lexer.fnProto(tree, &proto_buf, fn_decl) orelse return null;
+    const proto = tokens.fnProto(tree, &proto_buf, fn_decl) orelse return null;
     var it = proto.iterate(tree);
     while (it.next()) |p| {
         const nt = p.name_token orelse continue;
@@ -164,7 +164,7 @@ fn resolveLocalTypeAsUnion(
     return null;
 }
 
-const enclosingFnDecl = lexer.enclosingFnDecl;
+const enclosingFnDecl = tokens.enclosingFnDecl;
 
 fn baseTypeNameOfNode(tree: *const Ast, type_node: Ast.Node.Index) ?[]const u8 {
     const tags = tree.tokens.items(.tag);

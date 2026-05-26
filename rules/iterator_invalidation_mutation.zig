@@ -39,15 +39,15 @@ const problem_mod = @import("../problem.zig");
 const config_mod = @import("../config.zig");
 const file_cache_mod = @import("../file_cache.zig");
 
-const lexer = @import("../tokens.zig");
+const tokens = @import("../tokens.zig");
 const testing = @import("../testing.zig");
 
 const Problem = problem_mod.Problem;
 const Pos = problem_mod.Pos;
 
-const matchBrace = lexer.matchBrace;
-const matchParen = lexer.matchParen;
-const skipNestedFn = lexer.skipNestedFn;
+const matchBrace = tokens.matchBrace;
+const matchParen = tokens.matchParen;
+const skipNestedFn = tokens.skipNestedFn;
 
 pub fn check(
     gpa: std.mem.Allocator,
@@ -58,7 +58,7 @@ pub fn check(
 ) !void {
     if (!config_mod.isEnabled(config, .iterator_invalidation_mutation)) return;
     _ = cache;
-    try lexer.forEachFnBody(gpa, tree, problems, checkBody);
+    try tokens.forEachFnBody(gpa, tree, problems, checkBody);
 }
 
 fn checkBody(
@@ -111,7 +111,7 @@ fn checkBody(
             matchBrace(tags, body_first, last) orelse continue
         else blk: {
             // Inline body — single statement to next `;`.
-            break :blk lexer.findStmtSemicolon(tags, body_first, last) orelse continue;
+            break :blk tokens.findStmtSemicolon(tags, body_first, last) orelse continue;
         };
         // Search for `<recv-path>.<mutator>(` inside [body_first,
         // body_last].  recv_range is a token range that may be

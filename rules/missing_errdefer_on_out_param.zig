@@ -28,14 +28,14 @@
 const std = @import("std");
 const Ast = std.zig.Ast;
 
-const lexer = @import("../tokens.zig");
-const local = @import("../local_bindings.zig");
+const tokens = @import("../tokens.zig");
+const local_bindings = @import("../local_bindings.zig");
 const query = @import("../token_query.zig");
 const problem_mod = @import("../problem.zig");
 const testing = @import("../testing.zig");
 const config_mod = @import("../config.zig");
 const file_cache_mod = @import("../file_cache.zig");
-const receiver = @import("../method_names.zig");
+const method_names = @import("../method_names.zig");
 
 const Problem = problem_mod.Problem;
 const Pos = problem_mod.Pos;
@@ -64,7 +64,7 @@ pub fn check(
     problems: *std.ArrayListUnmanaged(Problem),
 ) !void {
     if (!config_mod.isEnabled(config, .missing_errdefer_on_out_param)) return;
-    try lexer.forEachFnCached(gpa, tree, cache, problems, checkFn);
+    try tokens.forEachFnCached(gpa, tree, cache, problems, checkFn);
 }
 
 const Acquire = struct {
@@ -88,7 +88,7 @@ fn checkFn(
     const last = tree.lastToken(body);
 
     // Cheap pre-scan: no `try` → no leak path → nothing to do.
-    if (!lexer.hasTokenInRange(tags, first, last, .keyword_try)) return;
+    if (!tokens.hasTokenInRange(tags, first, last, .keyword_try)) return;
 
     // Find var-declared canonical-out locals.  Hashed for the
     // per-acquire membership test below.
@@ -112,7 +112,7 @@ fn checkFn(
     for (all_acquires) |m| {
         const out_name = m.captureText(tree, 1).?;
         if (!var_outs.contains(out_name)) continue;
-        const sc = lexer.findStmtSemicolon(tags, m.end + 1, last) orelse continue;
+        const sc = tokens.findStmtSemicolon(tags, m.end + 1, last) orelse continue;
         try acquires.append(gpa, .{
             .out_name = out_name,
             .field_name = m.captureText(tree, 0).?,
@@ -167,7 +167,7 @@ fn bodyHasErrdeferOn(tree: *const Ast, first: Ast.TokenIndex, last: Ast.TokenInd
     return false;
 }
 
-const isCanonicalOutName = receiver.isCanonicalOutName;
+const isCanonicalOutName = method_names.isCanonicalOutName;
 
 fn isAcquireMethodName(name: []const u8) bool {
     return std.mem.eql(u8, name, "ensureTotalCapacity") or
@@ -204,9 +204,9 @@ fn errdeferReferences(
     }
     if (scan_start > last) return false;
     const range_end = if (tags[scan_start] == .l_brace)
-        (lexer.matchBrace(tags, scan_start, last) orelse last)
+        (tokens.matchBrace(tags, scan_start, last) orelse last)
     else
-        (lexer.findStmtSemicolon(tags, scan_start, last) orelse last);
+        (tokens.findStmtSemicolon(tags, scan_start, last) orelse last);
     var t: Ast.TokenIndex = scan_start;
     while (t <= range_end) : (t += 1) {
         if (tags[t] != .identifier) continue;

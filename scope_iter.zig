@@ -16,10 +16,10 @@
 
 const std = @import("std");
 const Ast = std.zig.Ast;
-const lexer = @import("tokens.zig");
+const tokens = @import("tokens.zig");
 
-const TokenIndex = lexer.TokenIndex;
-const TokenTag = lexer.TokenTag;
+const TokenIndex = tokens.TokenIndex;
+const TokenTag = tokens.TokenTag;
 
 /// Find the first identifier whose text equals `name` in the
 /// binding's enclosing scope.  Walks forward from `start`; allows

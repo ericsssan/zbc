@@ -853,7 +853,7 @@ test "stack_escape: composite — return .{ .s = local_array[0..] } is flagged" 
 }
 
 test "stack_escape: composite with &local.* (period_asterisk token) is NOT flagged" {
-    // `.*` is the single `period_asterisk` token in Zig's lexer.
+    // `.*` is the single `period_asterisk` token in Zig's tokens.
     // `&new.*` must be treated as a field-chain borrow (into caller
     // storage), not a bare `&local` stack borrow — fixing osc.zig:463 FP.
     const gpa = std.testing.allocator;

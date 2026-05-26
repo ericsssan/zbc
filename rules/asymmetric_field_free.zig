@@ -21,15 +21,15 @@
 const std = @import("std");
 const Ast = std.zig.Ast;
 
-const fmodel = @import("../file_model.zig");
+const file_model = @import("../file_model.zig");
 const problem_mod = @import("../problem.zig");
 const config_mod = @import("../config.zig");
 const file_cache_mod = @import("../file_cache.zig");
 
-const lexer = @import("../tokens.zig");
+const tokens = @import("../tokens.zig");
 const testing = @import("../testing.zig");
-const fnProto = lexer.fnProto;
-const bodyOf = lexer.bodyOf;
+const fnProto = tokens.fnProto;
+const bodyOf = tokens.bodyOf;
 
 const Problem = problem_mod.Problem;
 const Pos = problem_mod.Pos;
@@ -312,7 +312,7 @@ fn findRootSelfTypeName(tree: *const Ast) ?[]const u8 {
 fn checkFn(
     gpa: std.mem.Allocator,
     tree: *const Ast,
-    model: *const fmodel.FileModel,
+    model: *const file_model.FileModel,
     root_self_type: ?[]const u8,
     groups: *const std.StringHashMapUnmanaged(TypeGroups),
     fn_decl: Ast.Node.Index,
@@ -332,7 +332,7 @@ fn checkFn(
 
     // First param name — typically "this" or "self".  Used as the
     // identifier to scan against for `<param>.<field>`.
-    const first_param_name = lexer.firstParamName(tree, fp) orelse return;
+    const first_param_name = tokens.firstParamName(tree, fp) orelse return;
 
     const body = bodyOf(tree, fn_decl) orelse return;
 
@@ -378,7 +378,7 @@ fn checkFn(
 /// the named type isn't known locally (cross-file types that
 /// haven't been resolved — conservative skip rather than potential
 /// FP).
-fn innerTypeHasDeinit(model: *const fmodel.FileModel, tt: []const u8) bool {
+fn innerTypeHasDeinit(model: *const file_model.FileModel, tt: []const u8) bool {
     if (tt.len < 2 or tt[0] != '?') return false;
     var inner = std.mem.trim(u8, tt[1..], " \t");
     // Strip pointer prefixes (`*`, `*const`) to get the pointee

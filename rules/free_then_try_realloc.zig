@@ -10,7 +10,7 @@
 const std = @import("std");
 const Ast = std.zig.Ast;
 
-const lexer = @import("../tokens.zig");
+const tokens = @import("../tokens.zig");
 const query = @import("../token_query.zig");
 const problem_mod = @import("../problem.zig");
 const config_mod = @import("../config.zig");
@@ -21,7 +21,7 @@ const Problem = problem_mod.Problem;
 const Pos = problem_mod.Pos;
 const Atom = query.Atom;
 
-const bodyOf = lexer.bodyOf;
+const bodyOf = tokens.bodyOf;
 
 // `<recv>.free(<arg>);` — captures the freed arg as range slot 0.
 const free_call = &[_]Atom{

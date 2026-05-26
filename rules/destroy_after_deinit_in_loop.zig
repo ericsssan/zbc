@@ -18,7 +18,7 @@
 const std = @import("std");
 const Ast = std.zig.Ast;
 
-const lexer = @import("../tokens.zig");
+const tokens = @import("../tokens.zig");
 const problem_mod = @import("../problem.zig");
 const config_mod = @import("../config.zig");
 const file_cache_mod = @import("../file_cache.zig");
@@ -37,7 +37,7 @@ pub fn check(
     if (!config_mod.isEnabled(config, .destroy_after_deinit_in_loop)) return;
 
     var proto_buf: [1]Ast.Node.Index = undefined;
-    var fns = lexer.iterFnDecls(tree);
+    var fns = tokens.iterFnDecls(tree);
     while (fns.next(&proto_buf)) |fn_entry| {
         if (!isDestructorName(tree.tokenSlice(fn_entry.name_token))) continue;
         try checkFn(gpa, tree, cache, fn_entry.proto, fn_entry.body, problems);
@@ -361,7 +361,7 @@ fn isPointerListField(tree: *const Ast, field_name: []const u8) bool {
     return false;
 }
 
-const isIdentByte = lexer.isIdentByte;
+const isIdentByte = tokens.isIdentByte;
 
 /// Find the end of a field's type expression starting at `start`.
 /// Stops at the first `,` or `=` at brace/paren/bracket depth 0

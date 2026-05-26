@@ -20,16 +20,16 @@
 const std = @import("std");
 const Ast = std.zig.Ast;
 
-const fmodel = @import("../file_model.zig");
+const file_model = @import("../file_model.zig");
 const problem_mod = @import("../problem.zig");
 const config_mod = @import("../config.zig");
 const file_cache_mod = @import("../file_cache.zig");
 
-const lexer = @import("../tokens.zig");
-const local = @import("../local_bindings.zig");
+const tokens = @import("../tokens.zig");
+const local_bindings = @import("../local_bindings.zig");
 const testing = @import("../testing.zig");
-const fnProto = lexer.fnProto;
-const bodyOf = lexer.bodyOf;
+const fnProto = tokens.fnProto;
+const bodyOf = tokens.bodyOf;
 
 const Problem = problem_mod.Problem;
 const Pos = problem_mod.Pos;
@@ -59,7 +59,7 @@ fn checkFn(
     gpa: std.mem.Allocator,
     tree: *const Ast,
     cache: *file_cache_mod.FileCache,
-    model: *const fmodel.FileModel,
+    model: *const file_model.FileModel,
     fn_decl: Ast.Node.Index,
     problems: *std.ArrayListUnmanaged(Problem),
 ) !void {

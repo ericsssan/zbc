@@ -13,8 +13,8 @@
 const std = @import("std");
 const Ast = std.zig.Ast;
 
-const lexer = @import("../tokens.zig");
-const local = @import("../local_bindings.zig");
+const tokens = @import("../tokens.zig");
+const local_bindings = @import("../local_bindings.zig");
 const query = @import("../token_query.zig");
 const problem_mod = @import("../problem.zig");
 const testing = @import("../testing.zig");
@@ -42,7 +42,7 @@ pub fn check(
     problems: *std.ArrayListUnmanaged(Problem),
 ) !void {
     if (!config_mod.isEnabled(config, .borrowed_slice_into_stack_buffer_returned)) return;
-    try lexer.forEachFnCached(gpa, tree, cache, problems, checkFn);
+    try tokens.forEachFnCached(gpa, tree, cache, problems, checkFn);
 }
 
 fn checkFn(
@@ -58,7 +58,7 @@ fn checkFn(
     const last = tree.lastToken(body);
 
     // Cheap pre-scan: no return → nothing to escape, no fire possible.
-    if (!lexer.hasTokenInRange(tags, first, last, .keyword_return)) return;
+    if (!tokens.hasTokenInRange(tags, first, last, .keyword_return)) return;
 
     const bindings = try cache.localBindings(proto, body);
 
@@ -93,7 +93,7 @@ fn checkFn(
         // match's end token IS the `(`.
         const parse_m = findFirstMatchInRange(tree, parse_call, b.rhs_first, b.rhs_last) orelse continue;
         const lp = parse_m.end;
-        const rp = lexer.matchParen(tags, lp, b.rhs_last) orelse continue;
+        const rp = tokens.matchParen(tags, lp, b.rhs_last) orelse continue;
         if (!rangeMentionsAny(tree, lp + 1, rp - 1, stack_bufs.items)) continue;
         try tainted.append(gpa, b.name);
     }
@@ -103,11 +103,11 @@ fn checkFn(
     var t: Ast.TokenIndex = first;
     while (t <= last) : (t += 1) {
         if (tags[t] == .keyword_fn) {
-            t = lexer.skipNestedFn(tags, t, last);
+            t = tokens.skipNestedFn(tags, t, last);
             continue;
         }
         if (tags[t] != .keyword_return) continue;
-        const sc = lexer.findStmtSemicolon(tags, t + 1, last) orelse continue;
+        const sc = tokens.findStmtSemicolon(tags, t + 1, last) orelse continue;
         if (sc <= t + 1) continue;
         if (rangeMentionsName(tree, t + 1, sc - 1, tainted.items)) |n| {
             try report(gpa, problems, tree, t, n);

@@ -42,11 +42,11 @@
 const std = @import("std");
 const Ast = std.zig.Ast;
 
-const lexer = @import("tokens.zig");
-const receiver = @import("method_names.zig");
+const tokens = @import("tokens.zig");
+const method_names = @import("method_names.zig");
 
-pub const TokenIndex = lexer.TokenIndex;
-const TokenTag = lexer.TokenTag;
+pub const TokenIndex = tokens.TokenIndex;
+const TokenTag = tokens.TokenTag;
 
 pub const TypeKind = enum { struct_, union_, enum_, opaque_ };
 
@@ -131,7 +131,7 @@ pub const TypeInfo = struct {
     /// "this type owns something that needs releasing" signal.
     fn hasCleanupMethod(self: TypeInfo) bool {
         for (self.methods) |m| {
-            if (receiver.isCleanupMethodName(m.name)) return true;
+            if (method_names.isCleanupMethodName(m.name)) return true;
         }
         return false;
     }
@@ -893,9 +893,9 @@ pub fn buildWithPath(gpa: std.mem.Allocator, tree: *const Ast, file_path: ?[]con
         const node: Ast.Node.Index = @enumFromInt(idx);
         if (tree.nodeTag(node) != .fn_decl) continue;
         var proto_buf: [1]Ast.Node.Index = undefined;
-        const proto = lexer.fnProto(tree, &proto_buf, node) orelse continue;
+        const proto = tokens.fnProto(tree, &proto_buf, node) orelse continue;
         const name_tok = proto.name_token orelse continue;
-        const body = lexer.bodyOf(tree, node) orelse continue;
+        const body = tokens.bodyOf(tree, node) orelse continue;
 
         // Skip if inside a type body.
         var inside_type = false;
@@ -960,7 +960,7 @@ pub fn buildWithPath(gpa: std.mem.Allocator, tree: *const Ast, file_path: ?[]con
             var fs_methods: std.ArrayListUnmanaged(MethodInfo) = .empty;
             for (fns.items) |f| {
                 var proto_buf: [1]Ast.Node.Index = undefined;
-                const proto = lexer.fnProto(tree, &proto_buf, f.fn_decl) orelse continue;
+                const proto = tokens.fnProto(tree, &proto_buf, f.fn_decl) orelse continue;
                 try fs_methods.append(a, .{
                     .name = f.name,
                     .name_token = f.name_token,
@@ -1111,11 +1111,11 @@ fn collectTypesInRange(
         };
         var b: TokenIndex = k + 1;
         if (b <= end and tags[b] == .l_paren) {
-            const cp = lexer.matchParen(tags, b, end) orelse continue;
+            const cp = tokens.matchParen(tags, b, end) orelse continue;
             b = cp + 1;
         }
         if (b > end or tags[b] != .l_brace) continue;
-        const body_last = lexer.matchBrace(tags, b, end) orelse continue;
+        const body_last = tokens.matchBrace(tags, b, end) orelse continue;
 
         const fields_slice = if (kind == .struct_ or kind == .union_)
             try collectFields(a, tree, b + 1, body_last - 1)
@@ -1343,13 +1343,13 @@ fn collectFields(
     while (t <= end) : (t += 1) {
         // Skip nested braces (fn bodies, anon struct types).
         if (tags[t] == .l_brace) {
-            const close = lexer.matchBrace(tags, t, end) orelse break;
+            const close = tokens.matchBrace(tags, t, end) orelse break;
             t = close;
             continue;
         }
         // Skip fn declarations (proto + body).
         if (tags[t] == .keyword_fn) {
-            t = lexer.skipFnDecl(tags, t, end);
+            t = tokens.skipFnDecl(tags, t, end);
             continue;
         }
         // Skip nested decls — `[pub] const/var Name ...;` — the
@@ -1359,7 +1359,7 @@ fn collectFields(
             tags[t] == .keyword_var or tags[t] == .keyword_comptime or
             tags[t] == .keyword_threadlocal)
         {
-            const sc = lexer.findStmtSemicolon(tags, t, end) orelse break;
+            const sc = tokens.findStmtSemicolon(tags, t, end) orelse break;
             t = sc;
             continue;
         }
@@ -1432,12 +1432,12 @@ fn collectMethods(
         const node: Ast.Node.Index = @enumFromInt(idx);
         if (tree.nodeTag(node) != .fn_decl) continue;
         var proto_buf: [1]Ast.Node.Index = undefined;
-        const proto = lexer.fnProto(tree, &proto_buf, node) orelse continue;
+        const proto = tokens.fnProto(tree, &proto_buf, node) orelse continue;
         const name_tok = proto.name_token orelse continue;
         if (name_tok < start or name_tok > end) continue;
         // Reject if inside a nested type body (depth > 0 at name_tok).
         if (isInsideNestedBrace(tags, start, end, name_tok)) continue;
-        const body = lexer.bodyOf(tree, node) orelse continue;
+        const body = tokens.bodyOf(tree, node) orelse continue;
 
         try out.append(a, .{
             .name = tree.tokenSlice(name_tok),
@@ -1548,7 +1548,7 @@ fn protoReturnsErrorUnion(tree: *const Ast, proto: Ast.full.FnProto) bool {
     // inside the type's token range.
     if (first > 0 and tags[first - 1] == .bang) return true;
     const last_rt = tree.lastToken(rt);
-    return lexer.hasTokenInRange(tags, first, last_rt, .bang);
+    return tokens.hasTokenInRange(tags, first, last_rt, .bang);
 }
 
 // ── Tests ──────────────────────────────────────────────────
@@ -1784,7 +1784,7 @@ test "containingTypeOf: method's fn_decl resolves to its struct" {
         const n: Ast.Node.Index = @enumFromInt(idx);
         if (tree.nodeTag(n) != .fn_decl) continue;
         var buf: [1]Ast.Node.Index = undefined;
-        const fp = lexer.fnProto(&tree, &buf, n).?;
+        const fp = tokens.fnProto(&tree, &buf, n).?;
         const name_tok = fp.name_token.?;
         if (std.mem.eql(u8, tree.tokenSlice(name_tok), "deinit")) deinit_node = n;
         if (std.mem.eql(u8, tree.tokenSlice(name_tok), "top_level")) top_node = n;

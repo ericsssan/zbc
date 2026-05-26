@@ -33,12 +33,12 @@ const problem_mod = @import("../problem.zig");
 const config_mod = @import("../config.zig");
 const file_cache_mod = @import("../file_cache.zig");
 
-const lexer = @import("../tokens.zig");
+const tokens = @import("../tokens.zig");
 const testing = @import("../testing.zig");
-const matchBrace = lexer.matchBrace;
-const skipNestedFn = lexer.skipNestedFn;
-const returnsType = lexer.returnsType;
-const bodyOf = lexer.bodyOf;
+const matchBrace = tokens.matchBrace;
+const skipNestedFn = tokens.skipNestedFn;
+const returnsType = tokens.returnsType;
+const bodyOf = tokens.bodyOf;
 
 const Problem = problem_mod.Problem;
 const Pos = problem_mod.Pos;

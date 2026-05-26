@@ -33,15 +33,15 @@ const problem_mod = @import("../problem.zig");
 const config_mod = @import("../config.zig");
 const file_cache_mod = @import("../file_cache.zig");
 
-const lexer = @import("../tokens.zig");
-const local = @import("../local_bindings.zig");
+const tokens = @import("../tokens.zig");
+const local_bindings = @import("../local_bindings.zig");
 const testing = @import("../testing.zig");
 
 const Problem = problem_mod.Problem;
 const Pos = problem_mod.Pos;
 
-const matchParen = lexer.matchParen;
-const skipNestedFn = lexer.skipNestedFn;
+const matchParen = tokens.matchParen;
+const skipNestedFn = tokens.skipNestedFn;
 
 pub fn check(
     gpa: std.mem.Allocator,
@@ -51,7 +51,7 @@ pub fn check(
     problems: *std.ArrayListUnmanaged(Problem),
 ) !void {
     if (!config_mod.isEnabled(config, .thread_spawn_local_pointer)) return;
-    try lexer.forEachFnCached(gpa, tree, cache, problems, checkFn);
+    try tokens.forEachFnCached(gpa, tree, cache, problems, checkFn);
 }
 
 fn checkFn(

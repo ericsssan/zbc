@@ -16,10 +16,10 @@
 const std = @import("std");
 const Ast = std.zig.Ast;
 
-const lexer = @import("../tokens.zig");
-const local = @import("../local_bindings.zig");
+const tokens = @import("../tokens.zig");
+const local_bindings = @import("../local_bindings.zig");
 const query = @import("../token_query.zig");
-const fmodel = @import("../file_model.zig");
+const file_model = @import("../file_model.zig");
 const problem_mod = @import("../problem.zig");
 const testing = @import("../testing.zig");
 const config_mod = @import("../config.zig");
@@ -69,7 +69,7 @@ pub fn check(
 ) !void {
     if (!config_mod.isEnabled(config, .borrowed_slice_into_out_param)) return;
     var proto_buf: [1]Ast.Node.Index = undefined;
-    var fns = lexer.iterFnDecls(tree);
+    var fns = tokens.iterFnDecls(tree);
     while (fns.next(&proto_buf)) |fn_entry| {
         try checkFn(gpa, tree, cache, fn_entry.node, fn_entry.proto, fn_entry.body, problems);
     }
@@ -90,7 +90,7 @@ fn checkFn(
 
     // Cheap pre-scan: any `defer` keyword at all?  Without one the
     // rule can never fire, so skip the binding-walk cost.
-    if (!lexer.hasTokenInRange(tags, first, last, .keyword_defer)) return;
+    if (!tokens.hasTokenInRange(tags, first, last, .keyword_defer)) return;
 
     const bindings = try cache.localBindings(proto, body);
 
@@ -130,7 +130,7 @@ fn checkFn(
     var t: Ast.TokenIndex = first;
     while (t <= last) {
         if (tags[t] == .keyword_fn) {
-            t = lexer.skipNestedFn(tags, t, last);
+            t = tokens.skipNestedFn(tags, t, last);
             t = if (t < last) t + 1 else last + 1;
             continue;
         }
@@ -173,7 +173,7 @@ fn scanWrites(
     atoms: []const Atom,
     first: Ast.TokenIndex,
     last: Ast.TokenIndex,
-    model: *const fmodel.FileModel,
+    model: *const file_model.FileModel,
     pointer_params: []const PointerParam,
     deferred: []const DeferredItem,
     problems: *std.ArrayListUnmanaged(Problem),
@@ -226,7 +226,7 @@ fn scanWrites(
         // arg), not a borrow of the deferred local.  The deferred
         // cleanup happens AFTER the copy is made; out-param holds
         // a valid allocation.
-        const sc = lexer.findStmtSemicolon(tags, w.end + 1, last) orelse continue;
+        const sc = tokens.findStmtSemicolon(tags, w.end + 1, last) orelse continue;
         if (sc <= w.end + 1) continue;
         if (rhsContainsCopyingCall(tree, w.end + 1, sc - 1)) continue;
         // RHS ending in `].*` — array dereference produces a
@@ -463,7 +463,7 @@ fn rhsContainsCopyingCall(tree: *const Ast, start: Ast.TokenIndex, end: Ast.Toke
 /// and can't carry a borrowed slice from a deferred local — the
 /// out-param write through `<out>.<field> = <call>` where `<field>`
 /// has this shape can't dangle into a deferred local.
-fn structOnlyHoldsPrimitivesOrPointers(tree: *const Ast, ti: *const fmodel.TypeInfo) bool {
+fn structOnlyHoldsPrimitivesOrPointers(tree: *const Ast, ti: *const file_model.TypeInfo) bool {
     const tags = tree.tokens.items(.tag);
     if (ti.fields.len == 0) return false;
     for (ti.fields) |f| {
@@ -621,15 +621,15 @@ fn deferredOnlyInSwitchScrutinee(
     return saw_in_scrut;
 }
 
-const matchBraceEnd = lexer.matchBrace;
-const matchParenEnd = lexer.matchParen;
+const matchBraceEnd = tokens.matchBrace;
+const matchParenEnd = tokens.matchParen;
 
 /// Find a fn_decl AST node by name — top-level OR a method of
 /// any type.  Conservative: returns null on the FIRST match;
 /// multiple methods with the same name across types collapse to
 /// the first.  Acceptable because the borrowed-slice analysis
 /// is opportunistic (false-negative is fine).
-fn findFnDeclByName(model: *const fmodel.FileModel, name: []const u8) ?Ast.Node.Index {
+fn findFnDeclByName(model: *const file_model.FileModel, name: []const u8) ?Ast.Node.Index {
     for (model.fns) |f| {
         if (std.mem.eql(u8, f.name, name)) return f.fn_decl;
     }

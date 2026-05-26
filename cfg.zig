@@ -32,7 +32,7 @@ const abstract_state = @import("abstract_state.zig");
 const config_mod = @import("config.zig");
 const file_cache = @import("file_cache.zig");
 const fn_summary = @import("fn_summary.zig");
-const lexer = @import("tokens.zig");
+const tokens = @import("tokens.zig");
 const receiver_mod = @import("method_names.zig");
 const model_mod = @import("file_model.zig");
 const zls_resolver_mod = @import("zls_resolver.zig");
@@ -434,8 +434,8 @@ pub fn lowerFunctionFullWithZls(
     zls: ?*zls_resolver_mod.ZlsResolver,
 ) !?Cfg {
     var buf: [1]Ast.Node.Index = undefined;
-    const fn_proto = lexer.fnProto(tree, &buf, fn_decl) orelse return null;
-    const body_node = lexer.bodyOf(tree, fn_decl) orelse return null;
+    const fn_proto = tokens.fnProto(tree, &buf, fn_decl) orelse return null;
+    const body_node = tokens.bodyOf(tree, fn_decl) orelse return null;
 
     // Comptime-only functions (every parameter is `comptime`) are
     // evaluated entirely at comptime — their stack locals are
@@ -1597,7 +1597,7 @@ const Builder = struct {
             if (name_tok + 2 >= tags.len) continue;
             if (tags[name_tok + 1] != .l_paren) continue;
             // Find the matching `)`.
-            const close = lexer.matchParen(tags, name_tok + 1, @intCast(tags.len - 1)) orelse continue;
+            const close = tokens.matchParen(tags, name_tok + 1, @intCast(tags.len - 1)) orelse continue;
             var t: Ast.TokenIndex = close + 1;
             if (t < tags.len and tags[t] == .question_mark) t += 1;
             if (t >= tags.len or tags[t] != .asterisk) continue;
@@ -5105,7 +5105,7 @@ const Builder = struct {
             if (tags[t + 2] != .identifier) continue;
             if (tags[t + 3] != .l_paren) continue;
             // Found `recv.<method>(`.  Find matching `)`.
-            const close = lexer.matchParen(tags, t + 3, last) orelse continue;
+            const close = tokens.matchParen(tags, t + 3, last) orelse continue;
             // Require fn end (closing `}` of fn body) within K_TAIL
             // tokens after the call's `)`.  In source: typically `;`
             // then `}` or `;` then a 1-2 stmt tail then `}`.
@@ -5182,7 +5182,7 @@ const Builder = struct {
             var lp: Ast.TokenIndex = t;
             while (lp <= scan_end and tags[lp] != .l_paren) : (lp += 1) {}
             if (lp > scan_end) continue;
-            const close = lexer.matchParen(tags, lp, last) orelse continue;
+            const close = tokens.matchParen(tags, lp, last) orelse continue;
             // Cheap check: recv_name appears as a bare identifier in args
             // (no `.` before it), OR the call IS a method on recv.
             var has_recv: bool = is_method_on_recv;
@@ -5300,8 +5300,8 @@ const Builder = struct {
         path: []const u8,
     ) bool {
         var proto_buf: [1]Ast.Node.Index = undefined;
-        const proto = lexer.fnProto(tree, &proto_buf, fn_decl) orelse return false;
-        const body = lexer.bodyOf(tree, fn_decl) orelse return false;
+        const proto = tokens.fnProto(tree, &proto_buf, fn_decl) orelse return false;
+        const body = tokens.bodyOf(tree, fn_decl) orelse return false;
         const tags = tree.tokens.items(.tag);
         const body_first = tree.firstToken(body);
         const body_last = tree.lastToken(body);
@@ -5517,7 +5517,7 @@ const Builder = struct {
             // values (`&struct { fn dispatch(...) !void { try ... }
             // }.dispatch`) used as payload fields trip the rule.
             if (tags[t] == .keyword_fn) {
-                t = lexer.skipNestedFn(tags, t, last);
+                t = tokens.skipNestedFn(tags, t, last);
                 continue;
             }
             switch (tags[t]) {
@@ -5617,9 +5617,9 @@ const Builder = struct {
             }
             if (b > last) continue;
             const body_end: Ast.TokenIndex = if (tags[b] == .l_brace)
-                lexer.matchBrace(tags, b, last) orelse continue
+                tokens.matchBrace(tags, b, last) orelse continue
             else
-                lexer.findStmtSemicolon(tags, b, last) orelse continue;
+                tokens.findStmtSemicolon(tags, b, last) orelse continue;
             var k = b;
             while (k + 2 <= body_end) : (k += 1) {
                 if (tags[k] != .identifier) continue;
@@ -6119,7 +6119,7 @@ const Builder = struct {
         const start = i;
         while (i < text.len) : (i += 1) {
             const c = text[i];
-            if (!lexer.isIdentByte(c)) break;
+            if (!tokens.isIdentByte(c)) break;
         }
         if (i == start) return null;
         const name = text[start..i];

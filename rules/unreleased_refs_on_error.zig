@@ -35,13 +35,13 @@ const problem_mod = @import("../problem.zig");
 const config_mod = @import("../config.zig");
 const file_cache_mod = @import("../file_cache.zig");
 
-const lexer = @import("../tokens.zig");
+const tokens = @import("../tokens.zig");
 const query = @import("../token_query.zig");
-const receiver = @import("../method_names.zig");
+const method_names = @import("../method_names.zig");
 const testing = @import("../testing.zig");
-const matchBrace = lexer.matchBrace;
-const findStmtSemicolon = lexer.findStmtSemicolon;
-const hasTokenInRange = lexer.hasTokenInRange;
+const matchBrace = tokens.matchBrace;
+const findStmtSemicolon = tokens.findStmtSemicolon;
+const hasTokenInRange = tokens.hasTokenInRange;
 const Atom = query.Atom;
 
 // `.<addrefMethod>(` — preceded by `.` so it's a method call.
@@ -55,7 +55,7 @@ const addref_call_pattern = &[_]Atom{
 // `.<releaseMethod>(` — used inside defer/errdefer body scans.
 const release_call_pattern = &[_]Atom{
     .{ .tok = .period },
-    .{ .pred = receiver.isReleaseMethodName },
+    .{ .pred = method_names.isReleaseMethodName },
     .{ .tok = .l_paren },
 };
 
@@ -71,7 +71,7 @@ pub fn check(
 ) !void {
     if (!config_mod.isEnabled(config, .unreleased_refs_on_error)) return;
     _ = cache;
-    try lexer.forEachFnBody(gpa, tree, problems, checkBody);
+    try tokens.forEachFnBody(gpa, tree, problems, checkBody);
 }
 
 fn checkBody(

@@ -21,10 +21,10 @@
 const std = @import("std");
 const Ast = std.zig.Ast;
 
-const fmodel = @import("file_model.zig");
-const local = @import("local_bindings.zig");
+const file_model = @import("file_model.zig");
+const local_bindings = @import("local_bindings.zig");
 const fn_summary = @import("fn_summary.zig");
-const lexer = @import("tokens.zig");
+const tokens = @import("tokens.zig");
 const zls_resolver_mod = @import("zls_resolver.zig");
 const project_cache_mod = @import("project_cache.zig");
 
@@ -35,8 +35,8 @@ pub const FileCache = struct {
     /// (may_free_fields, result_heap_fields).  Lazy: only initialized
     /// on first summaryOf call that needs it.
     summary_arena: ?std.heap.ArenaAllocator = null,
-    file_model: ?fmodel.FileModel = null,
-    bindings: std.AutoHashMapUnmanaged(u32, local.LocalBindings) = .empty,
+    file_model: ?file_model.FileModel = null,
+    bindings: std.AutoHashMapUnmanaged(u32, local_bindings.LocalBindings) = .empty,
     summaries: std.AutoHashMapUnmanaged(u32, fn_summary.FnSummary) = .empty,
     /// Optional ZLS-backed type resolver.  When set, type-shaped
     /// questions (param container name, field type) prefer ZLS over
@@ -82,7 +82,7 @@ pub const FileCache = struct {
     pub fn findTypeAcrossImports(
         self: *FileCache,
         name: []const u8,
-    ) ?*const fmodel.TypeInfo {
+    ) ?*const file_model.TypeInfo {
         const model = self.fileModel() catch return null;
         if (model.findType(name)) |ti| return ti;
         const pc = self.project orelse return null;
@@ -108,7 +108,7 @@ pub const FileCache = struct {
     /// `method.fn_decl`.
     pub const ResolvedMethod = struct {
         tree: *const Ast,
-        method: *const fmodel.MethodInfo,
+        method: *const file_model.MethodInfo,
     };
 
     /// Look up `<type_name>.<method_name>` either in this file or
@@ -149,10 +149,10 @@ pub const FileCache = struct {
     }
 
     /// Lazily build (and cache) the FileModel for this file.
-    pub fn fileModel(self: *FileCache) !*const fmodel.FileModel {
+    pub fn fileModel(self: *FileCache) !*const file_model.FileModel {
         if (self.file_model == null) {
             const fp: ?[]const u8 = if (self.file_path.len > 0) self.file_path else null;
-            self.file_model = try fmodel.buildWithPath(self.gpa, self.tree, fp);
+            self.file_model = try file_model.buildWithPath(self.gpa, self.tree, fp);
         }
         return &self.file_model.?;
     }
@@ -165,11 +165,11 @@ pub const FileCache = struct {
         self: *FileCache,
         proto: Ast.full.FnProto,
         body: Ast.Node.Index,
-    ) !*const local.LocalBindings {
+    ) !*const local_bindings.LocalBindings {
         const key = @intFromEnum(body);
         const gop = try self.bindings.getOrPut(self.gpa, key);
         if (!gop.found_existing) {
-            gop.value_ptr.* = try local.build(self.gpa, self.tree, proto, body);
+            gop.value_ptr.* = try local_bindings.build(self.gpa, self.tree, proto, body);
         }
         return gop.value_ptr;
     }
@@ -226,7 +226,7 @@ pub const FileCache = struct {
     fn filterMayFreeFields(
         self: *FileCache,
         arena: std.mem.Allocator,
-        model: *const fmodel.FileModel,
+        model: *const file_model.FileModel,
         tree: *const Ast,
         proto: Ast.full.FnProto,
         raw: []const fn_summary.FieldFree,
@@ -304,8 +304,8 @@ pub const FileCache = struct {
         const seedFn = struct {
             fn run(self2: *FileCache, fn_decl: Ast.Node.Index) !void {
                 var pbuf: [1]Ast.Node.Index = undefined;
-                const proto = lexer.fnProto(self2.tree, &pbuf, fn_decl) orelse return;
-                const body = lexer.bodyOf(self2.tree, fn_decl) orelse return;
+                const proto = tokens.fnProto(self2.tree, &pbuf, fn_decl) orelse return;
+                const body = tokens.bodyOf(self2.tree, fn_decl) orelse return;
                 if (fn_summary.inferDirectTakes(self2.tree, proto, body)) |idx| {
                     const key = @intFromEnum(body);
                     if (self2.summaries.getPtr(key)) |entry| {
@@ -371,8 +371,8 @@ pub const FileCache = struct {
     /// iff this call set/updated the fn's `returns` field.
     fn inferDelegatorBorrowOne(self: *FileCache, fn_decl: Ast.Node.Index) !bool {
         var buf: [1]Ast.Node.Index = undefined;
-        const proto = lexer.fnProto(self.tree, &buf, fn_decl) orelse return false;
-        const body = lexer.bodyOf(self.tree, fn_decl) orelse return false;
+        const proto = tokens.fnProto(self.tree, &buf, fn_decl) orelse return false;
+        const body = tokens.bodyOf(self.tree, fn_decl) orelse return false;
 
         const s_ptr = try self.summaryOfFn(fn_decl);
         // Only fill when returns hasn't been determined yet.
@@ -576,8 +576,8 @@ pub const FileCache = struct {
     /// Apply filterMayFreeFields to one fn's summary in-place.
     fn filterMayFreeFieldsOne(self: *FileCache, fn_decl: Ast.Node.Index) !void {
         var buf: [1]Ast.Node.Index = undefined;
-        const proto = lexer.fnProto(self.tree, &buf, fn_decl) orelse return;
-        const body = lexer.bodyOf(self.tree, fn_decl) orelse return;
+        const proto = tokens.fnProto(self.tree, &buf, fn_decl) orelse return;
+        const body = tokens.bodyOf(self.tree, fn_decl) orelse return;
         const key = @intFromEnum(body);
         const entry = self.summaries.getPtr(key) orelse return;
         if (entry.may_free_fields.len == 0) return;
@@ -599,8 +599,8 @@ pub const FileCache = struct {
         receiver_type: ?[]const u8,
     ) !bool {
         var buf: [1]Ast.Node.Index = undefined;
-        const proto = lexer.fnProto(self.tree, &buf, fn_decl) orelse return false;
-        const body = lexer.bodyOf(self.tree, fn_decl) orelse return false;
+        const proto = tokens.fnProto(self.tree, &buf, fn_decl) orelse return false;
+        const body = tokens.bodyOf(self.tree, fn_decl) orelse return false;
 
         // If we already know a takes for this fn, no work to do.
         const s_ptr = try self.summaryOfFn(fn_decl);
@@ -614,7 +614,7 @@ pub const FileCache = struct {
         var t = first;
         while (t + 3 <= last) : (t += 1) {
             if (tags[t] == .keyword_fn) {
-                t = lexer.skipNestedFn(tags, t, last);
+                t = tokens.skipNestedFn(tags, t, last);
                 continue;
             }
             if (tags[t] != .identifier) continue;
@@ -722,8 +722,8 @@ pub const FileCache = struct {
     ) !?fn_summary.FnSummary {
         const rm = self.findMethodAcrossImports(type_name, method_name) orelse return null;
         var buf: [1]Ast.Node.Index = undefined;
-        const proto = lexer.fnProto(rm.tree, &buf, rm.method.fn_decl) orelse return null;
-        const body = lexer.bodyOf(rm.tree, rm.method.fn_decl) orelse return null;
+        const proto = tokens.fnProto(rm.tree, &buf, rm.method.fn_decl) orelse return null;
+        const body = tokens.bodyOf(rm.tree, rm.method.fn_decl) orelse return null;
         var summary: fn_summary.FnSummary = .{};
         summary.takes_ownership_of = fn_summary.inferDirectTakes(rm.tree, proto, body);
         return summary;
@@ -836,16 +836,16 @@ pub const FileCache = struct {
         var buf: [1]Ast.Node.Index = undefined;
 
         for (model.fns) |fi| {
-            const proto = lexer.fnProto(self.tree, &buf, fi.fn_decl) orelse continue;
-            const body = lexer.bodyOf(self.tree, fi.fn_decl) orelse continue;
+            const proto = tokens.fnProto(self.tree, &buf, fi.fn_decl) orelse continue;
+            const body = tokens.bodyOf(self.tree, fi.fn_decl) orelse continue;
             if (fn_summary.inferDirectTakes(self.tree, proto, body)) |idx| {
                 if (idx == 0) return true;
             }
         }
         for (model.types) |ti| {
             for (ti.methods) |m| {
-                const proto = lexer.fnProto(self.tree, &buf, m.fn_decl) orelse continue;
-                const body = lexer.bodyOf(self.tree, m.fn_decl) orelse continue;
+                const proto = tokens.fnProto(self.tree, &buf, m.fn_decl) orelse continue;
+                const body = tokens.bodyOf(self.tree, m.fn_decl) orelse continue;
                 if (fn_summary.inferDirectTakes(self.tree, proto, body)) |idx| {
                     if (idx == 0) return true;
                 }
@@ -864,7 +864,7 @@ pub const FileCache = struct {
     ) !*const fn_summary.FnSummary {
         // Resolve proto + body via lexer helpers.
         var proto_buf: [1]Ast.Node.Index = undefined;
-        const proto = lexer.fnProto(self.tree, &proto_buf, fn_decl) orelse {
+        const proto = tokens.fnProto(self.tree, &proto_buf, fn_decl) orelse {
             // Caller passed a non-fn_decl node — return a sentinel
             // .unknown summary.  Cache by fn_decl index so we don't
             // recompute.
@@ -873,7 +873,7 @@ pub const FileCache = struct {
             if (!gop.found_existing) gop.value_ptr.* = .{};
             return gop.value_ptr;
         };
-        const body = lexer.bodyOf(self.tree, fn_decl) orelse {
+        const body = tokens.bodyOf(self.tree, fn_decl) orelse {
             const key = @intFromEnum(fn_decl) | 0x8000_0000;
             const gop = try self.summaries.getOrPut(self.gpa, key);
             if (!gop.found_existing) gop.value_ptr.* = .{};
@@ -928,13 +928,13 @@ pub const FileCache = struct {
 /// aren't loaded yet — uncommon, and the conservative answer is to
 /// drop the entry).
 fn walkFieldPath(
-    model: *const fmodel.FileModel,
+    model: *const file_model.FileModel,
     outer_type: []const u8,
     path: []const u8,
-) ?fmodel.FileModel.FieldTypePath {
+) ?file_model.FileModel.FieldTypePath {
     var it = std.mem.splitScalar(u8, path, '.');
     var cur_outer: []const u8 = outer_type;
-    var last_result: ?fmodel.FileModel.FieldTypePath = null;
+    var last_result: ?file_model.FileModel.FieldTypePath = null;
     while (it.next()) |segment| {
         const ftp = model.fieldTypePath(cur_outer, segment) orelse return null;
         last_result = ftp;
@@ -968,7 +968,7 @@ fn findTypeViaImports(
     from_path: []const u8,
     name: []const u8,
     depth_left: u32,
-) ?*const fmodel.TypeInfo {
+) ?*const file_model.TypeInfo {
     if (depth_left == 0) return null;
     const tags = tree.tokens.items(.tag);
     var idx: u32 = 1;
@@ -993,7 +993,7 @@ fn findTypeViaImports(
         const lit = tree.tokenSlice(main + 2);
         if (lit.len < 2) continue;
         const import_str = lit[1 .. lit.len - 1];
-        const sub_model_opt: ?*const fmodel.FileModel = blk: {
+        const sub_model_opt: ?*const file_model.FileModel = blk: {
             if (project_cache_mod.isRelativeImport(import_str)) {
                 break :blk pc.modelForRelativeImport(from_path, import_str) catch null;
             }
@@ -1053,7 +1053,7 @@ fn findMethodViaImports(
         const import_str = lit[1 .. lit.len - 1];
         // Resolve either a relative path import OR a module-name
         // import via the project's build.zig / conventional layout.
-        const sub_model_opt: ?*const fmodel.FileModel = blk: {
+        const sub_model_opt: ?*const file_model.FileModel = blk: {
             if (project_cache_mod.isRelativeImport(import_str)) {
                 break :blk pc.modelForRelativeImport(from_path, import_str) catch null;
             }
@@ -1123,7 +1123,7 @@ test "FileCache: localBindings caches per body" {
 
     // Find the two fn bodies.
     var proto_buf: [1]Ast.Node.Index = undefined;
-    var fns = lexer.iterFnDecls(&tree);
+    var fns = tokens.iterFnDecls(&tree);
     const foo = fns.next(&proto_buf).?;
     const bar = fns.next(&proto_buf).?;
 
@@ -1236,7 +1236,7 @@ test "FileCache: summaryOf caches per body, classifies alloc as heap" {
     defer cache.deinit();
 
     var proto_buf: [1]Ast.Node.Index = undefined;
-    var fns = lexer.iterFnDecls(&tree);
+    var fns = tokens.iterFnDecls(&tree);
     const f = fns.next(&proto_buf).?;
     const a = try cache.summaryOf(f.proto, f.body);
     const b = try cache.summaryOf(f.proto, f.body);

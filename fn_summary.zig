@@ -18,7 +18,7 @@
 const std = @import("std");
 const Ast = std.zig.Ast;
 
-const lexer = @import("tokens.zig");
+const tokens = @import("tokens.zig");
 const receiver_mod = @import("method_names.zig");
 
 /// Result-shape classification.
@@ -137,7 +137,7 @@ pub fn inferFromBody(
     var t = first;
     while (t + 2 <= last) : (t += 1) {
         if (tags[t] == .keyword_fn) {
-            t = lexer.skipNestedFn(tags, t, last);
+            t = tokens.skipNestedFn(tags, t, last);
             continue;
         }
         if (tags[t] != .period) continue;
@@ -216,7 +216,7 @@ fn inferResultIndependentOfArgs(
     var t: Ast.TokenIndex = first;
     while (t <= last) : (t += 1) {
         if (tags[t] == .keyword_fn) {
-            t = lexer.skipNestedFn(tags, t, last);
+            t = tokens.skipNestedFn(tags, t, last);
             continue;
         }
         if (tags[t] != .keyword_return) continue;
@@ -269,8 +269,8 @@ fn inferReturnsHeap(tree: *const Ast, body_node: Ast.Node.Index) bool {
     const tags = tree.tokens.items(.tag);
     const first = tree.firstToken(expr);
     const last = tree.lastToken(expr);
-    var last_method: ?lexer.TokenIndex = null;
-    var t: lexer.TokenIndex = first;
+    var last_method: ?tokens.TokenIndex = null;
+    var t: tokens.TokenIndex = first;
     while (t + 2 <= last) : (t += 1) {
         if (tags[t] != .period) continue;
         if (tags[t + 1] != .identifier) continue;
@@ -285,21 +285,21 @@ fn inferReturnsHeap(tree: *const Ast, body_node: Ast.Node.Index) bool {
 /// brace-depth 0 (relative to the fn body).  Skips nested fns.
 fn firstReturnExpr(
     tree: *const Ast,
-    body_first: lexer.TokenIndex,
-    body_last: lexer.TokenIndex,
-) ?struct { first: lexer.TokenIndex, last: lexer.TokenIndex } {
+    body_first: tokens.TokenIndex,
+    body_last: tokens.TokenIndex,
+) ?struct { first: tokens.TokenIndex, last: tokens.TokenIndex } {
     const tags = tree.tokens.items(.tag);
     var t = body_first;
     while (t <= body_last) : (t += 1) {
         if (tags[t] == .keyword_fn) {
-            t = lexer.skipNestedFn(tags, t, body_last);
+            t = tokens.skipNestedFn(tags, t, body_last);
             continue;
         }
         if (tags[t] != .keyword_return) continue;
         if (t + 1 > body_last) return null;
         // `return;` (no value) — not a value return.
         if (tags[t + 1] == .semicolon) return null;
-        const sc = lexer.findStmtSemicolon(tags, t + 1, body_last) orelse return null;
+        const sc = tokens.findStmtSemicolon(tags, t + 1, body_last) orelse return null;
         if (sc == t + 1) return null;
         return .{ .first = t + 1, .last = sc - 1 };
     }
@@ -310,8 +310,8 @@ fn firstReturnExpr(
 fn classifyReturnExpr(
     tree: *const Ast,
     proto: Ast.full.FnProto,
-    first: lexer.TokenIndex,
-    last: lexer.TokenIndex,
+    first: tokens.TokenIndex,
+    last: tokens.TokenIndex,
     body_allocates: bool,
 ) Returns {
     const tags = tree.tokens.items(.tag);
@@ -353,14 +353,14 @@ fn classifyReturnExpr(
 
 fn returnIsAllocCall(
     tree: *const Ast,
-    first: lexer.TokenIndex,
-    last: lexer.TokenIndex,
+    first: tokens.TokenIndex,
+    last: tokens.TokenIndex,
 ) bool {
     const tags = tree.tokens.items(.tag);
     // Walk the chain `<id>(.<id>)*\(`, identify the LAST method ident
     // before the first `(`, and look it up in the vocabulary.
     var t = first;
-    var last_method: ?lexer.TokenIndex = null;
+    var last_method: ?tokens.TokenIndex = null;
     while (t <= last) : (t += 1) {
         switch (tags[t]) {
             .identifier => last_method = t,
@@ -413,7 +413,7 @@ pub fn inferDirectTakes(
     var t = first;
     while (t + 3 <= last) : (t += 1) {
         if (tags[t] == .keyword_fn) {
-            t = lexer.skipNestedFn(tags, t, last);
+            t = tokens.skipNestedFn(tags, t, last);
             continue;
         }
         // `.free(<param>)` / `.destroy(<param>)`.  The arg is the
@@ -585,7 +585,7 @@ pub fn inferMayFreeFields(
     var t = first;
     while (t + 5 <= last) : (t += 1) {
         if (tags[t] == .keyword_fn) {
-            t = lexer.skipNestedFn(tags, t, last);
+            t = tokens.skipNestedFn(tags, t, last);
             continue;
         }
         // Match `<id>(.<id>)+(` — receiver, one or more field
@@ -603,10 +603,10 @@ pub fn inferMayFreeFields(
         // forms the field path.
         const recv = tree.tokenSlice(t);
         const param_idx = paramIndex(tree, proto, recv) orelse continue;
-        const first_field_tok: lexer.TokenIndex = t + 2;
-        var last_field_tok: lexer.TokenIndex = t + 2;
-        var k: lexer.TokenIndex = t + 3;
-        var method_tok: ?lexer.TokenIndex = null;
+        const first_field_tok: tokens.TokenIndex = t + 2;
+        var last_field_tok: tokens.TokenIndex = t + 2;
+        var k: tokens.TokenIndex = t + 3;
+        var method_tok: ?tokens.TokenIndex = null;
         while (k + 1 <= last) {
             if (tags[k] == .period and tags[k + 1] == .identifier) {
                 // The trailing ident might be the method (followed by
@@ -658,7 +658,7 @@ pub fn inferHeapAllocatesSelf(
     var t = first;
     while (t + 4 <= last) : (t += 1) {
         if (tags[t] == .keyword_fn) {
-            t = lexer.skipNestedFn(tags, t, last);
+            t = tokens.skipNestedFn(tags, t, last);
             continue;
         }
         if (tags[t] != .period) continue;
@@ -712,7 +712,7 @@ pub fn inferResultHeapFields(
     var ret_at: ?Ast.TokenIndex = null;
     while (t <= last) : (t += 1) {
         if (tags[t] == .keyword_fn) {
-            t = lexer.skipNestedFn(tags, t, last);
+            t = tokens.skipNestedFn(tags, t, last);
             continue;
         }
         if (tags[t] == .keyword_return) {
@@ -726,9 +726,9 @@ pub fn inferResultHeapFields(
     while (k <= last and tags[k] != .l_brace and tags[k] != .semicolon) : (k += 1) {}
     if (k > last or tags[k] != .l_brace) return &.{};
     const lb = k;
-    const rb = lexer.matchBrace(tags, lb, last) orelse return &.{};
+    const rb = tokens.matchBrace(tags, lb, last) orelse return &.{};
     // Walk the literal's body looking for `.<name> = <rhs>,` pairs.
-    var i: lexer.TokenIndex = lb + 1;
+    var i: tokens.TokenIndex = lb + 1;
     while (i < rb) : (i += 1) {
         if (tags[i] != .period) continue;
         if (i + 2 > rb) break;
@@ -738,7 +738,7 @@ pub fn inferResultHeapFields(
         // Find end of this field's RHS: the comma at depth 0
         // (relative to where we are) or `}`.
         var depth: u32 = 0;
-        var j: lexer.TokenIndex = i + 3;
+        var j: tokens.TokenIndex = i + 3;
         while (j <= rb) : (j += 1) {
             switch (tags[j]) {
                 .l_paren, .l_brace, .l_bracket => depth += 1,
@@ -798,8 +798,8 @@ fn inferFirstFn(tree: *const Ast, proto_buf: *[1]Ast.Node.Index) FnSummary {
     while (idx < tree.nodes.len) : (idx += 1) {
         const node: Ast.Node.Index = @enumFromInt(idx);
         if (tree.nodeTag(node) != .fn_decl) continue;
-        const proto = lexer.fnProto(tree, proto_buf, node).?;
-        const body = lexer.bodyOf(tree, node).?;
+        const proto = tokens.fnProto(tree, proto_buf, node).?;
+        const body = tokens.bodyOf(tree, node).?;
         return inferFromBody(tree, proto, body);
     }
     unreachable;
@@ -901,7 +901,7 @@ fn firstFnProtoAndBody(
     while (idx < tree.nodes.len) : (idx += 1) {
         const node: Ast.Node.Index = @enumFromInt(idx);
         if (tree.nodeTag(node) != .fn_decl) continue;
-        return .{ lexer.fnProto(tree, proto_buf, node).?, lexer.bodyOf(tree, node).? };
+        return .{ tokens.fnProto(tree, proto_buf, node).?, tokens.bodyOf(tree, node).? };
     }
     unreachable;
 }

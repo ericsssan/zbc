@@ -20,10 +20,10 @@
 const std = @import("std");
 const Ast = std.zig.Ast;
 
-const lexer = @import("../tokens.zig");
-const local = @import("../local_bindings.zig");
+const tokens = @import("../tokens.zig");
+const local_bindings = @import("../local_bindings.zig");
 const query = @import("../token_query.zig");
-const receiver = @import("../method_names.zig");
+const method_names = @import("../method_names.zig");
 const problem_mod = @import("../problem.zig");
 const testing = @import("../testing.zig");
 const config_mod = @import("../config.zig");
@@ -70,7 +70,7 @@ pub fn check(
     problems: *std.ArrayListUnmanaged(Problem),
 ) !void {
     if (!config_mod.isEnabled(config, .slice_of_arena_into_heap)) return;
-    try lexer.forEachFnCached(gpa, tree, cache, problems, checkFn);
+    try tokens.forEachFnCached(gpa, tree, cache, problems, checkFn);
 }
 
 const ArenaVar = struct {
@@ -103,7 +103,7 @@ fn checkFn(
     // Cheap pre-scan: skip fns that don't even mention ArenaAllocator.
     // Avoids the per-fn local.build cost on the long tail of fns
     // that have no arena.
-    if (!lexer.hasIdentInRange(tree, body_first, body_last, "ArenaAllocator")) return;
+    if (!tokens.hasIdentInRange(tree, body_first, body_last, "ArenaAllocator")) return;
 
     const bindings = try cache.localBindings(proto, body);
 
@@ -144,7 +144,7 @@ fn checkFn(
         // (chained `<arena>.allocator().<allocMethod>()`).
         const c = b.asCall() orelse continue;
         const last_method = c.lastMethod() orelse continue;
-        if (!receiver.isAllocMethodName(last_method)) continue;
+        if (!method_names.isAllocMethodName(last_method)) continue;
         const arena_name: ?[]const u8 = blk: {
             if (c.isChained()) {
                 // Chained: must be `.allocator().<alloc>(...)` on an arena.
@@ -173,19 +173,19 @@ fn checkFn(
     const calls = try query.findAllInBody(gpa, tree, store_call, body_first, body_last);
     defer gpa.free(calls);
 
-    var args_buf: std.ArrayListUnmanaged(lexer.ArgRange) = .empty;
+    var args_buf: std.ArrayListUnmanaged(tokens.ArgRange) = .empty;
     defer args_buf.deinit(gpa);
 
     for (calls) |c| {
         const method_tok = c.captures[1].?;
-        if (!receiver.isContainerStoreMethodName(tree.tokenSlice(method_tok))) continue;
+        if (!method_names.isContainerStoreMethodName(tree.tokenSlice(method_tok))) continue;
         const recv_name = c.captureText(tree, 0).?;
         if (findArena(arenas.items, recv_name) != null) continue;
         if (findHandle(handles.items, recv_name) != null) continue;
         const lp = method_tok + 1; // l_paren is right after method_tok
-        const rp = lexer.matchParen(tags, lp, body_last) orelse continue;
+        const rp = tokens.matchParen(tags, lp, body_last) orelse continue;
         args_buf.clearRetainingCapacity();
-        lexer.splitCallArgs(gpa, tags, lp, rp, &args_buf) catch continue;
+        tokens.splitCallArgs(gpa, tags, lp, rp, &args_buf) catch continue;
         if (args_buf.items.len < 2) continue;
         if (firstArgIsArenaAllocator(tree, args_buf.items[0].start, args_buf.items[0].end, arenas.items, handles.items)) continue;
         var i: usize = 1;

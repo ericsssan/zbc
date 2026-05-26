@@ -29,7 +29,7 @@ const problem_mod = @import("../problem.zig");
 const config_mod = @import("../config.zig");
 const file_cache_mod = @import("../file_cache.zig");
 
-const lexer = @import("../tokens.zig");
+const tokens = @import("../tokens.zig");
 const query = @import("../token_query.zig");
 const testing = @import("../testing.zig");
 
@@ -92,7 +92,7 @@ pub fn check(
     // Reuse the original token-scan: forEachFnBody handles fn iteration.
     // We bypass that here since we now need the cache; do the iteration manually.
     var proto_buf: [1]Ast.Node.Index = undefined;
-    var fns = lexer.iterFnDecls(tree);
+    var fns = tokens.iterFnDecls(tree);
     while (fns.next(&proto_buf)) |fn_entry| {
         try ctx.check(gpa, tree, fn_entry.body, problems);
     }
@@ -136,7 +136,7 @@ fn xPtrFieldIsNonSentinel(
 
 /// Find the fn_decl AST node enclosing a given token by walking
 /// the file model's fn list / type methods.
-const enclosingFnDecl = lexer.enclosingFnDecl;
+const enclosingFnDecl = tokens.enclosingFnDecl;
 
 /// Return the type identifier of the local named `name` inside
 /// `fn_decl`.  Resolves method receivers (`this`/`self` typed as
@@ -150,7 +150,7 @@ fn bindingTypeName(
     name: []const u8,
 ) ?[]const u8 {
     var proto_buf: [1]Ast.Node.Index = undefined;
-    const proto = lexer.fnProto(tree, &proto_buf, fn_decl) orelse return null;
+    const proto = tokens.fnProto(tree, &proto_buf, fn_decl) orelse return null;
     var it = proto.iterate(tree);
     while (it.next()) |p| {
         const nt = p.name_token orelse continue;

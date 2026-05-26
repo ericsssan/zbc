@@ -35,10 +35,10 @@
 const std = @import("std");
 const Ast = std.zig.Ast;
 
-const lexer = @import("tokens.zig");
+const tokens = @import("tokens.zig");
 
 pub const TokenIndex = Ast.TokenIndex;
-pub const TokenTag = lexer.TokenTag;
+pub const TokenTag = tokens.TokenTag;
 
 const MAX_CAPTURES: u8 = 8;
 const MAX_RANGE_CAPTURES: u8 = 4;
@@ -260,17 +260,17 @@ fn matchSlice(
             },
             .paren_args => {
                 if (t.* > last or tags[t.*] != .l_paren) return false;
-                const close = lexer.matchParen(tags, t.*, last) orelse return false;
+                const close = tokens.matchParen(tags, t.*, last) orelse return false;
                 t.* = close + 1;
             },
             .bracket_args => {
                 if (t.* > last or tags[t.*] != .l_bracket) return false;
-                const close = lexer.matchBracket(tags, t.*, last) orelse return false;
+                const close = tokens.matchBracket(tags, t.*, last) orelse return false;
                 t.* = close + 1;
             },
             .brace_args => {
                 if (t.* > last or tags[t.*] != .l_brace) return false;
-                const close = lexer.matchBrace(tags, t.*, last) orelse return false;
+                const close = tokens.matchBrace(tags, t.*, last) orelse return false;
                 t.* = close + 1;
             },
             .capture_until => |cu| {
@@ -374,7 +374,7 @@ pub fn findAllInBody(
     var t: TokenIndex = start;
     while (t <= last) {
         if (tags[t] == .keyword_fn) {
-            t = lexer.skipNestedFn(tags, t, last);
+            t = tokens.skipNestedFn(tags, t, last);
             t = if (t < last) t + 1 else last + 1;
             continue;
         }
@@ -406,12 +406,12 @@ pub fn findAllInBodySkippingDefer(
     var t: TokenIndex = start;
     while (t <= last) {
         if (tags[t] == .keyword_fn) {
-            t = lexer.skipNestedFn(tags, t, last);
+            t = tokens.skipNestedFn(tags, t, last);
             t = if (t < last) t + 1 else last + 1;
             continue;
         }
         if (tags[t] == .keyword_defer or tags[t] == .keyword_errdefer) {
-            const end = lexer.skipDeferStmt(tags, t, last) orelse {
+            const end = tokens.skipDeferStmt(tags, t, last) orelse {
                 t = last + 1;
                 continue;
             };
@@ -448,16 +448,16 @@ pub fn findInSameScope(
     var t: TokenIndex = start;
     while (t <= last) {
         if (tags[t] == .l_brace) {
-            t = (lexer.matchBrace(tags, t, last) orelse return null) + 1;
+            t = (tokens.matchBrace(tags, t, last) orelse return null) + 1;
             continue;
         }
         if (tags[t] == .r_brace) return null;
         if (tags[t] == .keyword_defer or tags[t] == .keyword_errdefer) {
-            t = (lexer.skipDeferStmt(tags, t, last) orelse return null) + 1;
+            t = (tokens.skipDeferStmt(tags, t, last) orelse return null) + 1;
             continue;
         }
         if (tags[t] == .keyword_fn) {
-            t = lexer.skipNestedFn(tags, t, last);
+            t = tokens.skipNestedFn(tags, t, last);
             t = if (t < last) t + 1 else last + 1;
             continue;
         }
@@ -532,7 +532,7 @@ pub fn anyMatchAnywhere(
     var t: TokenIndex = start;
     while (t <= last) {
         if (tags[t] == .keyword_fn) {
-            t = lexer.skipNestedFn(tags, t, last);
+            t = tokens.skipNestedFn(tags, t, last);
             t = if (t < last) t + 1 else last + 1;
             continue;
         }

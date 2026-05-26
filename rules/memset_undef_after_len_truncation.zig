@@ -14,7 +14,7 @@
 const std = @import("std");
 const Ast = std.zig.Ast;
 
-const lexer = @import("../tokens.zig");
+const tokens = @import("../tokens.zig");
 const query = @import("../token_query.zig");
 const problem = @import("../problem.zig");
 const testing = @import("../testing.zig");
@@ -54,7 +54,7 @@ pub fn check(
 ) !void {
     if (!config_mod.isEnabled(config, .memset_undef_after_len_truncation)) return;
     _ = cache;
-    try lexer.forEachFnBody(gpa, tree, problems, checkBody);
+    try tokens.forEachFnBody(gpa, tree, problems, checkBody);
 }
 
 fn checkBody(

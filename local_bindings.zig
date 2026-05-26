@@ -31,10 +31,10 @@
 const std = @import("std");
 const Ast = std.zig.Ast;
 
-const lexer = @import("tokens.zig");
+const tokens = @import("tokens.zig");
 
-const TokenIndex = lexer.TokenIndex;
-const TokenTag = lexer.TokenTag;
+const TokenIndex = tokens.TokenIndex;
+const TokenTag = tokens.TokenTag;
 
 pub const OriginKind = enum {
     /// Fn parameter binding (declared in the proto).
@@ -204,7 +204,7 @@ pub const LocalBindings = struct {
 /// Build a LocalBindings for a fn body.  `proto` provides the
 /// parameter list (added as `.param` bindings before body locals).
 /// `body` is the AST body node — typically the result of
-/// `lexer.bodyOf(tree, fn_decl)`.
+/// `tokens.bodyOf(tree, fn_decl)`.
 pub fn build(
     gpa: std.mem.Allocator,
     tree: *const Ast,
@@ -255,7 +255,7 @@ pub fn build(
         if (tags[t] == .keyword_for or tags[t] == .keyword_while or tags[t] == .keyword_if) {
             // Skip past the (cond/iter) and walk to optional `|...|`.
             if (t + 1 > last or tags[t + 1] != .l_paren) continue;
-            const close = lexer.matchParen(tags, t + 1, last) orelse continue;
+            const close = tokens.matchParen(tags, t + 1, last) orelse continue;
             if (close + 1 > last or tags[close + 1] != .pipe) {
                 continue;
             }
@@ -294,7 +294,7 @@ pub fn build(
             continue;
         }
         const rhs_first = eq + 1;
-        const sc = lexer.findStmtSemicolon(tags, rhs_first, last) orelse {
+        const sc = tokens.findStmtSemicolon(tags, rhs_first, last) orelse {
             t = name_tok;
             continue;
         };
@@ -467,7 +467,7 @@ fn classifyOrigin(tree: *const Ast, first: TokenIndex, last: TokenIndex) Origin 
             };
 
             // Walk chained calls past the first `()`: `(...).<id>(`.
-            var cp = lexer.matchParen(tags, first_paren, last);
+            var cp = tokens.matchParen(tags, first_paren, last);
             while (cp) |close| {
                 const v = close + 1;
                 if (v + 2 > last) break;
@@ -477,7 +477,7 @@ fn classifyOrigin(tree: *const Ast, first: TokenIndex, last: TokenIndex) Origin 
                 info.outermost_method = tree.tokenSlice(v + 1);
                 info.outermost_method_token = v + 1;
                 info.outermost_paren_token = v + 2;
-                cp = lexer.matchParen(tags, v + 2, last);
+                cp = tokens.matchParen(tags, v + 2, last);
             }
 
             if (first_is_free) {
@@ -504,8 +504,8 @@ fn parseFn(src: [:0]const u8) !struct { tree: Ast, bindings: LocalBindings } {
         const node: Ast.Node.Index = @enumFromInt(idx);
         if (tree.nodeTag(node) != .fn_decl) continue;
         var buf: [1]Ast.Node.Index = undefined;
-        const proto = lexer.fnProto(&tree, &buf, node).?;
-        const body = lexer.bodyOf(&tree, node).?;
+        const proto = tokens.fnProto(&tree, &buf, node).?;
+        const body = tokens.bodyOf(&tree, node).?;
         const bindings = try build(testing.allocator, &tree, proto, body);
         return .{ .tree = tree, .bindings = bindings };
     }

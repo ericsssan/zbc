@@ -27,7 +27,7 @@
 const std = @import("std");
 const Ast = std.zig.Ast;
 
-const lexer = @import("../tokens.zig");
+const tokens = @import("../tokens.zig");
 const problem_mod = @import("../problem.zig");
 const config_mod = @import("../config.zig");
 const file_cache_mod = @import("../file_cache.zig");
@@ -36,9 +36,9 @@ const testing = @import("../testing.zig");
 const Problem = problem_mod.Problem;
 const Pos = problem_mod.Pos;
 
-const hasTokenInRange = lexer.hasTokenInRange;
-const matchBrace = lexer.matchBrace;
-const skipNestedFn = lexer.skipNestedFn;
+const hasTokenInRange = tokens.hasTokenInRange;
+const matchBrace = tokens.matchBrace;
+const skipNestedFn = tokens.skipNestedFn;
 
 const query = @import("../token_query.zig");
 const Atom = query.Atom;
@@ -69,7 +69,7 @@ pub fn check(
 ) !void {
     if (!config_mod.isEnabled(config, .defer_and_errdefer_free_overlap)) return;
     _ = cache;
-    try lexer.forEachFnBody(gpa, tree, problems, checkBody);
+    try tokens.forEachFnBody(gpa, tree, problems, checkBody);
 }
 
 fn checkBody(

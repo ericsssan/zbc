@@ -16,14 +16,14 @@
 const std = @import("std");
 const Ast = std.zig.Ast;
 
-const fmodel = @import("../file_model.zig");
+const file_model = @import("../file_model.zig");
 const mq = @import("../model_query.zig");
 const problem = @import("../problem.zig");
 const testing = @import("../testing.zig");
 const trace = @import("../trace.zig");
 const config_mod = @import("../config.zig");
 const file_cache_mod = @import("../file_cache.zig");
-const receiver = @import("../method_names.zig");
+const method_names = @import("../method_names.zig");
 
 const R = "owned-field-no-outer-cleanup";
 
@@ -144,7 +144,7 @@ pub fn check(
 /// fields hold VALUES (often FDs, IDs, etc.) used for hashing/
 /// equality, not owned allocations.  Common in Bun's hashmap
 /// adapters.
-fn isHashContextType(ti: *const fmodel.TypeInfo) bool {
+fn isHashContextType(ti: *const file_model.TypeInfo) bool {
     if (ti.methods.len == 0) return false;
     var saw_hash = false;
     var saw_eql = false;
@@ -165,7 +165,7 @@ fn isHashContextType(ti: *const fmodel.TypeInfo) bool {
 /// — strong signal the type is an entry in an external queue.
 /// The queue's container manages the entries' lifecycles; the
 /// entry doesn't need its own deinit.
-fn typeIsQueueEntry(tree: *const Ast, ti: *const fmodel.TypeInfo) bool {
+fn typeIsQueueEntry(tree: *const Ast, ti: *const file_model.TypeInfo) bool {
     const tags = tree.tokens.items(.tag);
     if (ti.body_first >= ti.body_last) return false;
     var t: Ast.TokenIndex = ti.body_first;
@@ -199,7 +199,7 @@ fn typeIsQueueEntry(tree: *const Ast, ti: *const fmodel.TypeInfo) bool {
 /// in an intrusive linked list / queue.  The container's deinit
 /// walks the chain and frees the entries; the node type doesn't
 /// need its own deinit.  Skip the rule for such nodes.
-fn isLinkedListNode(tree: *const Ast, ti: *const fmodel.TypeInfo) bool {
+fn isLinkedListNode(tree: *const Ast, ti: *const file_model.TypeInfo) bool {
     const tags = tree.tokens.items(.tag);
     for (ti.fields) |f| {
         if (!std.mem.eql(u8, f.name, "next") and
@@ -239,8 +239,8 @@ fn isLinkedListNode(tree: *const Ast, ti: *const fmodel.TypeInfo) bool {
 /// passes the resolved outer TypeInfo directly.
 fn fieldDefaultUnionTagTi(
     tree: *const Ast,
-    outer: *const fmodel.TypeInfo,
-    field: *const fmodel.FieldInfo,
+    outer: *const file_model.TypeInfo,
+    field: *const file_model.FieldInfo,
 ) ?[]const u8 {
     _ = outer;
     if (!field.has_default) return null;
@@ -273,10 +273,10 @@ fn fieldDefaultUnionTagTi(
 
 fn fieldStaysNonOwnedAcrossFile(
     tree: *const Ast,
-    model: *const fmodel.FileModel,
-    outer: *const fmodel.TypeInfo,
-    field: *const fmodel.FieldInfo,
-    inner_ti: *const fmodel.TypeInfo,
+    model: *const file_model.FileModel,
+    outer: *const file_model.TypeInfo,
+    field: *const file_model.FieldInfo,
+    inner_ti: *const file_model.TypeInfo,
 ) bool {
     if (!model.isTaggedUnion(inner_ti.name)) return false;
     // Field default must be a non-owned variant tag.  Use the
@@ -326,7 +326,7 @@ fn fieldStaysNonOwnedAcrossFile(
 /// regardless of the variant held, so a missing inline cleanup
 /// on the outer is harmless.  Uses model.unionVariantIsOwned per
 /// variant; bails on the first owned variant found.
-fn allUnionVariantsNonOwned(model: *const fmodel.FileModel, ti: *const fmodel.TypeInfo) bool {
+fn allUnionVariantsNonOwned(model: *const file_model.FileModel, ti: *const file_model.TypeInfo) bool {
     if (!model.isTaggedUnion(ti.name)) return false;
     const tree = model.tree;
     const tags = tree.tokens.items(.tag);
@@ -396,7 +396,7 @@ fn skipToNextComma(tags: []const std.zig.Token.Tag, start: Ast.TokenIndex, last:
 /// (`globalThis.allocator().create(@This())`).  The outer's
 /// missing inline cleanup isn't a leak because the owning caller
 /// is responsible for teardown.
-fn hasPointerReturningInit(tree: *const Ast, ti: *const fmodel.TypeInfo) bool {
+fn hasPointerReturningInit(tree: *const Ast, ti: *const file_model.TypeInfo) bool {
     const tags = tree.tokens.items(.tag);
     for (ti.methods) |m| {
         if (!std.mem.eql(u8, m.name, "init") and
@@ -425,8 +425,8 @@ fn hasPointerReturningInit(tree: *const Ast, ti: *const fmodel.TypeInfo) bool {
 /// responsible for tearing down nested-type instances; a
 /// missing inline cleanup on the nested type is harmless.
 fn outerIsNestedInsideCleanupType(
-    model: *const fmodel.FileModel,
-    outer: *const fmodel.TypeInfo,
+    model: *const file_model.FileModel,
+    outer: *const file_model.TypeInfo,
 ) bool {
     const parent_idx = outer.parent orelse return false;
     if (parent_idx >= model.types.len) return false;
@@ -445,7 +445,7 @@ fn outerIsNestedInsideCleanupType(
 /// as the composed-owner rule.
 fn fieldIsCallerSupplied(
     tree: *const Ast,
-    outer: *const fmodel.TypeInfo,
+    outer: *const file_model.TypeInfo,
     field_name: []const u8,
 ) bool {
     for (outer.methods) |m| {
@@ -468,7 +468,7 @@ fn fieldIsCallerSupplied(
     return false;
 }
 
-fn hasNewFactoryDecl(tree: *const Ast, ti: *const fmodel.TypeInfo) bool {
+fn hasNewFactoryDecl(tree: *const Ast, ti: *const file_model.TypeInfo) bool {
     const tags = tree.tokens.items(.tag);
     if (ti.body_first >= ti.body_last) return false;
     var t: Ast.TokenIndex = ti.body_first;
@@ -496,7 +496,7 @@ fn hasNewFactoryDecl(tree: *const Ast, ti: *const fmodel.TypeInfo) bool {
 /// CSS-value-type cluster names theirs differently, so we miss a
 /// few, but the false-negative direction is preferred over
 /// false-firing.
-fn outerHasAllocatorField(tree: *const Ast, ti: *const fmodel.TypeInfo) bool {
+fn outerHasAllocatorField(tree: *const Ast, ti: *const file_model.TypeInfo) bool {
     for (ti.fields) |f| {
         if (std.mem.eql(u8, f.name, "allocator") or
             std.mem.eql(u8, f.name, "alloc") or
@@ -525,7 +525,7 @@ fn outerHasAllocatorField(tree: *const Ast, ti: *const fmodel.TypeInfo) bool {
 /// extra arg without holding it — so a missing inline cleanup on
 /// the outer is consistent with the cleanup being a caller's
 /// responsibility, not the outer's.
-fn allCleanupMethodsNeedExtraArg(tree: *const Ast, ti: *const fmodel.TypeInfo) bool {
+fn allCleanupMethodsNeedExtraArg(tree: *const Ast, ti: *const file_model.TypeInfo) bool {
     if (ti.methods.len == 0) return false;
     var saw_cleanup = false;
     for (ti.methods) |m| {
@@ -539,7 +539,7 @@ fn allCleanupMethodsNeedExtraArg(tree: *const Ast, ti: *const fmodel.TypeInfo) b
 /// True iff the method's prototype has exactly one parameter (the
 /// receiver).  Used to detect `pub fn deinit(self: *T) void` vs
 /// `pub fn deinit(self: *T, alloc: Allocator) void`.
-fn cleanupTakesOnlySelf(tree: *const Ast, m: fmodel.MethodInfo) bool {
+fn cleanupTakesOnlySelf(tree: *const Ast, m: file_model.MethodInfo) bool {
     var buf: [1]Ast.Node.Index = undefined;
     const proto = tree.fullFnProto(&buf, m.fn_decl) orelse return false;
     var it = proto.iterate(tree);
@@ -554,7 +554,7 @@ fn cleanupTakesOnlySelf(tree: *const Ast, m: fmodel.MethodInfo) bool {
 /// does nothing on drop, so a missing outer cleanup is harmless.
 const anyNonTrivialCleanup = mq.anyNonTrivialCleanup;
 
-const isCleanupName = receiver.isCleanupMethodName;
+const isCleanupName = method_names.isCleanupMethodName;
 
 fn report(
     gpa: std.mem.Allocator,

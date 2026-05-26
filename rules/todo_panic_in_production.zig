@@ -34,13 +34,13 @@ const problem_mod = @import("../problem.zig");
 const config_mod = @import("../config.zig");
 const file_cache_mod = @import("../file_cache.zig");
 
-const lexer = @import("../tokens.zig");
+const tokens = @import("../tokens.zig");
 const testing = @import("../testing.zig");
 
 const Problem = problem_mod.Problem;
 const Pos = problem_mod.Pos;
 
-const skipNestedFn = lexer.skipNestedFn;
+const skipNestedFn = tokens.skipNestedFn;
 
 pub fn check(
     gpa: std.mem.Allocator,
@@ -51,7 +51,7 @@ pub fn check(
 ) !void {
     if (!config_mod.isEnabled(config, .todo_panic_in_production)) return;
     _ = cache;
-    try lexer.forEachFnBody(gpa, tree, problems, checkBody);
+    try tokens.forEachFnBody(gpa, tree, problems, checkBody);
 }
 
 fn checkBody(

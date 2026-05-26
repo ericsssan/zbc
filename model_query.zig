@@ -43,18 +43,18 @@
 const std = @import("std");
 const Ast = std.zig.Ast;
 
-const fmodel = @import("file_model.zig");
-const lexer = @import("tokens.zig");
+const file_model = @import("file_model.zig");
+const tokens = @import("tokens.zig");
 const query = @import("token_query.zig");
-const receiver = @import("method_names.zig");
+const method_names = @import("method_names.zig");
 
-const TokenIndex = lexer.TokenIndex;
+const TokenIndex = tokens.TokenIndex;
 
 // ── Predicates ───────────────────────────────────────────────
 
 pub const TypePred = struct {
     /// Kind filter (struct / union / enum / opaque).  null = any.
-    kind: ?fmodel.TypeKind = null,
+    kind: ?file_model.TypeKind = null,
     /// Type name must equal this.
     name_eq: ?[]const u8 = null,
     /// Type name must pass this predicate.
@@ -84,7 +84,7 @@ pub const MethodPred = struct {
     name_pred: ?*const fn ([]const u8) bool = null,
     /// True iff method name is in the canonical cleanup set
     /// (deinit/free/destroy/close/release/finalize/dispose/etc.).
-    /// Equivalent to `name_pred = receiver.isCleanupMethodName`.
+    /// Equivalent to `name_pred = method_names.isCleanupMethodName`.
     is_cleanup: bool = false,
     /// True iff method name is in the canonical acquire set
     /// (reference/retain/addRef/...).
@@ -98,7 +98,7 @@ pub const MethodPred = struct {
 
 // ── Predicate matchers ───────────────────────────────────────
 
-fn typeMatches(ti: *const fmodel.TypeInfo, pred: TypePred) bool {
+fn typeMatches(ti: *const file_model.TypeInfo, pred: TypePred) bool {
     if (pred.kind) |k| if (ti.kind != k) return false;
     if (pred.name_eq) |n| if (!std.mem.eql(u8, ti.name, n)) return false;
     if (pred.name_pred) |p| if (!p(ti.name)) return false;
@@ -109,9 +109,9 @@ fn typeMatches(ti: *const fmodel.TypeInfo, pred: TypePred) bool {
 
 fn fieldMatches(
     tree: *const Ast,
-    model: *const fmodel.FileModel,
-    ti_owner: *const fmodel.TypeInfo,
-    field: *const fmodel.FieldInfo,
+    model: *const file_model.FileModel,
+    ti_owner: *const file_model.TypeInfo,
+    field: *const file_model.FieldInfo,
     pred: FieldPred,
 ) bool {
     _ = ti_owner;
@@ -126,12 +126,12 @@ fn fieldMatches(
     return true;
 }
 
-fn methodMatches(m: *const fmodel.MethodInfo, pred: MethodPred) bool {
+fn methodMatches(m: *const file_model.MethodInfo, pred: MethodPred) bool {
     if (pred.name_eq) |n| if (!std.mem.eql(u8, m.name, n)) return false;
     if (pred.name_pred) |p| if (!p(m.name)) return false;
-    if (pred.is_cleanup and !receiver.isCleanupMethodName(m.name)) return false;
-    if (pred.is_acquire and !receiver.isAcquireMethodName(m.name)) return false;
-    if (pred.is_release and !receiver.isReleaseMethodName(m.name)) return false;
+    if (pred.is_cleanup and !method_names.isCleanupMethodName(m.name)) return false;
+    if (pred.is_acquire and !method_names.isAcquireMethodName(m.name)) return false;
+    if (pred.is_release and !method_names.isReleaseMethodName(m.name)) return false;
     if (pred.is_pub) |p| if (m.is_pub != p) return false;
     if (pred.has_receiver) |hr| {
         const has = m.receiver != null;
@@ -140,16 +140,16 @@ fn methodMatches(m: *const fmodel.MethodInfo, pred: MethodPred) bool {
     return true;
 }
 
-fn anyMethodOnType(ti: *const fmodel.TypeInfo, pred: MethodPred) bool {
+fn anyMethodOnType(ti: *const file_model.TypeInfo, pred: MethodPred) bool {
     for (ti.methods) |m| if (methodMatches(&m, pred)) return true;
     return false;
 }
 
 /// True iff `ti` has at least one cleanup method with a non-trivial body.
-pub fn anyNonTrivialCleanup(tree: *const Ast, ti: *const fmodel.TypeInfo) bool {
+pub fn anyNonTrivialCleanup(tree: *const Ast, ti: *const file_model.TypeInfo) bool {
     for (ti.methods) |m| {
-        if (!receiver.isCleanupMethodName(m.name)) continue;
-        if (!lexer.isTrivialBody(tree, m.body_first, m.body_last)) return true;
+        if (!method_names.isCleanupMethodName(m.name)) continue;
+        if (!tokens.isTrivialBody(tree, m.body_first, m.body_last)) return true;
     }
     return false;
 }
@@ -159,10 +159,10 @@ pub fn anyNonTrivialCleanup(tree: *const Ast, ti: *const fmodel.TypeInfo) bool {
 /// All TypeInfo in `model` matching `pred`.  Caller owns the slice.
 pub fn findTypes(
     gpa: std.mem.Allocator,
-    model: *const fmodel.FileModel,
+    model: *const file_model.FileModel,
     pred: TypePred,
-) ![]*const fmodel.TypeInfo {
-    var out: std.ArrayListUnmanaged(*const fmodel.TypeInfo) = .empty;
+) ![]*const file_model.TypeInfo {
+    var out: std.ArrayListUnmanaged(*const file_model.TypeInfo) = .empty;
     for (model.types) |*ti| {
         if (typeMatches(ti, pred)) try out.append(gpa, ti);
     }
@@ -172,12 +172,12 @@ pub fn findTypes(
 /// All fields of `ti` matching `pred`.  Caller owns the slice.
 pub fn findFields(
     gpa: std.mem.Allocator,
-    model: *const fmodel.FileModel,
+    model: *const file_model.FileModel,
     tree: *const Ast,
-    ti: *const fmodel.TypeInfo,
+    ti: *const file_model.TypeInfo,
     pred: FieldPred,
-) ![]*const fmodel.FieldInfo {
-    var out: std.ArrayListUnmanaged(*const fmodel.FieldInfo) = .empty;
+) ![]*const file_model.FieldInfo {
+    var out: std.ArrayListUnmanaged(*const file_model.FieldInfo) = .empty;
     for (ti.fields) |*f| {
         if (fieldMatches(tree, model, ti, f, pred)) try out.append(gpa, f);
     }
@@ -186,10 +186,10 @@ pub fn findFields(
 
 fn findMethods(
     gpa: std.mem.Allocator,
-    ti: *const fmodel.TypeInfo,
+    ti: *const file_model.TypeInfo,
     pred: MethodPred,
-) ![]*const fmodel.MethodInfo {
-    var out: std.ArrayListUnmanaged(*const fmodel.MethodInfo) = .empty;
+) ![]*const file_model.MethodInfo {
+    var out: std.ArrayListUnmanaged(*const file_model.MethodInfo) = .empty;
     for (ti.methods) |*m| {
         if (methodMatches(m, pred)) try out.append(gpa, m);
     }
@@ -200,7 +200,7 @@ fn findMethods(
 
 /// True iff the field's type is a bare identifier (peel one `?`),
 /// not a pointer/slice/array — the conservative "I own this" signal.
-fn isValueTyped(tree: *const Ast, field: *const fmodel.FieldInfo) bool {
+fn isValueTyped(tree: *const Ast, field: *const file_model.FieldInfo) bool {
     const tags = tree.tokens.items(.tag);
     var t: TokenIndex = field.type_first;
     if (t > field.type_last) return false;
@@ -215,9 +215,9 @@ fn isValueTyped(tree: *const Ast, field: *const fmodel.FieldInfo) bool {
 /// `*T`, `[]T`, foreign types, generics, etc.).
 fn resolveFieldType(
     tree: *const Ast,
-    model: *const fmodel.FileModel,
-    field: *const fmodel.FieldInfo,
-) ?*const fmodel.TypeInfo {
+    model: *const file_model.FileModel,
+    field: *const file_model.FieldInfo,
+) ?*const file_model.TypeInfo {
     const tags = tree.tokens.items(.tag);
     var t: TokenIndex = field.type_first;
     if (t > field.type_last) return null;
@@ -236,10 +236,10 @@ fn resolveFieldType(
 /// (`Future`, `State`) names a type in multiple enclosing scopes.
 pub fn resolveFieldTypeScoped(
     tree: *const Ast,
-    model: *const fmodel.FileModel,
-    owner: *const fmodel.TypeInfo,
-    field: *const fmodel.FieldInfo,
-) ?*const fmodel.TypeInfo {
+    model: *const file_model.FileModel,
+    owner: *const file_model.TypeInfo,
+    field: *const file_model.FieldInfo,
+) ?*const file_model.TypeInfo {
     const tags = tree.tokens.items(.tag);
     var t: TokenIndex = field.type_first;
     if (t > field.type_last) return null;
@@ -263,7 +263,7 @@ pub fn resolveFieldTypeScoped(
 /// nested fns, NOT defer/errdefer).  Composes with query.zig.
 pub fn methodBodyContains(
     tree: *const Ast,
-    method: *const fmodel.MethodInfo,
+    method: *const file_model.MethodInfo,
     atoms: []const query.Atom,
 ) bool {
     return query.anyMatchAnywhere(tree, atoms, method.body_first, method.body_last, null);
@@ -281,7 +281,7 @@ test "findTypes: kind + name filter" {
     ;
     var tree = try Ast.parse(testing.allocator, src, .zig);
     defer tree.deinit(testing.allocator);
-    var model = try fmodel.build(testing.allocator, &tree);
+    var model = try file_model.build(testing.allocator, &tree);
     defer model.deinit();
 
     const structs = try findTypes(testing.allocator, &model, .{ .kind = .struct_ });
@@ -292,7 +292,7 @@ test "findTypes: kind + name filter" {
     const named_b = try findTypes(testing.allocator, &model, .{ .name_eq = "B" });
     defer testing.allocator.free(named_b);
     try testing.expectEqual(@as(usize, 1), named_b.len);
-    try testing.expectEqual(fmodel.TypeKind.union_, named_b[0].kind);
+    try testing.expectEqual(file_model.TypeKind.union_, named_b[0].kind);
 }
 
 test "findTypes: has_method + no_method" {
@@ -306,7 +306,7 @@ test "findTypes: has_method + no_method" {
     ;
     var tree = try Ast.parse(testing.allocator, src, .zig);
     defer tree.deinit(testing.allocator);
-    var model = try fmodel.build(testing.allocator, &tree);
+    var model = try file_model.build(testing.allocator, &tree);
     defer model.deinit();
 
     const has = try findTypes(testing.allocator, &model, .{
@@ -337,7 +337,7 @@ test "findFields: value_typed includes ?T, excludes *T / []T" {
     ;
     var tree = try Ast.parse(testing.allocator, src, .zig);
     defer tree.deinit(testing.allocator);
-    var model = try fmodel.build(testing.allocator, &tree);
+    var model = try file_model.build(testing.allocator, &tree);
     defer model.deinit();
 
     const ti = model.findType("T").?;
@@ -362,7 +362,7 @@ test "findFields: type_matches chains to TypePred" {
     ;
     var tree = try Ast.parse(testing.allocator, src, .zig);
     defer tree.deinit(testing.allocator);
-    var model = try fmodel.build(testing.allocator, &tree);
+    var model = try file_model.build(testing.allocator, &tree);
     defer model.deinit();
 
     const outer = model.findType("Outer").?;
@@ -386,7 +386,7 @@ test "findMethods: is_cleanup classifier" {
     ;
     var tree = try Ast.parse(testing.allocator, src, .zig);
     defer tree.deinit(testing.allocator);
-    var model = try fmodel.build(testing.allocator, &tree);
+    var model = try file_model.build(testing.allocator, &tree);
     defer model.deinit();
 
     const ti = model.findType("T").?;
@@ -409,7 +409,7 @@ test "methodBodyContains: integrates with query.zig" {
     ;
     var tree = try Ast.parse(testing.allocator, src, .zig);
     defer tree.deinit(testing.allocator);
-    var model = try fmodel.build(testing.allocator, &tree);
+    var model = try file_model.build(testing.allocator, &tree);
     defer model.deinit();
 
     const ti = model.findType("T").?;

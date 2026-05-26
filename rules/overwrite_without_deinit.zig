@@ -26,18 +26,18 @@
 const std = @import("std");
 const Ast = std.zig.Ast;
 
-const fmodel = @import("../file_model.zig");
+const file_model = @import("../file_model.zig");
 const problem_mod = @import("../problem.zig");
 const config_mod = @import("../config.zig");
 const file_cache_mod = @import("../file_cache.zig");
 
-const lexer = @import("../tokens.zig");
-const receiver = @import("../method_names.zig");
+const tokens = @import("../tokens.zig");
+const method_names = @import("../method_names.zig");
 const testing = @import("../testing.zig");
-const findStmtSemicolon = lexer.findStmtSemicolon;
-const skipFnDecl = lexer.skipFnDecl;
-const fnProto = lexer.fnProto;
-const bodyOf = lexer.bodyOf;
+const findStmtSemicolon = tokens.findStmtSemicolon;
+const skipFnDecl = tokens.skipFnDecl;
+const fnProto = tokens.fnProto;
+const bodyOf = tokens.bodyOf;
 
 const Problem = problem_mod.Problem;
 const Pos = problem_mod.Pos;
@@ -62,7 +62,7 @@ pub fn check(
         const name_tok = fp.name_token orelse continue;
         if (isConstructorName(tree.tokenSlice(name_tok))) continue;
         const ct_ti = model.containingTypeOf(node) orelse continue;
-        const this_name = lexer.firstParamName(tree, fp) orelse continue;
+        const this_name = tokens.firstParamName(tree, fp) orelse continue;
         const body = bodyOf(tree, node) orelse continue;
         try checkBody(gpa, tree, model, ct_ti, this_name, body, problems);
     }
@@ -71,8 +71,8 @@ pub fn check(
 fn checkBody(
     gpa: std.mem.Allocator,
     tree: *const Ast,
-    model: *const fmodel.FileModel,
-    ct_ti: *const fmodel.TypeInfo,
+    model: *const file_model.FileModel,
+    ct_ti: *const file_model.TypeInfo,
     this_name: []const u8,
     body: Ast.Node.Index,
     problems: *std.ArrayListUnmanaged(Problem),
@@ -285,7 +285,7 @@ fn checkBody(
         // can't follow the chain.
         const qualified_ti = model.resolveFieldTypeQualifiedTi(ct_ti, field_name);
         const last_id = fieldTypeLastIdent(tree, model, ct, field_name) orelse field_type;
-        const union_ti: ?*const fmodel.TypeInfo = blk: {
+        const union_ti: ?*const file_model.TypeInfo = blk: {
             if (qualified_ti) |q| if (q.kind == .union_) break :blk q;
             // Scope-aware lookup: when multiple like-named types
             // exist in the file (e.g. Writable.Pending.Future and
@@ -345,8 +345,8 @@ fn checkBody(
 /// constraint) is non-owned — the retag can't leak.
 fn switchArmRetagIsSafeTi(
     tree: *const Ast,
-    model: *const fmodel.FileModel,
-    union_ti: *const fmodel.TypeInfo,
+    model: *const file_model.FileModel,
+    union_ti: *const file_model.TypeInfo,
     body_first: Ast.TokenIndex,
     assign_tok: Ast.TokenIndex,
     this_name: []const u8,
@@ -553,8 +553,8 @@ fn collectSwitchExplicitTags(
 }
 
 fn allVariantsExceptAreNonOwnedTi(
-    model: *const fmodel.FileModel,
-    ti: *const fmodel.TypeInfo,
+    model: *const file_model.FileModel,
+    ti: *const file_model.TypeInfo,
     explicit_tags: [16][]const u8,
 ) bool {
     const tree = model.tree;
@@ -637,7 +637,7 @@ fn skipPastVariantPayload(tags: []const std.zig.Token.Tag, start: Ast.TokenIndex
 /// type is qualified across nested type scopes.
 fn fieldTypeLastIdent(
     tree: *const Ast,
-    model: *const fmodel.FileModel,
+    model: *const file_model.FileModel,
     struct_name: []const u8,
     field_name: []const u8,
 ) ?[]const u8 {
@@ -664,8 +664,8 @@ fn fieldTypeLastIdent(
 /// equivalent); empty / primitive payloads are non-owned.
 fn taggedUnionRetagIsSafeTi(
     tree: *const Ast,
-    model: *const fmodel.FileModel,
-    union_ti: *const fmodel.TypeInfo,
+    model: *const file_model.FileModel,
+    union_ti: *const file_model.TypeInfo,
     body_first: Ast.TokenIndex,
     assign_tok: Ast.TokenIndex,
     sc: Ast.TokenIndex,
@@ -693,7 +693,7 @@ fn taggedUnionRetagIsSafeTi(
 /// default has no prior value to deinit on first write.
 fn fieldDefaultIsUndefinedTi(
     tree: *const Ast,
-    ti: *const fmodel.TypeInfo,
+    ti: *const file_model.TypeInfo,
     field_name: []const u8,
 ) bool {
     const f = ti.findField(field_name) orelse return false;
@@ -742,7 +742,7 @@ fn priorWriteInFn(
 /// field default.
 fn initFnDefaultUnionTag(
     tree: *const Ast,
-    model: *const fmodel.FileModel,
+    model: *const file_model.FileModel,
     outer_type_name: []const u8,
     field_name: []const u8,
 ) ?[]const u8 {
@@ -789,7 +789,7 @@ fn initFnDefaultUnionTag(
 /// `priorWriteInFn` returning false.
 fn initFnSetsFieldToUndefined(
     tree: *const Ast,
-    ti: *const fmodel.TypeInfo,
+    ti: *const file_model.TypeInfo,
     field_name: []const u8,
 ) bool {
     const tags = tree.tokens.items(.tag);
@@ -1033,7 +1033,7 @@ fn savedAndCleanedUp(
 /// same check in owned-field-no-outer-cleanup.  Returns false for
 /// types whose deinit is `{}` or only discards (CSS uniform-API
 /// conformance); overwriting such a field can't leak anything.
-fn hasNonTrivialDeinit(tree: *const Ast, ti: *const fmodel.TypeInfo) bool {
+fn hasNonTrivialDeinit(tree: *const Ast, ti: *const file_model.TypeInfo) bool {
     for (ti.methods) |m| {
         if (!std.mem.eql(u8, m.name, "deinit")) continue;
         if (!isTrivialBody(tree, m.body_first, m.body_last)) return true;
@@ -1041,7 +1041,7 @@ fn hasNonTrivialDeinit(tree: *const Ast, ti: *const fmodel.TypeInfo) bool {
     return false;
 }
 
-const isTrivialBody = lexer.isTrivialBody;
+const isTrivialBody = tokens.isTrivialBody;
 
 /// True iff `assign_tok` (the `<this>` ident in `<this>.<field> = …`)
 /// is the body of an inline `defer` / `errdefer` statement.  Matches:
@@ -1276,7 +1276,7 @@ fn priorCleanupExists(
     return false;
 }
 
-const isCleanupMethodName = receiver.isCleanupMethodName;
+const isCleanupMethodName = method_names.isCleanupMethodName;
 
 fn isFreeOrDestroy(name: []const u8) bool {
     return std.mem.eql(u8, name, "free") or
@@ -1366,7 +1366,7 @@ fn priorRealWriteInFn(
 /// an optional type regardless of whether it has an explicit null default.
 fn fieldTypeIsOptional(
     tree: *const Ast,
-    ct_ti: *const fmodel.TypeInfo,
+    ct_ti: *const file_model.TypeInfo,
     field_name: []const u8,
 ) bool {
     const f = ct_ti.findField(field_name) orelse return false;

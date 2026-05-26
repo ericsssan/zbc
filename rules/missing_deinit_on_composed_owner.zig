@@ -17,15 +17,15 @@
 const std = @import("std");
 const Ast = std.zig.Ast;
 
-const fmodel = @import("../file_model.zig");
+const file_model = @import("../file_model.zig");
 const mq = @import("../model_query.zig");
 const query = @import("../token_query.zig");
-const lexer = @import("../tokens.zig");
+const tokens = @import("../tokens.zig");
 const problem = @import("../problem.zig");
 const testing = @import("../testing.zig");
 const config_mod = @import("../config.zig");
 const file_cache_mod = @import("../file_cache.zig");
-const receiver = @import("../method_names.zig");
+const method_names = @import("../method_names.zig");
 
 const R = "missing-deinit-on-composed-owner";
 
@@ -195,8 +195,8 @@ const anyNonTrivialCleanup = mq.anyNonTrivialCleanup;
 /// no-ops).
 fn siblingMethodsCleanField(
     tree: *const Ast,
-    outer: *const fmodel.TypeInfo,
-    deinit_method: *const fmodel.MethodInfo,
+    outer: *const file_model.TypeInfo,
+    deinit_method: *const file_model.MethodInfo,
     field_name: []const u8,
 ) bool {
     const tags = tree.tokens.items(.tag);
@@ -227,7 +227,7 @@ fn siblingMethodsCleanField(
 /// the type has a `ref_count` field whose declared type expression
 /// contains `RefCount(@This(),` — the canonical bun shape produced
 /// by `bun.ptr.RefCount(@This(), "ref_count", deinit, ...)`.
-fn innerIsRefCounted(tree: *const Ast, inner_ti: *const fmodel.TypeInfo) bool {
+fn innerIsRefCounted(tree: *const Ast, inner_ti: *const file_model.TypeInfo) bool {
     const tags = tree.tokens.items(.tag);
     // Look anywhere in the type's body for the canonical bun shape:
     //   `RefCount(@This(), ...)` — typically the RHS of a
@@ -262,7 +262,7 @@ fn innerIsRefCounted(tree: *const Ast, inner_ti: *const fmodel.TypeInfo) bool {
 /// presence of any such accessor is sufficient signal.
 fn innerDeinitUsesFieldParentPtr(
     tree: *const Ast,
-    inner_ti: *const fmodel.TypeInfo,
+    inner_ti: *const file_model.TypeInfo,
     field_name: []const u8,
 ) bool {
     const tags = tree.tokens.items(.tag);
@@ -290,7 +290,7 @@ fn innerDeinitUsesFieldParentPtr(
 /// deinit legitimately defers cleanup to the caller.
 fn fieldIsCallerSupplied(
     tree: *const Ast,
-    outer: *const fmodel.TypeInfo,
+    outer: *const file_model.TypeInfo,
     field_name: []const u8,
 ) bool {
     for (outer.methods) |m| {
@@ -315,7 +315,7 @@ fn fieldIsCallerSupplied(
 /// at the LAST identifier of the type chain (handles `Route.RefCount`
 /// → "RefCount", `*lib.T.Inner` → "Inner") rather than the resolved
 /// type's name which is the FIRST identifier.
-fn fieldTypeTrailingNameEndsWith(tree: *const Ast, field: *const fmodel.FieldInfo, suffix: []const u8) bool {
+fn fieldTypeTrailingNameEndsWith(tree: *const Ast, field: *const file_model.FieldInfo, suffix: []const u8) bool {
     const tags = tree.tokens.items(.tag);
     var t = field.type_first;
     var last_id: ?[]const u8 = null;
@@ -335,9 +335,9 @@ fn fieldTypeTrailingNameEndsWith(tree: *const Ast, field: *const fmodel.FieldInf
 /// One level of delegation only — chains of helpers aren't followed.
 fn bodyHandlesFieldViaHelper(
     tree: *const Ast,
-    model: *const fmodel.FileModel,
-    deinit: *const fmodel.MethodInfo,
-    outer: *const fmodel.TypeInfo,
+    model: *const file_model.FileModel,
+    deinit: *const file_model.MethodInfo,
+    outer: *const file_model.TypeInfo,
     field_name: []const u8,
     cleanup_call: []const query.Atom,
 ) bool {
@@ -370,7 +370,7 @@ fn bodyHandlesFieldViaHelper(
 ///     the field name matches a tag enum's variant).
 /// Looser than a cleanup pattern match — used as a fall-through
 /// signal that the helper at least references the field in some way.
-fn methodBodyMentionsField(tree: *const Ast, method: *const fmodel.MethodInfo, field_name: []const u8) bool {
+fn methodBodyMentionsField(tree: *const Ast, method: *const file_model.MethodInfo, field_name: []const u8) bool {
     const tags = tree.tokens.items(.tag);
     var t: Ast.TokenIndex = method.body_first;
     while (t + 1 <= method.body_last) : (t += 1) {
@@ -394,7 +394,7 @@ fn methodBodyMentionsField(tree: *const Ast, method: *const fmodel.MethodInfo, f
 /// bare identifier (`|cap|` or `|*cap|`).  Doesn't try to match
 /// `while (X.field) |cap|` (loops on an optional field are rare for
 /// cleanup) or nested patterns.
-fn bodyHandlesFieldViaUnwrap(tree: *const Ast, method: *const fmodel.MethodInfo, field_name: []const u8) bool {
+fn bodyHandlesFieldViaUnwrap(tree: *const Ast, method: *const file_model.MethodInfo, field_name: []const u8) bool {
     const tags = tree.tokens.items(.tag);
     const first = method.body_first;
     const last = method.body_last;
@@ -402,7 +402,7 @@ fn bodyHandlesFieldViaUnwrap(tree: *const Ast, method: *const fmodel.MethodInfo,
     while (t + 5 <= last) : (t += 1) {
         if (tags[t] != .keyword_if) continue;
         if (tags[t + 1] != .l_paren) continue;
-        const rparen = lexer.matchParen(tags, t + 1, last) orelse continue;
+        const rparen = tokens.matchParen(tags, t + 1, last) orelse continue;
         // The condition's last two tokens must be `.<field_name>`.
         if (rparen < t + 4) continue;
         if (tags[rparen - 2] != .period) continue;
@@ -423,9 +423,9 @@ fn bodyHandlesFieldViaUnwrap(tree: *const Ast, method: *const fmodel.MethodInfo,
         const body_start = close_pipe + 1;
         if (body_start > last) continue;
         const body_end: Ast.TokenIndex = if (tags[body_start] == .l_brace)
-            lexer.matchBrace(tags, body_start, last) orelse continue
+            tokens.matchBrace(tags, body_start, last) orelse continue
         else
-            lexer.findStmtSemicolon(tags, body_start, last) orelse continue;
+            tokens.findStmtSemicolon(tags, body_start, last) orelse continue;
 
         // Scan the body for `<cap_name>.<cleanup>(`.
         var k: Ast.TokenIndex = body_start;
@@ -441,7 +441,7 @@ fn bodyHandlesFieldViaUnwrap(tree: *const Ast, method: *const fmodel.MethodInfo,
     return false;
 }
 
-const isCleanupName = receiver.isCleanupMethodName;
+const isCleanupName = method_names.isCleanupMethodName;
 
 fn report(
     gpa: std.mem.Allocator,
