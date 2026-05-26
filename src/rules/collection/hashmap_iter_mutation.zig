@@ -305,6 +305,9 @@ fn findReceiverMutate(
             if (t < 2 or tags[t - 1] != .period) continue;
             if (tags[t - 2] != .identifier) continue;
             if (!std.mem.eql(u8, tree.tokenSlice(t - 2), pfx)) continue;
+            // Reject if `pfx` is itself part of a longer chain: `other.pfx.recv.mutate()`.
+            // In that case the root object differs from the iterator's receiver.
+            if (t >= 4 and tags[t - 3] == .period) continue;
         }
         if (tags[t + 1] != .period) continue;
         if (tags[t + 2] != .identifier) continue;
@@ -443,6 +446,27 @@ test "hashmap-iter-mutation: self.map iterator + self.map mutation — same fiel
     );
     defer freeProblems(gpa, &problems);
     try std.testing.expectEqual(@as(usize, 1), problems.items.len);
+}
+
+test "hashmap-iter-mutation: outer.recv.map mutation vs recv.map iterator — does NOT fire" {
+    // Iterator is on `lockfile.workspace_paths`; mutation is on
+    // `manager.lockfile.workspace_paths` — same two-token suffix but a
+    // different root object.  The old code matched on the `lockfile` prefix
+    // alone and fired a false positive; the fix checks that `lockfile` is NOT
+    // itself preceded by `.`, which would indicate a deeper chain.
+    const gpa = std.testing.allocator;
+    var problems = try testing.runRule(gpa, check,
+        \\pub fn migrate(manager: anytype, lockfile: anytype) void {
+        \\    manager.lockfile.workspace_paths.clearRetainingCapacity();
+        \\    var iter = lockfile.workspace_paths.iterator();
+        \\    while (iter.next()) |entry| {
+        \\        manager.lockfile.workspace_paths.putAssumeCapacity(entry.key_ptr.*, entry.value_ptr.*);
+        \\    }
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
 }
 
 test "hashmap-iter-mutation: clearAndFree during iteration fires" {
