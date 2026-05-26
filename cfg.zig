@@ -434,8 +434,8 @@ pub fn lowerFunctionFullWithZls(
     zls: ?*zls_resolver_mod.ZlsResolver,
 ) !?Cfg {
     var buf: [1]Ast.Node.Index = undefined;
-    const fn_proto = (try fnProto(tree, &buf, fn_decl)) orelse return null;
-    const body_node = bodyOf(tree, fn_decl) orelse return null;
+    const fn_proto = lexer.fnProto(tree, &buf, fn_decl) orelse return null;
+    const body_node = lexer.bodyOf(tree, fn_decl) orelse return null;
 
     // Comptime-only functions (every parameter is `comptime`) are
     // evaluated entirely at comptime — their stack locals are
@@ -499,19 +499,6 @@ pub fn lowerFunctionFullWithZls(
     return try builder.finalize(tree, fn_decl, entry_id);
 }
 
-fn fnProto(tree: *const Ast, buf: *[1]Ast.Node.Index, node: Ast.Node.Index) !?Ast.full.FnProto {
-    return switch (tree.nodeTag(node)) {
-        .fn_decl => switch (tree.nodeTag(tree.nodeData(node).node_and_node[0])) {
-            .fn_proto => tree.fnProto(tree.nodeData(node).node_and_node[0]),
-            .fn_proto_multi => tree.fnProtoMulti(tree.nodeData(node).node_and_node[0]),
-            .fn_proto_one => tree.fnProtoOne(buf, tree.nodeData(node).node_and_node[0]),
-            .fn_proto_simple => tree.fnProtoSimple(buf, tree.nodeData(node).node_and_node[0]),
-            else => null,
-        },
-        else => null,
-    };
-}
-
 /// Does `text` contain any of `patterns` as a substring?  Used by
 /// the classifier + lowerCallStmt to dispatch on
 /// project-configurable text matches (phase 42).
@@ -552,11 +539,6 @@ fn typeMentionsAst(tree: *const Ast, type_node: Ast.Node.Index, name: []const u8
             return true;
     }
     return false;
-}
-
-fn bodyOf(tree: *const Ast, node: Ast.Node.Index) ?Ast.Node.Index {
-    if (tree.nodeTag(node) != .fn_decl) return null;
-    return tree.nodeData(node).node_and_node[1];
 }
 
 /// True iff every parameter in `fn_proto` is declared `comptime`.
