@@ -589,24 +589,9 @@ fn rhsTypeViaZlsLacksDeinit(
     return false;
 }
 
-fn typeHasDeinit(model: *const fmodel.FileModel, type_name: []const u8) bool {
-    if (model.hasType(type_name)) {
-        return model.typeHasMethod(type_name, "deinit");
-    }
-    // File-struct fallback: `const <Name> = @This();` at the file
-    // head means the file IS the type — top-level fns are methods.
-    if (model.fileIsTypeNamed(type_name)) {
-        return model.typeOrFileHasMethod(type_name, "deinit");
-    }
-    // Truly unknown (cross-file).  Conservative: assume has deinit.
-    return true;
-}
-
-/// Cross-file aware variant of `typeHasDeinit`.  Uses the
-/// FileCache's project-wide @import lookup to resolve type names
-/// that aren't in the current file model.  Returns:
-///   - true: type has a deinit method (or unresolvable → assume yes)
-///   - false: type RESOLVED to a model entry that has no deinit
+/// True iff `type_name` has a `deinit` method, with cross-file
+/// resolution via the FileCache's project-wide @import lookup.
+/// Returns true conservatively when the type is unresolvable.
 fn typeHasDeinitProject(
     cache: *file_cache_mod.FileCache,
     model: *const fmodel.FileModel,

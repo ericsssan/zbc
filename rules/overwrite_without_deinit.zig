@@ -343,22 +343,6 @@ fn checkBody(
 ///     arms.
 /// Returns true iff every possible prior variant (per the arm's
 /// constraint) is non-owned — the retag can't leak.
-fn switchArmRetagIsSafe(
-    tree: *const Ast,
-    model: *const fmodel.FileModel,
-    union_type_name: []const u8,
-    body_first: Ast.TokenIndex,
-    assign_tok: Ast.TokenIndex,
-    this_name: []const u8,
-    field_name: []const u8,
-) bool {
-    const ti = model.findType(union_type_name) orelse return false;
-    return switchArmRetagIsSafeTi(tree, model, ti, body_first, assign_tok, this_name, field_name);
-}
-
-/// TypeInfo-anchored variant of `switchArmRetagIsSafe` — avoids
-/// the `findType(name)` re-lookup that would pick the wrong
-/// like-named type when nested-type collisions exist.
 fn switchArmRetagIsSafeTi(
     tree: *const Ast,
     model: *const fmodel.FileModel,
@@ -568,18 +552,6 @@ fn collectSwitchExplicitTags(
     return n;
 }
 
-fn allVariantsExceptAreNonOwned(
-    model: *const fmodel.FileModel,
-    union_type_name: []const u8,
-    explicit_tags: [16][]const u8,
-) bool {
-    const ti = model.findType(union_type_name) orelse return false;
-    return allVariantsExceptAreNonOwnedTi(model, ti, explicit_tags);
-}
-
-/// TypeInfo-anchored variant of `allVariantsExceptAreNonOwned`.
-/// Walks the SAME `ti` rather than re-resolving the name (which
-/// would pick a like-named nested-type collision).
 fn allVariantsExceptAreNonOwnedTi(
     model: *const fmodel.FileModel,
     ti: *const fmodel.TypeInfo,
@@ -690,23 +662,6 @@ fn fieldTypeLastIdent(
 ///      declared default `.<tag>`.
 /// "Owned" payload = a payload type that has a `deinit` method (or
 /// equivalent); empty / primitive payloads are non-owned.
-fn taggedUnionRetagIsSafe(
-    tree: *const Ast,
-    model: *const fmodel.FileModel,
-    union_type_name: []const u8,
-    body_first: Ast.TokenIndex,
-    assign_tok: Ast.TokenIndex,
-    sc: Ast.TokenIndex,
-    this_name: []const u8,
-    field_name: []const u8,
-    outer_type_name: []const u8,
-) bool {
-    const ti = model.findType(union_type_name) orelse return false;
-    return taggedUnionRetagIsSafeTi(tree, model, ti, body_first, assign_tok, sc, this_name, field_name, outer_type_name);
-}
-
-/// TypeInfo-anchored variant — eliminates the `findType(name)`
-/// lookup that would pick the wrong like-named nested type.
 fn taggedUnionRetagIsSafeTi(
     tree: *const Ast,
     model: *const fmodel.FileModel,
