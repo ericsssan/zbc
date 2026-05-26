@@ -5884,7 +5884,8 @@ const Builder = struct {
     fn isWriteFirstArgBuiltin(name: []const u8) bool {
         // `name` includes the leading `@`.
         return std.mem.eql(u8, name, "@memcpy") or
-            std.mem.eql(u8, name, "@memset");
+            std.mem.eql(u8, name, "@memset") or
+            std.mem.eql(u8, name, "@memmove");
     }
 
     /// Emit a `.field_use` for every PREFIX of the dotted chain
