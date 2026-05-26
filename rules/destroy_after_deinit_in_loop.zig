@@ -365,12 +365,7 @@ fn isPointerListField(tree: *const Ast, field_name: []const u8) bool {
     return false;
 }
 
-fn isIdentByte(c: u8) bool {
-    return (c >= 'a' and c <= 'z') or
-        (c >= 'A' and c <= 'Z') or
-        (c >= '0' and c <= '9') or
-        c == '_';
-}
+const isIdentByte = lexer.isIdentByte;
 
 /// Find the end of a field's type expression starting at `start`.
 /// Stops at the first `,` or `=` at brace/paren/bracket depth 0

@@ -6151,7 +6151,7 @@ const Builder = struct {
         const start = i;
         while (i < text.len) : (i += 1) {
             const c = text[i];
-            if (!isIdentChar(c)) break;
+            if (!lexer.isIdentByte(c)) break;
         }
         if (i == start) return null;
         const name = text[start..i];
@@ -6367,11 +6367,6 @@ const Builder = struct {
         const last_start = tree.tokens.items(.start)[last_field];
         const last_len = tree.tokenSlice(last_field).len;
         return tree.source[start_byte..(last_start + last_len)];
-    }
-
-    fn isIdentChar(c: u8) bool {
-        return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or
-            (c >= '0' and c <= '9') or c == '_';
     }
 
     /// For a call-like node, return the source-text slice covering

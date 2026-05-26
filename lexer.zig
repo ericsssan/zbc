@@ -163,6 +163,12 @@ pub fn skipFnDecl(tags: []const TokenTag, start: TokenIndex, last: TokenIndex) T
     return @min(t -| 1, last);
 }
 
+/// True iff `c` can appear in a Zig identifier (`a-z A-Z 0-9 _`).
+pub fn isIdentByte(c: u8) bool {
+    return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or
+        (c >= '0' and c <= '9') or c == '_';
+}
+
 /// True iff any token in `[start, end]` has tag `needle`.
 pub fn hasTokenInRange(tags: []const TokenTag, start: TokenIndex, end: TokenIndex, needle: TokenTag) bool {
     if (start > end) return false;
