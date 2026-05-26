@@ -4,6 +4,7 @@
 
 const std = @import("std");
 const cfg_mod = @import("cfg.zig");
+const cfg_builder = @import("cfg_builder.zig");
 const state_mod = @import("abstract_state.zig");
 const transfer = @import("cfg_transfer.zig");
 const problem_mod = @import("problem.zig");
@@ -200,7 +201,7 @@ fn analyze(gpa: std.mem.Allocator, src: []const u8) !std.ArrayListUnmanaged(Prob
     while (node_idx < tree.nodes.len) : (node_idx += 1) {
         const node: Ast.Node.Index = @enumFromInt(node_idx);
         if (tree.nodeTag(node) != .fn_decl) continue;
-        var cfg = (try cfg_mod.lowerFunctionFull(
+        var cfg = (try cfg_builder.lowerFunctionFull(
             gpa,
             &tree,
             node,

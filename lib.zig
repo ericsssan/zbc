@@ -4,6 +4,7 @@ const std = @import("std");
 const Ast = std.zig.Ast;
 
 const cfg_mod = @import("cfg.zig");
+const cfg_builder = @import("cfg_builder.zig");
 const worklist = @import("worklist.zig");
 const config_mod = @import("config.zig");
 const problem_mod = @import("problem.zig");
@@ -95,7 +96,7 @@ pub fn analyzeEscape(
     while (node_idx < tree.nodes.len) : (node_idx += 1) {
         const node: Ast.Node.Index = @enumFromInt(node_idx);
         if (tree.nodeTag(node) != .fn_decl) continue;
-        var cfg = (try cfg_mod.lowerFunctionFullWithZls(
+        var cfg = (try cfg_builder.lowerFunctionFullWithZls(
             gpa,
             &tree,
             node,

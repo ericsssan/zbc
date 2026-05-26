@@ -8,6 +8,7 @@ const std = @import("std");
 const Ast = std.zig.Ast;
 
 const cfg_mod = @import("cfg.zig");
+const cfg_builder = @import("cfg_builder.zig");
 
 const Cfg = cfg_mod.Cfg;
 const BlockId = cfg_mod.BlockId;
@@ -15,7 +16,7 @@ const LocalId = cfg_mod.LocalId;
 const SrcPos = cfg_mod.SrcPos;
 const StmtKind = cfg_mod.StmtKind;
 const ExprKind = cfg_mod.ExprKind;
-const lowerFunction = cfg_mod.lowerFunction;
+const lowerFunction = cfg_builder.lowerFunction;
 
 // ── Tests ──────────────────────────────────────────────────
 
