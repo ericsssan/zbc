@@ -330,6 +330,13 @@ fn checkFn(
         root_self_type orelse return;
     const tg = groups.getPtr(ct) orelse return;
 
+    // Arena-backed types release all field memory via a single
+    // `self._arena.deinit()` call, so it is expected that partial
+    // cleanup fns (e.g. `finalize`) only handle some fields explicitly
+    // while leaving others to the arena.  Suppress the rule for any
+    // type that declares an ArenaAllocator field.
+    if (typeHasArenaField(model, tree, ct)) return;
+
     // First param name — typically "this" or "self".  Used as the
     // identifier to scan against for `<param>.<field>`.
     const first_param_name = tokens.firstParamName(tree, fp) orelse return;
@@ -369,6 +376,28 @@ fn checkFn(
             try report(gpa, problems, tree, f, ct, group.type_text, fn_name);
         }
     }
+}
+
+/// True iff the type named `ct` declares any field whose type text
+/// contains "ArenaAllocator" (e.g. `_arena: ?std.heap.ArenaAllocator`).
+/// Arena-backed types release all allocations at once; individual field
+/// cleanup in secondary destructors is intentionally partial — the
+/// asymmetric-field-free rule should not fire for such types.
+fn typeHasArenaField(
+    model: *const file_model.FileModel,
+    tree: *const Ast,
+    ct: []const u8,
+) bool {
+    const ti = model.findType(ct) orelse return false;
+    const tags = tree.tokens.items(.tag);
+    for (ti.fields) |f| {
+        var t: file_model.TokenIndex = f.type_first;
+        while (t <= f.type_last) : (t += 1) {
+            if (tags[t] != .identifier) continue;
+            if (std.mem.eql(u8, tree.tokenSlice(t), "ArenaAllocator")) return true;
+        }
+    }
+    return false;
 }
 
 /// True iff the inner type name of `?<X>` (or `?*<X>`) corresponds
@@ -548,6 +577,31 @@ test "asymmetric-field-free: bare slice siblings (`[]const u8`) — OK" {
         \\    message: []const u8 = "",
         \\    pub fn deinit(this: *T) void {
         \\        _ = this.message;
+        \\    }
+        \\};
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
+test "asymmetric-field-free: arena-backed type — partial finalize does NOT fire" {
+    // Mirrors the ghostty Config pattern: struct has an ArenaAllocator
+    // field; deinit drops the whole arena; finalize only touches some
+    // ?Command siblings — not a bug, the arena frees the rest.
+    const gpa = std.testing.allocator;
+    var problems = try testing.runRule(gpa, check,
+        \\const std = @import("std");
+        \\const Command = struct { pub fn deinit(self: *Command) void { _ = self; } };
+        \\const Config = struct {
+        \\    _arena: ?std.heap.ArenaAllocator = null,
+        \\    initial_command: ?Command = null,
+        \\    shell_command: ?Command = null,
+        \\    pub fn deinit(self: *Config) void {
+        \\        if (self._arena) |a| a.deinit();
+        \\    }
+        \\    pub fn finalize(self: *Config) void {
+        \\        if (self.shell_command) |*c| c.deinit();
         \\    }
         \\};
         \\
