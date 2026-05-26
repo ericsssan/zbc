@@ -1636,6 +1636,32 @@ test "overwrite-without-deinit: non-constructor fn sets field=undefined → firs
     try std.testing.expectEqual(@as(usize, 0), problems.items.len);
 }
 
+test "overwrite-without-deinit: struct-typed field with non-trivial deinit fires" {
+    const gpa = std.testing.allocator;
+    // Field has no default (`inner_real: InnerReal` — no `= .{}`), so the
+    // empty-struct-literal suppression does not apply and the rule fires.
+    var problems = try testing.runRule(gpa, check,
+        \\const InnerReal = struct {
+        \\    buf: []const u8 = &.{},
+        \\    pub fn deinit(self: *InnerReal) void { self.buf = &.{}; }
+        \\};
+        \\const Owner = struct {
+        \\    inner_real: InnerReal,
+        \\    pub fn deinit(this: *Owner) void { this.inner_real.deinit(); }
+        \\    pub fn set(this: *Owner, new_inner: InnerReal) void {
+        \\        this.inner_real = new_inner;
+        \\    }
+        \\};
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    var found = false;
+    for (problems.items) |p| {
+        if (std.mem.eql(u8, p.rule_id, "overwrite-without-deinit")) found = true;
+    }
+    try std.testing.expect(found);
+}
+
 test "overwrite-without-deinit: optional field first write inside orelse block — no fire" {
     const gpa = std.testing.allocator;
     var problems = try testing.runRule(gpa, check,
