@@ -40,8 +40,8 @@ const lexer = @import("lexer.zig");
 pub const TokenIndex = Ast.TokenIndex;
 pub const TokenTag = lexer.TokenTag;
 
-pub const MAX_CAPTURES: u8 = 8;
-pub const MAX_RANGE_CAPTURES: u8 = 4;
+const MAX_CAPTURES: u8 = 8;
+const MAX_RANGE_CAPTURES: u8 = 4;
 
 /// Inclusive token range captured by `.capture_until`.  `end` >=
 /// `start` when non-empty; the range CAN be empty (`start > end`)

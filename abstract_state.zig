@@ -205,7 +205,7 @@ pub const FieldKey = struct {
     };
 };
 
-pub const JoinResult = enum { unchanged, changed };
+const JoinResult = enum { unchanged, changed };
 
 /// Conservative CFG-merge join:
 ///   - Locals: same origin → keep; different → collapse to .plain
