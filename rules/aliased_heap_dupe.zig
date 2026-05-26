@@ -32,7 +32,6 @@ const fnProto = lexer.fnProto;
 const bodyOf = lexer.bodyOf;
 
 const Problem = problem_mod.Problem;
-const Severity = problem_mod.Severity;
 const Pos = problem_mod.Pos;
 
 /// Run the aliased-heap-dupe detector over every fn_decl in `tree`

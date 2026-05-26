@@ -52,10 +52,6 @@ const testing = @import("../testing.zig");
 const skipDeferStmt = lexer.skipDeferStmt;
 const matchBrace = lexer.matchBrace;
 const findStmtSemicolon = lexer.findStmtSemicolon;
-const skipNestedFn = lexer.skipNestedFn;
-const returnsType = lexer.returnsType;
-const fnProto = lexer.fnProto;
-const bodyOf = lexer.bodyOf;
 
 const Problem = problem_mod.Problem;
 const Pos = problem_mod.Pos;

@@ -35,14 +35,9 @@ const config_mod = @import("../config.zig");
 const file_cache_mod = @import("../file_cache.zig");
 
 const lexer = @import("../lexer.zig");
-const local = @import("../local.zig");
 const testing = @import("../testing.zig");
-const matchBrace = lexer.matchBrace;
 const matchParen = lexer.matchParen;
 const skipNestedFn = lexer.skipNestedFn;
-const returnsType = lexer.returnsType;
-const fnProto = lexer.fnProto;
-const bodyOf = lexer.bodyOf;
 
 const Problem = problem_mod.Problem;
 const Pos = problem_mod.Pos;

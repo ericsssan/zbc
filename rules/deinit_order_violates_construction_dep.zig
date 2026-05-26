@@ -28,10 +28,8 @@ const file_cache_mod = @import("../file_cache.zig");
 
 const lexer = @import("../lexer.zig");
 const testing = @import("../testing.zig");
-const matchBrace = lexer.matchBrace;
 const skipNestedFn = lexer.skipNestedFn;
 const returnsType = lexer.returnsType;
-const fnProto = lexer.fnProto;
 const bodyOf = lexer.bodyOf;
 
 const Problem = problem_mod.Problem;

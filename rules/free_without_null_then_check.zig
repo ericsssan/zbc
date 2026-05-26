@@ -44,7 +44,6 @@ const lexer = @import("../lexer.zig");
 const receiver = @import("../receiver.zig");
 const testing = @import("../testing.zig");
 const skipDeferStmt = lexer.skipDeferStmt;
-const matchBrace = lexer.matchBrace;
 const matchParen = lexer.matchParen;
 const findStmtSemicolon = lexer.findStmtSemicolon;
 const skipNestedFn = lexer.skipNestedFn;

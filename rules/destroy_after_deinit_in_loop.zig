@@ -19,7 +19,6 @@ const std = @import("std");
 const Ast = std.zig.Ast;
 
 const lexer = @import("../lexer.zig");
-const local = @import("../local.zig");
 const problem_mod = @import("../problem.zig");
 const config_mod = @import("../config.zig");
 const file_cache_mod = @import("../file_cache.zig");
@@ -27,9 +26,6 @@ const testing = @import("../testing.zig");
 
 const Problem = problem_mod.Problem;
 const Pos = problem_mod.Pos;
-
-const fnProto = lexer.fnProto;
-const bodyOf = lexer.bodyOf;
 
 pub fn check(
     gpa: std.mem.Allocator,

@@ -26,7 +26,6 @@ const file_cache_mod = @import("../file_cache.zig");
 const lexer = @import("../lexer.zig");
 const testing = @import("../testing.zig");
 const returnsType = lexer.returnsType;
-const fnProto = lexer.fnProto;
 const skipFnDecl = lexer.skipFnDecl;
 const bodyOf = lexer.bodyOf;
 

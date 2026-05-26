@@ -41,10 +41,7 @@ const testing = @import("../testing.zig");
 const Problem = problem_mod.Problem;
 const Pos = problem_mod.Pos;
 
-const matchBrace = lexer.matchBrace;
-const matchParen = lexer.matchParen;
 const skipNestedFn = lexer.skipNestedFn;
-const findStmtSemicolon = lexer.findStmtSemicolon;
 
 pub fn check(
     gpa: std.mem.Allocator,
