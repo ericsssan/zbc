@@ -798,9 +798,19 @@ pub const Invariant = enum {
     /// silently aliases the first instead of reading the intended field.
     /// Catches ziglang/zig#25099 (uri.user copied to both user and password).
     adjacent_decl_same_source_field,
+    /// `@intCast(-VAR)` — negating a signed runtime integer before casting;
+    /// if `VAR == minInt(T)` the negation overflows before the cast even runs.
+    /// Use `@abs(VAR)` to safely take the magnitude.
+    /// Catches ziglang/zig#23318 (fmtDurationSigned ns: i64 overflow).
+    intcast_of_negated_signed,
+    /// Two `.field = try <expr>` inside the same struct literal initializer;
+    /// if the second `try` fails the first allocation leaks because `errdefer`
+    /// cannot appear inside a struct literal expression.
+    /// Catches ziglang/zig#23285 (Ast.parse extra_data + errors leak).
+    struct_literal_multiple_try,
 };
 
-pub const all_invariants: [104]Invariant = .{
+pub const all_invariants: [106]Invariant = .{
     .arena_escape,
     .stack_escape,
     .use_undefined,
@@ -905,6 +915,8 @@ pub const all_invariants: [104]Invariant = .{
     .double_optional_ptr,
     .aligncast_on_optional_unwrap,
     .adjacent_decl_same_source_field,
+    .intcast_of_negated_signed,
+    .struct_literal_multiple_try,
 };
 
 pub const Default: Config = .{};

@@ -661,6 +661,8 @@ const hashmap_getentry_forced_unwrap_mod = @import("rules/collection/hashmap_get
 const double_optional_ptr_mod = @import("rules/misc/double_optional_ptr.zig");
 const aligncast_on_optional_unwrap_mod = @import("rules/misc/aligncast_on_optional_unwrap.zig");
 const adjacent_decl_same_source_field_mod = @import("rules/misc/adjacent_decl_same_source_field.zig");
+const intcast_of_negated_signed_mod = @import("rules/misc/intcast_of_negated_signed.zig");
+const struct_literal_multiple_try_mod = @import("rules/misc/struct_literal_multiple_try.zig");
 const reset_skips_pooled_resource_release_mod = @import("rules/cleanup/reset_skips_pooled_resource_release.zig");
 const return_borrowed_payload_mod = @import("rules/borrow/return_borrowed_payload.zig");
 const self_undefined_after_destroy_mod = @import("rules/borrow/self_undefined_after_destroy.zig");
@@ -767,6 +769,8 @@ const escape_detectors = [_]Detector{
     .{ .id = "double-optional-ptr",                    .check = double_optional_ptr_mod.check },
     .{ .id = "aligncast-on-optional-unwrap",           .check = aligncast_on_optional_unwrap_mod.check },
     .{ .id = "adjacent-decl-same-source-field",        .check = adjacent_decl_same_source_field_mod.check },
+    .{ .id = "intcast-of-negated-signed",               .check = intcast_of_negated_signed_mod.check },
+    .{ .id = "struct-literal-multiple-try",             .check = struct_literal_multiple_try_mod.check },
 };
 
 /// Dispatch all registered pattern detectors against `tree`.  `cache`
@@ -922,4 +926,6 @@ test "registry: pull in every rule module so inline tests run" {
     _ = double_optional_ptr_mod;
     _ = aligncast_on_optional_unwrap_mod;
     _ = adjacent_decl_same_source_field_mod;
+    _ = intcast_of_negated_signed_mod;
+    _ = struct_literal_multiple_try_mod;
 }
