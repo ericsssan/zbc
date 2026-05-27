@@ -665,6 +665,7 @@ const arena_allocator_free_noop_mod = @import("rules/misc/arena_allocator_free_n
 const memcpy_overlapping_slices_mod = @import("rules/misc/memcpy_overlapping_slices.zig");
 const cmpxchgweak_orelse_break_mod = @import("rules/misc/cmpxchgweak_orelse_break.zig");
 const slice_write_at_len_mod = @import("rules/misc/slice_write_at_len.zig");
+const clamp_wrong_direction_mod = @import("rules/misc/clamp_wrong_direction.zig");
 const double_optional_ptr_mod = @import("rules/misc/double_optional_ptr.zig");
 const aligncast_on_optional_unwrap_mod = @import("rules/misc/aligncast_on_optional_unwrap.zig");
 const adjacent_decl_same_source_field_mod = @import("rules/misc/adjacent_decl_same_source_field.zig");
@@ -787,6 +788,7 @@ const escape_detectors = [_]Detector{
     .{ .id = "memcpy-overlapping-slices",               .check = memcpy_overlapping_slices_mod.check },
     .{ .id = "cmpxchgweak-orelse-break",                .check = cmpxchgweak_orelse_break_mod.check },
     .{ .id = "slice-write-at-len",                     .check = slice_write_at_len_mod.check },
+    .{ .id = "clamp-wrong-direction",                  .check = clamp_wrong_direction_mod.check },
 };
 
 /// Dispatch all registered pattern detectors against `tree`.  `cache`
@@ -952,4 +954,5 @@ test "registry: pull in every rule module so inline tests run" {
     _ = memcpy_overlapping_slices_mod;
     _ = cmpxchgweak_orelse_break_mod;
     _ = slice_write_at_len_mod;
+    _ = clamp_wrong_direction_mod;
 }

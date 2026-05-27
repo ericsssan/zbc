@@ -842,9 +842,13 @@ pub const Invariant = enum {
     /// Also catches `obj.field[obj.field.len] = value` (ArrayList `.items`).
     /// Catches bun#29982 (toUTF16Alloc null-terminator off-by-one).
     slice_write_at_len,
+    /// `@max(x, std.math.maxInt(T))` or `@min(x, std.math.minInt(T))` — wrong
+    /// clamping direction.  Ensures the value is ABOVE/BELOW T's range rather
+    /// than within it.  Catches bun#29813 (@max → @min for queueSize clamp).
+    clamp_wrong_direction,
 };
 
-pub const all_invariants: [114]Invariant = .{
+pub const all_invariants: [115]Invariant = .{
     .arena_escape,
     .stack_escape,
     .use_undefined,
@@ -959,6 +963,7 @@ pub const all_invariants: [114]Invariant = .{
     .memcpy_overlapping_slices,
     .cmpxchgweak_orelse_break,
     .slice_write_at_len,
+    .clamp_wrong_direction,
 };
 
 pub const Default: Config = .{};
