@@ -793,9 +793,14 @@ pub const Invariant = enum {
     /// panics on misalignment.  Use a non-optional type or guard with `orelse`.
     /// Catches tigerbeetle/tigerbeetle#3717 (io even_listen context cast).
     aligncast_on_optional_unwrap,
+    /// Two consecutive `const VAR = STRUCT.FIELD orelse ...` declarations where
+    /// STRUCT and FIELD are identical but VAR names differ — the second binding
+    /// silently aliases the first instead of reading the intended field.
+    /// Catches ziglang/zig#25099 (uri.user copied to both user and password).
+    adjacent_decl_same_source_field,
 };
 
-pub const all_invariants: [103]Invariant = .{
+pub const all_invariants: [104]Invariant = .{
     .arena_escape,
     .stack_escape,
     .use_undefined,
@@ -899,6 +904,7 @@ pub const all_invariants: [103]Invariant = .{
     .hashmap_getentry_forced_unwrap,
     .double_optional_ptr,
     .aligncast_on_optional_unwrap,
+    .adjacent_decl_same_source_field,
 };
 
 pub const Default: Config = .{};
