@@ -573,9 +573,19 @@ pub const Invariant = enum {
     /// `@as(u32, @intCast(value))` or add an explicit minInt check.
     /// Catches oven-sh/bun#10782 (sourcemap.zig encodeVLQ overflow).
     negate_then_shift_without_minint_check,
+    /// `const <X> = try <reader>.readInt(...)` (or readU32 / readU64 /
+    /// readByte / etc.) deserializes an integer from untrusted data, then
+    /// `<recv>.<pos_field> = <X>` assigns it to a position/cursor/offset
+    /// field without a preceding `if (<X> > <recv>.buffer.len) return
+    /// error.CorruptData;`.  The unchecked cursor is later used to slice
+    /// the buffer, causing an out-of-bounds trap (Debug/Safe) or memory
+    /// disclosure (ReleaseFast).  Fix: validate `<X> <= buffer.len`
+    /// before writing the cursor.  Catches oven-sh/bun#12105 class
+    /// (lockfile.zig Buffers.readArray).
+    readint_unchecked_position_assignment,
 };
 
-pub const all_invariants: [68]Invariant = .{
+pub const all_invariants: [69]Invariant = .{
     .arena_escape,
     .stack_escape,
     .use_undefined,
@@ -644,6 +654,7 @@ pub const all_invariants: [68]Invariant = .{
     .recursive_parse_without_stack_check,
     .slice_from_fixed_offset_without_len_check,
     .negate_then_shift_without_minint_check,
+    .readint_unchecked_position_assignment,
 };
 
 pub const Default: Config = .{};
