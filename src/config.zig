@@ -640,9 +640,15 @@ pub const Invariant = enum {
     /// Catches oven-sh/bun#28495/#28592/#29081/#29643/#29656/#30169/#30437/#30465
     /// class (8 PRs — S3/node_fs/CSS constructors taking ownership of paths).
     errdefer_alive_after_ownership_transfer,
+    /// `@as(f32, @floatFromInt(expr))` narrows an integer to f32.  f32 only
+    /// represents integers exactly up to 2²⁴ (16,777,216); larger values are
+    /// silently rounded, defeating bounds checks and size arithmetic.  Use
+    /// `@as(f64, @floatFromInt(…))` instead, or clamp first if f32 is required.
+    /// Catches oven-sh/bun#30134 (CSS parser typed-array offset bounds checks).
+    f32_narrowing_int_to_float,
 };
 
-pub const all_invariants: [77]Invariant = .{
+pub const all_invariants: [78]Invariant = .{
     .arena_escape,
     .stack_escape,
     .use_undefined,
@@ -720,6 +726,7 @@ pub const all_invariants: [77]Invariant = .{
     .ptrfromint_zero,
     .resize_result_discarded,
     .errdefer_alive_after_ownership_transfer,
+    .f32_narrowing_int_to_float,
 };
 
 pub const Default: Config = .{};
