@@ -788,9 +788,14 @@ pub const Invariant = enum {
     /// is `?*T`; for a non-null pointer to an optional it is `*?T`.
     /// Catches oven-sh/bun#13955 (NAPI out-param corrupted caller stack).
     double_optional_ptr,
+    /// `@alignCast(x.?)` — forced optional unwrap inside an alignment assertion;
+    /// two panic sources in one expression: `.?` panics on null, `@alignCast`
+    /// panics on misalignment.  Use a non-optional type or guard with `orelse`.
+    /// Catches tigerbeetle/tigerbeetle#3717 (io even_listen context cast).
+    aligncast_on_optional_unwrap,
 };
 
-pub const all_invariants: [102]Invariant = .{
+pub const all_invariants: [103]Invariant = .{
     .arena_escape,
     .stack_escape,
     .use_undefined,
@@ -893,6 +898,7 @@ pub const all_invariants: [102]Invariant = .{
     .duplicate_defer_free,
     .hashmap_getentry_forced_unwrap,
     .double_optional_ptr,
+    .aligncast_on_optional_unwrap,
 };
 
 pub const Default: Config = .{};
