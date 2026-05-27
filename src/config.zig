@@ -670,9 +670,15 @@ pub const Invariant = enum {
     /// The correct out-of-range check is `x < A or x > B`.
     /// Catches oven-sh/bun#25905 (3 copy-paste dead RangeError guards).
     impossible_range_and,
+    /// `@intCast(std.time.milliTimestamp())` — casting a signed i64 timestamp
+    /// directly to an unsigned integer.  Negative timestamps (from clock skew
+    /// or VM resets) panic in debug/safe builds and wrap to huge values in
+    /// ReleaseFast.  Use `@intCast(@max(0, std.time.milliTimestamp()))`.
+    /// Catches oven-sh/bun#10365 (PRNG seed from raw milliTimestamp).
+    intcast_signed_timestamp,
 };
 
-pub const all_invariants: [82]Invariant = .{
+pub const all_invariants: [83]Invariant = .{
     .arena_escape,
     .stack_escape,
     .use_undefined,
@@ -755,6 +761,7 @@ pub const all_invariants: [82]Invariant = .{
     .intcast_clamp_uses_max,
     .forced_unwrap_iterator_next,
     .impossible_range_and,
+    .intcast_signed_timestamp,
 };
 
 pub const Default: Config = .{};

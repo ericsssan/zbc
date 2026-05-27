@@ -435,6 +435,11 @@ pub const all = [_]Rule{
         .title = "`x < A and x > B` dead range check — uses `and` instead of `or`; guard body is permanently unreachable",
         .body = @embedFile("rules/misc/impossible-range-and.md"),
     },
+    .{
+        .id = "intcast-signed-timestamp",
+        .title = "`@intCast(std.time.<fn>())` casts signed i64 timestamp without guard — negative values panic or wrap",
+        .body = @embedFile("rules/misc/intcast-signed-timestamp.md"),
+    },
 };
 
 /// Look up a rule by id.  Returns null on unknown id so callers can
@@ -534,6 +539,7 @@ const array_maxint_off_by_one_mod = @import("rules/misc/array_maxint_off_by_one.
 const intcast_clamp_uses_max_mod = @import("rules/misc/intcast_clamp_uses_max.zig");
 const forced_unwrap_iterator_next_mod = @import("rules/misc/forced_unwrap_iterator_next.zig");
 const impossible_range_and_mod = @import("rules/misc/impossible_range_and.zig");
+const intcast_signed_timestamp_mod = @import("rules/misc/intcast_signed_timestamp.zig");
 const reset_skips_pooled_resource_release_mod = @import("rules/cleanup/reset_skips_pooled_resource_release.zig");
 const return_borrowed_payload_mod = @import("rules/borrow/return_borrowed_payload.zig");
 const self_undefined_after_destroy_mod = @import("rules/borrow/self_undefined_after_destroy.zig");
@@ -618,6 +624,7 @@ const escape_detectors = [_]Detector{
     .{ .id = "intcast-clamp-uses-max",                   .check = intcast_clamp_uses_max_mod.check },
     .{ .id = "forced-unwrap-iterator-next",              .check = forced_unwrap_iterator_next_mod.check },
     .{ .id = "impossible-range-and",                    .check = impossible_range_and_mod.check },
+    .{ .id = "intcast-signed-timestamp",                .check = intcast_signed_timestamp_mod.check },
 };
 
 /// Dispatch all registered pattern detectors against `tree`.  `cache`
@@ -751,4 +758,5 @@ test "registry: pull in every rule module so inline tests run" {
     _ = intcast_clamp_uses_max_mod;
     _ = forced_unwrap_iterator_next_mod;
     _ = impossible_range_and_mod;
+    _ = intcast_signed_timestamp_mod;
 }
