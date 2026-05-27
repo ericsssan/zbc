@@ -1,0 +1,307 @@
+//! Detects parser/visitor/scanner functions that call themselves recursively
+//! without a stack-depth guard (`is_safe_to_recurse()` / `isSafeToRecurse()`
+//! / `isStackOverflow()`).  Deeply nested input overflows the call stack.
+//!
+//! Real-world shape: oven-sh/bun#31361 (skip_typescript_type / skip_binding
+//! without stack check), oven-sh/bun#31333 (visit_stmt / print_stmt /
+//! print_if without stack check).
+//!
+//! Detection (Tier 1, per-fn body token walk):
+//!   1. For each fn whose name contains "parse", "skip", "visit", or "scan"
+//!      (case-insensitive prefix or word-boundary match), inspect its body.
+//!   2. In the body, look for a self-recursive call:
+//!      a. Method form: `period identifier(fn_name) l_paren`
+//!      b. Bare form: `identifier(fn_name) l_paren` where the preceding token
+//!         is NOT a `period` (not a method call on another receiver).
+//!   3. Check whether the fn body contains any of the stack-guard identifiers
+//!      `is_safe_to_recurse`, `isSafeToRecurse`, `isStackOverflow`,
+//!      `safeRecurse`, or `checkStack`.
+//!   4. Suppress if the fn has a parameter named `depth` or `max_depth` — the
+//!      caller is threading a depth counter and likely guards elsewhere.
+//!   5. Fire at the recursive call site.
+
+const std = @import("std");
+const Ast = std.zig.Ast;
+
+const problem_mod = @import("../../problem.zig");
+const config_mod = @import("../../config.zig");
+const file_cache_mod = @import("../../cache/file_cache.zig");
+
+const tokens = @import("../../ast/tokens.zig");
+const testing = @import("../../testing.zig");
+
+const skipNestedFn = tokens.skipNestedFn;
+
+const Problem = problem_mod.Problem;
+const Pos = problem_mod.Pos;
+const R = "recursive-parse-fn-without-stack-check";
+
+pub fn check(
+    gpa: std.mem.Allocator,
+    tree: *const Ast,
+    cache: *file_cache_mod.FileCache,
+    config: *const config_mod.Config,
+    problems: *std.ArrayListUnmanaged(Problem),
+) !void {
+    if (!config_mod.isEnabled(config, .recursive_parse_without_stack_check)) return;
+    try tokens.forEachFnCached(gpa, tree, cache, problems, checkFn);
+}
+
+fn checkFn(
+    gpa: std.mem.Allocator,
+    tree: *const Ast,
+    _: *file_cache_mod.FileCache,
+    proto: Ast.full.FnProto,
+    body: Ast.Node.Index,
+    problems: *std.ArrayListUnmanaged(Problem),
+) !void {
+    // Step 1: get fn name.
+    const name_tok = proto.name_token orelse return;
+    const fn_name = tree.tokenSlice(name_tok);
+
+    // Step 2: fn name must match the recursive-parser heuristic.
+    if (!isRecursiveParserName(fn_name)) return;
+
+    const tags = tree.tokens.items(.tag);
+    const first = tree.firstToken(body);
+    const last = tree.lastToken(body);
+
+    // Step 3 (suppression): if any parameter is named "depth" or "max_depth",
+    // the fn is almost certainly bounded by a depth counter.
+    if (hasDepthParam(tree, proto)) return;
+
+    // Step 4: find a self-recursive call in the body.
+    const rec_tok = findRecursiveCall(tree, tags, first, last, fn_name) orelse return;
+
+    // Step 5: check for a stack guard anywhere in the body.
+    if (hasStackGuard(tags, tree, first, last)) return;
+
+    try report(gpa, problems, tree, rec_tok, fn_name);
+}
+
+/// True iff `name` looks like a recursive parser/visitor/scanner fn name.
+/// Matches names that start with (or contain a word-boundary before) one of
+/// the keywords, case-insensitive:
+///   "parse", "skip", "visit", "scan"
+fn isRecursiveParserName(name: []const u8) bool {
+    const keywords = [_][]const u8{ "parse", "skip", "visit", "scan" };
+    for (keywords) |kw| {
+        // Starts with the keyword (camelCase: parseFoo / snake_case: parse_foo).
+        if (std.ascii.startsWithIgnoreCase(name, kw)) return true;
+        // Word-boundary after underscore: "foo_parseFoo" or "foo_parse_bar".
+        var i: usize = 0;
+        while (i + kw.len <= name.len) : (i += 1) {
+            if (i > 0 and name[i - 1] == '_' and
+                std.ascii.eqlIgnoreCase(name[i .. i + kw.len], kw))
+                return true;
+        }
+    }
+    return false;
+}
+
+/// True iff the fn proto has a parameter named "depth" or "max_depth".
+fn hasDepthParam(tree: *const Ast, proto: Ast.full.FnProto) bool {
+    var iter = proto.iterate(tree);
+    while (iter.next()) |param| {
+        const name_tok = param.name_token orelse continue;
+        const name = tree.tokenSlice(name_tok);
+        if (std.mem.eql(u8, name, "depth") or
+            std.mem.eql(u8, name, "max_depth") or
+            std.mem.eql(u8, name, "nesting_depth") or
+            std.mem.eql(u8, name, "level"))
+            return true;
+    }
+    return false;
+}
+
+/// Scan `[first, last]` for a self-recursive call to `fn_name`.
+/// Returns the token index of the recursive call identifier, or null.
+///
+/// Detects:
+///   Method form: `period identifier(fn_name) l_paren`
+///   Bare form:   `identifier(fn_name) l_paren` where t-1 != period
+fn findRecursiveCall(
+    tree: *const Ast,
+    tags: []const std.zig.Token.Tag,
+    first: Ast.TokenIndex,
+    last: Ast.TokenIndex,
+    fn_name: []const u8,
+) ?Ast.TokenIndex {
+    if (first + 1 > last) return null;
+    var t: Ast.TokenIndex = first;
+    while (t + 1 <= last) : (t += 1) {
+        // Skip nested fn definitions (they can have their own recursive calls
+        // but that's a separate fn context).
+        if (tags[t] == .keyword_fn) {
+            t = skipNestedFn(tags, t, last);
+            continue;
+        }
+        if (tags[t] != .identifier) continue;
+        if (tags[t + 1] != .l_paren) continue;
+        if (!std.mem.eql(u8, tree.tokenSlice(t), fn_name)) continue;
+
+        // Method form: preceded by `.`
+        if (t > first and tags[t - 1] == .period) return t;
+
+        // Bare form: NOT preceded by `.`
+        if (t == first or tags[t - 1] != .period) return t;
+    }
+    return null;
+}
+
+/// True iff the range `[first, last]` contains a call to any of the
+/// recognised stack-depth guard functions.
+fn hasStackGuard(
+    tags: []const std.zig.Token.Tag,
+    tree: *const Ast,
+    first: Ast.TokenIndex,
+    last: Ast.TokenIndex,
+) bool {
+    if (first + 1 > last) return false;
+    var t: Ast.TokenIndex = first;
+    while (t + 1 <= last) : (t += 1) {
+        if (tags[t] == .keyword_fn) {
+            t = skipNestedFn(tags, t, last);
+            continue;
+        }
+        if (tags[t] != .identifier) continue;
+        if (tags[t + 1] != .l_paren) continue;
+        const name = tree.tokenSlice(t);
+        if (isStackGuardName(name)) return true;
+    }
+    return false;
+}
+
+fn isStackGuardName(name: []const u8) bool {
+    return std.mem.eql(u8, name, "is_safe_to_recurse") or
+        std.mem.eql(u8, name, "isSafeToRecurse") or
+        std.mem.eql(u8, name, "isStackOverflow") or
+        std.mem.eql(u8, name, "safeRecurse") or
+        std.mem.eql(u8, name, "checkStack") or
+        std.mem.eql(u8, name, "checkRecursion") or
+        std.mem.eql(u8, name, "stackOverflow");
+}
+
+fn report(
+    gpa: std.mem.Allocator,
+    problems: *std.ArrayListUnmanaged(Problem),
+    tree: *const Ast,
+    call_tok: Ast.TokenIndex,
+    fn_name: []const u8,
+) !void {
+    const msg = try std.fmt.allocPrint(
+        gpa,
+        "`{s}` calls itself recursively without a stack-depth guard — deeply nested input will overflow the call stack; add `if (!stack_check.is_safe_to_recurse()) return error.StackOverflow;` at the top of the function",
+        .{fn_name},
+    );
+    errdefer gpa.free(msg);
+    try problems.append(gpa, .{
+        .rule_id = R,
+        .severity = .@"error",
+        .start = Pos.fromTokenStart(tree, call_tok),
+        .end = Pos.fromTokenEnd(tree, call_tok),
+        .message = msg,
+    });
+}
+
+// ── Tests ──────────────────────────────────────────────────
+
+test "recursive-parse-fn-without-stack-check: bare recursive parse call fires" {
+    try testing.expectFires(check, R,
+        \\const Parser = struct {
+        \\    pub fn parseExpr(p: *Parser) !void {
+        \\        _ = try parseExpr(p);
+        \\    }
+        \\};
+        \\
+    );
+}
+
+test "recursive-parse-fn-without-stack-check: method recursive call fires" {
+    try testing.expectFires(check, R,
+        \\const Parser = struct {
+        \\    pub fn parseExpr(p: *Parser) !void {
+        \\        _ = try p.parseExpr();
+        \\    }
+        \\};
+        \\
+    );
+}
+
+test "recursive-parse-fn-without-stack-check: skip fn without guard fires" {
+    try testing.expectFires(check, R,
+        \\const Parser = struct {
+        \\    pub fn skipType(p: *Parser) void {
+        \\        p.skipType();
+        \\    }
+        \\};
+        \\
+    );
+}
+
+test "recursive-parse-fn-without-stack-check: visit fn without guard fires" {
+    try testing.expectFires(check, R,
+        \\const V = struct {
+        \\    pub fn visitNode(self: *V) void {
+        \\        self.visitNode();
+        \\    }
+        \\};
+        \\
+    );
+}
+
+test "recursive-parse-fn-without-stack-check: recursive fn with is_safe_to_recurse guard does not fire" {
+    try testing.expectNoFire(check,
+        \\const Parser = struct {
+        \\    pub fn parseExpr(p: *Parser) !void {
+        \\        if (!p.stack_check.is_safe_to_recurse()) return error.StackOverflow;
+        \\        _ = try p.parseExpr();
+        \\    }
+        \\};
+        \\
+    );
+}
+
+test "recursive-parse-fn-without-stack-check: recursive fn with depth param does not fire" {
+    try testing.expectNoFire(check,
+        \\const Parser = struct {
+        \\    pub fn parseExpr(p: *Parser, depth: u32) !void {
+        \\        _ = try p.parseExpr(depth + 1);
+        \\    }
+        \\};
+        \\
+    );
+}
+
+test "recursive-parse-fn-without-stack-check: non-recursive parse fn does not fire" {
+    try testing.expectNoFire(check,
+        \\const Parser = struct {
+        \\    pub fn parseExpr(p: *Parser) !void {
+        \\        _ = try p.parseToken();
+        \\    }
+        \\};
+        \\
+    );
+}
+
+test "recursive-parse-fn-without-stack-check: non-parser fn does not fire" {
+    try testing.expectNoFire(check,
+        \\const Allocator = struct {
+        \\    pub fn allocate(a: *Allocator) !void {
+        \\        _ = try a.allocate();
+        \\    }
+        \\};
+        \\
+    );
+}
+
+test "recursive-parse-fn-without-stack-check: scan fn without guard fires" {
+    try testing.expectFires(check, R,
+        \\const Lexer = struct {
+        \\    pub fn scanToken(l: *Lexer) void {
+        \\        l.scanToken();
+        \\    }
+        \\};
+        \\
+    );
+}

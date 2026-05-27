@@ -345,6 +345,16 @@ pub const all = [_]Rule{
         .title = "`recv.remoteField orelse recv.localField` — peer-advertised value falls back to local-config limit; verify `orelse` direction",
         .body = @embedFile("rules/misc/optional-fallback-wrong-side.md"),
     },
+    .{
+        .id = "escape-skip-without-bounds-recheck",
+        .title = "`if (buf[i] == '\\\\') { i += 1; }` followed by unconditional `i += 1` without bounds guard — OOB read when escape char is last byte",
+        .body = @embedFile("rules/misc/escape-skip-without-bounds-recheck.md"),
+    },
+    .{
+        .id = "recursive-parse-fn-without-stack-check",
+        .title = "recursive parse/skip/visit/scan fn calls itself without `is_safe_to_recurse()` guard — deep input overflows the call stack",
+        .body = @embedFile("rules/misc/recursive-parse-fn-without-stack-check.md"),
+    },
 };
 
 /// Look up a rule by id.  Returns null on unknown id so callers can
@@ -426,6 +436,8 @@ const index_type_narrowing_wraparound_mod = @import("rules/misc/index_type_narro
 const ref_counted_copy_without_dupe_mod = @import("rules/misc/ref_counted_copy_without_dupe.zig");
 const arraybuffer_slice_without_pin_mod = @import("rules/collection/arraybuffer_slice_without_pin.zig");
 const optional_fallback_wrong_side_mod = @import("rules/misc/optional_fallback_wrong_side.zig");
+const escape_skip_without_bounds_recheck_mod = @import("rules/misc/escape_skip_without_bounds_recheck.zig");
+const recursive_parse_without_stack_check_mod = @import("rules/misc/recursive_parse_without_stack_check.zig");
 const reset_skips_pooled_resource_release_mod = @import("rules/cleanup/reset_skips_pooled_resource_release.zig");
 const return_borrowed_payload_mod = @import("rules/borrow/return_borrowed_payload.zig");
 const self_undefined_after_destroy_mod = @import("rules/borrow/self_undefined_after_destroy.zig");
@@ -492,6 +504,8 @@ const escape_detectors = [_]Detector{
     .{ .id = "ref-counted-copy-without-dupe",              .check = ref_counted_copy_without_dupe_mod.check },
     .{ .id = "arraybuffer-slice-without-pin",               .check = arraybuffer_slice_without_pin_mod.check },
     .{ .id = "optional-fallback-wrong-side",                .check = optional_fallback_wrong_side_mod.check },
+    .{ .id = "escape-skip-without-bounds-recheck",          .check = escape_skip_without_bounds_recheck_mod.check },
+    .{ .id = "recursive-parse-fn-without-stack-check",      .check = recursive_parse_without_stack_check_mod.check },
 };
 
 /// Dispatch all registered pattern detectors against `tree`.  `cache`
@@ -607,4 +621,6 @@ test "registry: pull in every rule module so inline tests run" {
     _ = ref_counted_copy_without_dupe_mod;
     _ = arraybuffer_slice_without_pin_mod;
     _ = optional_fallback_wrong_side_mod;
+    _ = escape_skip_without_bounds_recheck_mod;
+    _ = recursive_parse_without_stack_check_mod;
 }

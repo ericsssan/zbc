@@ -537,9 +537,28 @@ pub const Invariant = enum {
     /// check.  The fallback should use the local limit directly.
     /// Catches oven-sh/bun#31129 class (h2_frame_parser.zig).
     optional_fallback_wrong_side,
+    /// Inside a loop, `if (buf[i] == ESCAPE_CHAR) { i += 1; }` is
+    /// immediately followed by an unconditional `i += 1;` without a
+    /// preceding bounds guard `i + 1 < buf.len`.  If the escape char
+    /// is the last byte, the skip pushes `i` to `buf.len`; the
+    /// subsequent unconditional `+= 1` or the next iteration reads
+    /// past the end.  Fix: add `i + 1 < buf.len and` before the array
+    /// access in the if condition.
+    /// Catches oven-sh/bun#31435 (fmt.zig JS syntax highlighter).
+    escape_skip_without_bounds_recheck,
+    /// A fn whose name contains "parse", "skip", "visit", or "scan"
+    /// calls itself recursively without a stack-depth guard
+    /// (`is_safe_to_recurse()` / `isSafeToRecurse()` /
+    /// `isStackOverflow()`).  Deeply nested input (e.g. thousands of
+    /// nested type expressions, statement blocks, or AST nodes) will
+    /// exhaust the call stack and crash the process.
+    /// Fix: add `if (!stack_check.is_safe_to_recurse()) return
+    /// error.StackOverflow;` at the entry of the function.
+    /// Catches oven-sh/bun#31361 / #31333 class.
+    recursive_parse_without_stack_check,
 };
 
-pub const all_invariants: [64]Invariant = .{
+pub const all_invariants: [66]Invariant = .{
     .arena_escape,
     .stack_escape,
     .use_undefined,
@@ -604,6 +623,8 @@ pub const all_invariants: [64]Invariant = .{
     .ref_counted_copy_without_dupe,
     .arraybuffer_slice_without_pin,
     .optional_fallback_wrong_side,
+    .escape_skip_without_bounds_recheck,
+    .recursive_parse_without_stack_check,
 };
 
 pub const Default: Config = .{};
