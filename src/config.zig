@@ -723,9 +723,22 @@ pub const Invariant = enum {
     /// `catch unreachable` only when the error is provably impossible.
     /// Catches oven-sh/bun#30082 (S3 URL encode with fixed 1024-byte buffer).
     catch_error_panic,
+    /// `.toUTF8(alloc).slice()` inline chain — the `LazyUTF8` temporary is
+    /// freed at statement end, leaving the returned slice dangling.
+    /// Catches oven-sh/bun#29600 (ResolveMessage UAF on referrer slice).
+    toutf8_inline_slice_borrow,
+    /// `@intCast(rc.int())` on a libuv return code — `.int()` returns `c_int`
+    /// (32-bit) but the underlying result is `ssize_t` (64-bit); truncation
+    /// causes a panic for I/O > 2 GB.
+    /// Catches oven-sh/bun#29327 (Windows readFile panic on files > 2 GB).
+    uv_return_value_intcast_truncation,
+    /// `tryGet() orelse unreachable` on a JSRef — `tryGet()` returns null for
+    /// finalized objects; `unreachable` produces SIGILL after finalization.
+    /// Catches oven-sh/bun#29210 (valkey client SIGILL after finalize).
+    tryget_orelse_unreachable,
 };
 
-pub const all_invariants: [89]Invariant = .{
+pub const all_invariants: [92]Invariant = .{
     .arena_escape,
     .stack_escape,
     .use_undefined,
@@ -815,6 +828,9 @@ pub const all_invariants: [89]Invariant = .{
     .index_minus_one_without_zero_guard,
     .else_literal_absorbs_addend,
     .catch_error_panic,
+    .toutf8_inline_slice_borrow,
+    .uv_return_value_intcast_truncation,
+    .tryget_orelse_unreachable,
 };
 
 pub const Default: Config = .{};

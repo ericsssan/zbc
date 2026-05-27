@@ -470,6 +470,21 @@ pub const all = [_]Rule{
         .title = "`catch |err| @panic(...)` — catching an error and panicking turns a recoverable error into a process crash; use `try` to propagate or `catch unreachable` if impossible",
         .body = @embedFile("rules/misc/catch-error-panic.md"),
     },
+    .{
+        .id = "toutf8-inline-slice-borrow",
+        .title = "`.toUTF8(alloc).slice()` inline chain — the temporary `LazyUTF8` is freed at statement end, leaving the returned slice dangling",
+        .body = @embedFile("rules/misc/toutf8-inline-slice-borrow.md"),
+    },
+    .{
+        .id = "uv-return-value-intcast-truncation",
+        .title = "`@intCast(rc.int())` on a libuv return code — `.int()` returns 32-bit `c_int` but the actual result is 64-bit `ssize_t`; panics for I/O transfers > 2 GB",
+        .body = @embedFile("rules/misc/uv-return-value-intcast-truncation.md"),
+    },
+    .{
+        .id = "tryget-orelse-unreachable",
+        .title = "`tryGet() orelse unreachable` — `tryGet()` returns null for finalized JSRef objects; `unreachable` becomes SIGILL after finalization",
+        .body = @embedFile("rules/misc/tryget-orelse-unreachable.md"),
+    },
 };
 
 /// Look up a rule by id.  Returns null on unknown id so callers can
@@ -576,6 +591,9 @@ const initcapacity_plain_add_overflow_mod = @import("rules/misc/initcapacity_pla
 const index_minus_one_without_zero_guard_mod = @import("rules/misc/index_minus_one_without_zero_guard.zig");
 const else_literal_absorbs_addend_mod = @import("rules/misc/else_literal_absorbs_addend.zig");
 const catch_error_panic_mod = @import("rules/misc/catch_error_panic.zig");
+const toutf8_inline_slice_borrow_mod = @import("rules/misc/toutf8_inline_slice_borrow.zig");
+const uv_return_value_intcast_truncation_mod = @import("rules/misc/uv_return_value_intcast_truncation.zig");
+const tryget_orelse_unreachable_mod = @import("rules/misc/tryget_orelse_unreachable.zig");
 const reset_skips_pooled_resource_release_mod = @import("rules/cleanup/reset_skips_pooled_resource_release.zig");
 const return_borrowed_payload_mod = @import("rules/borrow/return_borrowed_payload.zig");
 const self_undefined_after_destroy_mod = @import("rules/borrow/self_undefined_after_destroy.zig");
@@ -667,6 +685,9 @@ const escape_detectors = [_]Detector{
     .{ .id = "index-minus-one-without-zero-guard",      .check = index_minus_one_without_zero_guard_mod.check },
     .{ .id = "else-literal-absorbs-addend",             .check = else_literal_absorbs_addend_mod.check },
     .{ .id = "catch-error-panic",                       .check = catch_error_panic_mod.check },
+    .{ .id = "toutf8-inline-slice-borrow",              .check = toutf8_inline_slice_borrow_mod.check },
+    .{ .id = "uv-return-value-intcast-truncation",      .check = uv_return_value_intcast_truncation_mod.check },
+    .{ .id = "tryget-orelse-unreachable",               .check = tryget_orelse_unreachable_mod.check },
 };
 
 /// Dispatch all registered pattern detectors against `tree`.  `cache`
@@ -807,4 +828,7 @@ test "registry: pull in every rule module so inline tests run" {
     _ = index_minus_one_without_zero_guard_mod;
     _ = else_literal_absorbs_addend_mod;
     _ = catch_error_panic_mod;
+    _ = toutf8_inline_slice_borrow_mod;
+    _ = uv_return_value_intcast_truncation_mod;
+    _ = tryget_orelse_unreachable_mod;
 }
