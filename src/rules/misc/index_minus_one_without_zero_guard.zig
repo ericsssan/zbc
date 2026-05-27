@@ -9,12 +9,16 @@
 //!     optional payload could be 0; fix added `pi == 0 or` guard.
 //!   - oven-sh/bun#28487 (braces.zig): `self.items[self.current - 1]` when
 //!     `self.current` could be 0; fix added `if (self.current > 0)` guard.
+//!   - ziglang/zig#26057 (ArgIteratorWasi): `self.args[self.args.len - 1]`
+//!     panics when `self.args.len == 0`; `0 - 1` wraps to `maxInt(usize)`.
 //!
 //! Detection (Tier 1, token walk):
-//!   Pattern: `l_bracket identifier minus number_literal["1"] r_bracket`
-//!   — 5 tokens.  Fire at the `l_bracket` token.
+//!   Form A: `[ identifier - 1 ]`                          (5 tokens)
+//!   Form B: `[ identifier . identifier - 1 ]`             (7 tokens)
+//!   Form C: `[ identifier . identifier . len - 1 ]`       (9 tokens)
+//!   Fire at the `l_bracket` token.
 //!   Suppression: none at the token level — any `buf[x - 1]` without a
-//!   a statically visible guard is suspect.
+//!   statically visible guard is suspect.
 
 const std = @import("std");
 const Ast = std.zig.Ast;
@@ -99,9 +103,36 @@ fn checkBody(
             std.mem.eql(u8, tree.tokenSlice(t + 5), "1") and
             tags[t + 6] == .r_bracket)
         {
-            // Report using the field name (t+3) as the index expression.
             const idx_name = tree.tokenSlice(t + 3);
             try report(gpa, problems, tree, t, idx_name);
+            continue;
+        }
+
+        // Form C: `[ identifier . identifier . len - 1 ]`
+        //   t+0: l_bracket
+        //   t+1: identifier (recv)
+        //   t+2: period
+        //   t+3: identifier (field)
+        //   t+4: period
+        //   t+5: identifier "len"
+        //   t+6: minus
+        //   t+7: number_literal "1"
+        //   t+8: r_bracket
+        if (t + 8 <= last and
+            tags[t + 1] == .identifier and
+            tags[t + 2] == .period and
+            tags[t + 3] == .identifier and
+            tags[t + 4] == .period and
+            tags[t + 5] == .identifier and
+            std.mem.eql(u8, tree.tokenSlice(t + 5), "len") and
+            tags[t + 6] == .minus and
+            tags[t + 7] == .number_literal and
+            std.mem.eql(u8, tree.tokenSlice(t + 7), "1") and
+            tags[t + 8] == .r_bracket)
+        {
+            const idx_name = tree.tokenSlice(t + 3);
+            try reportC(gpa, problems, tree, t,
+                tree.tokenSlice(t + 1), idx_name);
             continue;
         }
     }
@@ -125,6 +156,29 @@ fn report(
         .severity = .@"error",
         .start = Pos.fromTokenStart(tree, lb_tok),
         .end = Pos.fromTokenEnd(tree, lb_tok + 4),
+        .message = msg,
+    });
+}
+
+fn reportC(
+    gpa: std.mem.Allocator,
+    problems: *std.ArrayListUnmanaged(Problem),
+    tree: *const Ast,
+    lb_tok: Ast.TokenIndex,
+    recv: []const u8,
+    field: []const u8,
+) !void {
+    const msg = try std.fmt.allocPrint(
+        gpa,
+        "`[{s}.{s}.len - 1]` — if `{s}.{s}.len` is `0`, the subtraction wraps to `maxInt(usize)`, producing an OOB panic (Debug/Safe) or silent arbitrary-memory read (ReleaseFast); add a `{s}.{s}.len > 0` guard before this expression",
+        .{ recv, field, recv, field, recv, field },
+    );
+    errdefer gpa.free(msg);
+    try problems.append(gpa, .{
+        .rule_id = R,
+        .severity = .@"error",
+        .start = Pos.fromTokenStart(tree, lb_tok),
+        .end = Pos.fromTokenEnd(tree, lb_tok + 8),
         .message = msg,
     });
 }
@@ -172,6 +226,26 @@ test "index-minus-one-without-zero-guard: plain index does not fire" {
     try testing.expectNoFire(check,
         \\fn f(items: []const u8, idx: usize) u8 {
         \\    return items[idx];
+        \\}
+        \\
+    );
+}
+
+test "index-minus-one-without-zero-guard: recv.field.len - 1 fires (Form C)" {
+    try testing.expectFires(check, R,
+        \\const Self = struct { args: []const u8 };
+        \\fn deinit(self: *Self) void {
+        \\    _ = self.args[self.args.len - 1];
+        \\}
+        \\
+    );
+}
+
+test "index-minus-one-without-zero-guard: recv.field.len - 2 does not fire" {
+    try testing.expectNoFire(check,
+        \\const Self = struct { args: []const u8 };
+        \\fn f(self: *Self) void {
+        \\    _ = self.args[self.args.len - 2];
         \\}
         \\
     );
