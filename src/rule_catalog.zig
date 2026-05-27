@@ -530,6 +530,11 @@ pub const all = [_]Rule{
         .title = "`.getEntry(key).?` — `HashMap.getEntry` returns `?Entry`; forced `.?` panics when key is absent; use `if`/`orelse` guard instead",
         .body = @embedFile("rules/collection/hashmap-getentry-forced-unwrap.md"),
     },
+    .{
+        .id = "double-optional-ptr",
+        .title = "`?*?T` — doubly-optional pointer; almost always a copy-paste error; for nullable out-params use `?*T`, for non-null pointer to optional use `*?T`",
+        .body = @embedFile("rules/misc/double-optional-ptr.md"),
+    },
 };
 
 /// Look up a rule by id.  Returns null on unknown id so callers can
@@ -648,6 +653,7 @@ const return_arraylist_items_mod = @import("rules/misc/return_arraylist_items.zi
 const lessthan_uses_leq_mod = @import("rules/misc/lessthan_uses_leq.zig");
 const duplicate_defer_free_mod = @import("rules/misc/duplicate_defer_free.zig");
 const hashmap_getentry_forced_unwrap_mod = @import("rules/collection/hashmap_getentry_forced_unwrap.zig");
+const double_optional_ptr_mod = @import("rules/misc/double_optional_ptr.zig");
 const reset_skips_pooled_resource_release_mod = @import("rules/cleanup/reset_skips_pooled_resource_release.zig");
 const return_borrowed_payload_mod = @import("rules/borrow/return_borrowed_payload.zig");
 const self_undefined_after_destroy_mod = @import("rules/borrow/self_undefined_after_destroy.zig");
@@ -751,6 +757,7 @@ const escape_detectors = [_]Detector{
     .{ .id = "lessthan-uses-leq",                       .check = lessthan_uses_leq_mod.check },
     .{ .id = "duplicate-defer-free",                    .check = duplicate_defer_free_mod.check },
     .{ .id = "hashmap-getentry-forced-unwrap",          .check = hashmap_getentry_forced_unwrap_mod.check },
+    .{ .id = "double-optional-ptr",                    .check = double_optional_ptr_mod.check },
 };
 
 /// Dispatch all registered pattern detectors against `tree`.  `cache`
@@ -903,4 +910,5 @@ test "registry: pull in every rule module so inline tests run" {
     _ = lessthan_uses_leq_mod;
     _ = duplicate_defer_free_mod;
     _ = hashmap_getentry_forced_unwrap_mod;
+    _ = double_optional_ptr_mod;
 }

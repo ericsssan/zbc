@@ -783,9 +783,14 @@ pub const Invariant = enum {
     /// `if (map.getEntry(key)) |e| { … }` or `orelse return`.
     /// Catches oven-sh/bun#14606 (H2 stream forced-unwrap after callback dispatch).
     hashmap_getentry_forced_unwrap,
+    /// `?*?T` — doubly-optional pointer type; almost always a copy-paste error
+    /// where one `?` was duplicated.  The correct form for a nullable out-param
+    /// is `?*T`; for a non-null pointer to an optional it is `*?T`.
+    /// Catches oven-sh/bun#13955 (NAPI out-param corrupted caller stack).
+    double_optional_ptr,
 };
 
-pub const all_invariants: [101]Invariant = .{
+pub const all_invariants: [102]Invariant = .{
     .arena_escape,
     .stack_escape,
     .use_undefined,
@@ -887,6 +892,7 @@ pub const all_invariants: [101]Invariant = .{
     .lessthan_uses_leq,
     .duplicate_defer_free,
     .hashmap_getentry_forced_unwrap,
+    .double_optional_ptr,
 };
 
 pub const Default: Config = .{};
