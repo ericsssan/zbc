@@ -565,9 +565,17 @@ pub const Invariant = enum {
     /// `if (buf.len < N) return error.TruncatedInput;` before the slice.
     /// Catches oven-sh/bun#31227 / #31264 class.
     slice_from_fixed_offset_without_len_check,
+    /// `-value << N` where `value` is a signed integer variable and no
+    /// `std.math.minInt` guard appears in the fn body.  When
+    /// `value == minInt`, negation overflows in two's complement (wraps
+    /// back to `minInt`); the subsequent left shift produces wrong output
+    /// or undefined behaviour in ReleaseFast.  Fix: use `@bitCast` /
+    /// `@as(u32, @intCast(value))` or add an explicit minInt check.
+    /// Catches oven-sh/bun#10782 (sourcemap.zig encodeVLQ overflow).
+    negate_then_shift_without_minint_check,
 };
 
-pub const all_invariants: [67]Invariant = .{
+pub const all_invariants: [68]Invariant = .{
     .arena_escape,
     .stack_escape,
     .use_undefined,
@@ -635,6 +643,7 @@ pub const all_invariants: [67]Invariant = .{
     .escape_skip_without_bounds_recheck,
     .recursive_parse_without_stack_check,
     .slice_from_fixed_offset_without_len_check,
+    .negate_then_shift_without_minint_check,
 };
 
 pub const Default: Config = .{};
