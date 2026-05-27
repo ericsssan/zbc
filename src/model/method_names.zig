@@ -144,6 +144,94 @@ pub fn isContainerStoreMethodName(name: []const u8) bool {
 }
 
 
+/// Methods in JSC (JavaScriptCore) that dispatch into user JavaScript
+/// code or otherwise trigger GC.  A raw byte slice taken from a
+/// JSC-managed ArrayBuffer or JSString that is live across one of
+/// these calls may be dangling — the GC may have moved or freed the
+/// backing buffer.
+pub fn isGcTriggerMethodName(name: []const u8) bool {
+    return std.mem.eql(u8, name, "call") or
+        std.mem.eql(u8, name, "callAsFunction") or
+        std.mem.eql(u8, name, "callAsConstructor") or
+        std.mem.eql(u8, name, "callFunction") or
+        std.mem.eql(u8, name, "evaluate") or
+        std.mem.eql(u8, name, "evaluateExpression") or
+        std.mem.eql(u8, name, "runMicrotasks") or
+        std.mem.eql(u8, name, "dispatch") or
+        std.mem.eql(u8, name, "invoke") or
+        std.mem.eql(u8, name, "handleEvent") or
+        std.mem.eql(u8, name, "collectGarbage") or
+        std.mem.eql(u8, name, "runGC") or
+        std.mem.eql(u8, name, "triggerGC");
+}
+
+/// Names used to acquire an additional reference on a refcounted
+/// object.  A shallow copy of a struct containing a field of a
+/// refcounted type — without first calling one of these — creates an
+/// unbalanced decrement on drop.
+pub fn isRefAcquireName(name: []const u8) bool {
+    return std.mem.eql(u8, name, "ref") or
+        std.mem.eql(u8, name, "retain") or
+        std.mem.eql(u8, name, "addRef") or
+        std.mem.eql(u8, name, "dupeRef") or
+        std.mem.eql(u8, name, "clone") or
+        std.mem.eql(u8, name, "copy") or
+        std.mem.eql(u8, name, "strongRef") or
+        std.mem.eql(u8, name, "reference") or
+        std.mem.eql(u8, name, "acquireRef") or
+        std.mem.eql(u8, name, "incRef");
+}
+
+/// Bare function names used to register a callback that may run on
+/// any thread (at-exit handlers, signal handlers, cross-thread task
+/// queues).  A function registered via one of these may be called
+/// concurrently with main-thread data structures.
+pub fn isExitCallbackRegisterName(name: []const u8) bool {
+    return std.mem.eql(u8, name, "add_exit_callback") or
+        std.mem.eql(u8, name, "addExitCallback") or
+        std.mem.eql(u8, name, "onExit") or
+        std.mem.eql(u8, name, "atexit") or
+        std.mem.eql(u8, name, "addAtExit") or
+        std.mem.eql(u8, name, "registerAtExit") or
+        std.mem.eql(u8, name, "onSignal") or
+        std.mem.eql(u8, name, "addSignalHandler");
+}
+
+/// Method names that push a new scope/frame/context onto a stack.
+/// Must be balanced with a corresponding pop/exit call on all exit
+/// paths — ideally via `defer`.
+pub fn isScopePushMethodName(name: []const u8) bool {
+    return std.mem.eql(u8, name, "pushScope") or
+        std.mem.eql(u8, name, "push_scope") or
+        std.mem.eql(u8, name, "enterScope") or
+        std.mem.eql(u8, name, "enter_scope") or
+        std.mem.eql(u8, name, "pushContext") or
+        std.mem.eql(u8, name, "enterContext") or
+        std.mem.eql(u8, name, "pushFrame") or
+        std.mem.eql(u8, name, "beginScope") or
+        std.mem.eql(u8, name, "openScope") or
+        std.mem.eql(u8, name, "pushNamespace") or
+        std.mem.eql(u8, name, "enterNamespace");
+}
+
+/// Counterparts to isScopePushMethodName.  Must appear on every exit
+/// path of a function that called a push method — or under a `defer`
+/// that fires unconditionally.
+pub fn isScopePopMethodName(name: []const u8) bool {
+    return std.mem.eql(u8, name, "popScope") or
+        std.mem.eql(u8, name, "pop_scope") or
+        std.mem.eql(u8, name, "exitScope") or
+        std.mem.eql(u8, name, "exit_scope") or
+        std.mem.eql(u8, name, "popContext") or
+        std.mem.eql(u8, name, "exitContext") or
+        std.mem.eql(u8, name, "popFrame") or
+        std.mem.eql(u8, name, "endScope") or
+        std.mem.eql(u8, name, "closeScope") or
+        std.mem.eql(u8, name, "popNamespace") or
+        std.mem.eql(u8, name, "exitNamespace");
+}
+
+
 // ── Tests ──────────────────────────────────────────────────
 
 test "isAllocatorishName" {
@@ -188,4 +276,92 @@ test "method classifiers don't overlap incorrectly" {
     try t.expect(!isAcquireMethodName("ref")); // too generic
     try t.expect(isReleaseMethodName("release"));
     try t.expect(isReleaseMethodName("pendingActivityUnref"));
+}
+
+test "isGcTriggerMethodName" {
+    const t = std.testing;
+    try t.expect(isGcTriggerMethodName("call"));
+    try t.expect(isGcTriggerMethodName("callAsFunction"));
+    try t.expect(isGcTriggerMethodName("callAsConstructor"));
+    try t.expect(isGcTriggerMethodName("callFunction"));
+    try t.expect(isGcTriggerMethodName("evaluate"));
+    try t.expect(isGcTriggerMethodName("evaluateExpression"));
+    try t.expect(isGcTriggerMethodName("runMicrotasks"));
+    try t.expect(isGcTriggerMethodName("dispatch"));
+    try t.expect(isGcTriggerMethodName("invoke"));
+    try t.expect(isGcTriggerMethodName("handleEvent"));
+    try t.expect(isGcTriggerMethodName("collectGarbage"));
+    try t.expect(isGcTriggerMethodName("runGC"));
+    try t.expect(isGcTriggerMethodName("triggerGC"));
+    try t.expect(!isGcTriggerMethodName("append"));
+    try t.expect(!isGcTriggerMethodName("deinit"));
+    try t.expect(!isGcTriggerMethodName("totally_made_up"));
+}
+
+test "isRefAcquireName" {
+    const t = std.testing;
+    try t.expect(isRefAcquireName("ref"));
+    try t.expect(isRefAcquireName("retain"));
+    try t.expect(isRefAcquireName("addRef"));
+    try t.expect(isRefAcquireName("dupeRef"));
+    try t.expect(isRefAcquireName("clone"));
+    try t.expect(isRefAcquireName("copy"));
+    try t.expect(isRefAcquireName("strongRef"));
+    try t.expect(isRefAcquireName("reference"));
+    try t.expect(isRefAcquireName("acquireRef"));
+    try t.expect(isRefAcquireName("incRef"));
+    try t.expect(!isRefAcquireName("release"));
+    try t.expect(!isRefAcquireName("unref"));
+    try t.expect(!isRefAcquireName("totally_made_up"));
+}
+
+test "isExitCallbackRegisterName" {
+    const t = std.testing;
+    try t.expect(isExitCallbackRegisterName("add_exit_callback"));
+    try t.expect(isExitCallbackRegisterName("addExitCallback"));
+    try t.expect(isExitCallbackRegisterName("onExit"));
+    try t.expect(isExitCallbackRegisterName("atexit"));
+    try t.expect(isExitCallbackRegisterName("addAtExit"));
+    try t.expect(isExitCallbackRegisterName("registerAtExit"));
+    try t.expect(isExitCallbackRegisterName("onSignal"));
+    try t.expect(isExitCallbackRegisterName("addSignalHandler"));
+    try t.expect(!isExitCallbackRegisterName("append"));
+    try t.expect(!isExitCallbackRegisterName("deinit"));
+    try t.expect(!isExitCallbackRegisterName("totally_made_up"));
+}
+
+test "isScopePushMethodName" {
+    const t = std.testing;
+    try t.expect(isScopePushMethodName("pushScope"));
+    try t.expect(isScopePushMethodName("push_scope"));
+    try t.expect(isScopePushMethodName("enterScope"));
+    try t.expect(isScopePushMethodName("enter_scope"));
+    try t.expect(isScopePushMethodName("pushContext"));
+    try t.expect(isScopePushMethodName("enterContext"));
+    try t.expect(isScopePushMethodName("pushFrame"));
+    try t.expect(isScopePushMethodName("beginScope"));
+    try t.expect(isScopePushMethodName("openScope"));
+    try t.expect(isScopePushMethodName("pushNamespace"));
+    try t.expect(isScopePushMethodName("enterNamespace"));
+    try t.expect(!isScopePushMethodName("popScope"));
+    try t.expect(!isScopePushMethodName("exitScope"));
+    try t.expect(!isScopePushMethodName("totally_made_up"));
+}
+
+test "isScopePopMethodName" {
+    const t = std.testing;
+    try t.expect(isScopePopMethodName("popScope"));
+    try t.expect(isScopePopMethodName("pop_scope"));
+    try t.expect(isScopePopMethodName("exitScope"));
+    try t.expect(isScopePopMethodName("exit_scope"));
+    try t.expect(isScopePopMethodName("popContext"));
+    try t.expect(isScopePopMethodName("exitContext"));
+    try t.expect(isScopePopMethodName("popFrame"));
+    try t.expect(isScopePopMethodName("endScope"));
+    try t.expect(isScopePopMethodName("closeScope"));
+    try t.expect(isScopePopMethodName("popNamespace"));
+    try t.expect(isScopePopMethodName("exitNamespace"));
+    try t.expect(!isScopePopMethodName("pushScope"));
+    try t.expect(!isScopePopMethodName("enterScope"));
+    try t.expect(!isScopePopMethodName("totally_made_up"));
 }

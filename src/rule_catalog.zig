@@ -315,6 +315,36 @@ pub const all = [_]Rule{
         .title = "function call inside `for (<recv>.items)` loop may grow the collection — backing buffer reallocated mid-iteration",
         .body = @embedFile("rules/collection/slice-loop-reentrant-grow.md"),
     },
+    .{
+        .id = "scope-push-pop-imbalance",
+        .title = "`pushScope`/`enterScope`/etc. without `defer popScope` — early returns leave scope stack unbalanced",
+        .body = @embedFile("rules/misc/scope-push-pop-imbalance.md"),
+    },
+    .{
+        .id = "exit-callback-cross-thread",
+        .title = "at-exit callback accesses `self.` fields without `is_main_thread()` guard — races when exit fires from a worker thread",
+        .body = @embedFile("rules/misc/exit-callback-cross-thread.md"),
+    },
+    .{
+        .id = "index-type-narrowing-wraparound",
+        .title = "`var NAME: iN = …len…` — narrow signed index wraps when collection exceeds type max; loop never executes or runs backward",
+        .body = @embedFile("rules/misc/index-type-narrowing-wraparound.md"),
+    },
+    .{
+        .id = "ref-counted-copy-without-dupe",
+        .title = "`.field = recv.field` copies refcounted/owned field without `clone()`/`dupeRef()` — both sides decrement on drop → double-free / SIGFPE",
+        .body = @embedFile("rules/misc/ref-counted-copy-without-dupe.md"),
+    },
+    .{
+        .id = "arraybuffer-slice-without-pin",
+        .title = "raw slice from JSC-managed buffer live across GC-trigger call — backing buffer may be moved or freed",
+        .body = @embedFile("rules/collection/arraybuffer-slice-without-pin.md"),
+    },
+    .{
+        .id = "optional-fallback-wrong-side",
+        .title = "`recv.remoteField orelse recv.localField` — peer-advertised value falls back to local-config limit; verify `orelse` direction",
+        .body = @embedFile("rules/misc/optional-fallback-wrong-side.md"),
+    },
 };
 
 /// Look up a rule by id.  Returns null on unknown id so callers can
@@ -390,6 +420,12 @@ const tagged_union_payload_early_exit_mod = @import("rules/misc/tagged_union_pay
 const union_payload_ptr_after_variant_change_mod = @import("rules/misc/union_payload_ptr_after_variant_change.zig");
 const flag_reset_after_callback_mod = @import("rules/misc/flag_reset_after_callback.zig");
 const slice_loop_reentrant_grow_mod = @import("rules/collection/slice_loop_reentrant_grow.zig");
+const scope_push_pop_imbalance_mod = @import("rules/misc/scope_push_pop_imbalance.zig");
+const exit_callback_cross_thread_mod = @import("rules/misc/exit_callback_cross_thread.zig");
+const index_type_narrowing_wraparound_mod = @import("rules/misc/index_type_narrowing_wraparound.zig");
+const ref_counted_copy_without_dupe_mod = @import("rules/misc/ref_counted_copy_without_dupe.zig");
+const arraybuffer_slice_without_pin_mod = @import("rules/collection/arraybuffer_slice_without_pin.zig");
+const optional_fallback_wrong_side_mod = @import("rules/misc/optional_fallback_wrong_side.zig");
 const reset_skips_pooled_resource_release_mod = @import("rules/cleanup/reset_skips_pooled_resource_release.zig");
 const return_borrowed_payload_mod = @import("rules/borrow/return_borrowed_payload.zig");
 const self_undefined_after_destroy_mod = @import("rules/borrow/self_undefined_after_destroy.zig");
@@ -450,6 +486,12 @@ const escape_detectors = [_]Detector{
     .{ .id = "union-payload-ptr-after-variant-change",     .check = union_payload_ptr_after_variant_change_mod.check },
     .{ .id = "flag-reset-after-callback",                  .check = flag_reset_after_callback_mod.check },
     .{ .id = "slice-loop-reentrant-grow",                  .check = slice_loop_reentrant_grow_mod.check },
+    .{ .id = "scope-push-pop-imbalance",                   .check = scope_push_pop_imbalance_mod.check },
+    .{ .id = "exit-callback-cross-thread",                 .check = exit_callback_cross_thread_mod.check },
+    .{ .id = "index-type-narrowing-wraparound",            .check = index_type_narrowing_wraparound_mod.check },
+    .{ .id = "ref-counted-copy-without-dupe",              .check = ref_counted_copy_without_dupe_mod.check },
+    .{ .id = "arraybuffer-slice-without-pin",               .check = arraybuffer_slice_without_pin_mod.check },
+    .{ .id = "optional-fallback-wrong-side",                .check = optional_fallback_wrong_side_mod.check },
 };
 
 /// Dispatch all registered pattern detectors against `tree`.  `cache`
@@ -559,4 +601,10 @@ test "registry: pull in every rule module so inline tests run" {
     _ = union_payload_ptr_after_variant_change_mod;
     _ = flag_reset_after_callback_mod;
     _ = slice_loop_reentrant_grow_mod;
+    _ = scope_push_pop_imbalance_mod;
+    _ = exit_callback_cross_thread_mod;
+    _ = index_type_narrowing_wraparound_mod;
+    _ = ref_counted_copy_without_dupe_mod;
+    _ = arraybuffer_slice_without_pin_mod;
+    _ = optional_fallback_wrong_side_mod;
 }

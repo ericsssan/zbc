@@ -490,9 +490,56 @@ pub const Invariant = enum {
     /// implicit slice pointer is invalidated by the reallocation.
     /// oven-sh/bun#29981, #29483.
     slice_loop_reentrant_grow,
+    /// `<recv>.pushScope(…)` (or enterScope/pushContext/etc.) without
+    /// a matching `defer <recv>.popScope()` (or similar pop method),
+    /// when the fn body has at least one early `return`.  Early returns
+    /// exit without popping, leaving the scope stack one level too deep
+    /// and causing underflows on subsequent calls.  Catches
+    /// oven-sh/bun#31239 / #31340 / #31231 class.
+    scope_push_pop_imbalance,
+    /// A function registered as an at-exit or cross-thread callback
+    /// (via add_exit_callback / addExitCallback / onExit / atexit /
+    /// etc.) accesses mutable state via `self.` field accesses without
+    /// a `is_main_thread()` / `isMainThread()` / `isCLIThread()` guard.
+    /// When process exit is triggered from a worker thread, the callback
+    /// runs there and races with main-thread teardown.
+    /// Catches oven-sh/bun#31376 class.
+    exit_callback_cross_thread,
+    /// `var NAME: iN = EXPR` where N ∈ {8, 16, 32} (a narrow signed
+    /// integer) and EXPR contains `.len`, OR NAME is subsequently used
+    /// as an array subscript `[NAME`.  When the collection has more
+    /// items than iN can represent, the index wraps — the loop never
+    /// executes or runs in reverse.  Catches oven-sh/bun#31129
+    /// (url_path reverse scan) and oven-sh/bun#31339 (SQL result) class.
+    index_type_narrowing_wraparound,
+    /// `.field = recv.field` inside a struct literal where the field
+    /// name suggests a refcounted / heap-owned type (`name`, `str`,
+    /// `string`, `ref`, `handle`, `buf`, `data`, `content`) and no
+    /// ref-acquire method (`clone()` / `dupeRef()` / `ref()` / etc.)
+    /// is called on `recv.field` in the surrounding tokens.  Both the
+    /// source and the copy will call the destructor on the same
+    /// allocation → double-decrement → SIGFPE or UAF.  Catches
+    /// oven-sh/bun#30955 (Blob.name SIGFPE), oven-sh/bun#30991 (WTF
+    /// string ref), oven-sh/bun#30882 (specifier dupe_ref) class.
+    ref_counted_copy_without_dupe,
+    /// `const bytes = buf.slice();` (or `.utf8()`, `.latin1()`,
+    /// `.utf16()`, etc.) takes a raw pointer into a JSC-managed
+    /// buffer.  A subsequent call that enters the JS engine (e.g.
+    /// `vm.call(...)`, `vm.evaluate(...)`) may trigger GC, which can
+    /// move or free the backing buffer.  Bytes now dangles.  Fix:
+    /// call `.pin(globalObject)` before taking the slice and
+    /// `.unpin()` after.  Catches oven-sh/bun#31339 class.
+    arraybuffer_slice_without_pin,
+    /// `self.remoteSettings orelse self.localSettings` uses the wrong
+    /// fallback direction — the left-hand field is likely a peer-
+    /// advertised value; when absent (null), the code falls back to
+    /// the locally-configured limit, silently relaxing a security
+    /// check.  The fallback should use the local limit directly.
+    /// Catches oven-sh/bun#31129 class (h2_frame_parser.zig).
+    optional_fallback_wrong_side,
 };
 
-pub const all_invariants: [58]Invariant = .{
+pub const all_invariants: [64]Invariant = .{
     .arena_escape,
     .stack_escape,
     .use_undefined,
@@ -551,6 +598,12 @@ pub const all_invariants: [58]Invariant = .{
     .union_payload_ptr_after_variant_change,
     .flag_reset_after_callback,
     .slice_loop_reentrant_grow,
+    .scope_push_pop_imbalance,
+    .exit_callback_cross_thread,
+    .index_type_narrowing_wraparound,
+    .ref_counted_copy_without_dupe,
+    .arraybuffer_slice_without_pin,
+    .optional_fallback_wrong_side,
 };
 
 pub const Default: Config = .{};

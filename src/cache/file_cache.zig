@@ -384,6 +384,40 @@ pub const FileCache = struct {
             }
             if (!changed) break;
         }
+
+        // Phase 6: propagate `may_invoke_gc` transitively within the file.
+        // If fn A calls fn B (bare call, not method) and B may_invoke_gc,
+        // A also may_invoke_gc.  Direct detection is done in `inferFromBody`.
+        iters = 0;
+        while (iters < 16) : (iters += 1) {
+            var changed = false;
+            for (model.fns) |fi| {
+                if (try self.propagateMayInvokeGcOne(fi.fn_decl)) changed = true;
+            }
+            for (model.types) |ti| {
+                for (ti.methods) |m| {
+                    if (try self.propagateMayInvokeGcOne(m.fn_decl)) changed = true;
+                }
+            }
+            if (!changed) break;
+        }
+
+        // Phase 7: propagate `may_run_on_any_thread` transitively.
+        // A fn that calls a fn registered as an exit/signal callback is also
+        // considered to may_run_on_any_thread (it may be called transitively).
+        iters = 0;
+        while (iters < 16) : (iters += 1) {
+            var changed = false;
+            for (model.fns) |fi| {
+                if (try self.propagateMayRunOnAnyThreadOne(fi.fn_decl)) changed = true;
+            }
+            for (model.types) |ti| {
+                for (ti.methods) |m| {
+                    if (try self.propagateMayRunOnAnyThreadOne(m.fn_decl)) changed = true;
+                }
+            }
+            if (!changed) break;
+        }
     }
 
     /// Propagate `may_grow_collections` from same-file bare-call callees.
@@ -414,6 +448,78 @@ pub const FileCache = struct {
                     const key = @intFromEnum(body);
                     if (self.summaries.getPtr(key)) |entry| {
                         entry.may_grow_collections = true;
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    /// Propagate `may_invoke_gc` from same-file bare-call callees.
+    /// Returns true iff this call updated the fn's flag.
+    fn propagateMayInvokeGcOne(self: *FileCache, fn_decl: Ast.Node.Index) !bool {
+        const s_ptr = try self.summaryOfFn(fn_decl);
+        if (s_ptr.may_invoke_gc) return false;
+
+        const tree = self.tree;
+        const tags = tree.tokens.items(.tag);
+        const body = tokens.bodyOf(tree, fn_decl) orelse return false;
+        const first = tree.firstToken(body);
+        const last = tree.lastToken(body);
+
+        var t = first;
+        while (t + 1 <= last) : (t += 1) {
+            if (tags[t] == .keyword_fn) {
+                t = tokens.skipNestedFn(tags, t, last);
+                continue;
+            }
+            if (tags[t] != .identifier) continue;
+            if (tags[t + 1] != .l_paren) continue;
+            if (t > first and tags[t - 1] == .period) continue;
+
+            const callee_name = tree.tokenSlice(t);
+            if (try self.summaryByName(callee_name)) |cs| {
+                if (cs.may_invoke_gc) {
+                    const key = @intFromEnum(body);
+                    if (self.summaries.getPtr(key)) |entry| {
+                        entry.may_invoke_gc = true;
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    /// Propagate `may_run_on_any_thread` from same-file bare-call callees.
+    /// Returns true iff this call updated the fn's flag.
+    fn propagateMayRunOnAnyThreadOne(self: *FileCache, fn_decl: Ast.Node.Index) !bool {
+        const s_ptr = try self.summaryOfFn(fn_decl);
+        if (s_ptr.may_run_on_any_thread) return false;
+
+        const tree = self.tree;
+        const tags = tree.tokens.items(.tag);
+        const body = tokens.bodyOf(tree, fn_decl) orelse return false;
+        const first = tree.firstToken(body);
+        const last = tree.lastToken(body);
+
+        var t = first;
+        while (t + 1 <= last) : (t += 1) {
+            if (tags[t] == .keyword_fn) {
+                t = tokens.skipNestedFn(tags, t, last);
+                continue;
+            }
+            if (tags[t] != .identifier) continue;
+            if (tags[t + 1] != .l_paren) continue;
+            if (t > first and tags[t - 1] == .period) continue;
+
+            const callee_name = tree.tokenSlice(t);
+            if (try self.summaryByName(callee_name)) |cs| {
+                if (cs.may_run_on_any_thread) {
+                    const key = @intFromEnum(body);
+                    if (self.summaries.getPtr(key)) |entry| {
+                        entry.may_run_on_any_thread = true;
                         return true;
                     }
                 }

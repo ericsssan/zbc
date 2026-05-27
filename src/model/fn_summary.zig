@@ -110,6 +110,21 @@ pub const FnSummary = struct {
     /// `FileCache.resolveTransitiveTakes` Phase 5.
     /// Consumed by `slice-loop-reentrant-grow`.
     may_grow_collections: bool = false,
+    /// True iff this fn (or any callee it reaches transitively within the
+    /// same file) calls a JSC method that may trigger garbage collection,
+    /// making raw slice/pointer borrows from ArrayBuffers or JSStrings
+    /// potentially invalid after the call returns.
+    /// Set by direct body scan in `inferFromBody`; propagated transitively
+    /// by `FileCache.resolveTransitiveTakes` Phase 6.
+    /// Consumed by `arraybuffer-slice-without-pin`.
+    may_invoke_gc: bool = false,
+    /// True iff this fn is registered (or transitively reachable from a
+    /// function registered) as an at-exit callback, signal handler, or
+    /// cross-thread task — meaning it may run on a non-main thread.
+    /// Set by direct body scan (detects registration-site bare calls);
+    /// propagated transitively by Phase 7.
+    /// Consumed by `exit-callback-cross-thread`.
+    may_run_on_any_thread: bool = false,
     /// Internal flag: true iff FileCache.summaryOfFn has fully
     /// populated this entry (cheap + deep inference).  Distinct
     /// from "no fields detected" — without this flag, fns with
@@ -166,6 +181,24 @@ pub fn inferFromBody(
         const method = tree.tokenSlice(t + 1);
         if (receiver_mod.isAllocMethodName(method)) out.allocates = true;
         if (receiver_mod.isArrayListGrowMethodName(method)) out.may_grow_collections = true;
+        if (receiver_mod.isGcTriggerMethodName(method)) out.may_invoke_gc = true;
+    }
+
+    // Second pass: detect bare exit-callback-register calls:
+    // `add_exit_callback(fn_ptr)` — a top-level (non-method) bare call.
+    t = first;
+    while (t + 1 <= last) : (t += 1) {
+        if (tags[t] == .keyword_fn) {
+            t = tokens.skipNestedFn(tags, t, last);
+            continue;
+        }
+        if (tags[t] != .identifier) continue;
+        if (tags[t + 1] != .l_paren) continue;
+        if (t > first and tags[t - 1] == .period) continue;
+        if (receiver_mod.isExitCallbackRegisterName(tree.tokenSlice(t))) {
+            out.may_run_on_any_thread = true;
+            break;
+        }
     }
 
     // ── returns: scan the FIRST `return <expr>` shape ──────────

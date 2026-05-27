@@ -176,6 +176,45 @@ pub const ZlsResolver = struct {
             else => false,
         };
     }
+
+    /// Returns true iff `node`'s type is an optional (`?T`) at the
+    /// outermost level (before any unwrapping).  Used to detect
+    /// `self.remoteField orelse self.localField` when `remoteField`
+    /// is `?T` — potential wrong-pole fallback pattern.
+    pub fn isOptionalType(self: *ZlsResolver, node: Ast.Node.Index) !bool {
+        const ty_maybe = try self.analyser.resolveTypeOfNode(.of(node, self.handle));
+        const ty = ty_maybe orelse return false;
+        return switch (ty.data) {
+            .optional => true,
+            // When the child type is a primitive (e.g. `?u32`), ZLS stores
+            // `?T` as an InternPool `optional_type` entry rather than the
+            // `.optional` union variant.  Inspect the IP type tag directly.
+            .ip_index => |payload| switch (self.ip.indexToKey(payload.type)) {
+                .optional_type => true,
+                else => false,
+            },
+            else => false,
+        };
+    }
+
+    /// Returns true iff `node`'s type is a single-item pointer (`*T` or
+    /// `*const T`) at the outermost level — i.e. not a slice (`[]T`) or
+    /// many-item pointer (`[*]T`).  Used to detect raw-pointer fields
+    /// that lack drop glue and require manual lifetime management.
+    pub fn isRawSinglePointerType(self: *ZlsResolver, node: Ast.Node.Index) !bool {
+        const ty_maybe = try self.analyser.resolveTypeOfNode(.of(node, self.handle));
+        const ty = ty_maybe orelse return false;
+        return switch (ty.data) {
+            .pointer => |info| info.size == .one,
+            // When the pointee type is a primitive (e.g. `*u32`), ZLS
+            // stores the pointer as an InternPool `pointer_type` entry.
+            .ip_index => |payload| switch (self.ip.indexToKey(payload.type)) {
+                .pointer_type => |info| info.flags.size == .one,
+                else => false,
+            },
+            else => false,
+        };
+    }
 };
 
 /// Best-effort container-name extraction.  ZLS represents containers
@@ -411,5 +450,116 @@ test "ZlsResolver.resolvedTypeIsPointer: pointer-returning factory fn" {
     const cn = call_node orelse return error.CallNodeNotFound;
     const is_ptr = try resolver.resolvedTypeIsPointer(cn);
     try std.testing.expect(is_ptr);
+}
+
+test "ZlsResolver.isOptionalType: optional-returning fn returns true, plain u32-returning fn returns false" {
+    const gpa = std.testing.allocator;
+    const tio = std.testing.io;
+
+    // Two factory functions: one returning ?u32, one returning u32.
+    // We resolve the type of their call-expression nodes to check
+    // isOptionalType — mirroring the resolvedTypeIsPointer test style.
+    const src: [:0]const u8 =
+        \\fn makeOptional() ?u32 {
+        \\    return null;
+        \\}
+        \\
+        \\fn makePlain() u32 {
+        \\    return 0;
+        \\}
+        \\
+        \\pub fn foo() void {
+        \\    const a = makeOptional();
+        \\    _ = a;
+        \\    const b = makePlain();
+        \\    _ = b;
+        \\}
+    ;
+
+    var resolver: ZlsResolver = undefined;
+    try resolver.init(gpa, tio, "/tmp/zls_resolver_test_opt.zig", src);
+    defer resolver.deinit();
+
+    const tree = resolver.handle.tree;
+
+    // Find call nodes for makeOptional() and makePlain().
+    var opt_call: ?Ast.Node.Index = null;
+    var plain_call: ?Ast.Node.Index = null;
+    var node_idx: u32 = 1;
+    while (node_idx < tree.nodes.len) : (node_idx += 1) {
+        const n: Ast.Node.Index = @enumFromInt(node_idx);
+        switch (tree.nodeTag(n)) {
+            .call, .call_comma, .call_one, .call_one_comma => {
+                const first_tok = tree.firstToken(n);
+                const slice = tree.tokenSlice(first_tok);
+                if (std.mem.eql(u8, slice, "makeOptional") and opt_call == null)
+                    opt_call = n;
+                if (std.mem.eql(u8, slice, "makePlain") and plain_call == null)
+                    plain_call = n;
+            },
+            else => {},
+        }
+    }
+
+    const on = opt_call orelse return error.OptCallNotFound;
+    const pn = plain_call orelse return error.PlainCallNotFound;
+
+    try std.testing.expect(try resolver.isOptionalType(on));
+    try std.testing.expect(!(try resolver.isOptionalType(pn)));
+}
+
+test "ZlsResolver.isRawSinglePointerType: *Widget returns true, []u8 returns false" {
+    const gpa = std.testing.allocator;
+    const tio = std.testing.io;
+
+    const src: [:0]const u8 =
+        \\const Widget = struct { x: u32 = 0 };
+        \\
+        \\fn makeWidget() *Widget {
+        \\    return undefined;
+        \\}
+        \\
+        \\fn makeSlice() []u8 {
+        \\    return undefined;
+        \\}
+        \\
+        \\pub fn foo() void {
+        \\    const w = makeWidget();
+        \\    _ = w;
+        \\    const s = makeSlice();
+        \\    _ = s;
+        \\}
+    ;
+
+    var resolver: ZlsResolver = undefined;
+    try resolver.init(gpa, tio, "/tmp/zls_resolver_test_rawptr.zig", src);
+    defer resolver.deinit();
+
+    const tree = resolver.handle.tree;
+
+    // Locate call nodes for makeWidget() and makeSlice().
+    var widget_call: ?Ast.Node.Index = null;
+    var slice_call: ?Ast.Node.Index = null;
+    var node_idx: u32 = 1;
+    while (node_idx < tree.nodes.len) : (node_idx += 1) {
+        const n: Ast.Node.Index = @enumFromInt(node_idx);
+        switch (tree.nodeTag(n)) {
+            .call, .call_comma, .call_one, .call_one_comma => {
+                const first_tok = tree.firstToken(n);
+                const slice = tree.tokenSlice(first_tok);
+                if (std.mem.eql(u8, slice, "makeWidget") and widget_call == null)
+                    widget_call = n;
+                if (std.mem.eql(u8, slice, "makeSlice") and slice_call == null)
+                    slice_call = n;
+            },
+            else => {},
+        }
+    }
+
+    const wn = widget_call orelse return error.WidgetCallNotFound;
+    const sn = slice_call orelse return error.SliceCallNotFound;
+
+    try std.testing.expect(try resolver.isRawSinglePointerType(wn));
+    try std.testing.expect(!(try resolver.isRawSinglePointerType(sn)));
 }
 
