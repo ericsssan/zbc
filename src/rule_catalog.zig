@@ -395,6 +395,16 @@ pub const all = [_]Rule{
         .title = "`recv.lock()` twice without `recv.unlock()` in between — non-reentrant Mutex deadlocks (ReleaseFast) or asserts (Debug)",
         .body = @embedFile("rules/misc/mutex-double-lock.md"),
     },
+    .{
+        .id = "ptrfromint-zero",
+        .title = "`@ptrFromInt(0)` — null pointer to non-nullable type is UB (trap in Debug/Safe, silent corruption in ReleaseFast)",
+        .body = @embedFile("rules/misc/ptrfromint-zero.md"),
+    },
+    .{
+        .id = "resize-result-discarded",
+        .title = "`_ = allocator.resize(…)` discards in-place-growth bool — slice may still be old length; OOB writes follow",
+        .body = @embedFile("rules/heap/resize-result-discarded.md"),
+    },
 };
 
 /// Look up a rule by id.  Returns null on unknown id so callers can
@@ -486,6 +496,8 @@ const intfromfloat_without_clamp_mod = @import("rules/misc/intfromfloat_without_
 const int_sum_overflow_in_bounds_cmp_mod = @import("rules/misc/int_sum_overflow_in_bounds_cmp.zig");
 const ptr_slice_without_bounds_check_mod = @import("rules/misc/ptr_slice_without_bounds_check.zig");
 const mutex_double_lock_mod = @import("rules/misc/mutex_double_lock.zig");
+const ptrfromint_zero_mod = @import("rules/misc/ptrfromint_zero.zig");
+const resize_result_discarded_mod = @import("rules/heap/resize_result_discarded.zig");
 const reset_skips_pooled_resource_release_mod = @import("rules/cleanup/reset_skips_pooled_resource_release.zig");
 const return_borrowed_payload_mod = @import("rules/borrow/return_borrowed_payload.zig");
 const self_undefined_after_destroy_mod = @import("rules/borrow/self_undefined_after_destroy.zig");
@@ -562,6 +574,8 @@ const escape_detectors = [_]Detector{
     .{ .id = "int-sum-overflow-in-bounds-cmp",             .check = int_sum_overflow_in_bounds_cmp_mod.check },
     .{ .id = "ptr-slice-without-bounds-check",             .check = ptr_slice_without_bounds_check_mod.check },
     .{ .id = "mutex-double-lock",                          .check = mutex_double_lock_mod.check },
+    .{ .id = "ptrfromint-zero",                            .check = ptrfromint_zero_mod.check },
+    .{ .id = "resize-result-discarded",                    .check = resize_result_discarded_mod.check },
 };
 
 /// Dispatch all registered pattern detectors against `tree`.  `cache`
@@ -687,4 +701,6 @@ test "registry: pull in every rule module so inline tests run" {
     _ = int_sum_overflow_in_bounds_cmp_mod;
     _ = ptr_slice_without_bounds_check_mod;
     _ = mutex_double_lock_mod;
+    _ = ptrfromint_zero_mod;
+    _ = resize_result_discarded_mod;
 }

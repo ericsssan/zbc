@@ -621,9 +621,19 @@ pub const Invariant = enum {
     /// (spins forever) and asserts in Debug.  Unlock before re-acquiring.
     /// Catches oven-sh/bun#28907 class (ThreadPool sync deadlock).
     mutex_double_lock,
+    /// `@ptrFromInt(0)` creates a null pointer to a non-nullable type.
+    /// Dereferencing it is undefined behaviour on every platform:
+    /// traps in Debug/ReleaseSafe, silent corruption in ReleaseFast.
+    /// Use `?*T` with `null` for a sentinel or `usize` for offset arithmetic.
+    ptrfromint_zero,
+    /// `_ = allocator.resize(slice, new_len)` discards the boolean that
+    /// indicates whether in-place growth succeeded.  When resize returns
+    /// false the slice is still at the old length; writing beyond it is OOB.
+    /// Fix: use `realloc` or capture the bool and fall back on false.
+    resize_result_discarded,
 };
 
-pub const all_invariants: [74]Invariant = .{
+pub const all_invariants: [76]Invariant = .{
     .arena_escape,
     .stack_escape,
     .use_undefined,
@@ -698,6 +708,8 @@ pub const all_invariants: [74]Invariant = .{
     .int_sum_overflow_in_bounds_cmp,
     .ptr_slice_without_bounds_check,
     .mutex_double_lock,
+    .ptrfromint_zero,
+    .resize_result_discarded,
 };
 
 pub const Default: Config = .{};
