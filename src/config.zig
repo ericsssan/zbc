@@ -466,9 +466,33 @@ pub const Invariant = enum {
     /// UAF.  Inline-clear variant of oven-sh/bun#29979.  The callee-
     /// clear variant is covered by heap-use-after-free (CFG-level).
     opt_capture_ptr_after_field_clear,
+    /// Single-field tagged-union literal assignment where the payload
+    /// expression contains `try`.  Under Zig's x86_64 self-hosted
+    /// backend (post-0.15) the tag flip happens BEFORE the payload
+    /// evaluates; if `try` propagates an error the tag is written
+    /// but the payload remains from the previous variant.
+    /// oven-sh/bun#29422.
+    tagged_union_payload_early_exit,
+    /// `const <ptr> = &<recv>.<field1>.<field2>` followed by
+    /// `<recv>.<field1> = …` (variant change) followed by use of
+    /// `<ptr>`.  After the variant change the payload storage `<ptr>`
+    /// points into is repurposed; any use is a UAF.
+    /// oven-sh/bun#29977.
+    union_payload_ptr_after_variant_change,
+    /// `<recv>.<field> = true` → function call → `<recv>.<field> =
+    /// false`, where `<field>` contains `in_progress`.  If the
+    /// function triggers re-entrant code that sets the flag back to
+    /// `true`, the post-call `false` clobbers that new state.
+    /// oven-sh/bun#29899.
+    flag_reset_after_callback,
+    /// `for (<recv>.items) |…| { … call() … }` where `call`
+    /// transitively invokes an ArrayList-grow method.  The loop's
+    /// implicit slice pointer is invalidated by the reallocation.
+    /// oven-sh/bun#29981, #29483.
+    slice_loop_reentrant_grow,
 };
 
-pub const all_invariants: [54]Invariant = .{
+pub const all_invariants: [58]Invariant = .{
     .arena_escape,
     .stack_escape,
     .use_undefined,
@@ -523,6 +547,10 @@ pub const all_invariants: [54]Invariant = .{
     .hashmap_iter_mutation,
     .ref_before_ownership_transfer,
     .opt_capture_ptr_after_field_clear,
+    .tagged_union_payload_early_exit,
+    .union_payload_ptr_after_variant_change,
+    .flag_reset_after_callback,
+    .slice_loop_reentrant_grow,
 };
 
 pub const Default: Config = .{};

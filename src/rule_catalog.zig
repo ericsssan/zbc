@@ -295,6 +295,26 @@ pub const all = [_]Rule{
         .title = "pointer derived from `if (<recv>.<field>) |*<cap>|` payload used after `<recv>.<field> = …` — storage invalidated",
         .body = @embedFile("rules/heap/opt-capture-ptr-after-field-clear.md"),
     },
+    .{
+        .id = "tagged-union-payload-early-exit",
+        .title = "`try` inside single-field union literal assignment — tag written before payload; error exit leaves union in inconsistent state",
+        .body = @embedFile("rules/misc/tagged-union-payload-early-exit.md"),
+    },
+    .{
+        .id = "union-payload-ptr-after-variant-change",
+        .title = "pointer into union payload taken then variant reassigned — payload storage repurposed, pointer becomes dangling",
+        .body = @embedFile("rules/misc/union-payload-ptr-after-variant-change.md"),
+    },
+    .{
+        .id = "flag-reset-after-callback",
+        .title = "`<recv>.<in_progress> = false` after function call that may re-enter — re-entrant `true` assignment clobbered",
+        .body = @embedFile("rules/misc/flag-reset-after-callback.md"),
+    },
+    .{
+        .id = "slice-loop-reentrant-grow",
+        .title = "function call inside `for (<recv>.items)` loop may grow the collection — backing buffer reallocated mid-iteration",
+        .body = @embedFile("rules/collection/slice-loop-reentrant-grow.md"),
+    },
 };
 
 /// Look up a rule by id.  Returns null on unknown id so callers can
@@ -366,6 +386,10 @@ const publish_then_touch_self_mod = @import("rules/misc/publish_then_touch_self.
 const realloc_byte_count_mod = @import("rules/heap/realloc_byte_count.zig");
 const ref_before_ownership_transfer_mod = @import("rules/heap/ref_before_ownership_transfer.zig");
 const opt_capture_ptr_after_field_clear_mod = @import("rules/heap/opt_capture_ptr_after_field_clear.zig");
+const tagged_union_payload_early_exit_mod = @import("rules/misc/tagged_union_payload_early_exit.zig");
+const union_payload_ptr_after_variant_change_mod = @import("rules/misc/union_payload_ptr_after_variant_change.zig");
+const flag_reset_after_callback_mod = @import("rules/misc/flag_reset_after_callback.zig");
+const slice_loop_reentrant_grow_mod = @import("rules/collection/slice_loop_reentrant_grow.zig");
 const reset_skips_pooled_resource_release_mod = @import("rules/cleanup/reset_skips_pooled_resource_release.zig");
 const return_borrowed_payload_mod = @import("rules/borrow/return_borrowed_payload.zig");
 const self_undefined_after_destroy_mod = @import("rules/borrow/self_undefined_after_destroy.zig");
@@ -422,6 +446,10 @@ const escape_detectors = [_]Detector{
     .{ .id = "todo-panic-in-production",                   .check = todo_panic_in_production_mod.check },
     .{ .id = "ref-before-ownership-transfer",              .check = ref_before_ownership_transfer_mod.check },
     .{ .id = "opt-capture-ptr-after-field-clear",          .check = opt_capture_ptr_after_field_clear_mod.check },
+    .{ .id = "tagged-union-payload-early-exit",            .check = tagged_union_payload_early_exit_mod.check },
+    .{ .id = "union-payload-ptr-after-variant-change",     .check = union_payload_ptr_after_variant_change_mod.check },
+    .{ .id = "flag-reset-after-callback",                  .check = flag_reset_after_callback_mod.check },
+    .{ .id = "slice-loop-reentrant-grow",                  .check = slice_loop_reentrant_grow_mod.check },
 };
 
 /// Dispatch all registered pattern detectors against `tree`.  `cache`
@@ -527,4 +555,8 @@ test "registry: pull in every rule module so inline tests run" {
     _ = unreleased_refs_on_error_mod;
     _ = ref_before_ownership_transfer_mod;
     _ = opt_capture_ptr_after_field_clear_mod;
+    _ = tagged_union_payload_early_exit_mod;
+    _ = union_payload_ptr_after_variant_change_mod;
+    _ = flag_reset_after_callback_mod;
+    _ = slice_loop_reentrant_grow_mod;
 }

@@ -103,6 +103,29 @@ pub fn isAllocMethodName(name: []const u8) bool {
         std.mem.eql(u8, name, "realloc");
 }
 
+/// ArrayList (and SegmentedList / similar) methods that may grow the
+/// backing buffer — i.e. may reallocate and move the buffer pointer.
+/// Any slice or element pointer into the buffer taken BEFORE one of
+/// these calls may be invalidated AFTER the call.
+///
+/// Excludes `*AssumeCapacity` variants — those require the buffer to
+/// already have sufficient capacity and cannot reallocate.
+pub fn isArrayListGrowMethodName(name: []const u8) bool {
+    return std.mem.eql(u8, name, "append") or
+        std.mem.eql(u8, name, "appendSlice") or
+        std.mem.eql(u8, name, "appendNTimes") or
+        std.mem.eql(u8, name, "insertAt") or
+        std.mem.eql(u8, name, "insertSlice") or
+        std.mem.eql(u8, name, "ensureCapacity") or
+        std.mem.eql(u8, name, "ensureTotalCapacity") or
+        std.mem.eql(u8, name, "ensureUnusedCapacity") or
+        std.mem.eql(u8, name, "ensureTotalCapacityPrecise") or
+        std.mem.eql(u8, name, "resize") or
+        std.mem.eql(u8, name, "addOne") or
+        std.mem.eql(u8, name, "addManyAsSlice") or
+        std.mem.eql(u8, name, "addManyAsArray");
+}
+
 /// Container-mutation methods that STORE the caller's data into the
 /// container's backing storage.  When the data is borrowed (e.g.
 /// from an arena that's about to die), storing it through one of

@@ -102,6 +102,14 @@ pub const FnSummary = struct {
     /// suppression when the overall `result_independent_of_args` is
     /// false because a DIFFERENT param appears in returns.
     result_params_in_return: u32 = 0,
+    /// True iff this fn (or any fn it transitively calls in the same
+    /// file) directly invokes an ArrayList-grow method — i.e. a call
+    /// that may reallocate the backing buffer and invalidate existing
+    /// element pointers / slices.  Set by direct body scan in
+    /// `inferFromBody`; propagated transitively by
+    /// `FileCache.resolveTransitiveTakes` Phase 5.
+    /// Consumed by `slice-loop-reentrant-grow`.
+    may_grow_collections: bool = false,
     /// Internal flag: true iff FileCache.summaryOfFn has fully
     /// populated this entry (cheap + deep inference).  Distinct
     /// from "no fields detected" — without this flag, fns with
@@ -157,6 +165,7 @@ pub fn inferFromBody(
         if (tags[t + 2] != .l_paren) continue;
         const method = tree.tokenSlice(t + 1);
         if (receiver_mod.isAllocMethodName(method)) out.allocates = true;
+        if (receiver_mod.isArrayListGrowMethodName(method)) out.may_grow_collections = true;
     }
 
     // ── returns: scan the FIRST `return <expr>` shape ──────────

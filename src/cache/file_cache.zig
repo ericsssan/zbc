@@ -365,6 +365,61 @@ pub const FileCache = struct {
             }
             if (!changed) break;
         }
+
+        // Phase 5: propagate `may_grow_collections` transitively within
+        // the file.  If fn A makes a bare call to fn B (same file) and B
+        // may_grow_collections, A also may_grow_collections.  Direct
+        // detection (body contains `.append(` etc.) is done in
+        // `inferFromBody`; this phase handles one-hop callee chains.
+        iters = 0;
+        while (iters < 16) : (iters += 1) {
+            var changed = false;
+            for (model.fns) |fi| {
+                if (try self.propagateMayGrowOne(fi.fn_decl)) changed = true;
+            }
+            for (model.types) |ti| {
+                for (ti.methods) |m| {
+                    if (try self.propagateMayGrowOne(m.fn_decl)) changed = true;
+                }
+            }
+            if (!changed) break;
+        }
+    }
+
+    /// Propagate `may_grow_collections` from same-file bare-call callees.
+    /// Returns true iff this call updated the fn's flag.
+    fn propagateMayGrowOne(self: *FileCache, fn_decl: Ast.Node.Index) !bool {
+        const s_ptr = try self.summaryOfFn(fn_decl);
+        if (s_ptr.may_grow_collections) return false;
+
+        const tree = self.tree;
+        const tags = tree.tokens.items(.tag);
+        const body = tokens.bodyOf(tree, fn_decl) orelse return false;
+        const first = tree.firstToken(body);
+        const last = tree.lastToken(body);
+
+        var t = first;
+        while (t + 1 <= last) : (t += 1) {
+            if (tags[t] == .keyword_fn) {
+                t = tokens.skipNestedFn(tags, t, last);
+                continue;
+            }
+            if (tags[t] != .identifier) continue;
+            if (tags[t + 1] != .l_paren) continue;
+            if (t > first and tags[t - 1] == .period) continue;
+
+            const callee_name = tree.tokenSlice(t);
+            if (try self.summaryByName(callee_name)) |cs| {
+                if (cs.may_grow_collections) {
+                    const key = @intFromEnum(body);
+                    if (self.summaries.getPtr(key)) |entry| {
+                        entry.may_grow_collections = true;
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
     }
 
     /// Apply R7 delegator-borrow inference to one fn.  Returns true
