@@ -599,9 +599,17 @@ pub const Invariant = enum {
     /// Fix: `@intFromFloat(@min(@max(x, min_f), max_f))` or `std.math.lossyCast`.
     /// Catches oven-sh/bun#28364 + #29328 class.
     intfromfloat_without_clamp,
+    /// `data.len < (a + b)` — bounds check where the sum `(a + b)` is
+    /// computed in a narrower integer type (e.g. `u32`) and may wrap to a
+    /// small value before comparison against the `usize` length.  The guard
+    /// evaluates `false` for huge inputs, bypassing it.  Fix: subtract to
+    /// keep everything in `usize`: `data.len - a < b`; or explicitly widen:
+    /// `@as(usize, a) + @as(usize, b)`.
+    /// Catches oven-sh/bun#30157 class (IPC message decoder u32 wraparound).
+    int_sum_overflow_in_bounds_cmp,
 };
 
-pub const all_invariants: [71]Invariant = .{
+pub const all_invariants: [72]Invariant = .{
     .arena_escape,
     .stack_escape,
     .use_undefined,
@@ -673,6 +681,7 @@ pub const all_invariants: [71]Invariant = .{
     .readint_unchecked_position_assignment,
     .arraylist_sentinel_write_without_capacity,
     .intfromfloat_without_clamp,
+    .int_sum_overflow_in_bounds_cmp,
 };
 
 pub const Default: Config = .{};

@@ -380,6 +380,11 @@ pub const all = [_]Rule{
         .title = "`@intFromFloat(x)` without `@min`/`@max`/`clamp` guard — panics on ±Inf, NaN, or out-of-range float (UB in ReleaseFast)",
         .body = @embedFile("rules/misc/intfromfloat-without-clamp.md"),
     },
+    .{
+        .id = "int-sum-overflow-in-bounds-cmp",
+        .title = "`data.len < (a + b)` bounds check — sum computed in narrower type wraps to small value, bypassing the guard",
+        .body = @embedFile("rules/misc/int-sum-overflow-in-bounds-cmp.md"),
+    },
 };
 
 /// Look up a rule by id.  Returns null on unknown id so callers can
@@ -468,6 +473,7 @@ const negate_then_shift_without_minint_check_mod = @import("rules/misc/negate_th
 const readint_unchecked_position_assignment_mod = @import("rules/misc/readint_unchecked_position_assignment.zig");
 const arraylist_sentinel_write_without_capacity_mod = @import("rules/collection/arraylist_sentinel_write_without_capacity.zig");
 const intfromfloat_without_clamp_mod = @import("rules/misc/intfromfloat_without_clamp.zig");
+const int_sum_overflow_in_bounds_cmp_mod = @import("rules/misc/int_sum_overflow_in_bounds_cmp.zig");
 const reset_skips_pooled_resource_release_mod = @import("rules/cleanup/reset_skips_pooled_resource_release.zig");
 const return_borrowed_payload_mod = @import("rules/borrow/return_borrowed_payload.zig");
 const self_undefined_after_destroy_mod = @import("rules/borrow/self_undefined_after_destroy.zig");
@@ -541,6 +547,7 @@ const escape_detectors = [_]Detector{
     .{ .id = "readint-unchecked-position-assignment",       .check = readint_unchecked_position_assignment_mod.check },
     .{ .id = "arraylist-sentinel-write-without-capacity",  .check = arraylist_sentinel_write_without_capacity_mod.check },
     .{ .id = "intfromfloat-without-clamp",                 .check = intfromfloat_without_clamp_mod.check },
+    .{ .id = "int-sum-overflow-in-bounds-cmp",             .check = int_sum_overflow_in_bounds_cmp_mod.check },
 };
 
 /// Dispatch all registered pattern detectors against `tree`.  `cache`
@@ -663,4 +670,5 @@ test "registry: pull in every rule module so inline tests run" {
     _ = readint_unchecked_position_assignment_mod;
     _ = arraylist_sentinel_write_without_capacity_mod;
     _ = intfromfloat_without_clamp_mod;
+    _ = int_sum_overflow_in_bounds_cmp_mod;
 }
