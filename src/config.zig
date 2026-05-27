@@ -808,9 +808,14 @@ pub const Invariant = enum {
     /// cannot appear inside a struct literal expression.
     /// Catches ziglang/zig#23285 (Ast.parse extra_data + errors leak).
     struct_literal_multiple_try,
+    /// `writeInt(NarrowType, @as(NarrowType, @truncate(EXPR)), endian)` —
+    /// `@truncate` silently discards high bits of wider source values; use the
+    /// correct wider type for `writeInt` or add a bounds check.
+    /// Catches ziglang/zig#22233 (Elf.Atom dynAbs reloc truncation).
+    writeint_truncated_value,
 };
 
-pub const all_invariants: [106]Invariant = .{
+pub const all_invariants: [107]Invariant = .{
     .arena_escape,
     .stack_escape,
     .use_undefined,
@@ -917,6 +922,7 @@ pub const all_invariants: [106]Invariant = .{
     .adjacent_decl_same_source_field,
     .intcast_of_negated_signed,
     .struct_literal_multiple_try,
+    .writeint_truncated_value,
 };
 
 pub const Default: Config = .{};
