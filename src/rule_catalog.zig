@@ -520,6 +520,11 @@ pub const all = [_]Rule{
         .title = "`<=` inside a `lessThan` comparator violates strict weak ordering — `lessThan(a, a)` returns `true`; `std.sort` may loop or produce incorrect results",
         .body = @embedFile("rules/misc/lessthan-uses-leq.md"),
     },
+    .{
+        .id = "duplicate-defer-free",
+        .title = "`defer alloc.free(X)` appears twice in the same fn body — both fire at exit (LIFO), freeing `X` twice; remove the duplicate",
+        .body = @embedFile("rules/misc/duplicate-defer-free.md"),
+    },
 };
 
 /// Look up a rule by id.  Returns null on unknown id so callers can
@@ -636,6 +641,7 @@ const field_self_assign_with_cast_mod = @import("rules/misc/field_self_assign_wi
 const maybe_assert_panics_mod = @import("rules/misc/maybe_assert_panics.zig");
 const return_arraylist_items_mod = @import("rules/misc/return_arraylist_items.zig");
 const lessthan_uses_leq_mod = @import("rules/misc/lessthan_uses_leq.zig");
+const duplicate_defer_free_mod = @import("rules/misc/duplicate_defer_free.zig");
 const reset_skips_pooled_resource_release_mod = @import("rules/cleanup/reset_skips_pooled_resource_release.zig");
 const return_borrowed_payload_mod = @import("rules/borrow/return_borrowed_payload.zig");
 const self_undefined_after_destroy_mod = @import("rules/borrow/self_undefined_after_destroy.zig");
@@ -737,6 +743,7 @@ const escape_detectors = [_]Detector{
     .{ .id = "maybe-assert-panics",                     .check = maybe_assert_panics_mod.check },
     .{ .id = "return-arraylist-items",                  .check = return_arraylist_items_mod.check },
     .{ .id = "lessthan-uses-leq",                       .check = lessthan_uses_leq_mod.check },
+    .{ .id = "duplicate-defer-free",                    .check = duplicate_defer_free_mod.check },
 };
 
 /// Dispatch all registered pattern detectors against `tree`.  `cache`
@@ -887,4 +894,5 @@ test "registry: pull in every rule module so inline tests run" {
     _ = maybe_assert_panics_mod;
     _ = return_arraylist_items_mod;
     _ = lessthan_uses_leq_mod;
+    _ = duplicate_defer_free_mod;
 }

@@ -772,9 +772,15 @@ pub const Invariant = enum {
     /// to loop indefinitely or produce incorrect output.
     /// Catches oven-sh/bun#24146 (sourcemap sort infinite loop).
     lessthan_uses_leq,
+    /// `defer allocator.free(X)` appearing twice at the outermost level of the
+    /// same function body — both defers fire at fn exit (LIFO), freeing X twice.
+    /// Almost always a copy-paste error where a block was duplicated without
+    /// removing the original defer.
+    /// Catches oven-sh/bun#22978 (createArgv double-free of argv allocation).
+    duplicate_defer_free,
 };
 
-pub const all_invariants: [99]Invariant = .{
+pub const all_invariants: [100]Invariant = .{
     .arena_escape,
     .stack_escape,
     .use_undefined,
@@ -874,6 +880,7 @@ pub const all_invariants: [99]Invariant = .{
     .maybe_assert_panics,
     .return_arraylist_items,
     .lessthan_uses_leq,
+    .duplicate_defer_free,
 };
 
 pub const Default: Config = .{};
