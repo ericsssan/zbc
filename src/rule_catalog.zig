@@ -490,6 +490,16 @@ pub const all = [_]Rule{
         .title = "`joinAbsStringBuf(...)` — unchecked variant silently writes past fixed-size buffers on overflow; use `joinAbsStringBufChecked` which falls back to heap",
         .body = @embedFile("rules/misc/joinabsstringbuf-without-checked-variant.md"),
     },
+    .{
+        .id = "aligncast-on-byte-slice",
+        .title = "`@alignCast(expr.ptr)` — alignment assertion on a raw byte-slice pointer panics non-deterministically for unaligned network/file data",
+        .body = @embedFile("rules/misc/aligncast-on-byte-slice.md"),
+    },
+    .{
+        .id = "truncate-len-to-narrow-int",
+        .title = "`@truncate(X.len)` — silently discards high bits of a `usize` length; user-controlled data ≥ 2^N bytes wraps to a garbage size",
+        .body = @embedFile("rules/misc/truncate-len-to-narrow-int.md"),
+    },
 };
 
 /// Look up a rule by id.  Returns null on unknown id so callers can
@@ -600,6 +610,8 @@ const toutf8_inline_slice_borrow_mod = @import("rules/misc/toutf8_inline_slice_b
 const uv_return_value_intcast_truncation_mod = @import("rules/misc/uv_return_value_intcast_truncation.zig");
 const tryget_orelse_unreachable_mod = @import("rules/misc/tryget_orelse_unreachable.zig");
 const joinabsstringbuf_without_checked_variant_mod = @import("rules/misc/joinabsstringbuf_without_checked_variant.zig");
+const aligncast_on_byte_slice_mod = @import("rules/misc/aligncast_on_byte_slice.zig");
+const truncate_len_to_narrow_int_mod = @import("rules/misc/truncate_len_to_narrow_int.zig");
 const reset_skips_pooled_resource_release_mod = @import("rules/cleanup/reset_skips_pooled_resource_release.zig");
 const return_borrowed_payload_mod = @import("rules/borrow/return_borrowed_payload.zig");
 const self_undefined_after_destroy_mod = @import("rules/borrow/self_undefined_after_destroy.zig");
@@ -695,6 +707,8 @@ const escape_detectors = [_]Detector{
     .{ .id = "uv-return-value-intcast-truncation",      .check = uv_return_value_intcast_truncation_mod.check },
     .{ .id = "tryget-orelse-unreachable",               .check = tryget_orelse_unreachable_mod.check },
     .{ .id = "joinabsstringbuf-without-checked-variant", .check = joinabsstringbuf_without_checked_variant_mod.check },
+    .{ .id = "aligncast-on-byte-slice",                 .check = aligncast_on_byte_slice_mod.check },
+    .{ .id = "truncate-len-to-narrow-int",              .check = truncate_len_to_narrow_int_mod.check },
 };
 
 /// Dispatch all registered pattern detectors against `tree`.  `cache`
@@ -839,4 +853,6 @@ test "registry: pull in every rule module so inline tests run" {
     _ = uv_return_value_intcast_truncation_mod;
     _ = tryget_orelse_unreachable_mod;
     _ = joinabsstringbuf_without_checked_variant_mod;
+    _ = aligncast_on_byte_slice_mod;
+    _ = truncate_len_to_narrow_int_mod;
 }

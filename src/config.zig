@@ -741,9 +741,18 @@ pub const Invariant = enum {
     /// use `joinAbsStringBufChecked` which falls back to heap on overflow.
     /// Catches oven-sh/bun#28585 (pathToFileURL OOB write on long paths).
     joinabsstringbuf_without_checked_variant,
+    /// `@alignCast(expr.ptr)` — asserting alignment on a raw byte-slice pointer
+    /// is unsafe; panics non-deterministically for network/file data at odd
+    /// byte offsets.  Use `std.mem.readInt` or `@memcpy` into an aligned local.
+    /// Catches oven-sh/bun#27082, #27281, #27384, #27290.
+    aligncast_on_byte_slice,
+    /// `@truncate(X.len)` — silently discards high bits of a slice length;
+    /// user-controlled data ≥ 2^N bytes wraps to a garbage size, corrupting
+    /// subsequent reads/allocs.  Catches oven-sh/bun#27443 (4 GB form body).
+    truncate_len_to_narrow_int,
 };
 
-pub const all_invariants: [93]Invariant = .{
+pub const all_invariants: [95]Invariant = .{
     .arena_escape,
     .stack_escape,
     .use_undefined,
@@ -837,6 +846,8 @@ pub const all_invariants: [93]Invariant = .{
     .uv_return_value_intcast_truncation,
     .tryget_orelse_unreachable,
     .joinabsstringbuf_without_checked_variant,
+    .aligncast_on_byte_slice,
+    .truncate_len_to_narrow_int,
 };
 
 pub const Default: Config = .{};
