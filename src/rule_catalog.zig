@@ -660,6 +660,10 @@ const duplicate_defer_free_mod = @import("rules/misc/duplicate_defer_free.zig");
 const hashmap_getentry_forced_unwrap_mod = @import("rules/collection/hashmap_getentry_forced_unwrap.zig");
 const multiarray_items_deref_assign_mod = @import("rules/collection/multiarray_items_deref_assign.zig");
 const startswith_strip_off_by_one_mod = @import("rules/misc/startswith_strip_off_by_one.zig");
+const midpoint_addition_overflow_mod = @import("rules/misc/midpoint_addition_overflow.zig");
+const arena_allocator_free_noop_mod = @import("rules/misc/arena_allocator_free_noop.zig");
+const memcpy_overlapping_slices_mod = @import("rules/misc/memcpy_overlapping_slices.zig");
+const cmpxchgweak_orelse_break_mod = @import("rules/misc/cmpxchgweak_orelse_break.zig");
 const double_optional_ptr_mod = @import("rules/misc/double_optional_ptr.zig");
 const aligncast_on_optional_unwrap_mod = @import("rules/misc/aligncast_on_optional_unwrap.zig");
 const adjacent_decl_same_source_field_mod = @import("rules/misc/adjacent_decl_same_source_field.zig");
@@ -777,6 +781,10 @@ const escape_detectors = [_]Detector{
     .{ .id = "writeint-truncated-value",                .check = writeint_truncated_value_mod.check },
     .{ .id = "multiarray-items-deref-assign",           .check = multiarray_items_deref_assign_mod.check },
     .{ .id = "startswith-strip-off-by-one",             .check = startswith_strip_off_by_one_mod.check },
+    .{ .id = "midpoint-addition-overflow",              .check = midpoint_addition_overflow_mod.check },
+    .{ .id = "arena-allocator-free-noop",               .check = arena_allocator_free_noop_mod.check },
+    .{ .id = "memcpy-overlapping-slices",               .check = memcpy_overlapping_slices_mod.check },
+    .{ .id = "cmpxchgweak-orelse-break",                .check = cmpxchgweak_orelse_break_mod.check },
 };
 
 /// Dispatch all registered pattern detectors against `tree`.  `cache`
@@ -937,4 +945,8 @@ test "registry: pull in every rule module so inline tests run" {
     _ = writeint_truncated_value_mod;
     _ = multiarray_items_deref_assign_mod;
     _ = startswith_strip_off_by_one_mod;
+    _ = midpoint_addition_overflow_mod;
+    _ = arena_allocator_free_noop_mod;
+    _ = memcpy_overlapping_slices_mod;
+    _ = cmpxchgweak_orelse_break_mod;
 }

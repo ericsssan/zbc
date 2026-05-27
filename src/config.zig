@@ -823,9 +823,24 @@ pub const Invariant = enum {
     /// `SLICE[literal.len..]` or `SLICE["LITERAL".len..]`.
     /// Catches oven-sh/bun#27970 (node_fs_watcher "file://" = 7 chars, used 6).
     startswith_strip_off_by_one,
+    /// `(a + b) / 2` — classic binary-search midpoint overflow; if `a + b`
+    /// exceeds the integer type's maximum the sum wraps before division.
+    /// Use `a + (b - a) / 2` instead.  Catches zig#20029, zig#18718.
+    midpoint_addition_overflow,
+    /// `.allocator().free(X)` on an ArenaAllocator — free is a no-op; the
+    /// arena only reclaims memory via `.deinit()`.  Catches bun#29380.
+    arena_allocator_free_noop,
+    /// `@memcpy(BASE[A..B], BASE[C..D])` — source and destination derive from
+    /// the same slice and may overlap; @memcpy requires non-aliasing args.
+    /// Use `std.mem.copyForwards` or `copyBackwards`.  Catches zig#21447.
+    memcpy_overlapping_slices,
+    /// `cmpxchgWeak(...) orelse break/return/continue` — logic inversion:
+    /// null = success in Zig's cmpxchgWeak, so orelse exits on success not failure.
+    /// Catches bun#28940 (ThreadPool spawn loop never spawned threads).
+    cmpxchgweak_orelse_break,
 };
 
-pub const all_invariants: [109]Invariant = .{
+pub const all_invariants: [113]Invariant = .{
     .arena_escape,
     .stack_escape,
     .use_undefined,
@@ -935,6 +950,10 @@ pub const all_invariants: [109]Invariant = .{
     .writeint_truncated_value,
     .multiarray_items_deref_assign,
     .startswith_strip_off_by_one,
+    .midpoint_addition_overflow,
+    .arena_allocator_free_noop,
+    .memcpy_overlapping_slices,
+    .cmpxchgweak_orelse_break,
 };
 
 pub const Default: Config = .{};
