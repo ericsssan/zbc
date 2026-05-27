@@ -425,6 +425,11 @@ pub const all = [_]Rule{
         .title = "`@intCast(@max(…, maxInt(T)))` uses `@max` instead of `@min` — overflows the intended upper bound",
         .body = @embedFile("rules/misc/intcast-clamp-uses-max.md"),
     },
+    .{
+        .id = "forced-unwrap-iterator-next",
+        .title = "`.next().?` force-unwraps iterator result — panics when iterator is exhausted; use `orelse` instead",
+        .body = @embedFile("rules/misc/forced-unwrap-iterator-next.md"),
+    },
 };
 
 /// Look up a rule by id.  Returns null on unknown id so callers can
@@ -522,6 +527,7 @@ const errdefer_alive_after_ownership_transfer_mod = @import("rules/errdefer/errd
 const f32_narrowing_int_to_float_mod = @import("rules/misc/f32_narrowing_int_to_float.zig");
 const array_maxint_off_by_one_mod = @import("rules/misc/array_maxint_off_by_one.zig");
 const intcast_clamp_uses_max_mod = @import("rules/misc/intcast_clamp_uses_max.zig");
+const forced_unwrap_iterator_next_mod = @import("rules/misc/forced_unwrap_iterator_next.zig");
 const reset_skips_pooled_resource_release_mod = @import("rules/cleanup/reset_skips_pooled_resource_release.zig");
 const return_borrowed_payload_mod = @import("rules/borrow/return_borrowed_payload.zig");
 const self_undefined_after_destroy_mod = @import("rules/borrow/self_undefined_after_destroy.zig");
@@ -604,6 +610,7 @@ const escape_detectors = [_]Detector{
     .{ .id = "f32-narrowing-int-to-float",                .check = f32_narrowing_int_to_float_mod.check },
     .{ .id = "array-maxint-off-by-one",                  .check = array_maxint_off_by_one_mod.check },
     .{ .id = "intcast-clamp-uses-max",                   .check = intcast_clamp_uses_max_mod.check },
+    .{ .id = "forced-unwrap-iterator-next",              .check = forced_unwrap_iterator_next_mod.check },
 };
 
 /// Dispatch all registered pattern detectors against `tree`.  `cache`
@@ -735,4 +742,5 @@ test "registry: pull in every rule module so inline tests run" {
     _ = f32_narrowing_int_to_float_mod;
     _ = array_maxint_off_by_one_mod;
     _ = intcast_clamp_uses_max_mod;
+    _ = forced_unwrap_iterator_next_mod;
 }

@@ -658,9 +658,15 @@ pub const Invariant = enum {
     /// The correct builtin is `@min`.
     /// Catches oven-sh/bun#29813 (queueSize clamped with @max instead of @min).
     intcast_clamp_uses_max,
+    /// `.next().?` force-unwraps an iterator's optional result.  When the
+    /// iterator is exhausted (e.g., the caller provided fewer items than
+    /// expected), this panics in debug/safe builds and invokes UB in
+    /// ReleaseFast.  Use `orelse <handler>` or `while (iter.next()) |v|`.
+    /// Catches oven-sh/bun#27415 (seq builtin) and #27316 (cmds_array).
+    forced_unwrap_iterator_next,
 };
 
-pub const all_invariants: [80]Invariant = .{
+pub const all_invariants: [81]Invariant = .{
     .arena_escape,
     .stack_escape,
     .use_undefined,
@@ -741,6 +747,7 @@ pub const all_invariants: [80]Invariant = .{
     .f32_narrowing_int_to_float,
     .array_maxint_off_by_one,
     .intcast_clamp_uses_max,
+    .forced_unwrap_iterator_next,
 };
 
 pub const Default: Config = .{};
