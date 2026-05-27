@@ -838,9 +838,13 @@ pub const Invariant = enum {
     /// null = success in Zig's cmpxchgWeak, so orelse exits on success not failure.
     /// Catches bun#28940 (ThreadPool spawn loop never spawned threads).
     cmpxchgweak_orelse_break,
+    /// `buf[buf.len] = value` — write one past the end of a slice.
+    /// Also catches `obj.field[obj.field.len] = value` (ArrayList `.items`).
+    /// Catches bun#29982 (toUTF16Alloc null-terminator off-by-one).
+    slice_write_at_len,
 };
 
-pub const all_invariants: [113]Invariant = .{
+pub const all_invariants: [114]Invariant = .{
     .arena_escape,
     .stack_escape,
     .use_undefined,
@@ -954,6 +958,7 @@ pub const all_invariants: [113]Invariant = .{
     .arena_allocator_free_noop,
     .memcpy_overlapping_slices,
     .cmpxchgweak_orelse_break,
+    .slice_write_at_len,
 };
 
 pub const Default: Config = .{};
