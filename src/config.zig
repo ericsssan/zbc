@@ -631,9 +631,18 @@ pub const Invariant = enum {
     /// false the slice is still at the old length; writing beyond it is OOB.
     /// Fix: use `realloc` or capture the bool and fall back on false.
     resize_result_discarded,
+    /// `errdefer X.deinit()` (or .deref/.free/.release) remains armed
+    /// after an ownership-taking constructor call receives `X` as an
+    /// argument.  A subsequent `try` triggers the errdefer even though `X`
+    /// is now owned by the constructor → double-free.  Fix: reset
+    /// `X = .{}` (or the type's inert sentinel) immediately after the
+    /// constructor call to disarm the errdefer.
+    /// Catches oven-sh/bun#28495/#28592/#29081/#29643/#29656/#30169/#30437/#30465
+    /// class (8 PRs — S3/node_fs/CSS constructors taking ownership of paths).
+    errdefer_alive_after_ownership_transfer,
 };
 
-pub const all_invariants: [76]Invariant = .{
+pub const all_invariants: [77]Invariant = .{
     .arena_escape,
     .stack_escape,
     .use_undefined,
@@ -710,6 +719,7 @@ pub const all_invariants: [76]Invariant = .{
     .mutex_double_lock,
     .ptrfromint_zero,
     .resize_result_discarded,
+    .errdefer_alive_after_ownership_transfer,
 };
 
 pub const Default: Config = .{};
