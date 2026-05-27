@@ -355,6 +355,11 @@ pub const all = [_]Rule{
         .title = "recursive parse/skip/visit/scan fn calls itself without `is_safe_to_recurse()` guard — deep input overflows the call stack",
         .body = @embedFile("rules/misc/recursive-parse-fn-without-stack-check.md"),
     },
+    .{
+        .id = "slice-from-fixed-offset-without-len-check",
+        .title = "`buf[N..]` from a non-zero literal offset without a prior `buf.len >= N` check — OOB trap (Debug/Safe) or UB (ReleaseFast)",
+        .body = @embedFile("rules/misc/slice-from-fixed-offset-without-len-check.md"),
+    },
 };
 
 /// Look up a rule by id.  Returns null on unknown id so callers can
@@ -438,6 +443,7 @@ const arraybuffer_slice_without_pin_mod = @import("rules/collection/arraybuffer_
 const optional_fallback_wrong_side_mod = @import("rules/misc/optional_fallback_wrong_side.zig");
 const escape_skip_without_bounds_recheck_mod = @import("rules/misc/escape_skip_without_bounds_recheck.zig");
 const recursive_parse_without_stack_check_mod = @import("rules/misc/recursive_parse_without_stack_check.zig");
+const slice_from_fixed_offset_without_len_check_mod = @import("rules/misc/slice_from_fixed_offset_without_len_check.zig");
 const reset_skips_pooled_resource_release_mod = @import("rules/cleanup/reset_skips_pooled_resource_release.zig");
 const return_borrowed_payload_mod = @import("rules/borrow/return_borrowed_payload.zig");
 const self_undefined_after_destroy_mod = @import("rules/borrow/self_undefined_after_destroy.zig");
@@ -506,6 +512,7 @@ const escape_detectors = [_]Detector{
     .{ .id = "optional-fallback-wrong-side",                .check = optional_fallback_wrong_side_mod.check },
     .{ .id = "escape-skip-without-bounds-recheck",          .check = escape_skip_without_bounds_recheck_mod.check },
     .{ .id = "recursive-parse-fn-without-stack-check",      .check = recursive_parse_without_stack_check_mod.check },
+    .{ .id = "slice-from-fixed-offset-without-len-check",   .check = slice_from_fixed_offset_without_len_check_mod.check },
 };
 
 /// Dispatch all registered pattern detectors against `tree`.  `cache`
@@ -623,4 +630,5 @@ test "registry: pull in every rule module so inline tests run" {
     _ = optional_fallback_wrong_side_mod;
     _ = escape_skip_without_bounds_recheck_mod;
     _ = recursive_parse_without_stack_check_mod;
+    _ = slice_from_fixed_offset_without_len_check_mod;
 }

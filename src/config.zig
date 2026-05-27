@@ -556,9 +556,18 @@ pub const Invariant = enum {
     /// error.StackOverflow;` at the entry of the function.
     /// Catches oven-sh/bun#31361 / #31333 class.
     recursive_parse_without_stack_check,
+    /// `buf[N..]` where `N` is a non-zero integer literal and no `buf.len`
+    /// check appears in the fn body before the slice expression.  When
+    /// `buf.len < N`, this is a safety-checked OOB trap (Debug/Safe) or
+    /// undefined behaviour (ReleaseFast).  Common in parsers that slice off
+    /// fixed-size prefixes ("--- a/", "HTTP/1.1 ", etc.) without validating
+    /// that the input is at least N bytes long.  Fix: add
+    /// `if (buf.len < N) return error.TruncatedInput;` before the slice.
+    /// Catches oven-sh/bun#31227 / #31264 class.
+    slice_from_fixed_offset_without_len_check,
 };
 
-pub const all_invariants: [66]Invariant = .{
+pub const all_invariants: [67]Invariant = .{
     .arena_escape,
     .stack_escape,
     .use_undefined,
@@ -625,6 +634,7 @@ pub const all_invariants: [66]Invariant = .{
     .optional_fallback_wrong_side,
     .escape_skip_without_bounds_recheck,
     .recursive_parse_without_stack_check,
+    .slice_from_fixed_offset_without_len_check,
 };
 
 pub const Default: Config = .{};
