@@ -664,9 +664,15 @@ pub const Invariant = enum {
     /// ReleaseFast.  Use `orelse <handler>` or `while (iter.next()) |v|`.
     /// Catches oven-sh/bun#27415 (seq builtin) and #27316 (cmds_array).
     forced_unwrap_iterator_next,
+    /// `x < A and x > B` — an impossible range check that uses `and` instead
+    /// of `or`.  No value can be simultaneously less than A and greater than B
+    /// (when A ≤ B), so the guard body is permanently dead code.
+    /// The correct out-of-range check is `x < A or x > B`.
+    /// Catches oven-sh/bun#25905 (3 copy-paste dead RangeError guards).
+    impossible_range_and,
 };
 
-pub const all_invariants: [81]Invariant = .{
+pub const all_invariants: [82]Invariant = .{
     .arena_escape,
     .stack_escape,
     .use_undefined,
@@ -748,6 +754,7 @@ pub const all_invariants: [81]Invariant = .{
     .array_maxint_off_by_one,
     .intcast_clamp_uses_max,
     .forced_unwrap_iterator_next,
+    .impossible_range_and,
 };
 
 pub const Default: Config = .{};
