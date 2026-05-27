@@ -658,6 +658,7 @@ const return_arraylist_items_mod = @import("rules/misc/return_arraylist_items.zi
 const lessthan_uses_leq_mod = @import("rules/misc/lessthan_uses_leq.zig");
 const duplicate_defer_free_mod = @import("rules/misc/duplicate_defer_free.zig");
 const hashmap_getentry_forced_unwrap_mod = @import("rules/collection/hashmap_getentry_forced_unwrap.zig");
+const multiarray_items_deref_assign_mod = @import("rules/collection/multiarray_items_deref_assign.zig");
 const double_optional_ptr_mod = @import("rules/misc/double_optional_ptr.zig");
 const aligncast_on_optional_unwrap_mod = @import("rules/misc/aligncast_on_optional_unwrap.zig");
 const adjacent_decl_same_source_field_mod = @import("rules/misc/adjacent_decl_same_source_field.zig");
@@ -773,6 +774,7 @@ const escape_detectors = [_]Detector{
     .{ .id = "intcast-of-negated-signed",               .check = intcast_of_negated_signed_mod.check },
     .{ .id = "struct-literal-multiple-try",             .check = struct_literal_multiple_try_mod.check },
     .{ .id = "writeint-truncated-value",                .check = writeint_truncated_value_mod.check },
+    .{ .id = "multiarray-items-deref-assign",           .check = multiarray_items_deref_assign_mod.check },
 };
 
 /// Dispatch all registered pattern detectors against `tree`.  `cache`
@@ -931,4 +933,5 @@ test "registry: pull in every rule module so inline tests run" {
     _ = intcast_of_negated_signed_mod;
     _ = struct_literal_multiple_try_mod;
     _ = writeint_truncated_value_mod;
+    _ = multiarray_items_deref_assign_mod;
 }

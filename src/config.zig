@@ -813,9 +813,14 @@ pub const Invariant = enum {
     /// correct wider type for `writeInt` or add a bounds check.
     /// Catches ziglang/zig#22233 (Elf.Atom dynAbs reloc truncation).
     writeint_truncated_value,
+    /// `.items(.FIELD)[i].* = VALUE` on a MultiArrayList — `items(.field)`
+    /// returns `[]FieldType` (values, not pointers); `[i].*` dereferences the
+    /// field value as a memory address (UB).  Remove `.*` and assign directly.
+    /// Catches ziglang/zig#22968 (ArrayHashMap setKey store_hash=true).
+    multiarray_items_deref_assign,
 };
 
-pub const all_invariants: [107]Invariant = .{
+pub const all_invariants: [108]Invariant = .{
     .arena_escape,
     .stack_escape,
     .use_undefined,
@@ -923,6 +928,7 @@ pub const all_invariants: [107]Invariant = .{
     .intcast_of_negated_signed,
     .struct_literal_multiple_try,
     .writeint_truncated_value,
+    .multiarray_items_deref_assign,
 };
 
 pub const Default: Config = .{};
