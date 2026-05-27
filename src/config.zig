@@ -818,9 +818,14 @@ pub const Invariant = enum {
     /// field value as a memory address (UB).  Remove `.*` and assign directly.
     /// Catches ziglang/zig#22968 (ArrayHashMap setKey store_hash=true).
     multiarray_items_deref_assign,
+    /// `startsWith(SLICE, "LITERAL")` followed by `SLICE[literal.len-1..]` —
+    /// off-by-one strips one fewer character than the prefix; use
+    /// `SLICE[literal.len..]` or `SLICE["LITERAL".len..]`.
+    /// Catches oven-sh/bun#27970 (node_fs_watcher "file://" = 7 chars, used 6).
+    startswith_strip_off_by_one,
 };
 
-pub const all_invariants: [108]Invariant = .{
+pub const all_invariants: [109]Invariant = .{
     .arena_escape,
     .stack_escape,
     .use_undefined,
@@ -929,6 +934,7 @@ pub const all_invariants: [108]Invariant = .{
     .struct_literal_multiple_try,
     .writeint_truncated_value,
     .multiarray_items_deref_assign,
+    .startswith_strip_off_by_one,
 };
 
 pub const Default: Config = .{};
