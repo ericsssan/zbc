@@ -415,6 +415,16 @@ pub const all = [_]Rule{
         .title = "`@as(f32, @floatFromInt(…))` narrows integer to f32 — values above 2²⁴ silently round, defeating bounds checks",
         .body = @embedFile("rules/misc/f32-narrowing-int-to-float.md"),
     },
+    .{
+        .id = "array-maxint-off-by-one",
+        .title = "`[std.math.maxInt(T)]` array has one slot too few — index `maxInt(T)` is always out of bounds",
+        .body = @embedFile("rules/misc/array-maxint-off-by-one.md"),
+    },
+    .{
+        .id = "intcast-clamp-uses-max",
+        .title = "`@intCast(@max(…, maxInt(T)))` uses `@max` instead of `@min` — overflows the intended upper bound",
+        .body = @embedFile("rules/misc/intcast-clamp-uses-max.md"),
+    },
 };
 
 /// Look up a rule by id.  Returns null on unknown id so callers can
@@ -510,6 +520,8 @@ const ptrfromint_zero_mod = @import("rules/misc/ptrfromint_zero.zig");
 const resize_result_discarded_mod = @import("rules/heap/resize_result_discarded.zig");
 const errdefer_alive_after_ownership_transfer_mod = @import("rules/errdefer/errdefer_alive_after_ownership_transfer.zig");
 const f32_narrowing_int_to_float_mod = @import("rules/misc/f32_narrowing_int_to_float.zig");
+const array_maxint_off_by_one_mod = @import("rules/misc/array_maxint_off_by_one.zig");
+const intcast_clamp_uses_max_mod = @import("rules/misc/intcast_clamp_uses_max.zig");
 const reset_skips_pooled_resource_release_mod = @import("rules/cleanup/reset_skips_pooled_resource_release.zig");
 const return_borrowed_payload_mod = @import("rules/borrow/return_borrowed_payload.zig");
 const self_undefined_after_destroy_mod = @import("rules/borrow/self_undefined_after_destroy.zig");
@@ -590,6 +602,8 @@ const escape_detectors = [_]Detector{
     .{ .id = "resize-result-discarded",                    .check = resize_result_discarded_mod.check },
     .{ .id = "errdefer-alive-after-ownership-transfer",    .check = errdefer_alive_after_ownership_transfer_mod.check },
     .{ .id = "f32-narrowing-int-to-float",                .check = f32_narrowing_int_to_float_mod.check },
+    .{ .id = "array-maxint-off-by-one",                  .check = array_maxint_off_by_one_mod.check },
+    .{ .id = "intcast-clamp-uses-max",                   .check = intcast_clamp_uses_max_mod.check },
 };
 
 /// Dispatch all registered pattern detectors against `tree`.  `cache`
@@ -719,4 +733,6 @@ test "registry: pull in every rule module so inline tests run" {
     _ = resize_result_discarded_mod;
     _ = errdefer_alive_after_ownership_transfer_mod;
     _ = f32_narrowing_int_to_float_mod;
+    _ = array_maxint_off_by_one_mod;
+    _ = intcast_clamp_uses_max_mod;
 }

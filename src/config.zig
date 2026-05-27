@@ -646,9 +646,21 @@ pub const Invariant = enum {
     /// `@as(f64, @floatFromInt(…))` instead, or clamp first if f32 is required.
     /// Catches oven-sh/bun#30134 (CSS parser typed-array offset bounds checks).
     f32_narrowing_int_to_float,
+    /// `[std.math.maxInt(T)]SomeType` declares `maxInt(T)` slots, leaving
+    /// index `maxInt(T)` out of bounds when the array is later indexed by a
+    /// value of type T.  Correct form: `[std.math.maxInt(T) + 1]SomeType`.
+    /// Catches oven-sh/bun#29976 (hex_table[255] OOB) and
+    /// #29973 (sort_table[std.math.maxInt(u8)] OOB).
+    array_maxint_off_by_one,
+    /// `@intCast(@max(expr, std.math.maxInt(T)))` uses `@max` to clamp
+    /// before narrowing — but `@max` returns the *larger* operand, so values
+    /// exceeding `maxInt(T)` are passed through and `@intCast` panics/wraps.
+    /// The correct builtin is `@min`.
+    /// Catches oven-sh/bun#29813 (queueSize clamped with @max instead of @min).
+    intcast_clamp_uses_max,
 };
 
-pub const all_invariants: [78]Invariant = .{
+pub const all_invariants: [80]Invariant = .{
     .arena_escape,
     .stack_escape,
     .use_undefined,
@@ -727,6 +739,8 @@ pub const all_invariants: [78]Invariant = .{
     .resize_result_discarded,
     .errdefer_alive_after_ownership_transfer,
     .f32_narrowing_int_to_float,
+    .array_maxint_off_by_one,
+    .intcast_clamp_uses_max,
 };
 
 pub const Default: Config = .{};
