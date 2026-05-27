@@ -458,9 +458,17 @@ pub const Invariant = enum {
     /// the object leaks.  Fix: remove the addref, OR keep it and add a
     /// paired `defer <recv>.deref()`.  Catches oven-sh/bun#30137 class.
     ref_before_ownership_transfer,
+    /// Inside `if (<recv>.<field>) |*<cap>| { … }`, a local `<ptr>`
+    /// is derived from `<cap>` (mutable pointer to the optional
+    /// payload).  The same block then contains an inline assignment
+    /// `<recv>.<field> = …` (null or other) that destroys the storage
+    /// `<ptr>` was pointing into.  Any subsequent use of `<ptr>` is a
+    /// UAF.  Inline-clear variant of oven-sh/bun#29979.  The callee-
+    /// clear variant is covered by heap-use-after-free (CFG-level).
+    opt_capture_ptr_after_field_clear,
 };
 
-pub const all_invariants: [53]Invariant = .{
+pub const all_invariants: [54]Invariant = .{
     .arena_escape,
     .stack_escape,
     .use_undefined,
@@ -514,6 +522,7 @@ pub const all_invariants: [53]Invariant = .{
     .getorput_unguarded_value_read,
     .hashmap_iter_mutation,
     .ref_before_ownership_transfer,
+    .opt_capture_ptr_after_field_clear,
 };
 
 pub const Default: Config = .{};

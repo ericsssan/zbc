@@ -290,6 +290,11 @@ pub const all = [_]Rule{
         .title = "`<recv>.<addref>()` before `init(<recv>, …)` — caller bumps refcount, callee decrements once, extra ref leaks",
         .body = @embedFile("rules/heap/ref-before-ownership-transfer.md"),
     },
+    .{
+        .id = "opt-capture-ptr-after-field-clear",
+        .title = "pointer derived from `if (<recv>.<field>) |*<cap>|` payload used after `<recv>.<field> = …` — storage invalidated",
+        .body = @embedFile("rules/heap/opt-capture-ptr-after-field-clear.md"),
+    },
 };
 
 /// Look up a rule by id.  Returns null on unknown id so callers can
@@ -360,6 +365,7 @@ const owned_field_no_outer_cleanup_mod = @import("rules/cleanup/owned_field_no_o
 const publish_then_touch_self_mod = @import("rules/misc/publish_then_touch_self.zig");
 const realloc_byte_count_mod = @import("rules/heap/realloc_byte_count.zig");
 const ref_before_ownership_transfer_mod = @import("rules/heap/ref_before_ownership_transfer.zig");
+const opt_capture_ptr_after_field_clear_mod = @import("rules/heap/opt_capture_ptr_after_field_clear.zig");
 const reset_skips_pooled_resource_release_mod = @import("rules/cleanup/reset_skips_pooled_resource_release.zig");
 const return_borrowed_payload_mod = @import("rules/borrow/return_borrowed_payload.zig");
 const self_undefined_after_destroy_mod = @import("rules/borrow/self_undefined_after_destroy.zig");
@@ -415,6 +421,7 @@ const escape_detectors = [_]Detector{
     .{ .id = "self-pointer-in-returned-value",             .check = self_pointer_in_returned_value_mod.check },
     .{ .id = "todo-panic-in-production",                   .check = todo_panic_in_production_mod.check },
     .{ .id = "ref-before-ownership-transfer",              .check = ref_before_ownership_transfer_mod.check },
+    .{ .id = "opt-capture-ptr-after-field-clear",          .check = opt_capture_ptr_after_field_clear_mod.check },
 };
 
 /// Dispatch all registered pattern detectors against `tree`.  `cache`
@@ -519,4 +526,5 @@ test "registry: pull in every rule module so inline tests run" {
     _ = unreleased_factory_handle_mod;
     _ = unreleased_refs_on_error_mod;
     _ = ref_before_ownership_transfer_mod;
+    _ = opt_capture_ptr_after_field_clear_mod;
 }
