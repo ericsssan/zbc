@@ -285,6 +285,11 @@ pub const all = [_]Rule{
         .title = "`@panic(\"TODO …\")` marker left in production code — crashes users when the branch is reached",
         .body = @embedFile("rules/invariants/todo-panic-in-production.md"),
     },
+    .{
+        .id = "ref-before-ownership-transfer",
+        .title = "`<recv>.<addref>()` before `init(<recv>, …)` — caller bumps refcount, callee decrements once, extra ref leaks",
+        .body = @embedFile("rules/heap/ref-before-ownership-transfer.md"),
+    },
 };
 
 /// Look up a rule by id.  Returns null on unknown id so callers can
@@ -354,6 +359,7 @@ const overwrite_without_deinit_mod = @import("rules/cleanup/overwrite_without_de
 const owned_field_no_outer_cleanup_mod = @import("rules/cleanup/owned_field_no_outer_cleanup.zig");
 const publish_then_touch_self_mod = @import("rules/misc/publish_then_touch_self.zig");
 const realloc_byte_count_mod = @import("rules/heap/realloc_byte_count.zig");
+const ref_before_ownership_transfer_mod = @import("rules/heap/ref_before_ownership_transfer.zig");
 const reset_skips_pooled_resource_release_mod = @import("rules/cleanup/reset_skips_pooled_resource_release.zig");
 const return_borrowed_payload_mod = @import("rules/borrow/return_borrowed_payload.zig");
 const self_undefined_after_destroy_mod = @import("rules/borrow/self_undefined_after_destroy.zig");
@@ -408,6 +414,7 @@ const escape_detectors = [_]Detector{
     .{ .id = "thread-spawn-local-pointer",                 .check = thread_spawn_local_pointer_mod.check },
     .{ .id = "self-pointer-in-returned-value",             .check = self_pointer_in_returned_value_mod.check },
     .{ .id = "todo-panic-in-production",                   .check = todo_panic_in_production_mod.check },
+    .{ .id = "ref-before-ownership-transfer",              .check = ref_before_ownership_transfer_mod.check },
 };
 
 /// Dispatch all registered pattern detectors against `tree`.  `cache`
@@ -511,4 +518,5 @@ test "registry: pull in every rule module so inline tests run" {
     _ = union_deinit_without_inert_reset_mod;
     _ = unreleased_factory_handle_mod;
     _ = unreleased_refs_on_error_mod;
+    _ = ref_before_ownership_transfer_mod;
 }

@@ -451,9 +451,16 @@ pub const Invariant = enum {
     /// `valueIterator()` invalidates the iterator's internal cursor.
     /// Subsequent calls to `iter.next()` have undefined behaviour.
     hashmap_iter_mutation,
+    /// `<recv>.<addref>()` (addref ∈ ref/retain/reference/addRef/
+    /// addref) immediately before `init(<recv>, …)` — the caller bumps
+    /// the refcount by 1, but the init-style callee takes ownership and
+    /// decrements exactly once.  The extra ref is never balanced and
+    /// the object leaks.  Fix: remove the addref, OR keep it and add a
+    /// paired `defer <recv>.deref()`.  Catches oven-sh/bun#30137 class.
+    ref_before_ownership_transfer,
 };
 
-pub const all_invariants: [52]Invariant = .{
+pub const all_invariants: [53]Invariant = .{
     .arena_escape,
     .stack_escape,
     .use_undefined,
@@ -506,6 +513,7 @@ pub const all_invariants: [52]Invariant = .{
     .todo_panic_in_production,
     .getorput_unguarded_value_read,
     .hashmap_iter_mutation,
+    .ref_before_ownership_transfer,
 };
 
 pub const Default: Config = .{};
