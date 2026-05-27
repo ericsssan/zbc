@@ -755,9 +755,26 @@ pub const Invariant = enum {
     /// freshly-computed local was intended.
     /// Catches oven-sh/bun#25905 (BufferReadStream.seek never advanced pos).
     field_self_assign_with_cast,
+    /// `someCall(...).assert()` — chaining `.assert()` on the result of a
+    /// fallible call converts every OS error into a process-crashing panic.
+    /// In bun's codebase, `bun.sys.Maybe(T).assert()` panics when the variant
+    /// is `.err`.  Catches oven-sh/bun#23344, #23520, #23935 (pipe start
+    /// panicked on UV_ENOTCONN / UV_EPIPE after libuv error paths).
+    maybe_assert_panics,
+    /// `return list.items;` — returns the `.items` slice of a local
+    /// `ArrayList` directly; the caller receives a `[]T` but has no
+    /// `ArrayList` handle to free the backing allocation, leaking the
+    /// capacity bytes.  Fix: `return list.toOwnedSlice();`.
+    /// Catches oven-sh/bun#23885 (toUTF8AllocWithType capacity leak).
+    return_arraylist_items,
+    /// `<=` inside a `lessThan` comparator violates strict weak ordering —
+    /// `lessThan(a, a)` returns `true` for equal elements, causing `std.sort`
+    /// to loop indefinitely or produce incorrect output.
+    /// Catches oven-sh/bun#24146 (sourcemap sort infinite loop).
+    lessthan_uses_leq,
 };
 
-pub const all_invariants: [96]Invariant = .{
+pub const all_invariants: [99]Invariant = .{
     .arena_escape,
     .stack_escape,
     .use_undefined,
@@ -854,6 +871,9 @@ pub const all_invariants: [96]Invariant = .{
     .aligncast_on_byte_slice,
     .truncate_len_to_narrow_int,
     .field_self_assign_with_cast,
+    .maybe_assert_panics,
+    .return_arraylist_items,
+    .lessthan_uses_leq,
 };
 
 pub const Default: Config = .{};

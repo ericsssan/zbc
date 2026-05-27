@@ -505,6 +505,21 @@ pub const all = [_]Rule{
         .title = "`self.field = @as(T, @intCast(self.field))` — self-assign through a cast is a no-op; almost always a copy-paste error where a freshly-computed variable was intended",
         .body = @embedFile("rules/misc/field-self-assign-with-cast.md"),
     },
+    .{
+        .id = "maybe-assert-panics",
+        .title = "`someCall(...).assert()` — chaining `.assert()` on a fallible call converts every OS error into a process crash; check and propagate instead",
+        .body = @embedFile("rules/misc/maybe-assert-panics.md"),
+    },
+    .{
+        .id = "return-arraylist-items",
+        .title = "`return list.items` — returns the `.items` slice without transferring the backing allocation; caller cannot free it; use `toOwnedSlice()` instead",
+        .body = @embedFile("rules/misc/return-arraylist-items.md"),
+    },
+    .{
+        .id = "lessthan-uses-leq",
+        .title = "`<=` inside a `lessThan` comparator violates strict weak ordering — `lessThan(a, a)` returns `true`; `std.sort` may loop or produce incorrect results",
+        .body = @embedFile("rules/misc/lessthan-uses-leq.md"),
+    },
 };
 
 /// Look up a rule by id.  Returns null on unknown id so callers can
@@ -618,6 +633,9 @@ const joinabsstringbuf_without_checked_variant_mod = @import("rules/misc/joinabs
 const aligncast_on_byte_slice_mod = @import("rules/misc/aligncast_on_byte_slice.zig");
 const truncate_len_to_narrow_int_mod = @import("rules/misc/truncate_len_to_narrow_int.zig");
 const field_self_assign_with_cast_mod = @import("rules/misc/field_self_assign_with_cast.zig");
+const maybe_assert_panics_mod = @import("rules/misc/maybe_assert_panics.zig");
+const return_arraylist_items_mod = @import("rules/misc/return_arraylist_items.zig");
+const lessthan_uses_leq_mod = @import("rules/misc/lessthan_uses_leq.zig");
 const reset_skips_pooled_resource_release_mod = @import("rules/cleanup/reset_skips_pooled_resource_release.zig");
 const return_borrowed_payload_mod = @import("rules/borrow/return_borrowed_payload.zig");
 const self_undefined_after_destroy_mod = @import("rules/borrow/self_undefined_after_destroy.zig");
@@ -716,6 +734,9 @@ const escape_detectors = [_]Detector{
     .{ .id = "aligncast-on-byte-slice",                 .check = aligncast_on_byte_slice_mod.check },
     .{ .id = "truncate-len-to-narrow-int",              .check = truncate_len_to_narrow_int_mod.check },
     .{ .id = "field-self-assign-with-cast",             .check = field_self_assign_with_cast_mod.check },
+    .{ .id = "maybe-assert-panics",                     .check = maybe_assert_panics_mod.check },
+    .{ .id = "return-arraylist-items",                  .check = return_arraylist_items_mod.check },
+    .{ .id = "lessthan-uses-leq",                       .check = lessthan_uses_leq_mod.check },
 };
 
 /// Dispatch all registered pattern detectors against `tree`.  `cache`
@@ -863,4 +884,7 @@ test "registry: pull in every rule module so inline tests run" {
     _ = aligncast_on_byte_slice_mod;
     _ = truncate_len_to_narrow_int_mod;
     _ = field_self_assign_with_cast_mod;
+    _ = maybe_assert_panics_mod;
+    _ = return_arraylist_items_mod;
+    _ = lessthan_uses_leq_mod;
 }
