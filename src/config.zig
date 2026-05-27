@@ -750,9 +750,14 @@ pub const Invariant = enum {
     /// user-controlled data ≥ 2^N bytes wraps to a garbage size, corrupting
     /// subsequent reads/allocs.  Catches oven-sh/bun#27443 (4 GB form body).
     truncate_len_to_narrow_int,
+    /// `self.field = @as(T, @intCast(self.field))` — field assigned to itself
+    /// through a cast is a no-op; almost always a copy-paste error where a
+    /// freshly-computed local was intended.
+    /// Catches oven-sh/bun#25905 (BufferReadStream.seek never advanced pos).
+    field_self_assign_with_cast,
 };
 
-pub const all_invariants: [95]Invariant = .{
+pub const all_invariants: [96]Invariant = .{
     .arena_escape,
     .stack_escape,
     .use_undefined,
@@ -848,6 +853,7 @@ pub const all_invariants: [95]Invariant = .{
     .joinabsstringbuf_without_checked_variant,
     .aligncast_on_byte_slice,
     .truncate_len_to_narrow_int,
+    .field_self_assign_with_cast,
 };
 
 pub const Default: Config = .{};
