@@ -676,9 +676,42 @@ pub const Invariant = enum {
     /// ReleaseFast.  Use `@intCast(@max(0, std.time.milliTimestamp()))`.
     /// Catches oven-sh/bun#10365 (PRNG seed from raw milliTimestamp).
     intcast_signed_timestamp,
+    /// `while (i >= 0)` where `i` is a `usize` (or any other unsigned type) —
+    /// the condition is always `true` because unsigned values can never be
+    /// negative.  The loop never exits through this guard; the subsequent
+    /// `i -= 1` wraps to `maxInt(usize)` (panic in Debug, silent runaway in
+    /// ReleaseFast).  Fix: use `while (i > 0)` or restructure the loop to
+    /// decrement before comparing.
+    /// Catches oven-sh/bun#11491 (glob.zig reverse scan) and
+    /// oven-sh/bun#24561 (hosted_git_info.zig) class.
+    usize_geq_zero_loop,
+    /// `@truncate(a - b)` or `@truncate(recv.field - other)` where the
+    /// unsigned subtraction is not guarded by `a >= b`.  When `b > a` the
+    /// subtraction wraps to a huge value BEFORE `@truncate` narrows it,
+    /// yielding a garbage result.  Fix: add `if (a >= b)` guard, or use
+    /// saturating subtraction `-|`.
+    /// Catches oven-sh/bun#23993 (OKPacket.zig) and
+    /// oven-sh/bun#6761/#29905 (h2_frame_parser.zig) class.
+    truncate_subtraction_without_guard,
+    /// `initCapacity(allocator, size + N)` where `N` is a small integer
+    /// literal and `size` is a variable.  Plain `+` overflows when `size` is
+    /// near `maxInt(usize)`, wrapping the requested capacity to a small value
+    /// — the allocation succeeds but writes beyond its end corrupt the heap.
+    /// Fix: use saturating add `+|` so the capacity caps at `maxInt(usize)`.
+    /// Catches oven-sh/bun#29284 (read_file.zig) and
+    /// oven-sh/bun#26999 (cron parser) class.
+    initcapacity_plain_add_overflow,
+    /// `buf[idx - 1]` where `idx` is an identifier without a visible
+    /// `idx > 0` (or `idx != 0`) guard before the subscript.  When `idx`
+    /// is `usize` and equals `0`, the subtraction wraps to `maxInt(usize)`,
+    /// an OOB panic in Debug/Safe or silent arbitrary-memory read in
+    /// ReleaseFast.  Fix: add a zero-guard before the expression.
+    /// Catches oven-sh/bun#24561 (hosted_git_info.zig) and
+    /// oven-sh/bun#28487 (braces.zig) class.
+    index_minus_one_without_zero_guard,
 };
 
-pub const all_invariants: [83]Invariant = .{
+pub const all_invariants: [87]Invariant = .{
     .arena_escape,
     .stack_escape,
     .use_undefined,
@@ -762,6 +795,10 @@ pub const all_invariants: [83]Invariant = .{
     .forced_unwrap_iterator_next,
     .impossible_range_and,
     .intcast_signed_timestamp,
+    .usize_geq_zero_loop,
+    .truncate_subtraction_without_guard,
+    .initcapacity_plain_add_overflow,
+    .index_minus_one_without_zero_guard,
 };
 
 pub const Default: Config = .{};

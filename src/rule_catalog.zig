@@ -440,6 +440,26 @@ pub const all = [_]Rule{
         .title = "`@intCast(std.time.<fn>())` casts signed i64 timestamp without guard — negative values panic or wrap",
         .body = @embedFile("rules/misc/intcast-signed-timestamp.md"),
     },
+    .{
+        .id = "usize-geq-zero-loop",
+        .title = "`while (i >= 0)` with unsigned `i` — condition always true; `i -= 1` wraps to `maxInt(usize)` (panic or infinite loop)",
+        .body = @embedFile("rules/misc/usize-geq-zero-loop.md"),
+    },
+    .{
+        .id = "truncate-subtraction-without-guard",
+        .title = "`@truncate(a - b)` without `a >= b` guard — unsigned underflow wraps before truncation, yielding garbage",
+        .body = @embedFile("rules/misc/truncate-subtraction-without-guard.md"),
+    },
+    .{
+        .id = "initcapacity-plain-add-overflow",
+        .title = "`initCapacity(alloc, size + N)` plain add overflows when `size` near `maxInt(usize)` — under-allocates, heap corruption follows",
+        .body = @embedFile("rules/misc/initcapacity-plain-add-overflow.md"),
+    },
+    .{
+        .id = "index-minus-one-without-zero-guard",
+        .title = "`buf[idx - 1]` without `idx > 0` guard — unsigned underflow wraps to `maxInt(usize)` (OOB panic or arbitrary memory read)",
+        .body = @embedFile("rules/misc/index-minus-one-without-zero-guard.md"),
+    },
 };
 
 /// Look up a rule by id.  Returns null on unknown id so callers can
@@ -540,6 +560,10 @@ const intcast_clamp_uses_max_mod = @import("rules/misc/intcast_clamp_uses_max.zi
 const forced_unwrap_iterator_next_mod = @import("rules/misc/forced_unwrap_iterator_next.zig");
 const impossible_range_and_mod = @import("rules/misc/impossible_range_and.zig");
 const intcast_signed_timestamp_mod = @import("rules/misc/intcast_signed_timestamp.zig");
+const usize_geq_zero_loop_mod = @import("rules/misc/usize_geq_zero_loop.zig");
+const truncate_subtraction_without_guard_mod = @import("rules/misc/truncate_subtraction_without_guard.zig");
+const initcapacity_plain_add_overflow_mod = @import("rules/misc/initcapacity_plain_add_overflow.zig");
+const index_minus_one_without_zero_guard_mod = @import("rules/misc/index_minus_one_without_zero_guard.zig");
 const reset_skips_pooled_resource_release_mod = @import("rules/cleanup/reset_skips_pooled_resource_release.zig");
 const return_borrowed_payload_mod = @import("rules/borrow/return_borrowed_payload.zig");
 const self_undefined_after_destroy_mod = @import("rules/borrow/self_undefined_after_destroy.zig");
@@ -625,6 +649,10 @@ const escape_detectors = [_]Detector{
     .{ .id = "forced-unwrap-iterator-next",              .check = forced_unwrap_iterator_next_mod.check },
     .{ .id = "impossible-range-and",                    .check = impossible_range_and_mod.check },
     .{ .id = "intcast-signed-timestamp",                .check = intcast_signed_timestamp_mod.check },
+    .{ .id = "usize-geq-zero-loop",                     .check = usize_geq_zero_loop_mod.check },
+    .{ .id = "truncate-subtraction-without-guard",      .check = truncate_subtraction_without_guard_mod.check },
+    .{ .id = "initcapacity-plain-add-overflow",         .check = initcapacity_plain_add_overflow_mod.check },
+    .{ .id = "index-minus-one-without-zero-guard",      .check = index_minus_one_without_zero_guard_mod.check },
 };
 
 /// Dispatch all registered pattern detectors against `tree`.  `cache`
@@ -759,4 +787,8 @@ test "registry: pull in every rule module so inline tests run" {
     _ = forced_unwrap_iterator_next_mod;
     _ = impossible_range_and_mod;
     _ = intcast_signed_timestamp_mod;
+    _ = usize_geq_zero_loop_mod;
+    _ = truncate_subtraction_without_guard_mod;
+    _ = initcapacity_plain_add_overflow_mod;
+    _ = index_minus_one_without_zero_guard_mod;
 }
