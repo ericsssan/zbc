@@ -465,6 +465,11 @@ pub const all = [_]Rule{
         .title = "`else 0 + addend` — Zig's `if` has lower precedence than `+`, absorbing the addend into the else-branch and silently dropping it when the condition is true",
         .body = @embedFile("rules/misc/else-literal-absorbs-addend.md"),
     },
+    .{
+        .id = "catch-error-panic",
+        .title = "`catch |err| @panic(...)` — catching an error and panicking turns a recoverable error into a process crash; use `try` to propagate or `catch unreachable` if impossible",
+        .body = @embedFile("rules/misc/catch-error-panic.md"),
+    },
 };
 
 /// Look up a rule by id.  Returns null on unknown id so callers can
@@ -570,6 +575,7 @@ const truncate_subtraction_without_guard_mod = @import("rules/misc/truncate_subt
 const initcapacity_plain_add_overflow_mod = @import("rules/misc/initcapacity_plain_add_overflow.zig");
 const index_minus_one_without_zero_guard_mod = @import("rules/misc/index_minus_one_without_zero_guard.zig");
 const else_literal_absorbs_addend_mod = @import("rules/misc/else_literal_absorbs_addend.zig");
+const catch_error_panic_mod = @import("rules/misc/catch_error_panic.zig");
 const reset_skips_pooled_resource_release_mod = @import("rules/cleanup/reset_skips_pooled_resource_release.zig");
 const return_borrowed_payload_mod = @import("rules/borrow/return_borrowed_payload.zig");
 const self_undefined_after_destroy_mod = @import("rules/borrow/self_undefined_after_destroy.zig");
@@ -660,6 +666,7 @@ const escape_detectors = [_]Detector{
     .{ .id = "initcapacity-plain-add-overflow",         .check = initcapacity_plain_add_overflow_mod.check },
     .{ .id = "index-minus-one-without-zero-guard",      .check = index_minus_one_without_zero_guard_mod.check },
     .{ .id = "else-literal-absorbs-addend",             .check = else_literal_absorbs_addend_mod.check },
+    .{ .id = "catch-error-panic",                       .check = catch_error_panic_mod.check },
 };
 
 /// Dispatch all registered pattern detectors against `tree`.  `cache`
@@ -799,4 +806,5 @@ test "registry: pull in every rule module so inline tests run" {
     _ = initcapacity_plain_add_overflow_mod;
     _ = index_minus_one_without_zero_guard_mod;
     _ = else_literal_absorbs_addend_mod;
+    _ = catch_error_panic_mod;
 }

@@ -718,9 +718,14 @@ pub const Invariant = enum {
     /// Catches oven-sh/bun#30466 and 20+ duplicate PRs (Bun.build crash with
     /// many `conditions`).
     else_literal_absorbs_addend,
+    /// `catch |err| @panic(...)` — catching a named error and panicking turns
+    /// a recoverable error into a process crash; use `try` to propagate or
+    /// `catch unreachable` only when the error is provably impossible.
+    /// Catches oven-sh/bun#30082 (S3 URL encode with fixed 1024-byte buffer).
+    catch_error_panic,
 };
 
-pub const all_invariants: [88]Invariant = .{
+pub const all_invariants: [89]Invariant = .{
     .arena_escape,
     .stack_escape,
     .use_undefined,
@@ -809,6 +814,7 @@ pub const all_invariants: [88]Invariant = .{
     .initcapacity_plain_add_overflow,
     .index_minus_one_without_zero_guard,
     .else_literal_absorbs_addend,
+    .catch_error_panic,
 };
 
 pub const Default: Config = .{};
