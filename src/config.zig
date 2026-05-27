@@ -778,9 +778,14 @@ pub const Invariant = enum {
     /// removing the original defer.
     /// Catches oven-sh/bun#22978 (createArgv double-free of argv allocation).
     duplicate_defer_free,
+    /// `map.getEntry(key).?` — forced optional unwrap on the `?Entry` result of
+    /// `HashMap.getEntry`; panics when the key is absent.  Use
+    /// `if (map.getEntry(key)) |e| { … }` or `orelse return`.
+    /// Catches oven-sh/bun#14606 (H2 stream forced-unwrap after callback dispatch).
+    hashmap_getentry_forced_unwrap,
 };
 
-pub const all_invariants: [100]Invariant = .{
+pub const all_invariants: [101]Invariant = .{
     .arena_escape,
     .stack_escape,
     .use_undefined,
@@ -881,6 +886,7 @@ pub const all_invariants: [100]Invariant = .{
     .return_arraylist_items,
     .lessthan_uses_leq,
     .duplicate_defer_free,
+    .hashmap_getentry_forced_unwrap,
 };
 
 pub const Default: Config = .{};

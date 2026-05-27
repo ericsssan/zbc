@@ -525,6 +525,11 @@ pub const all = [_]Rule{
         .title = "`defer alloc.free(X)` appears twice in the same fn body — both fire at exit (LIFO), freeing `X` twice; remove the duplicate",
         .body = @embedFile("rules/misc/duplicate-defer-free.md"),
     },
+    .{
+        .id = "hashmap-getentry-forced-unwrap",
+        .title = "`.getEntry(key).?` — `HashMap.getEntry` returns `?Entry`; forced `.?` panics when key is absent; use `if`/`orelse` guard instead",
+        .body = @embedFile("rules/collection/hashmap-getentry-forced-unwrap.md"),
+    },
 };
 
 /// Look up a rule by id.  Returns null on unknown id so callers can
@@ -642,6 +647,7 @@ const maybe_assert_panics_mod = @import("rules/misc/maybe_assert_panics.zig");
 const return_arraylist_items_mod = @import("rules/misc/return_arraylist_items.zig");
 const lessthan_uses_leq_mod = @import("rules/misc/lessthan_uses_leq.zig");
 const duplicate_defer_free_mod = @import("rules/misc/duplicate_defer_free.zig");
+const hashmap_getentry_forced_unwrap_mod = @import("rules/collection/hashmap_getentry_forced_unwrap.zig");
 const reset_skips_pooled_resource_release_mod = @import("rules/cleanup/reset_skips_pooled_resource_release.zig");
 const return_borrowed_payload_mod = @import("rules/borrow/return_borrowed_payload.zig");
 const self_undefined_after_destroy_mod = @import("rules/borrow/self_undefined_after_destroy.zig");
@@ -744,6 +750,7 @@ const escape_detectors = [_]Detector{
     .{ .id = "return-arraylist-items",                  .check = return_arraylist_items_mod.check },
     .{ .id = "lessthan-uses-leq",                       .check = lessthan_uses_leq_mod.check },
     .{ .id = "duplicate-defer-free",                    .check = duplicate_defer_free_mod.check },
+    .{ .id = "hashmap-getentry-forced-unwrap",          .check = hashmap_getentry_forced_unwrap_mod.check },
 };
 
 /// Dispatch all registered pattern detectors against `tree`.  `cache`
@@ -895,4 +902,5 @@ test "registry: pull in every rule module so inline tests run" {
     _ = return_arraylist_items_mod;
     _ = lessthan_uses_leq_mod;
     _ = duplicate_defer_free_mod;
+    _ = hashmap_getentry_forced_unwrap_mod;
 }
