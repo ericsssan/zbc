@@ -583,9 +583,25 @@ pub const Invariant = enum {
     /// before writing the cursor.  Catches oven-sh/bun#12105 class
     /// (lockfile.zig Buffers.readArray).
     readint_unchecked_position_assignment,
+    /// `list.items[list.items.len] = value;` — writes one slot past the
+    /// initialized region without ensuring capacity first.  When
+    /// `items.len == capacity` (the ArrayList is exactly full), this
+    /// writes into allocator bookkeeping bytes, producing a safety-checked
+    /// OOB trap in Debug mode or silent heap corruption in ReleaseFast.
+    /// Fix: `try list.ensureUnusedCapacity(1); list.appendAssumeCapacity(value);`.
+    /// Catches oven-sh/bun#29982 class (toUTF16Alloc sentinel branch).
+    arraylist_sentinel_write_without_capacity,
+    /// `@intFromFloat(<expr>)` without a `@min` / `@max` / `std.math.clamp`
+    /// guard wrapping the argument.  Timer values, peer-advertised delays, and
+    /// GC-scheduler floats can be ±Inf or exceed the target integer's range —
+    /// `@intFromFloat` panics in Debug/Safe and produces undefined behaviour
+    /// in ReleaseFast for those inputs.
+    /// Fix: `@intFromFloat(@min(@max(x, min_f), max_f))` or `std.math.lossyCast`.
+    /// Catches oven-sh/bun#28364 + #29328 class.
+    intfromfloat_without_clamp,
 };
 
-pub const all_invariants: [69]Invariant = .{
+pub const all_invariants: [71]Invariant = .{
     .arena_escape,
     .stack_escape,
     .use_undefined,
@@ -655,6 +671,8 @@ pub const all_invariants: [69]Invariant = .{
     .slice_from_fixed_offset_without_len_check,
     .negate_then_shift_without_minint_check,
     .readint_unchecked_position_assignment,
+    .arraylist_sentinel_write_without_capacity,
+    .intfromfloat_without_clamp,
 };
 
 pub const Default: Config = .{};

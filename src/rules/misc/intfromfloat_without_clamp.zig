@@ -1,0 +1,198 @@
+//! Detects `@intFromFloat(<expr>)` where the float argument is not
+//! guarded by a clamp/min/max inside the call's argument expression.
+//!
+//! `@intFromFloat` panics in Debug/Safe when the float value is outside
+//! the target integer's range, is NaN, or is ±Inf.  In ReleaseFast it
+//! produces undefined behaviour.  Timer values, peer-advertised timeouts,
+//! and GC-scheduler floats received from the JS engine can be huge
+//! (or infinite) and must be clamped before conversion.
+//!
+//! Pattern (fires):
+//!   const sec: i64 = @intFromFloat(seconds);        // seconds may be +Inf
+//!   interval.sec += @intFromFloat(modf.ipart);       // modf.ipart from JS timer
+//!
+//! Safe forms (suppressed):
+//!   @intFromFloat(@min(seconds, @as(f64, std.math.maxInt(i32))))
+//!   @intFromFloat(@max(@min(x, max_f), min_f))
+//!   @intFromFloat(@round(x))   -- @floor / @ceil / @trunc are also accepted
+//!
+//! Real-world shape: oven-sh/bun#28364 (Timer: modf.ipart ± Inf panic),
+//!                   oven-sh/bun#29328 (GC scheduler float out of i64 range).
+//!
+//! Detection (Tier 1, token walk):
+//!   1. Scan for `.builtin` token with slice "@intFromFloat".
+//!   2. The next token must be `.l_paren`.
+//!   3. Scan the argument expression (up to the matching `r_paren`)
+//!      for a `.builtin` token whose slice is "@min", "@max", "@round",
+//!      "@floor", "@ceil", "@trunc".  If found, suppress.
+//!   4. Also suppress if `std.math.clamp` appears as an identifier
+//!      sequence in the argument.
+//!   5. Fire at the `@intFromFloat` builtin token.
+
+const std = @import("std");
+const Ast = std.zig.Ast;
+
+const problem_mod = @import("../../problem.zig");
+const config_mod = @import("../../config.zig");
+const file_cache_mod = @import("../../cache/file_cache.zig");
+
+const tokens = @import("../../ast/tokens.zig");
+const testing = @import("../../testing.zig");
+
+const matchParen = tokens.matchParen;
+const skipNestedFn = tokens.skipNestedFn;
+
+const Problem = problem_mod.Problem;
+const Pos = problem_mod.Pos;
+const R = "intfromfloat-without-clamp";
+
+pub fn check(
+    gpa: std.mem.Allocator,
+    tree: *const Ast,
+    cache: *file_cache_mod.FileCache,
+    config: *const config_mod.Config,
+    problems: *std.ArrayListUnmanaged(Problem),
+) !void {
+    if (!config_mod.isEnabled(config, .intfromfloat_without_clamp)) return;
+    _ = cache;
+    try tokens.forEachFnBody(gpa, tree, problems, checkBody);
+}
+
+fn checkBody(
+    gpa: std.mem.Allocator,
+    tree: *const Ast,
+    body: Ast.Node.Index,
+    problems: *std.ArrayListUnmanaged(Problem),
+) !void {
+    const tags = tree.tokens.items(.tag);
+    const first = tree.firstToken(body);
+    const last = tree.lastToken(body);
+
+    var t: Ast.TokenIndex = first;
+    while (t + 1 <= last) : (t += 1) {
+        if (tags[t] == .keyword_fn) {
+            t = skipNestedFn(tags, t, last);
+            continue;
+        }
+
+        if (tags[t] != .builtin) continue;
+        if (!std.mem.eql(u8, tree.tokenSlice(t), "@intFromFloat")) continue;
+        if (t + 1 > last or tags[t + 1] != .l_paren) continue;
+
+        // Find the matching close-paren for the @intFromFloat(...) call.
+        const arg_open = t + 1;
+        const arg_close = matchParen(tags, arg_open, last) orelse last;
+
+        // Suppress if the argument contains a clamp/min/max/rounding builtin.
+        if (argHasClampGuard(tree, tags, arg_open, arg_close)) continue;
+
+        try report(gpa, problems, tree, t);
+    }
+}
+
+/// Returns true iff the token range (arg_open..arg_close) contains a
+/// builtin that guards against out-of-range float values:
+///   @min, @max, @round, @floor, @ceil, @trunc
+/// OR the identifier sequence `clamp` (for std.math.clamp).
+fn argHasClampGuard(
+    tree: *const Ast,
+    tags: []const std.zig.Token.Tag,
+    arg_open: Ast.TokenIndex,
+    arg_close: Ast.TokenIndex,
+) bool {
+    if (arg_open >= arg_close) return false;
+    var t: Ast.TokenIndex = arg_open + 1;
+    while (t < arg_close) : (t += 1) {
+        if (tags[t] == .builtin) {
+            const s = tree.tokenSlice(t);
+            if (std.mem.eql(u8, s, "@min") or
+                std.mem.eql(u8, s, "@max") or
+                std.mem.eql(u8, s, "@round") or
+                std.mem.eql(u8, s, "@floor") or
+                std.mem.eql(u8, s, "@ceil") or
+                std.mem.eql(u8, s, "@trunc")) return true;
+        }
+        if (tags[t] == .identifier and std.mem.eql(u8, tree.tokenSlice(t), "clamp")) return true;
+    }
+    return false;
+}
+
+fn report(
+    gpa: std.mem.Allocator,
+    problems: *std.ArrayListUnmanaged(Problem),
+    tree: *const Ast,
+    builtin_tok: Ast.TokenIndex,
+) !void {
+    const msg = try std.fmt.allocPrint(
+        gpa,
+        "`@intFromFloat` without a preceding clamp/min/max guard — if the float argument is ±Inf, NaN, or outside the target integer's range, this panics in Debug/Safe and produces undefined behaviour in ReleaseFast; clamp first with `@intFromFloat(@min(@max(x, min_f), max_f))` or use `std.math.lossyCast`",
+        .{},
+    );
+    errdefer gpa.free(msg);
+    try problems.append(gpa, .{
+        .rule_id = R,
+        .severity = .@"error",
+        .start = Pos.fromTokenStart(tree, builtin_tok),
+        .end = Pos.fromTokenEnd(tree, builtin_tok),
+        .message = msg,
+    });
+}
+
+// ── Tests ──────────────────────────────────────────────────
+
+test "intfromfloat-without-clamp: bare intFromFloat fires" {
+    try testing.expectFires(check, R,
+        \\fn setInterval(seconds: f64) void {
+        \\    const sec: i64 = @intFromFloat(seconds);
+        \\    _ = sec;
+        \\}
+        \\
+    );
+}
+
+test "intfromfloat-without-clamp: modf result fires" {
+    try testing.expectFires(check, R,
+        \\fn encodeTime(value: f64) i32 {
+        \\    const modf = std.math.modf(value);
+        \\    return @intFromFloat(modf.ipart);
+        \\}
+        \\
+    );
+}
+
+test "intfromfloat-without-clamp: @min guard suppresses" {
+    try testing.expectNoFire(check,
+        \\fn setInterval(seconds: f64) void {
+        \\    const sec: i32 = @intFromFloat(@min(seconds, @as(f64, std.math.maxInt(i32))));
+        \\    _ = sec;
+        \\}
+        \\
+    );
+}
+
+test "intfromfloat-without-clamp: @max guard suppresses" {
+    try testing.expectNoFire(check,
+        \\fn clampPositive(x: f64) u32 {
+        \\    return @intFromFloat(@max(x, 0.0));
+        \\}
+        \\
+    );
+}
+
+test "intfromfloat-without-clamp: @round guard suppresses" {
+    try testing.expectNoFire(check,
+        \\fn rounded(x: f64) i32 {
+        \\    return @intFromFloat(@round(x));
+        \\}
+        \\
+    );
+}
+
+test "intfromfloat-without-clamp: clamp identifier suppresses" {
+    try testing.expectNoFire(check,
+        \\fn clamped(x: f64) i32 {
+        \\    return @intFromFloat(std.math.clamp(x, -1e9, 1e9));
+        \\}
+        \\
+    );
+}

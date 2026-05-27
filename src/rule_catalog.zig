@@ -370,6 +370,16 @@ pub const all = [_]Rule{
         .title = "`readInt`-deserialized value assigned to position/cursor field without bounds check — OOB when used to slice buffer",
         .body = @embedFile("rules/misc/readint-unchecked-position-assignment.md"),
     },
+    .{
+        .id = "arraylist-sentinel-write-without-capacity",
+        .title = "`list.items[list.items.len] = …` — write past end of ArrayList without `ensureUnusedCapacity`; OOB trap or heap corruption",
+        .body = @embedFile("rules/collection/arraylist-sentinel-write-without-capacity.md"),
+    },
+    .{
+        .id = "intfromfloat-without-clamp",
+        .title = "`@intFromFloat(x)` without `@min`/`@max`/`clamp` guard — panics on ±Inf, NaN, or out-of-range float (UB in ReleaseFast)",
+        .body = @embedFile("rules/misc/intfromfloat-without-clamp.md"),
+    },
 };
 
 /// Look up a rule by id.  Returns null on unknown id so callers can
@@ -456,6 +466,8 @@ const recursive_parse_without_stack_check_mod = @import("rules/misc/recursive_pa
 const slice_from_fixed_offset_without_len_check_mod = @import("rules/misc/slice_from_fixed_offset_without_len_check.zig");
 const negate_then_shift_without_minint_check_mod = @import("rules/misc/negate_then_shift_without_minint_check.zig");
 const readint_unchecked_position_assignment_mod = @import("rules/misc/readint_unchecked_position_assignment.zig");
+const arraylist_sentinel_write_without_capacity_mod = @import("rules/collection/arraylist_sentinel_write_without_capacity.zig");
+const intfromfloat_without_clamp_mod = @import("rules/misc/intfromfloat_without_clamp.zig");
 const reset_skips_pooled_resource_release_mod = @import("rules/cleanup/reset_skips_pooled_resource_release.zig");
 const return_borrowed_payload_mod = @import("rules/borrow/return_borrowed_payload.zig");
 const self_undefined_after_destroy_mod = @import("rules/borrow/self_undefined_after_destroy.zig");
@@ -527,6 +539,8 @@ const escape_detectors = [_]Detector{
     .{ .id = "slice-from-fixed-offset-without-len-check",   .check = slice_from_fixed_offset_without_len_check_mod.check },
     .{ .id = "negate-then-shift-without-minint-check",      .check = negate_then_shift_without_minint_check_mod.check },
     .{ .id = "readint-unchecked-position-assignment",       .check = readint_unchecked_position_assignment_mod.check },
+    .{ .id = "arraylist-sentinel-write-without-capacity",  .check = arraylist_sentinel_write_without_capacity_mod.check },
+    .{ .id = "intfromfloat-without-clamp",                 .check = intfromfloat_without_clamp_mod.check },
 };
 
 /// Dispatch all registered pattern detectors against `tree`.  `cache`
@@ -647,4 +661,6 @@ test "registry: pull in every rule module so inline tests run" {
     _ = slice_from_fixed_offset_without_len_check_mod;
     _ = negate_then_shift_without_minint_check_mod;
     _ = readint_unchecked_position_assignment_mod;
+    _ = arraylist_sentinel_write_without_capacity_mod;
+    _ = intfromfloat_without_clamp_mod;
 }
