@@ -385,6 +385,16 @@ pub const all = [_]Rule{
         .title = "`data.len < (a + b)` bounds check — sum computed in narrower type wraps to small value, bypassing the guard",
         .body = @embedFile("rules/misc/int-sum-overflow-in-bounds-cmp.md"),
     },
+    .{
+        .id = "ptr-slice-without-bounds-check",
+        .title = "`.ptr[0..N]` for N∈{2,3,4} bypasses slice length check — OOB read when slice has fewer than N bytes",
+        .body = @embedFile("rules/misc/ptr-slice-without-bounds-check.md"),
+    },
+    .{
+        .id = "mutex-double-lock",
+        .title = "`recv.lock()` twice without `recv.unlock()` in between — non-reentrant Mutex deadlocks (ReleaseFast) or asserts (Debug)",
+        .body = @embedFile("rules/misc/mutex-double-lock.md"),
+    },
 };
 
 /// Look up a rule by id.  Returns null on unknown id so callers can
@@ -474,6 +484,8 @@ const readint_unchecked_position_assignment_mod = @import("rules/misc/readint_un
 const arraylist_sentinel_write_without_capacity_mod = @import("rules/collection/arraylist_sentinel_write_without_capacity.zig");
 const intfromfloat_without_clamp_mod = @import("rules/misc/intfromfloat_without_clamp.zig");
 const int_sum_overflow_in_bounds_cmp_mod = @import("rules/misc/int_sum_overflow_in_bounds_cmp.zig");
+const ptr_slice_without_bounds_check_mod = @import("rules/misc/ptr_slice_without_bounds_check.zig");
+const mutex_double_lock_mod = @import("rules/misc/mutex_double_lock.zig");
 const reset_skips_pooled_resource_release_mod = @import("rules/cleanup/reset_skips_pooled_resource_release.zig");
 const return_borrowed_payload_mod = @import("rules/borrow/return_borrowed_payload.zig");
 const self_undefined_after_destroy_mod = @import("rules/borrow/self_undefined_after_destroy.zig");
@@ -548,6 +560,8 @@ const escape_detectors = [_]Detector{
     .{ .id = "arraylist-sentinel-write-without-capacity",  .check = arraylist_sentinel_write_without_capacity_mod.check },
     .{ .id = "intfromfloat-without-clamp",                 .check = intfromfloat_without_clamp_mod.check },
     .{ .id = "int-sum-overflow-in-bounds-cmp",             .check = int_sum_overflow_in_bounds_cmp_mod.check },
+    .{ .id = "ptr-slice-without-bounds-check",             .check = ptr_slice_without_bounds_check_mod.check },
+    .{ .id = "mutex-double-lock",                          .check = mutex_double_lock_mod.check },
 };
 
 /// Dispatch all registered pattern detectors against `tree`.  `cache`
@@ -671,4 +685,6 @@ test "registry: pull in every rule module so inline tests run" {
     _ = arraylist_sentinel_write_without_capacity_mod;
     _ = intfromfloat_without_clamp_mod;
     _ = int_sum_overflow_in_bounds_cmp_mod;
+    _ = ptr_slice_without_bounds_check_mod;
+    _ = mutex_double_lock_mod;
 }

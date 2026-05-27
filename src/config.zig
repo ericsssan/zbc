@@ -607,9 +607,23 @@ pub const Invariant = enum {
     /// `@as(usize, a) + @as(usize, b)`.
     /// Catches oven-sh/bun#30157 class (IPC message decoder u32 wraparound).
     int_sum_overflow_in_bounds_cmp,
+    /// `.ptr[0..N]` for N ∈ {2, 3, 4} bypasses Zig's slice length check.
+    /// If the source slice has fewer than N bytes, this reads past the
+    /// end of the allocation — silent OOB read in ReleaseFast, or memory
+    /// disclosure / corruption.  Add a `if (slice.len < N) return error.Truncated`
+    /// guard before using `.ptr` for a fixed-size window.
+    /// Catches oven-sh/bun#29999 class (CodepointIterator.next: `.ptr[0..4]`
+    /// without checking `bytes.len >= 4` at end-of-input).
+    ptr_slice_without_bounds_check,
+    /// `recv.lock()` called a second time on the same receiver without a
+    /// preceding `recv.unlock()`.  `std.Thread.Mutex` is non-reentrant:
+    /// a second `lock()` on the same thread deadlocks in ReleaseFast
+    /// (spins forever) and asserts in Debug.  Unlock before re-acquiring.
+    /// Catches oven-sh/bun#28907 class (ThreadPool sync deadlock).
+    mutex_double_lock,
 };
 
-pub const all_invariants: [72]Invariant = .{
+pub const all_invariants: [74]Invariant = .{
     .arena_escape,
     .stack_escape,
     .use_undefined,
@@ -682,6 +696,8 @@ pub const all_invariants: [72]Invariant = .{
     .arraylist_sentinel_write_without_capacity,
     .intfromfloat_without_clamp,
     .int_sum_overflow_in_bounds_cmp,
+    .ptr_slice_without_bounds_check,
+    .mutex_double_lock,
 };
 
 pub const Default: Config = .{};
