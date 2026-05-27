@@ -709,9 +709,18 @@ pub const Invariant = enum {
     /// Catches oven-sh/bun#24561 (hosted_git_info.zig) and
     /// oven-sh/bun#28487 (braces.zig) class.
     index_minus_one_without_zero_guard,
+    /// `if (COND) EXPR else 0 + ADDEND` — Zig's `if` has lower precedence
+    /// than `+`, so this parses as `else (0 + ADDEND)`.  When COND is true,
+    /// ADDEND is silently dropped from the result.  Causes capacity undercounts
+    /// in hash-map and ArrayList pre-allocations, leading to `putAssumeCapacity`
+    /// panics.  Fix: `(if (COND) EXPR else 0) + ADDEND` or
+    /// `@intFromBool(COND) + ADDEND`.
+    /// Catches oven-sh/bun#30466 and 20+ duplicate PRs (Bun.build crash with
+    /// many `conditions`).
+    else_literal_absorbs_addend,
 };
 
-pub const all_invariants: [87]Invariant = .{
+pub const all_invariants: [88]Invariant = .{
     .arena_escape,
     .stack_escape,
     .use_undefined,
@@ -799,6 +808,7 @@ pub const all_invariants: [87]Invariant = .{
     .truncate_subtraction_without_guard,
     .initcapacity_plain_add_overflow,
     .index_minus_one_without_zero_guard,
+    .else_literal_absorbs_addend,
 };
 
 pub const Default: Config = .{};

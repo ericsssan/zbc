@@ -460,6 +460,11 @@ pub const all = [_]Rule{
         .title = "`buf[idx - 1]` without `idx > 0` guard — unsigned underflow wraps to `maxInt(usize)` (OOB panic or arbitrary memory read)",
         .body = @embedFile("rules/misc/index-minus-one-without-zero-guard.md"),
     },
+    .{
+        .id = "else-literal-absorbs-addend",
+        .title = "`else 0 + addend` — Zig's `if` has lower precedence than `+`, absorbing the addend into the else-branch and silently dropping it when the condition is true",
+        .body = @embedFile("rules/misc/else-literal-absorbs-addend.md"),
+    },
 };
 
 /// Look up a rule by id.  Returns null on unknown id so callers can
@@ -564,6 +569,7 @@ const usize_geq_zero_loop_mod = @import("rules/misc/usize_geq_zero_loop.zig");
 const truncate_subtraction_without_guard_mod = @import("rules/misc/truncate_subtraction_without_guard.zig");
 const initcapacity_plain_add_overflow_mod = @import("rules/misc/initcapacity_plain_add_overflow.zig");
 const index_minus_one_without_zero_guard_mod = @import("rules/misc/index_minus_one_without_zero_guard.zig");
+const else_literal_absorbs_addend_mod = @import("rules/misc/else_literal_absorbs_addend.zig");
 const reset_skips_pooled_resource_release_mod = @import("rules/cleanup/reset_skips_pooled_resource_release.zig");
 const return_borrowed_payload_mod = @import("rules/borrow/return_borrowed_payload.zig");
 const self_undefined_after_destroy_mod = @import("rules/borrow/self_undefined_after_destroy.zig");
@@ -653,6 +659,7 @@ const escape_detectors = [_]Detector{
     .{ .id = "truncate-subtraction-without-guard",      .check = truncate_subtraction_without_guard_mod.check },
     .{ .id = "initcapacity-plain-add-overflow",         .check = initcapacity_plain_add_overflow_mod.check },
     .{ .id = "index-minus-one-without-zero-guard",      .check = index_minus_one_without_zero_guard_mod.check },
+    .{ .id = "else-literal-absorbs-addend",             .check = else_literal_absorbs_addend_mod.check },
 };
 
 /// Dispatch all registered pattern detectors against `tree`.  `cache`
@@ -791,4 +798,5 @@ test "registry: pull in every rule module so inline tests run" {
     _ = truncate_subtraction_without_guard_mod;
     _ = initcapacity_plain_add_overflow_mod;
     _ = index_minus_one_without_zero_guard_mod;
+    _ = else_literal_absorbs_addend_mod;
 }
