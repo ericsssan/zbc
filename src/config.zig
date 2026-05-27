@@ -736,9 +736,14 @@ pub const Invariant = enum {
     /// finalized objects; `unreachable` produces SIGILL after finalization.
     /// Catches oven-sh/bun#29210 (valkey client SIGILL after finalize).
     tryget_orelse_unreachable,
+    /// `joinAbsStringBuf(...)` — unchecked variant does not detect buffer
+    /// overflow and silently writes past fixed-size stack/threadlocal buffers;
+    /// use `joinAbsStringBufChecked` which falls back to heap on overflow.
+    /// Catches oven-sh/bun#28585 (pathToFileURL OOB write on long paths).
+    joinabsstringbuf_without_checked_variant,
 };
 
-pub const all_invariants: [92]Invariant = .{
+pub const all_invariants: [93]Invariant = .{
     .arena_escape,
     .stack_escape,
     .use_undefined,
@@ -831,6 +836,7 @@ pub const all_invariants: [92]Invariant = .{
     .toutf8_inline_slice_borrow,
     .uv_return_value_intcast_truncation,
     .tryget_orelse_unreachable,
+    .joinabsstringbuf_without_checked_variant,
 };
 
 pub const Default: Config = .{};

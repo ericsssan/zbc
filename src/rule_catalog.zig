@@ -485,6 +485,11 @@ pub const all = [_]Rule{
         .title = "`tryGet() orelse unreachable` — `tryGet()` returns null for finalized JSRef objects; `unreachable` becomes SIGILL after finalization",
         .body = @embedFile("rules/misc/tryget-orelse-unreachable.md"),
     },
+    .{
+        .id = "joinabsstringbuf-without-checked-variant",
+        .title = "`joinAbsStringBuf(...)` — unchecked variant silently writes past fixed-size buffers on overflow; use `joinAbsStringBufChecked` which falls back to heap",
+        .body = @embedFile("rules/misc/joinabsstringbuf-without-checked-variant.md"),
+    },
 };
 
 /// Look up a rule by id.  Returns null on unknown id so callers can
@@ -594,6 +599,7 @@ const catch_error_panic_mod = @import("rules/misc/catch_error_panic.zig");
 const toutf8_inline_slice_borrow_mod = @import("rules/misc/toutf8_inline_slice_borrow.zig");
 const uv_return_value_intcast_truncation_mod = @import("rules/misc/uv_return_value_intcast_truncation.zig");
 const tryget_orelse_unreachable_mod = @import("rules/misc/tryget_orelse_unreachable.zig");
+const joinabsstringbuf_without_checked_variant_mod = @import("rules/misc/joinabsstringbuf_without_checked_variant.zig");
 const reset_skips_pooled_resource_release_mod = @import("rules/cleanup/reset_skips_pooled_resource_release.zig");
 const return_borrowed_payload_mod = @import("rules/borrow/return_borrowed_payload.zig");
 const self_undefined_after_destroy_mod = @import("rules/borrow/self_undefined_after_destroy.zig");
@@ -688,6 +694,7 @@ const escape_detectors = [_]Detector{
     .{ .id = "toutf8-inline-slice-borrow",              .check = toutf8_inline_slice_borrow_mod.check },
     .{ .id = "uv-return-value-intcast-truncation",      .check = uv_return_value_intcast_truncation_mod.check },
     .{ .id = "tryget-orelse-unreachable",               .check = tryget_orelse_unreachable_mod.check },
+    .{ .id = "joinabsstringbuf-without-checked-variant", .check = joinabsstringbuf_without_checked_variant_mod.check },
 };
 
 /// Dispatch all registered pattern detectors against `tree`.  `cache`
@@ -831,4 +838,5 @@ test "registry: pull in every rule module so inline tests run" {
     _ = toutf8_inline_slice_borrow_mod;
     _ = uv_return_value_intcast_truncation_mod;
     _ = tryget_orelse_unreachable_mod;
+    _ = joinabsstringbuf_without_checked_variant_mod;
 }
