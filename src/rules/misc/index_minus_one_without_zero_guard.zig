@@ -248,9 +248,15 @@ fn hasAndGuard(
 /// One entry from the AST pre-pass: guard identifiers + the EXACT token range
 /// of the corresponding if-body (`then_expr`).  A subscript `[` that falls
 /// within [first, last] is structurally inside the if-body.
+///
+/// When `pair` is true, ALL names[0..n] must appear in the subscript's
+/// check_names (AND semantics).  Used for dotted guards like `a.len > 0`,
+/// where suppression requires the subscript to use BOTH `a` and `len`.
+/// When `pair` is false, ANY matching name suffices (OR semantics).
 const GuardedRange = struct {
     names: [3][]const u8,
     n: u8,
+    pair: bool,
     first: Ast.TokenIndex,
     last: Ast.TokenIndex,
 };
@@ -323,6 +329,7 @@ fn collectGuardedRanges(
                 try out.append(gpa, .{
                     .names = .{ capture, "", "" },
                     .n = 1,
+                    .pair = false,
                     .first = tree.firstToken(fd.ast.then_expr),
                     .last = tree.lastToken(fd.ast.then_expr),
                 });
@@ -337,11 +344,8 @@ fn collectGuardedRanges(
         const cf = tree.firstToken(ifd.ast.cond_expr);
         const cl = tree.lastToken(ifd.ast.cond_expr);
 
-        var nonzero_names: [3][]const u8 = .{ "", "", "" };
-        var nz: u8 = 0;
-        var zero_names: [3][]const u8 = .{ "", "", "" };
-        var zn: u8 = 0;
-
+        // Emit one GuardedRange per condition pattern found (not one aggregate).
+        // Dotted patterns set pair=true so isInGuardedRange requires BOTH names.
         var ct = cf;
         while (ct <= cl) : (ct += 1) {
             if (ttags[ct] != .identifier) continue;
@@ -353,14 +357,26 @@ fn collectGuardedRanges(
                 std.mem.eql(u8, tree.tokenSlice(ct + 4), "0"))
             {
                 const cmp = ttags[ct + 3];
-                if ((cmp == .angle_bracket_right or cmp == .bang_equal) and nz + 1 < 3) {
-                    nonzero_names[nz] = tree.tokenSlice(ct);
-                    nonzero_names[nz + 1] = tree.tokenSlice(ct + 2);
-                    nz += 2;
-                } else if (cmp == .equal_equal and zn + 1 < 3) {
-                    zero_names[zn] = tree.tokenSlice(ct);
-                    zero_names[zn + 1] = tree.tokenSlice(ct + 2);
-                    zn += 2;
+                const outer = tree.tokenSlice(ct);
+                const inner = tree.tokenSlice(ct + 2);
+                if (cmp == .angle_bracket_right or cmp == .bang_equal) {
+                    try out.append(gpa, .{
+                        .names = .{ outer, inner, "" },
+                        .n = 2,
+                        .pair = true,
+                        .first = tree.firstToken(ifd.ast.then_expr),
+                        .last = tree.lastToken(ifd.ast.then_expr),
+                    });
+                } else if (cmp == .equal_equal) {
+                    if (ifd.ast.else_expr.unwrap()) |else_node| {
+                        try out.append(gpa, .{
+                            .names = .{ outer, inner, "" },
+                            .n = 2,
+                            .pair = true,
+                            .first = tree.firstToken(else_node),
+                            .last = tree.lastToken(else_node),
+                        });
+                    }
                 }
                 ct += 4;
                 continue;
@@ -371,37 +387,114 @@ fn collectGuardedRanges(
                 std.mem.eql(u8, tree.tokenSlice(ct + 2), "0"))
             {
                 const cmp = ttags[ct + 1];
-                if ((cmp == .angle_bracket_right or cmp == .bang_equal) and nz < 3) {
-                    nonzero_names[nz] = tree.tokenSlice(ct);
-                    nz += 1;
-                } else if (cmp == .equal_equal and zn < 3) {
-                    zero_names[zn] = tree.tokenSlice(ct);
-                    zn += 1;
+                const ident = tree.tokenSlice(ct);
+                if (cmp == .angle_bracket_right or cmp == .bang_equal) {
+                    try out.append(gpa, .{
+                        .names = .{ ident, "", "" },
+                        .n = 1,
+                        .pair = false,
+                        .first = tree.firstToken(ifd.ast.then_expr),
+                        .last = tree.lastToken(ifd.ast.then_expr),
+                    });
+                } else if (cmp == .equal_equal) {
+                    if (ifd.ast.else_expr.unwrap()) |else_node| {
+                        try out.append(gpa, .{
+                            .names = .{ ident, "", "" },
+                            .n = 1,
+                            .pair = false,
+                            .first = tree.firstToken(else_node),
+                            .last = tree.lastToken(else_node),
+                        });
+                    }
                 }
                 ct += 2;
                 continue;
             }
         }
+    }
 
-        if (nz > 0) {
-            try out.append(gpa, .{
-                .names = nonzero_names,
-                .n = nz,
-                .first = tree.firstToken(ifd.ast.then_expr),
-                .last = tree.lastToken(ifd.ast.then_expr),
-            });
-        }
-        if (zn > 0) {
-            if (ifd.ast.else_expr.unwrap()) |else_node| {
-                try out.append(gpa, .{
-                    .names = zero_names,
-                    .n = zn,
-                    .first = tree.firstToken(else_node),
-                    .last = tree.lastToken(else_node),
-                });
+    // ── Cross-pass 1: for-input slice-to-len-minus-one ────────────────────
+    // For any for-loop input of the form `IDENT [ expr .. IDENT . len - 1 ]`,
+    // `IDENT.len ≥ 1` is required for the slice bound to be valid.
+    // Record the entire function body as guarded for (IDENT, len).
+    // Covers `for (entries[0..entries.len - 1], ...) |...|` → entries.len ≥ 1.
+    {
+        var ni2: u32 = 1;
+        while (ni2 < tree.nodes.len) : (ni2 += 1) {
+            const ntag2 = ntags[ni2];
+            if (ntag2 != .for_simple and ntag2 != .@"for") continue;
+            const node2: Ast.Node.Index = @enumFromInt(ni2);
+            const nf2 = tree.firstToken(node2);
+            const nl2 = tree.lastToken(node2);
+            if (nf2 < body_first or nl2 > body_last) continue;
+            const fd2 = tree.fullFor(node2) orelse continue;
+            for (fd2.ast.inputs) |inp2| {
+                // Input must start with an identifier (the array being sliced).
+                const inp_first = tree.firstToken(inp2);
+                const inp_last = tree.lastToken(inp2);
+                if (ttags[inp_first] != .identifier) continue;
+                const arr = tree.tokenSlice(inp_first);
+                // Scan for `.. arr . len - 1` inside the input's token range.
+                var st2 = inp_first + 1;
+                while (st2 + 5 <= inp_last) : (st2 += 1) {
+                    if (ttags[st2] != .ellipsis2) continue;
+                    if (ttags[st2 + 1] != .identifier) continue;
+                    if (!std.mem.eql(u8, tree.tokenSlice(st2 + 1), arr)) continue;
+                    if (ttags[st2 + 2] != .period) continue;
+                    if (ttags[st2 + 3] != .identifier or
+                        !std.mem.eql(u8, tree.tokenSlice(st2 + 3), "len")) continue;
+                    if (ttags[st2 + 4] != .minus) continue;
+                    if (st2 + 5 > inp_last or
+                        ttags[st2 + 5] != .number_literal or
+                        !std.mem.eql(u8, tree.tokenSlice(st2 + 5), "1")) continue;
+                    // Found `.. arr.len - 1` → arr.len ≥ 1 throughout the body.
+                    try out.append(gpa, .{
+                        .names = .{ arr, "len", "" },
+                        .n = 2,
+                        .pair = true,
+                        .first = body_first,
+                        .last = body_last,
+                    });
+                    break;
+                }
             }
         }
     }
+
+    // ── Cross-pass 2: function-wide dotted assert scan ─────────────────────
+    // Scan the ENTIRE function body for `assert ( OUTER . INNER (> | !=) 0 )`
+    // (dotted form only — bare identifiers are too generic).
+    // Records the full body as guarded; handles asserts that are far from the
+    // subscript in large functions, acting as function-entry preconditions.
+    {
+        var st3 = body_first;
+        while (st3 + 7 <= body_last) : (st3 += 1) {
+            if (ttags[st3] != .identifier) continue;
+            if (!std.mem.eql(u8, tree.tokenSlice(st3), "assert")) continue;
+            if (ttags[st3 + 1] != .l_paren) continue;
+            // Dotted: assert ( OUTER . INNER cmp 0 )
+            if (ttags[st3 + 2] == .identifier and
+                ttags[st3 + 3] == .period and
+                ttags[st3 + 4] == .identifier and
+                ttags[st3 + 6] == .number_literal and
+                std.mem.eql(u8, tree.tokenSlice(st3 + 6), "0"))
+            {
+                const cmp3 = ttags[st3 + 5];
+                if (cmp3 == .angle_bracket_right or cmp3 == .bang_equal) {
+                    const outer3 = tree.tokenSlice(st3 + 2);
+                    const inner3 = tree.tokenSlice(st3 + 4);
+                    try out.append(gpa, .{
+                        .names = .{ outer3, inner3, "" },
+                        .n = 2,
+                        .pair = true,
+                        .first = body_first,
+                        .last = body_last,
+                    });
+                }
+            }
+        }
+    }
+
     return out;
 }
 
@@ -453,7 +546,11 @@ fn isAllPositiveLiterals(
 }
 
 /// True when the subscript `[` at `t` is inside a guarded if-body AND
-/// one of `check_names` matches a guard identifier from that range.
+/// the guard names match check_names according to the range's matching mode:
+///   pair=false: any name in names[0..n] matches any name in check_names (OR)
+///   pair=true:  ALL names in names[0..n] must appear in check_names (AND)
+///               Used for dotted guards like `a.len > 0` to avoid suppressing
+///               `b[b.len-1]` when only "len" coincidentally matches.
 fn isInGuardedRange(
     ranges: []const GuardedRange,
     t: Ast.TokenIndex,
@@ -461,9 +558,23 @@ fn isInGuardedRange(
 ) bool {
     for (ranges) |r| {
         if (t < r.first or t > r.last) continue;
-        for (check_names) |cn| {
+        if (r.pair) {
+            // AND semantics: every name in the guard must appear in check_names.
+            var all_found = true;
             for (r.names[0..r.n]) |gn| {
-                if (std.mem.eql(u8, cn, gn)) return true;
+                var found = false;
+                for (check_names) |cn| {
+                    if (std.mem.eql(u8, cn, gn)) { found = true; break; }
+                }
+                if (!found) { all_found = false; break; }
+            }
+            if (all_found) return true;
+        } else {
+            // OR semantics: any matching name is enough.
+            for (check_names) |cn| {
+                for (r.names[0..r.n]) |gn| {
+                    if (std.mem.eql(u8, cn, gn)) return true;
+                }
             }
         }
     }
@@ -494,7 +605,10 @@ fn hasAssertGuard(
         if (k + 1 >= t or tags[k + 1] != .l_paren) continue;
 
         // Scan inside assert( ... ) for any IDENT (> | !=) 0 pattern.
-        // Stop at the first unbalanced `)` or after 24 tokens.
+        // Stop at the first unbalanced `)` or after 26 tokens.
+        // IMPORTANT: check the dotted pattern FIRST and advance past it so the
+        // inner identifier (e.g. "len" in `a.len > 0`) is not then matched as a
+        // standalone simple-ident guard on a subsequent iteration.
         var depth: u32 = 1;
         var ct = k + 2;
         while (ct < t and ct < k + 26) : (ct += 1) {
@@ -508,6 +622,9 @@ fn hasAssertGuard(
             if (tags[ct] != .identifier) continue;
 
             // Dotted: OUTER . INNER (> | !=) 0
+            // Require BOTH outer AND inner to appear in guard_names.  Skip past
+            // the whole 5-token pattern regardless of match to prevent the
+            // inner identifier from being matched as a simple guard later.
             if (ct + 4 < t and
                 tags[ct + 1] == .period and
                 tags[ct + 2] == .identifier and
@@ -517,9 +634,15 @@ fn hasAssertGuard(
             {
                 const outer_id = tree.tokenSlice(ct);
                 const inner_id = tree.tokenSlice(ct + 2);
+                var has_outer = false;
+                var has_inner = false;
                 for (guard_names) |gn| {
-                    if (std.mem.eql(u8, outer_id, gn) or std.mem.eql(u8, inner_id, gn)) return true;
+                    if (std.mem.eql(u8, outer_id, gn)) has_outer = true;
+                    if (std.mem.eql(u8, inner_id, gn)) has_inner = true;
                 }
+                if (has_outer and has_inner) return true;
+                ct += 4; // skip `.INNER cmp 0`; loop adds 1 more
+                continue;
             }
 
             // Simple: IDENT (> | !=) 0
@@ -609,9 +732,13 @@ fn hasEarlyReturnGuard(
             if (hasExitWithin(tags, k + 8, k + 11, t)) {
                 const outer_id = tree.tokenSlice(k + 2);
                 const inner_id = tree.tokenSlice(k + 4);
+                var has_outer = false;
+                var has_inner = false;
                 for (guard_names) |gn| {
-                    if (std.mem.eql(u8, outer_id, gn) or std.mem.eql(u8, inner_id, gn)) return true;
+                    if (std.mem.eql(u8, outer_id, gn)) has_outer = true;
+                    if (std.mem.eql(u8, inner_id, gn)) has_inner = true;
                 }
+                if (has_outer and has_inner) return true;
             }
         }
     }
@@ -1209,6 +1336,46 @@ test "index-minus-one-without-zero-guard: for over array containing 0 still fire
         \\    for ([_]usize{ 3, 2, 1, 0 }) |i| {
         \\        blocks[i] = blocks[i - 1];
         \\    }
+        \\}
+        \\
+    );
+}
+
+// ── Cross-pass 1: slice-to-len-minus-one guard tests ──────────────────────
+
+test "index-minus-one-without-zero-guard: for input entries[0..entries.len-1] suppresses" {
+    try testing.expectNoFire(check,
+        \\fn f(entries: []const u8) void {
+        \\    for (entries[0 .. entries.len - 1], entries[1..]) |a, b| {
+        \\        _ = a;
+        \\        _ = b;
+        \\    }
+        \\    _ = entries[entries.len - 1];
+        \\}
+        \\
+    );
+}
+
+// ── Cross-pass 2: function-wide dotted assert tests ────────────────────────
+
+test "index-minus-one-without-zero-guard: assert(x.len > 0) anywhere in body suppresses" {
+    try testing.expectNoFire(check,
+        \\fn f(buf: []const u8) u8 {
+        \\    assert(buf.len > 0);
+        \\    const n = buf.len;
+        \\    const x = n * 2;
+        \\    _ = x;
+        \\    return buf[buf.len - 1];
+        \\}
+        \\
+    );
+}
+
+test "index-minus-one-without-zero-guard: assert on different ident does not suppress" {
+    try testing.expectFires(check, R,
+        \\fn f(a: []const u8, b: []const u8) u8 {
+        \\    assert(a.len > 0);
+        \\    return b[b.len - 1];
         \\}
         \\
     );
