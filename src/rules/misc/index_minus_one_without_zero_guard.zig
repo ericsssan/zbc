@@ -64,6 +64,62 @@ const Problem = problem_mod.Problem;
 const Pos = problem_mod.Pos;
 const R = "index-minus-one-without-zero-guard";
 
+/// Maps callee function name → field name for functions that guarantee the
+/// returned value's `.field.len >= 1`.  Detected by finding:
+///   `const X = CALLEE(...)`  followed (≤80 tokens) by
+///   `assert(X.FIELD.len (> 0 | >= 1 | != 0))`
+/// anywhere in the file.  Keyed on source slices (valid as long as tree lives).
+const CalleeNonEmptyMap = std.StringHashMapUnmanaged([]const u8);
+
+fn collectCalleeNonEmptySliceFields(
+    gpa: std.mem.Allocator,
+    tree: *const Ast,
+) !CalleeNonEmptyMap {
+    var map: CalleeNonEmptyMap = .empty;
+    errdefer map.deinit(gpa);
+    const ttags = tree.tokens.items(.tag);
+    const n: u32 = @intCast(tree.tokens.len);
+    var i: u32 = 0;
+    while (i + 4 < n) : (i += 1) {
+        // Look for: keyword_const IDENT1 equal IDENT2 l_paren
+        if (ttags[i] != .keyword_const) continue;
+        if (ttags[i + 1] != .identifier) continue;
+        if (ttags[i + 2] != .equal) continue;
+        if (ttags[i + 3] != .identifier) continue;
+        if (ttags[i + 4] != .l_paren) continue;
+        const local_name = tree.tokenSlice(i + 1);
+        const callee_name = tree.tokenSlice(i + 3);
+        // Scan forward for assert(local_name.FIELD.len (> 0 | >= 1 | != 0)).
+        const j_end: u32 = @min(i + 80, n -| 10);
+        var j = i + 5;
+        while (j < j_end) : (j += 1) {
+            if (ttags[j] != .identifier) continue;
+            if (!std.mem.eql(u8, tree.tokenSlice(j), "assert")) continue;
+            if (j + 8 >= n) break;
+            if (ttags[j + 1] != .l_paren) continue;
+            if (ttags[j + 2] != .identifier) continue;
+            if (!std.mem.eql(u8, tree.tokenSlice(j + 2), local_name)) continue;
+            if (ttags[j + 3] != .period) continue;
+            if (ttags[j + 4] != .identifier) continue;
+            if (ttags[j + 5] != .period) continue;
+            if (ttags[j + 6] != .identifier) continue;
+            if (!std.mem.eql(u8, tree.tokenSlice(j + 6), "len")) continue;
+            const cmp = ttags[j + 7];
+            const vt = j + 8;
+            if (ttags[vt] != .number_literal) continue;
+            const val = tree.tokenSlice(vt);
+            const nonzero =
+                ((cmp == .angle_bracket_right or cmp == .bang_equal) and std.mem.eql(u8, val, "0")) or
+                (cmp == .angle_bracket_right_equal and std.mem.eql(u8, val, "1"));
+            if (!nonzero) continue;
+            const field_name = tree.tokenSlice(j + 4);
+            try map.put(gpa, callee_name, field_name);
+            break;
+        }
+    }
+    return map;
+}
+
 pub fn check(
     gpa: std.mem.Allocator,
     tree: *const Ast,
@@ -73,7 +129,14 @@ pub fn check(
 ) !void {
     if (!config_mod.isEnabled(config, .index_minus_one_without_zero_guard)) return;
     _ = cache;
-    try tokens.forEachFnBody(gpa, tree, problems, checkBody);
+    // File-level pre-pass: find callees that guarantee a non-empty slice field.
+    var callee_nonempty = try collectCalleeNonEmptySliceFields(gpa, tree);
+    defer callee_nonempty.deinit(gpa);
+    var proto_buf: [1]Ast.Node.Index = undefined;
+    var fns = tokens.iterFnDecls(tree);
+    while (fns.next(&proto_buf)) |fn_entry| {
+        try checkBody(gpa, tree, fn_entry.body, problems, &callee_nonempty);
+    }
 }
 
 fn checkBody(
@@ -81,6 +144,7 @@ fn checkBody(
     tree: *const Ast,
     body: Ast.Node.Index,
     problems: *std.ArrayListUnmanaged(Problem),
+    callee_nonempty: *const CalleeNonEmptyMap,
 ) !void {
     const tags = tree.tokens.items(.tag);
     const first = tree.firstToken(body);
@@ -90,7 +154,7 @@ fn checkBody(
 
     // AST pre-pass: collect token ranges of if-bodies whose condition
     // contains a zero-guard on some identifier.  Used by `isInGuardedRange`.
-    var guarded = try collectGuardedRanges(gpa, tree, first, last);
+    var guarded = try collectGuardedRanges(gpa, tree, first, last, callee_nonempty);
     defer guarded.deinit(gpa);
 
     var t: Ast.TokenIndex = first;
@@ -281,6 +345,7 @@ fn collectGuardedRanges(
     tree: *const Ast,
     body_first: Ast.TokenIndex,
     body_last: Ast.TokenIndex,
+    callee_nonempty: *const CalleeNonEmptyMap,
 ) !std.ArrayListUnmanaged(GuardedRange) {
     var out: std.ArrayListUnmanaged(GuardedRange) = .empty;
     const ttags = tree.tokens.items(.tag);
@@ -343,6 +408,30 @@ fn collectGuardedRanges(
         const ifd = tree.fullIf(node) orelse continue;
         const cf = tree.firstToken(ifd.ast.cond_expr);
         const cl = tree.lastToken(ifd.ast.cond_expr);
+
+        // Detect `X.METHOD_OR_NULL()` with a payload binding `|...|`.
+        // When the condition is a nullable-returning method (e.g. getLastOrNull,
+        // popOrNull), non-null means the container is non-empty.
+        // Covers `if (result.getLastOrNull()) |prev| { ... result.items[result.items.len-1] }`.
+        if (ifd.payload_token != null) {
+            var ct2 = cf;
+            while (ct2 + 4 <= cl) : (ct2 += 1) {
+                if (ttags[ct2] != .identifier) continue;
+                if (ttags[ct2 + 1] != .period) continue;
+                if (ttags[ct2 + 2] != .identifier) continue;
+                if (!std.mem.endsWith(u8, tree.tokenSlice(ct2 + 2), "OrNull")) continue;
+                if (ttags[ct2 + 3] != .l_paren) continue;
+                if (ttags[ct2 + 4] != .r_paren) continue;
+                try out.append(gpa, .{
+                    .names = .{ tree.tokenSlice(ct2), "", "" },
+                    .n = 1,
+                    .pair = false,
+                    .first = tree.firstToken(ifd.ast.then_expr),
+                    .last = tree.lastToken(ifd.ast.then_expr),
+                });
+                break;
+            }
+        }
 
         // Emit one GuardedRange per condition pattern found (not one aggregate).
         // Dotted patterns set pair=true so isInGuardedRange requires BOTH names.
@@ -491,6 +580,35 @@ fn collectGuardedRanges(
                         .last = body_last,
                     });
                 }
+            }
+        }
+    }
+
+    // ── Cross-pass 3: callee postcondition — non-empty slice field ─────────────
+    // For each `const LOCAL = CALLEE(...)` in the function body where CALLEE is
+    // in the file-level callee_nonempty map (inferred from `assert(X.F.len >= 1)`
+    // patterns in other functions), record the body from that point on as guarded
+    // for (LOCAL, FIELD) pair.
+    // Covers `const headers_a = message_body_as_view_headers(...)` where
+    // verify_message() has `assert(headers.slice.len >= 1)`.
+    {
+        var ci = body_first;
+        while (ci + 4 <= body_last) : (ci += 1) {
+            if (ttags[ci] != .keyword_const) continue;
+            if (ttags[ci + 1] != .identifier) continue;
+            if (ttags[ci + 2] != .equal) continue;
+            if (ttags[ci + 3] != .identifier) continue;
+            if (ttags[ci + 4] != .l_paren) continue;
+            const local_name = tree.tokenSlice(ci + 1);
+            const callee_name = tree.tokenSlice(ci + 3);
+            if (callee_nonempty.get(callee_name)) |field_name| {
+                try out.append(gpa, .{
+                    .names = .{ local_name, field_name, "" },
+                    .n = 2,
+                    .pair = true,
+                    .first = ci,
+                    .last = body_last,
+                });
             }
         }
     }
@@ -1376,6 +1494,66 @@ test "index-minus-one-without-zero-guard: assert on different ident does not sup
         \\fn f(a: []const u8, b: []const u8) u8 {
         \\    assert(a.len > 0);
         \\    return b[b.len - 1];
+        \\}
+        \\
+    );
+}
+
+// ── Cross-pass 3: callee postcondition tests ───────────────────────────────
+
+test "index-minus-one-without-zero-guard: callee postcondition assert(X.F.len>=1) suppresses" {
+    try testing.expectNoFire(check,
+        \\fn getSlice(msg: []const u8) Wrapper {
+        \\    return .{ .slice = msg };
+        \\}
+        \\fn verify(msg: []const u8) void {
+        \\    const h = getSlice(msg);
+        \\    assert(h.slice.len >= 1);
+        \\}
+        \\fn use(msg: []const u8) u8 {
+        \\    const h = getSlice(msg);
+        \\    return h.slice[h.slice.len - 1];
+        \\}
+        \\
+    );
+}
+
+test "index-minus-one-without-zero-guard: callee postcondition does not suppress different local" {
+    try testing.expectFires(check, R,
+        \\fn getSlice(msg: []const u8) Wrapper {
+        \\    return .{ .slice = msg };
+        \\}
+        \\fn verify(msg: []const u8) void {
+        \\    const h = getSlice(msg);
+        \\    assert(h.slice.len >= 1);
+        \\}
+        \\fn use(msg: []const u8, other: []const u8) u8 {
+        \\    _ = getSlice(msg);
+        \\    return other[other.len - 1];
+        \\}
+        \\
+    );
+}
+
+// ── Optional payload (getLastOrNull) guard tests ───────────────────────────
+
+test "index-minus-one-without-zero-guard: getLastOrNull payload suppresses" {
+    try testing.expectNoFire(check,
+        \\fn f(result: anytype) void {
+        \\    if (result.getLastOrNull()) |_| {
+        \\        _ = result.items[result.items.len - 1];
+        \\    }
+        \\}
+        \\
+    );
+}
+
+test "index-minus-one-without-zero-guard: getLastOrNull different base still fires" {
+    try testing.expectFires(check, R,
+        \\fn f(a: anytype, b: []const u8) void {
+        \\    if (a.getLastOrNull()) |_| {
+        \\        _ = b[b.len - 1];
+        \\    }
         \\}
         \\
     );
