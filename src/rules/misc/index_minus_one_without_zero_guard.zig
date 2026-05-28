@@ -18,21 +18,22 @@
 //!   Form C: `[ identifier . identifier . len - 1 ]`       (9 tokens)
 //!   Fire at the `l_bracket` token.
 //!
-//! Suppression (five checks, all applied):
+//! Suppression (six checks, all applied):
 //!
 //!   1. Same-expression `and`-guard (window 15): `GUARD_IDENT (> | !=) 0
 //!      keyword_and` immediately before the array identifier.
 //!      Covers `x > 0 and buf[x - 1]`.
 //!
-//!   2. If-body guard (AST pre-pass, `collectGuardedRanges`): scans all
-//!      `if_simple`/`if` nodes via `tree.fullIf`.
-//!      • `IDENT (> | !=) 0` in condition → records `then_expr` token range.
-//!      • `IDENT == 0` in condition → records `else_expr` token range
-//!        (else-body only reached when IDENT != 0).
-//!      Token-range containment is exact for all body shapes (single expr,
-//!      no-brace stmt, multi-statement block).
-//!      Covers `if (x > 0) { stmt; arr[x-1]; }` and
-//!      `if (x == 0) { ... } else { arr[x-1] }`.
+//!   2. If/for-body guard (AST pre-pass, `collectGuardedRanges`):
+//!      Scans `if_simple`/`if` nodes via `tree.fullIf`:
+//!      • `IDENT (> | !=) 0` in condition → records `then_expr` range.
+//!      • `IDENT == 0` in condition → records `else_expr` range.
+//!      Scans `for_simple`/`for` nodes via `tree.fullFor`:
+//!      • Single input `K..N` with K ≥ 1 → capture ≥ 1, records body range.
+//!        Covers `for (1..n) |i| arr[i-1]` and `for (2..n) |i| arr[i-1]`.
+//!      • Single input is a literal array with all values > 0 → capture > 0.
+//!        Covers `inline for ([_]usize{7,6,5,4,3,2,1}) |i| arr[i-1]`.
+//!      Token-range containment is exact for all body shapes.
 //!
 //!   3. Assert guard (window 50): scans inside `assert(...)` for
 //!      `GUARD_IDENT (> | !=) 0` (simple or dotted), including compound
@@ -254,17 +255,21 @@ const GuardedRange = struct {
     last: Ast.TokenIndex,
 };
 
-/// Walk all AST nodes in [body_first, body_last].  For each `if_simple`/`if`:
+/// Walk all AST nodes in [body_first, body_last].
 ///
-///   • Condition contains `IDENT (> | !=) 0` → record `then_expr` range.
-///   • Condition contains `IDENT == 0`       → record `else_expr` range
-///     (the else-body is only reached when IDENT != 0).
+/// `if_simple`/`if` nodes:
+///   • Condition `IDENT (> | !=) 0` → record `then_expr` range.
+///   • Condition `IDENT == 0`       → record `else_expr` range.
 ///
-/// Both simple and dotted (`OUTER . INNER`) condition shapes are matched.
-/// Multiple guard names can be extracted from compound conditions (`a > 0 and
-/// b.len > 0`).
+/// `for_simple`/`for` nodes with a single iterable:
+///   • Iterable is a range `K..N` with K ≥ 1 (e.g. `1..len`, `2..max+1`):
+///     the capture variable is guaranteed ≥ 1 inside the body.
+///   • Iterable is a literal array `{v1, v2, …}` where all vᵢ > 0
+///     (e.g. `inline for ([_]usize{7,6,5,4,3,2,1}) |i|`):
+///     the capture variable takes only positive values.
 ///
-/// `tree.firstToken/lastToken(then/else_expr)` is exact for all body shapes.
+/// In both `for` cases the exact token range of `then_expr` (the loop body)
+/// is recorded as a guarded range for the capture variable name.
 fn collectGuardedRanges(
     gpa: std.mem.Allocator,
     tree: *const Ast,
@@ -279,19 +284,59 @@ fn collectGuardedRanges(
     while (ni < tree.nodes.len) : (ni += 1) {
         const node: Ast.Node.Index = @enumFromInt(ni);
         const ntag = ntags[ni];
-        if (ntag != .if_simple and ntag != .@"if") continue;
 
         const nf = tree.firstToken(node);
         const nl = tree.lastToken(node);
         if (nf < body_first or nl > body_last) continue;
 
+        // ── For-loop analysis ─────────────────────────────────────────────
+        if (ntag == .for_simple or ntag == .@"for") {
+            const fd = tree.fullFor(node) orelse continue;
+            // Only handle single-iterable for-loops.
+            if (fd.ast.inputs.len != 1) continue;
+            const input = fd.ast.inputs[0];
+
+            // payload_token points directly to the first capture identifier
+            // (not the preceding `|`).  Skip `*` for pointer captures.
+            var pt = fd.payload_token;
+            if (pt < tree.tokens.len and ttags[pt] == .asterisk) pt += 1;
+            if (pt >= tree.tokens.len or ttags[pt] != .identifier) continue;
+            const capture = tree.tokenSlice(pt);
+
+            const input_first = tree.firstToken(input);
+            var guarded = false;
+
+            // Case A: range `K..N` where K ≥ 1 (integer literal).
+            //   Capture iterates K, K+1, …, N-1 — all ≥ 1.
+            if (ttags[input_first] == .number_literal and
+                input_first + 1 < tree.tokens.len and
+                ttags[input_first + 1] == .ellipsis2)
+            {
+                const start_val = std.fmt.parseUnsigned(u64, tree.tokenSlice(input_first), 0) catch 0;
+                if (start_val >= 1) guarded = true;
+            }
+
+            // Case B: literal array `{v1, v2, …}` with all vᵢ > 0.
+            if (!guarded) guarded = isAllPositiveLiterals(tree, ttags, input);
+
+            if (guarded) {
+                try out.append(gpa, .{
+                    .names = .{ capture, "", "" },
+                    .n = 1,
+                    .first = tree.firstToken(fd.ast.then_expr),
+                    .last = tree.lastToken(fd.ast.then_expr),
+                });
+            }
+            continue;
+        }
+
+        // ── If-node analysis ──────────────────────────────────────────────
+        if (ntag != .if_simple and ntag != .@"if") continue;
+
         const ifd = tree.fullIf(node) orelse continue;
         const cf = tree.firstToken(ifd.ast.cond_expr);
         const cl = tree.lastToken(ifd.ast.cond_expr);
 
-        // Scan condition tokens for guard patterns.
-        // nonzero_names: identifiers from `IDENT (> | !=) 0` → guards then_expr.
-        // zero_names:    identifiers from `IDENT == 0`        → guards else_expr.
         var nonzero_names: [3][]const u8 = .{ "", "", "" };
         var nz: u8 = 0;
         var zero_names: [3][]const u8 = .{ "", "", "" };
@@ -338,7 +383,6 @@ fn collectGuardedRanges(
             }
         }
 
-        // Record then_expr range for nonzero guards.
         if (nz > 0) {
             try out.append(gpa, .{
                 .names = nonzero_names,
@@ -347,8 +391,6 @@ fn collectGuardedRanges(
                 .last = tree.lastToken(ifd.ast.then_expr),
             });
         }
-
-        // Record else_expr range for zero-equality guards.
         if (zn > 0) {
             if (ifd.ast.else_expr.unwrap()) |else_node| {
                 try out.append(gpa, .{
@@ -361,6 +403,53 @@ fn collectGuardedRanges(
         }
     }
     return out;
+}
+
+/// True when `node` is an array-init literal whose element list (between
+/// `{` and `}`) contains only positive integer literals (no zero, no
+/// variable references).  Handles all `array_init*` node variants.
+fn isAllPositiveLiterals(
+    tree: *const Ast,
+    ttags: []const std.zig.Token.Tag,
+    node: Ast.Node.Index,
+) bool {
+    const ntag = tree.nodeTag(node);
+    switch (ntag) {
+        .array_init,
+        .array_init_comma,
+        .array_init_one,
+        .array_init_one_comma,
+        .array_init_dot,
+        .array_init_dot_comma,
+        .array_init_dot_two,
+        .array_init_dot_two_comma,
+        => {},
+        else => return false,
+    }
+    // Find the opening `{` in the node's token range.
+    const first = tree.firstToken(node);
+    const last = tree.lastToken(node);
+    var brace: ?Ast.TokenIndex = null;
+    var t = first;
+    while (t <= last) : (t += 1) {
+        if (ttags[t] == .l_brace) { brace = t; break; }
+    }
+    const open = brace orelse return false;
+    // Scan element tokens between `{` and `}`.
+    var has_elem = false;
+    t = open + 1;
+    while (t < last) : (t += 1) {
+        switch (ttags[t]) {
+            .number_literal => {
+                const val = std.fmt.parseUnsigned(u64, tree.tokenSlice(t), 0) catch return false;
+                if (val == 0) return false;
+                has_elem = true;
+            },
+            .comma, .r_brace => {},
+            else => return false, // identifier, operator, etc. → not a pure literal
+        }
+    }
+    return has_elem;
 }
 
 /// True when the subscript `[` at `t` is inside a guarded if-body AND
@@ -1063,6 +1152,63 @@ test "index-minus-one-without-zero-guard: constants.X - 1 does not fire" {
     try testing.expectNoFire(check,
         \\fn f(levels: anytype) void {
         \\    _ = levels[constants.max_level - 1];
+        \\}
+        \\
+    );
+}
+
+// ── For-range (1..N) and literal-array guard tests ────────────────────────
+
+test "index-minus-one-without-zero-guard: for (1..N) capture suppresses" {
+    try testing.expectNoFire(check,
+        \\fn f(buf: []const u8) void {
+        \\    for (1..buf.len) |i| {
+        \\        _ = buf[i - 1];
+        \\    }
+        \\}
+        \\
+    );
+}
+
+test "index-minus-one-without-zero-guard: for (2..N) capture suppresses" {
+    try testing.expectNoFire(check,
+        \\fn f(arr: []const u8) void {
+        \\    for (2..arr.len) |i| {
+        \\        _ = arr[i - 1];
+        \\    }
+        \\}
+        \\
+    );
+}
+
+test "index-minus-one-without-zero-guard: for (0..N) capture still fires" {
+    try testing.expectFires(check, R,
+        \\fn f(arr: []const u8) void {
+        \\    for (0..arr.len) |i| {
+        \\        _ = arr[i - 1];
+        \\    }
+        \\}
+        \\
+    );
+}
+
+test "index-minus-one-without-zero-guard: inline for over all-positive literals suppresses" {
+    try testing.expectNoFire(check,
+        \\fn f(blocks: []u8) void {
+        \\    inline for ([_]usize{ 7, 6, 5, 4, 3, 2, 1 }) |i| {
+        \\        blocks[i] = blocks[i - 1];
+        \\    }
+        \\}
+        \\
+    );
+}
+
+test "index-minus-one-without-zero-guard: for over array containing 0 still fires" {
+    try testing.expectFires(check, R,
+        \\fn f(blocks: []u8) void {
+        \\    for ([_]usize{ 3, 2, 1, 0 }) |i| {
+        \\        blocks[i] = blocks[i - 1];
+        \\    }
         \\}
         \\
     );
