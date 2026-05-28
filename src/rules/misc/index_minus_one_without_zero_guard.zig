@@ -24,9 +24,13 @@
 //!      keyword_and` immediately before the array identifier.
 //!      Covers `x > 0 and buf[x - 1]`.
 //!
-//!   2. If-body guard (window 25): `keyword_if ( GUARD_IDENT (> | !=) 0 )` with
-//!      no `;` between the condition `)` and `[`.  Covers
-//!      `if (x > 0) assert(arr[x - 1])`.
+//!   2. If-body guard (AST pre-pass): `collectGuardedRanges` scans all
+//!      `if_simple`/`if` nodes in the function body via `tree.fullIf` and
+//!      records the exact `firstToken..lastToken` range of each `then_expr`
+//!      whose condition contains `IDENT (> | !=) 0`.  A subscript whose `[`
+//!      token falls within such a range is suppressed.  Exact for all body
+//!      shapes: single expression, no-brace single statement, multi-statement
+//!      block.  Covers `if (x > 0) { stmt; arr[x - 1]; }` and simpler forms.
 //!
 //!   3. Assert guard (window 30): `assert ( GUARD_IDENT (> | !=) 0 )` anywhere
 //!      in the preceding tokens (semicolons allowed — the assert may be on a
@@ -80,6 +84,11 @@ fn checkBody(
 
     if (first + 4 > last) return;
 
+    // AST pre-pass: collect token ranges of if-bodies whose condition
+    // contains a zero-guard on some identifier.  Used by `isInGuardedRange`.
+    var guarded = try collectGuardedRanges(gpa, tree, first, last);
+    defer guarded.deinit(gpa);
+
     var t: Ast.TokenIndex = first;
     while (t + 4 <= last) : (t += 1) {
         if (tags[t] == .keyword_fn) {
@@ -107,7 +116,7 @@ fn checkBody(
         {
             const idx_name = tree.tokenSlice(t + 1);
             if (hasAndGuard(tags, tree, t, &.{idx_name})) continue;
-            if (hasIfBodyGuard(tags, tree, t, &.{idx_name})) continue;
+            if (isInGuardedRange(guarded.items, t, &.{idx_name})) continue;
             if (hasAssertGuard(tags, tree, t, &.{idx_name})) continue;
             if (hasEarlyReturnGuard(tags, tree, t, &.{idx_name})) continue;
             try report(gpa, problems, tree, t, idx_name);
@@ -134,7 +143,7 @@ fn checkBody(
             const outer_name = tree.tokenSlice(t + 1);
             const idx_name = tree.tokenSlice(t + 3);
             if (hasAndGuard(tags, tree, t, &.{ outer_name, idx_name })) continue;
-            if (hasIfBodyGuard(tags, tree, t, &.{ outer_name, idx_name })) continue;
+            if (isInGuardedRange(guarded.items, t, &.{ outer_name, idx_name })) continue;
             if (hasAssertGuard(tags, tree, t, &.{ outer_name, idx_name })) continue;
             if (hasEarlyReturnGuard(tags, tree, t, &.{ outer_name, idx_name })) continue;
             try report(gpa, problems, tree, t, idx_name);
@@ -166,7 +175,7 @@ fn checkBody(
             const recv_name = tree.tokenSlice(t + 1);
             const field_name = tree.tokenSlice(t + 3);
             if (hasAndGuard(tags, tree, t, &.{ recv_name, field_name, "len" })) continue;
-            if (hasIfBodyGuard(tags, tree, t, &.{ recv_name, field_name, "len" })) continue;
+            if (isInGuardedRange(guarded.items, t, &.{ recv_name, field_name, "len" })) continue;
             if (hasAssertGuard(tags, tree, t, &.{ recv_name, field_name, "len" })) continue;
             if (hasEarlyReturnGuard(tags, tree, t, &.{ recv_name, field_name, "len" })) continue;
             try reportC(gpa, problems, tree, t, recv_name, field_name);
@@ -223,73 +232,104 @@ fn hasAndGuard(
     return false;
 }
 
-/// Returns true when the subscript at `t` is inside an `if`-body whose
-/// condition is a simple zero-guard on one of `guard_names`.
+/// One entry from the AST pre-pass: guard identifiers + the EXACT token range
+/// of the corresponding if-body (`then_expr`).  A subscript `[` that falls
+/// within [first, last] is structurally inside the if-body.
+const GuardedRange = struct {
+    names: [3][]const u8,
+    n: u8,
+    first: Ast.TokenIndex,
+    last: Ast.TokenIndex,
+};
+
+/// Walk all AST nodes in [body_first, body_last].  For each `if_simple`/`if`
+/// node whose condition contains `IDENT (> | !=) 0` or
+/// `OUTER . INNER (> | !=) 0`, record the exact token range of `then_expr`.
 ///
-/// Looks backward within 25 tokens for `keyword_if`, then checks two
-/// condition shapes (both require no `;` between condition-close and `[`
-/// — ensuring the subscript is in the body, not a later statement):
-///
-///   Simple  (5 tok): `( GUARD_IDENT (> | !=) 0 )`
-///   Dotted  (7 tok): `( OUTER . INNER (> | !=) 0 )`
-///
-/// In both shapes the matched identifier must be in `guard_names`.
-/// `or`-conditions are intentionally not matched — `if (x > 0 or cond)`
-/// does not guarantee `x > 0`.
-fn hasIfBodyGuard(
-    tags: []const std.zig.Token.Tag,
+/// Using `tree.firstToken/lastToken(then_expr)` is exact for all body shapes
+/// (single expression, single statement without braces, multi-statement block)
+/// — no semicolon/brace heuristic needed.
+fn collectGuardedRanges(
+    gpa: std.mem.Allocator,
     tree: *const Ast,
-    t: Ast.TokenIndex,
-    guard_names: []const []const u8,
-) bool {
-    if (t < 7) return false;
-    const window: u32 = 25;
-    const start: Ast.TokenIndex = if (t >= window) t - window else 0;
-    var k: Ast.TokenIndex = t;
-    while (k > start) {
-        k -= 1;
-        if (tags[k] != .keyword_if) continue;
+    body_first: Ast.TokenIndex,
+    body_last: Ast.TokenIndex,
+) !std.ArrayListUnmanaged(GuardedRange) {
+    var out: std.ArrayListUnmanaged(GuardedRange) = .empty;
+    const ttags = tree.tokens.items(.tag);
+    const ntags = tree.nodes.items(.tag);
 
-        // Simple form: `keyword_if ( GUARD_IDENT cmp 0 )` — 6 tokens total,
-        // condition closes at k+5.
-        if (k + 5 < t and
-            tags[k + 1] == .l_paren and
-            tags[k + 2] == .identifier and
-            (tags[k + 3] == .angle_bracket_right or tags[k + 3] == .bang_equal) and
-            tags[k + 4] == .number_literal and
-            std.mem.eql(u8, tree.tokenSlice(k + 4), "0") and
-            tags[k + 5] == .r_paren)
-        {
-            const guard_id = tree.tokenSlice(k + 2);
-            var matched = false;
-            for (guard_names) |gn| {
-                if (std.mem.eql(u8, guard_id, gn)) { matched = true; break; }
+    var ni: u32 = 1;
+    while (ni < tree.nodes.len) : (ni += 1) {
+        const node: Ast.Node.Index = @enumFromInt(ni);
+        const ntag = ntags[ni];
+        if (ntag != .if_simple and ntag != .@"if") continue;
+
+        const nf = tree.firstToken(node);
+        const nl = tree.lastToken(node);
+        if (nf < body_first or nl > body_last) continue;
+
+        const ifd = tree.fullIf(node) orelse continue;
+        const cf = tree.firstToken(ifd.ast.cond_expr);
+        const cl = tree.lastToken(ifd.ast.cond_expr);
+
+        var names: [3][]const u8 = .{ "", "", "" };
+        var n: u8 = 0;
+        var ct = cf;
+        while (ct <= cl and n < 3) : (ct += 1) {
+            if (ttags[ct] != .identifier) continue;
+            // Dotted: OUTER . INNER cmp 0
+            if (ct + 4 <= cl and
+                ttags[ct + 1] == .period and
+                ttags[ct + 2] == .identifier and
+                (ttags[ct + 3] == .angle_bracket_right or ttags[ct + 3] == .bang_equal) and
+                ttags[ct + 4] == .number_literal and
+                std.mem.eql(u8, tree.tokenSlice(ct + 4), "0") and
+                n + 1 < 3)
+            {
+                names[n] = tree.tokenSlice(ct);
+                names[n + 1] = tree.tokenSlice(ct + 2);
+                n += 2;
+                ct += 4;
+                continue;
             }
-            if (matched and !hasSemicolon(tags, k + 6, t)) return true;
+            // Simple: IDENT cmp 0
+            if (ct + 2 <= cl and
+                (ttags[ct + 1] == .angle_bracket_right or ttags[ct + 1] == .bang_equal) and
+                ttags[ct + 2] == .number_literal and
+                std.mem.eql(u8, tree.tokenSlice(ct + 2), "0"))
+            {
+                names[n] = tree.tokenSlice(ct);
+                n += 1;
+                ct += 2;
+                continue;
+            }
         }
+        if (n == 0) continue;
 
-        // Dotted form: `keyword_if ( OUTER . INNER cmp 0 )` — 8 tokens total,
-        // condition closes at k+7.
-        if (k + 7 < t and
-            tags[k + 1] == .l_paren and
-            tags[k + 2] == .identifier and
-            tags[k + 3] == .period and
-            tags[k + 4] == .identifier and
-            (tags[k + 5] == .angle_bracket_right or tags[k + 5] == .bang_equal) and
-            tags[k + 6] == .number_literal and
-            std.mem.eql(u8, tree.tokenSlice(k + 6), "0") and
-            tags[k + 7] == .r_paren)
-        {
-            const outer_id = tree.tokenSlice(k + 2);
-            const inner_id = tree.tokenSlice(k + 4);
-            var matched = false;
-            for (guard_names) |gn| {
-                if (std.mem.eql(u8, outer_id, gn) or std.mem.eql(u8, inner_id, gn)) {
-                    matched = true;
-                    break;
-                }
+        try out.append(gpa, .{
+            .names = names,
+            .n = n,
+            .first = tree.firstToken(ifd.ast.then_expr),
+            .last = tree.lastToken(ifd.ast.then_expr),
+        });
+    }
+    return out;
+}
+
+/// True when the subscript `[` at `t` is inside a guarded if-body AND
+/// one of `check_names` matches a guard identifier from that range.
+fn isInGuardedRange(
+    ranges: []const GuardedRange,
+    t: Ast.TokenIndex,
+    check_names: []const []const u8,
+) bool {
+    for (ranges) |r| {
+        if (t < r.first or t > r.last) continue;
+        for (check_names) |cn| {
+            for (r.names[0..r.n]) |gn| {
+                if (std.mem.eql(u8, cn, gn)) return true;
             }
-            if (matched and !hasSemicolon(tags, k + 8, t)) return true;
         }
     }
     return false;
@@ -424,15 +464,6 @@ fn hasReturnWithin(tags: []const std.zig.Token.Tag, from: Ast.TokenIndex, to: As
     var i = from;
     while (i < end) : (i += 1) {
         if (tags[i] == .keyword_return) return true;
-    }
-    return false;
-}
-
-/// True if any token in [from, to) is a semicolon.
-fn hasSemicolon(tags: []const std.zig.Token.Tag, from: Ast.TokenIndex, to: Ast.TokenIndex) bool {
-    var i = from;
-    while (i < to) : (i += 1) {
-        if (tags[i] == .semicolon) return true;
     }
     return false;
 }
@@ -620,6 +651,18 @@ test "index-minus-one-without-zero-guard: Form A fires when if guard is followed
         \\fn f(buf: []const u8, x: usize) void {
         \\    if (x > 0) doSomething();
         \\    _ = buf[x - 1];
+        \\}
+        \\
+    );
+}
+
+test "index-minus-one-without-zero-guard: Form A suppressed inside multi-statement block" {
+    try testing.expectNoFire(check,
+        \\fn f(buf: []const u8, x: usize) void {
+        \\    if (x > 0) {
+        \\        doSomething();
+        \\        _ = buf[x - 1];
+        \\    }
         \\}
         \\
     );
