@@ -17,8 +17,12 @@
 //!   Form B: `[ identifier . identifier - 1 ]`             (7 tokens)
 //!   Form C: `[ identifier . identifier . len - 1 ]`       (9 tokens)
 //!   Fire at the `l_bracket` token.
-//!   Suppression: none at the token level — any `buf[x - 1]` without a
-//!   statically visible guard is suspect.
+//!
+//! Suppression: same-expression `and`-guard.  Suppressed when within the
+//! 15 tokens before `[` there is a `keyword_and` preceded (within 3 tokens)
+//! by `GUARD_IDENT (> | !=) 0` and GUARD_IDENT matches an identifier in
+//! the subscript index expression.  Covers the common idiom
+//! `x > 0 and buf[x - 1]` and `prefix.len > 0 and buf[prefix.len - 1]`.
 
 const std = @import("std");
 const Ast = std.zig.Ast;
@@ -82,6 +86,7 @@ fn checkBody(
             tags[t + 4] == .r_bracket)
         {
             const idx_name = tree.tokenSlice(t + 1);
+            if (hasAndGuard(tags, tree, t, &.{idx_name})) continue;
             try report(gpa, problems, tree, t, idx_name);
             continue;
         }
@@ -103,7 +108,9 @@ fn checkBody(
             std.mem.eql(u8, tree.tokenSlice(t + 5), "1") and
             tags[t + 6] == .r_bracket)
         {
+            const outer_name = tree.tokenSlice(t + 1);
             const idx_name = tree.tokenSlice(t + 3);
+            if (hasAndGuard(tags, tree, t, &.{ outer_name, idx_name })) continue;
             try report(gpa, problems, tree, t, idx_name);
             continue;
         }
@@ -130,12 +137,48 @@ fn checkBody(
             std.mem.eql(u8, tree.tokenSlice(t + 7), "1") and
             tags[t + 8] == .r_bracket)
         {
-            const idx_name = tree.tokenSlice(t + 3);
-            try reportC(gpa, problems, tree, t,
-                tree.tokenSlice(t + 1), idx_name);
+            const recv_name = tree.tokenSlice(t + 1);
+            const field_name = tree.tokenSlice(t + 3);
+            if (hasAndGuard(tags, tree, t, &.{ recv_name, field_name, "len" })) continue;
+            try reportC(gpa, problems, tree, t, recv_name, field_name);
             continue;
         }
     }
+}
+
+/// Returns true when a same-expression `and`-guard for one of `guard_names` is
+/// present in the 15 tokens immediately before the `[` at position `t`.
+///
+/// Matched token pattern (reading backward from `t`):
+///   ... GUARD_IDENT (> | !=) 0 keyword_and ARRAY_IDENT [t]
+///
+/// GUARD_IDENT must match one of `guard_names`.  Covers `x > 0 and buf[x - 1]`
+/// and `prefix.len > 0 and arr[prefix.len - 1]` (guard_names includes both
+/// "prefix" and "len" for Form B).
+fn hasAndGuard(
+    tags: []const std.zig.Token.Tag,
+    tree: *const Ast,
+    t: Ast.TokenIndex,
+    guard_names: []const []const u8,
+) bool {
+    if (t < 5) return false;
+    const window: u32 = 15;
+    const start: Ast.TokenIndex = if (t >= window) t - window else 0;
+    var k: Ast.TokenIndex = t;
+    while (k > start) {
+        k -= 1;
+        if (tags[k] != .keyword_and) continue;
+        if (k < 3) continue;
+        if (tags[k - 1] != .number_literal) continue;
+        if (!std.mem.eql(u8, tree.tokenSlice(k - 1), "0")) continue;
+        if (tags[k - 2] != .angle_bracket_right and tags[k - 2] != .bang_equal) continue;
+        if (tags[k - 3] != .identifier) continue;
+        const guard_id = tree.tokenSlice(k - 3);
+        for (guard_names) |gn| {
+            if (std.mem.eql(u8, guard_id, gn)) return true;
+        }
+    }
+    return false;
 }
 
 fn report(
@@ -246,6 +289,42 @@ test "index-minus-one-without-zero-guard: recv.field.len - 2 does not fire" {
         \\const Self = struct { args: []const u8 };
         \\fn f(self: *Self) void {
         \\    _ = self.args[self.args.len - 2];
+        \\}
+        \\
+    );
+}
+
+test "index-minus-one-without-zero-guard: Form A suppressed by and-guard" {
+    try testing.expectNoFire(check,
+        \\fn f(buf: []const u8, x: usize) u8 {
+        \\    return if (x > 0 and buf[x - 1] == 0) 1 else 0;
+        \\}
+        \\
+    );
+}
+
+test "index-minus-one-without-zero-guard: Form A suppressed by != 0 and-guard" {
+    try testing.expectNoFire(check,
+        \\fn f(buf: []const u8, x: usize) u8 {
+        \\    return if (x != 0 and buf[x - 1] == 0) 1 else 0;
+        \\}
+        \\
+    );
+}
+
+test "index-minus-one-without-zero-guard: Form A fires when guard uses different ident" {
+    try testing.expectFires(check, R,
+        \\fn f(buf: []const u8, x: usize, y: usize) u8 {
+        \\    return if (y > 0 and buf[x - 1] == 0) 1 else 0;
+        \\}
+        \\
+    );
+}
+
+test "index-minus-one-without-zero-guard: Form B suppressed by and-guard on outer ident" {
+    try testing.expectNoFire(check,
+        \\fn f(items: []const u8, s: anytype) bool {
+        \\    return s.len > 0 and items[s.len - 1] == 0;
         \\}
         \\
     );

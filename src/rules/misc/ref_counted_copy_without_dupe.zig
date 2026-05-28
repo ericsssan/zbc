@@ -120,10 +120,31 @@ fn checkBody(
     }
 }
 
-/// True iff the field name contains one of the refcounted substrings.
+/// True iff any underscore-delimited word component of `name` exactly matches
+/// one of the refcounted substrings.  Whole-word matching prevents short
+/// substrings like "ref" from firing on compound names like "react_fast_refresh",
+/// or "name" from firing on "rename".
+///
+/// Also suppressed when the last component is all-digits (e.g. `user_data_64`,
+/// `user_data_32`) — a numeric suffix strongly implies an integer type.
 fn isRefcountedFieldName(name: []const u8) bool {
-    for (refcounted_substrings) |sub| {
-        if (std.mem.indexOf(u8, name, sub) != null) return true;
+    // If the final underscore-component is purely numeric, the field almost
+    // certainly holds an integer, not a refcounted pointer.
+    if (std.mem.lastIndexOfScalar(u8, name, '_')) |last_us| {
+        const suffix = name[last_us + 1 ..];
+        if (suffix.len > 0) {
+            var all_digits = true;
+            for (suffix) |c| {
+                if (!std.ascii.isDigit(c)) { all_digits = false; break; }
+            }
+            if (all_digits) return false;
+        }
+    }
+    var it = std.mem.splitScalar(u8, name, '_');
+    while (it.next()) |word| {
+        for (refcounted_substrings) |sub| {
+            if (std.mem.eql(u8, word, sub)) return true;
+        }
     }
     return false;
 }
@@ -260,6 +281,66 @@ test "ref-counted-copy-without-dupe: .name = source.name.dupeRef() does not fire
         \\    const result = .{
         \\        .name = source.name.dupeRef(),
         \\    };
+        \\    _ = result;
+        \\}
+        \\
+    );
+}
+
+test "ref-counted-copy-without-dupe: .rename = other.rename does not fire (whole-word)" {
+    try testing.expectNoFire(check,
+        \\fn copy(other: anytype) void {
+        \\    const result = .{ .rename = other.rename };
+        \\    _ = result;
+        \\}
+        \\
+    );
+}
+
+test "ref-counted-copy-without-dupe: .metadata = other.metadata does not fire (whole-word)" {
+    try testing.expectNoFire(check,
+        \\fn copy(other: anytype) void {
+        \\    const result = .{ .metadata = other.metadata };
+        \\    _ = result;
+        \\}
+        \\
+    );
+}
+
+test "ref-counted-copy-without-dupe: .react_fast_refresh = other.react_fast_refresh does not fire" {
+    try testing.expectNoFire(check,
+        \\fn copy(other: anytype) void {
+        \\    const result = .{ .react_fast_refresh = other.react_fast_refresh };
+        \\    _ = result;
+        \\}
+        \\
+    );
+}
+
+test "ref-counted-copy-without-dupe: .user_data = other.user_data fires (data is whole word)" {
+    try testing.expectFires(check, R,
+        \\fn copy(other: anytype) void {
+        \\    const result = .{ .user_data = other.user_data };
+        \\    _ = result;
+        \\}
+        \\
+    );
+}
+
+test "ref-counted-copy-without-dupe: .user_data_64 = other.user_data_64 does not fire (numeric suffix)" {
+    try testing.expectNoFire(check,
+        \\fn copy(other: anytype) void {
+        \\    const result = .{ .user_data_64 = other.user_data_64 };
+        \\    _ = result;
+        \\}
+        \\
+    );
+}
+
+test "ref-counted-copy-without-dupe: .user_data_128 = other.user_data_128 does not fire (numeric suffix)" {
+    try testing.expectNoFire(check,
+        \\fn copy(other: anytype) void {
+        \\    const result = .{ .user_data_128 = other.user_data_128 };
         \\    _ = result;
         \\}
         \\
