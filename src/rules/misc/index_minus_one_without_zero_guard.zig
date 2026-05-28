@@ -221,6 +221,7 @@ fn checkBody(
             if (hasZeroAccessGuard(tags, tree, t, &.{ outer_name, idx_name })) continue;
             if (hasIncrementGuard(tags, tree, t, &.{ outer_name, idx_name })) continue;
             if (hasInitToOneGuard(tags, tree, t, &.{ outer_name, idx_name })) continue;
+            if (hasPriorArithmeticGuard(tags, tree, t, &.{ outer_name, idx_name })) continue;
             try report(gpa, problems, tree, t, idx_name);
             continue;
         }
@@ -859,6 +860,52 @@ fn hasEarlyReturnGuard(
                 if (has_outer and has_inner) return true;
             }
         }
+    }
+    return false;
+}
+
+/// True when `OUTER . INNER - 1` appears within 80 tokens before the `[` at
+/// position `t` in a NON-subscript context (i.e. the `OUTER` token is NOT
+/// immediately preceded by `[`).
+///
+/// Rationale: if a programmer writes `x = arr.field - 1` (arithmetic), they are
+/// implicitly asserting `arr.field > 0` — otherwise the subtraction underflows.
+/// A subsequent subscript `buf[arr.field - 1]` carries the same assumption, so
+/// it is redundant to flag it separately.
+///
+/// Only applied to Form B (dotted OUTER.INNER) to avoid overly-broad suppression;
+/// requires BOTH outer and inner names to match check_names (pair semantics).
+fn hasPriorArithmeticGuard(
+    tags: []const std.zig.Token.Tag,
+    tree: *const Ast,
+    t: Ast.TokenIndex,
+    guard_names: []const []const u8,
+) bool {
+    if (t < 5) return false;
+    const window: u32 = 80;
+    const start: Ast.TokenIndex = if (t >= window) t - window else 0;
+    var k: Ast.TokenIndex = t;
+    while (k > start) {
+        k -= 1;
+        if (tags[k] != .identifier) continue;
+        if (k + 4 >= t) continue; // too close to the current subscript
+        if (tags[k + 1] != .period) continue;
+        if (tags[k + 2] != .identifier) continue;
+        if (tags[k + 3] != .minus) continue;
+        if (tags[k + 4] != .number_literal) continue;
+        if (!std.mem.eql(u8, tree.tokenSlice(k + 4), "1")) continue;
+        // Skip if this is itself a subscript expression (preceded by `[`).
+        if (k > 0 and tags[k - 1] == .l_bracket) continue;
+        // Require both names to match (pair semantics prevents false suppression).
+        const outer = tree.tokenSlice(k);
+        const inner = tree.tokenSlice(k + 2);
+        var has_outer = false;
+        var has_inner = false;
+        for (guard_names) |gn| {
+            if (std.mem.eql(u8, outer, gn)) has_outer = true;
+            if (std.mem.eql(u8, inner, gn)) has_inner = true;
+        }
+        if (has_outer and has_inner) return true;
     }
     return false;
 }
@@ -1543,6 +1590,28 @@ test "index-minus-one-without-zero-guard: getLastOrNull payload suppresses" {
         \\    if (result.getLastOrNull()) |_| {
         \\        _ = result.items[result.items.len - 1];
         \\    }
+        \\}
+        \\
+    );
+}
+
+// ── Prior arithmetic guard tests ───────────────────────────────────────────
+
+test "index-minus-one-without-zero-guard: prior non-subscript OUTER.INNER-1 suppresses" {
+    try testing.expectNoFire(check,
+        \\fn f(s: anytype, arr: []u8) void {
+        \\    arr[0] = @intCast(s.len - 1); // arithmetic: implicitly assumes s.len > 0
+        \\    _ = arr[s.len - 1];            // subscript: same assumption, suppressed
+        \\}
+        \\
+    );
+}
+
+test "index-minus-one-without-zero-guard: prior arithmetic on different pair still fires" {
+    try testing.expectFires(check, R,
+        \\fn f(a: anytype, b: anytype, arr: []u8) void {
+        \\    arr[0] = @intCast(a.len - 1); // guard on a.len, not b.len
+        \\    _ = arr[b.len - 1];
         \\}
         \\
     );
