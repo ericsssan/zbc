@@ -122,6 +122,8 @@ fn checkBody(
             if (isInGuardedRange(guarded.items, t, &.{idx_name})) continue;
             if (hasAssertGuard(tags, tree, t, &.{idx_name})) continue;
             if (hasEarlyReturnGuard(tags, tree, t, &.{idx_name})) continue;
+            if (hasIncrementGuard(tags, tree, t, &.{idx_name})) continue;
+            if (hasInitToOneGuard(tags, tree, t, &.{idx_name})) continue;
             try report(gpa, problems, tree, t, idx_name);
             continue;
         }
@@ -145,10 +147,15 @@ fn checkBody(
         {
             const outer_name = tree.tokenSlice(t + 1);
             const idx_name = tree.tokenSlice(t + 3);
+            // `constants.X` is a comptime namespace in Zig; subscripts are safe.
+            if (std.mem.eql(u8, outer_name, "constants")) continue;
             if (hasAndGuard(tags, tree, t, &.{ outer_name, idx_name })) continue;
             if (isInGuardedRange(guarded.items, t, &.{ outer_name, idx_name })) continue;
             if (hasAssertGuard(tags, tree, t, &.{ outer_name, idx_name })) continue;
             if (hasEarlyReturnGuard(tags, tree, t, &.{ outer_name, idx_name })) continue;
+            if (hasZeroAccessGuard(tags, tree, t, &.{ outer_name, idx_name })) continue;
+            if (hasIncrementGuard(tags, tree, t, &.{ outer_name, idx_name })) continue;
+            if (hasInitToOneGuard(tags, tree, t, &.{ outer_name, idx_name })) continue;
             try report(gpa, problems, tree, t, idx_name);
             continue;
         }
@@ -177,10 +184,12 @@ fn checkBody(
         {
             const recv_name = tree.tokenSlice(t + 1);
             const field_name = tree.tokenSlice(t + 3);
+            if (std.mem.eql(u8, recv_name, "constants")) continue;
             if (hasAndGuard(tags, tree, t, &.{ recv_name, field_name, "len" })) continue;
             if (isInGuardedRange(guarded.items, t, &.{ recv_name, field_name, "len" })) continue;
             if (hasAssertGuard(tags, tree, t, &.{ recv_name, field_name, "len" })) continue;
             if (hasEarlyReturnGuard(tags, tree, t, &.{ recv_name, field_name, "len" })) continue;
+            if (hasZeroAccessGuard(tags, tree, t, &.{ recv_name, field_name })) continue;
             try reportC(gpa, problems, tree, t, recv_name, field_name);
             continue;
         }
@@ -530,6 +539,99 @@ fn hasExitWithin(tags: []const std.zig.Token.Tag, from: Ast.TokenIndex, to: Ast.
         switch (tags[i]) {
             .keyword_return, .keyword_continue, .keyword_break => return true,
             else => {},
+        }
+    }
+    return false;
+}
+
+/// True when `IDENT [ 0 ]` appears within 40 tokens before `t` and IDENT
+/// matches one of `guard_names`.  Accessing index 0 of a slice/array asserts
+/// it is non-empty, so `slice[slice.len - 1]` later in the same expression
+/// or statement is safe.
+fn hasZeroAccessGuard(
+    tags: []const std.zig.Token.Tag,
+    tree: *const Ast,
+    t: Ast.TokenIndex,
+    guard_names: []const []const u8,
+) bool {
+    if (t < 4) return false;
+    const window: u32 = 40;
+    const start: Ast.TokenIndex = if (t >= window) t - window else 0;
+    var k: Ast.TokenIndex = t;
+    while (k > start) {
+        k -= 1;
+        if (tags[k] != .identifier) continue;
+        if (k + 3 >= t) continue;
+        if (tags[k + 1] != .l_bracket) continue;
+        if (tags[k + 2] != .number_literal or !std.mem.eql(u8, tree.tokenSlice(k + 2), "0")) continue;
+        if (tags[k + 3] != .r_bracket) continue;
+        const id = tree.tokenSlice(k);
+        for (guard_names) |gn| {
+            if (std.mem.eql(u8, id, gn)) return true;
+        }
+    }
+    return false;
+}
+
+/// True when `IDENT += 1` appears within 20 tokens before `t`.  After
+/// `x += 1`, x ≥ 1, so `arr[x - 1]` is in bounds.
+fn hasIncrementGuard(
+    tags: []const std.zig.Token.Tag,
+    tree: *const Ast,
+    t: Ast.TokenIndex,
+    guard_names: []const []const u8,
+) bool {
+    if (t < 3) return false;
+    const window: u32 = 20;
+    const start: Ast.TokenIndex = if (t >= window) t - window else 0;
+    var k: Ast.TokenIndex = t;
+    while (k > start) {
+        k -= 1;
+        if (tags[k] != .identifier) continue;
+        if (k + 2 >= t) continue;
+        if (tags[k + 1] != .plus_equal) continue;
+        if (tags[k + 2] != .number_literal or !std.mem.eql(u8, tree.tokenSlice(k + 2), "1")) continue;
+        const id = tree.tokenSlice(k);
+        for (guard_names) |gn| {
+            if (std.mem.eql(u8, id, gn)) return true;
+        }
+    }
+    return false;
+}
+
+/// True when `IDENT ... = 1` (initialized to 1) appears within 30 tokens
+/// before `t`.  Looks forward up to 5 tokens from the identifier for `= 1`,
+/// skipping an optional `: Type` annotation.  `var x: T = 1` means x starts
+/// at 1, making `arr[x - 1]` safe on its first use.
+fn hasInitToOneGuard(
+    tags: []const std.zig.Token.Tag,
+    tree: *const Ast,
+    t: Ast.TokenIndex,
+    guard_names: []const []const u8,
+) bool {
+    if (t < 5) return false;
+    const window: u32 = 30;
+    const start: Ast.TokenIndex = if (t >= window) t - window else 0;
+    var k: Ast.TokenIndex = t;
+    while (k > start) {
+        k -= 1;
+        if (tags[k] != .identifier) continue;
+        const id = tree.tokenSlice(k);
+        var matched = false;
+        for (guard_names) |gn| {
+            if (std.mem.eql(u8, id, gn)) { matched = true; break; }
+        }
+        if (!matched) continue;
+        // Scan forward up to 5 tokens for `equal number_literal("1")`.
+        var j = k + 1;
+        while (j < t and j <= k + 5) : (j += 1) {
+            if (tags[j] == .equal) {
+                if (j + 1 < t and
+                    tags[j + 1] == .number_literal and
+                    std.mem.eql(u8, tree.tokenSlice(j + 1), "1"))
+                    return true;
+                break;
+            }
         }
     }
     return false;
@@ -902,6 +1004,65 @@ test "index-minus-one-without-zero-guard: break guard suppresses" {
         \\fn f(buf: []const u8, i: usize) void {
         \\    if (i == 0) break;
         \\    _ = buf[i - 1];
+        \\}
+        \\
+    );
+}
+
+// ── Zero-access guard tests ────────────────────────────────────────────────
+
+test "index-minus-one-without-zero-guard: prior [0] access suppresses" {
+    try testing.expectNoFire(check,
+        \\fn f(buf: []const u8) u8 {
+        \\    _ = buf[0];
+        \\    return buf[buf.len - 1];
+        \\}
+        \\
+    );
+}
+
+// ── Increment guard tests ──────────────────────────────────────────────────
+
+test "index-minus-one-without-zero-guard: += 1 before subscript suppresses" {
+    try testing.expectNoFire(check,
+        \\fn f(arr: []u8, count: *usize) u8 {
+        \\    count.* += 1;
+        \\    return arr[count.* - 1];
+        \\}
+        \\
+    );
+}
+
+// ── Init-to-one guard tests ────────────────────────────────────────────────
+
+test "index-minus-one-without-zero-guard: var x = 1 suppresses" {
+    try testing.expectNoFire(check,
+        \\fn f(buf: []const u8) void {
+        \\    var count: usize = 1;
+        \\    _ = buf[count - 1];
+        \\}
+        \\
+    );
+}
+
+test "index-minus-one-without-zero-guard: loop var starting at 1 suppresses" {
+    try testing.expectNoFire(check,
+        \\fn f(buf: []const u8) void {
+        \\    var i: usize = 1;
+        \\    while (i < buf.len) : (i += 1) {
+        \\        _ = buf[i - 1];
+        \\    }
+        \\}
+        \\
+    );
+}
+
+// ── Constants guard tests ──────────────────────────────────────────────────
+
+test "index-minus-one-without-zero-guard: constants.X - 1 does not fire" {
+    try testing.expectNoFire(check,
+        \\fn f(levels: anytype) void {
+        \\    _ = levels[constants.max_level - 1];
         \\}
         \\
     );
