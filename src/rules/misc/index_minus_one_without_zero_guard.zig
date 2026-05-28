@@ -573,7 +573,7 @@ fn hasZeroAccessGuard(
     return false;
 }
 
-/// True when `IDENT += 1` appears within 20 tokens before `t`.  After
+/// True when `IDENT += 1` appears within 35 tokens before `t`.  After
 /// `x += 1`, x ≥ 1, so `arr[x - 1]` is in bounds.
 fn hasIncrementGuard(
     tags: []const std.zig.Token.Tag,
@@ -582,7 +582,7 @@ fn hasIncrementGuard(
     guard_names: []const []const u8,
 ) bool {
     if (t < 3) return false;
-    const window: u32 = 20;
+    const window: u32 = 35;
     const start: Ast.TokenIndex = if (t >= window) t - window else 0;
     var k: Ast.TokenIndex = t;
     while (k > start) {
@@ -599,7 +599,7 @@ fn hasIncrementGuard(
     return false;
 }
 
-/// True when `IDENT ... = 1` (initialized to 1) appears within 30 tokens
+/// True when `IDENT ... = 1` (initialized to 1) appears within 50 tokens
 /// before `t`.  Looks forward up to 5 tokens from the identifier for `= 1`,
 /// skipping an optional `: Type` annotation.  `var x: T = 1` means x starts
 /// at 1, making `arr[x - 1]` safe on its first use.
@@ -610,7 +610,7 @@ fn hasInitToOneGuard(
     guard_names: []const []const u8,
 ) bool {
     if (t < 5) return false;
-    const window: u32 = 30;
+    const window: u32 = 50;
     const start: Ast.TokenIndex = if (t >= window) t - window else 0;
     var k: Ast.TokenIndex = t;
     while (k > start) {
