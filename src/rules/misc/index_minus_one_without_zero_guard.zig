@@ -24,21 +24,24 @@
 //!      keyword_and` immediately before the array identifier.
 //!      Covers `x > 0 and buf[x - 1]`.
 //!
-//!   2. If-body guard (AST pre-pass): `collectGuardedRanges` scans all
-//!      `if_simple`/`if` nodes in the function body via `tree.fullIf` and
-//!      records the exact `firstToken..lastToken` range of each `then_expr`
-//!      whose condition contains `IDENT (> | !=) 0`.  A subscript whose `[`
-//!      token falls within such a range is suppressed.  Exact for all body
-//!      shapes: single expression, no-brace single statement, multi-statement
-//!      block.  Covers `if (x > 0) { stmt; arr[x - 1]; }` and simpler forms.
+//!   2. If-body guard (AST pre-pass, `collectGuardedRanges`): scans all
+//!      `if_simple`/`if` nodes via `tree.fullIf`.
+//!      • `IDENT (> | !=) 0` in condition → records `then_expr` token range.
+//!      • `IDENT == 0` in condition → records `else_expr` token range
+//!        (else-body only reached when IDENT != 0).
+//!      Token-range containment is exact for all body shapes (single expr,
+//!      no-brace stmt, multi-statement block).
+//!      Covers `if (x > 0) { stmt; arr[x-1]; }` and
+//!      `if (x == 0) { ... } else { arr[x-1] }`.
 //!
-//!   3. Assert guard (window 30): `assert ( GUARD_IDENT (> | !=) 0 )` anywhere
-//!      in the preceding tokens (semicolons allowed — the assert may be on a
-//!      prior line).  Covers `assert(len > 0); arr[len - 1]`.
+//!   3. Assert guard (window 30): scans inside `assert(...)` for
+//!      `GUARD_IDENT (> | !=) 0` (simple or dotted), including compound
+//!      conditions (`assert(a > 0 and b.len > 0)`) and OR-short-circuit
+//!      forms (`assert(x == 0 or arr[x-1] < limit)`).
 //!
-//!   4. Early-return guard (window 45): `keyword_if ( GUARD_IDENT == 0 )
-//!      keyword_return` (return within 3 tokens of condition close).
-//!      Covers `if (len == 0) return err; arr[len - 1]`.
+//!   4. Early-exit guard (window 45): `if (GUARD == 0)` followed within 3
+//!      tokens by `return`, `continue`, or `break`.  Covers
+//!      `if (i == 0) continue; arr[i - 1]` in loop bodies.
 //!
 //!   5. Comptime context (window 5): `keyword_comptime` within 5 tokens of `[`.
 //!      A comptime subscript is bounds-checked at compile time.
@@ -242,13 +245,17 @@ const GuardedRange = struct {
     last: Ast.TokenIndex,
 };
 
-/// Walk all AST nodes in [body_first, body_last].  For each `if_simple`/`if`
-/// node whose condition contains `IDENT (> | !=) 0` or
-/// `OUTER . INNER (> | !=) 0`, record the exact token range of `then_expr`.
+/// Walk all AST nodes in [body_first, body_last].  For each `if_simple`/`if`:
 ///
-/// Using `tree.firstToken/lastToken(then_expr)` is exact for all body shapes
-/// (single expression, single statement without braces, multi-statement block)
-/// — no semicolon/brace heuristic needed.
+///   • Condition contains `IDENT (> | !=) 0` → record `then_expr` range.
+///   • Condition contains `IDENT == 0`       → record `else_expr` range
+///     (the else-body is only reached when IDENT != 0).
+///
+/// Both simple and dotted (`OUTER . INNER`) condition shapes are matched.
+/// Multiple guard names can be extracted from compound conditions (`a > 0 and
+/// b.len > 0`).
+///
+/// `tree.firstToken/lastToken(then/else_expr)` is exact for all body shapes.
 fn collectGuardedRanges(
     gpa: std.mem.Allocator,
     tree: *const Ast,
@@ -273,46 +280,76 @@ fn collectGuardedRanges(
         const cf = tree.firstToken(ifd.ast.cond_expr);
         const cl = tree.lastToken(ifd.ast.cond_expr);
 
-        var names: [3][]const u8 = .{ "", "", "" };
-        var n: u8 = 0;
+        // Scan condition tokens for guard patterns.
+        // nonzero_names: identifiers from `IDENT (> | !=) 0` → guards then_expr.
+        // zero_names:    identifiers from `IDENT == 0`        → guards else_expr.
+        var nonzero_names: [3][]const u8 = .{ "", "", "" };
+        var nz: u8 = 0;
+        var zero_names: [3][]const u8 = .{ "", "", "" };
+        var zn: u8 = 0;
+
         var ct = cf;
-        while (ct <= cl and n < 3) : (ct += 1) {
+        while (ct <= cl) : (ct += 1) {
             if (ttags[ct] != .identifier) continue;
             // Dotted: OUTER . INNER cmp 0
             if (ct + 4 <= cl and
                 ttags[ct + 1] == .period and
                 ttags[ct + 2] == .identifier and
-                (ttags[ct + 3] == .angle_bracket_right or ttags[ct + 3] == .bang_equal) and
                 ttags[ct + 4] == .number_literal and
-                std.mem.eql(u8, tree.tokenSlice(ct + 4), "0") and
-                n + 1 < 3)
+                std.mem.eql(u8, tree.tokenSlice(ct + 4), "0"))
             {
-                names[n] = tree.tokenSlice(ct);
-                names[n + 1] = tree.tokenSlice(ct + 2);
-                n += 2;
+                const cmp = ttags[ct + 3];
+                if ((cmp == .angle_bracket_right or cmp == .bang_equal) and nz + 1 < 3) {
+                    nonzero_names[nz] = tree.tokenSlice(ct);
+                    nonzero_names[nz + 1] = tree.tokenSlice(ct + 2);
+                    nz += 2;
+                } else if (cmp == .equal_equal and zn + 1 < 3) {
+                    zero_names[zn] = tree.tokenSlice(ct);
+                    zero_names[zn + 1] = tree.tokenSlice(ct + 2);
+                    zn += 2;
+                }
                 ct += 4;
                 continue;
             }
             // Simple: IDENT cmp 0
             if (ct + 2 <= cl and
-                (ttags[ct + 1] == .angle_bracket_right or ttags[ct + 1] == .bang_equal) and
                 ttags[ct + 2] == .number_literal and
                 std.mem.eql(u8, tree.tokenSlice(ct + 2), "0"))
             {
-                names[n] = tree.tokenSlice(ct);
-                n += 1;
+                const cmp = ttags[ct + 1];
+                if ((cmp == .angle_bracket_right or cmp == .bang_equal) and nz < 3) {
+                    nonzero_names[nz] = tree.tokenSlice(ct);
+                    nz += 1;
+                } else if (cmp == .equal_equal and zn < 3) {
+                    zero_names[zn] = tree.tokenSlice(ct);
+                    zn += 1;
+                }
                 ct += 2;
                 continue;
             }
         }
-        if (n == 0) continue;
 
-        try out.append(gpa, .{
-            .names = names,
-            .n = n,
-            .first = tree.firstToken(ifd.ast.then_expr),
-            .last = tree.lastToken(ifd.ast.then_expr),
-        });
+        // Record then_expr range for nonzero guards.
+        if (nz > 0) {
+            try out.append(gpa, .{
+                .names = nonzero_names,
+                .n = nz,
+                .first = tree.firstToken(ifd.ast.then_expr),
+                .last = tree.lastToken(ifd.ast.then_expr),
+            });
+        }
+
+        // Record else_expr range for zero-equality guards.
+        if (zn > 0) {
+            if (ifd.ast.else_expr.unwrap()) |else_node| {
+                try out.append(gpa, .{
+                    .names = zero_names,
+                    .n = zn,
+                    .first = tree.firstToken(else_node),
+                    .last = tree.lastToken(else_node),
+                });
+            }
+        }
     }
     return out;
 }
@@ -335,13 +372,13 @@ fn isInGuardedRange(
     return false;
 }
 
-/// Returns true when an `assert`-guard within 30 tokens before `[` protects
-/// one of `guard_names`.
+/// Returns true when `assert(...)` within 30 tokens before `[` contains
+/// `GUARD_IDENT (> | !=) 0` anywhere inside the call — including compound
+/// conditions like `assert(a > 0 and b.len > 0)` and OR-short-circuit forms
+/// like `assert(x == 0 or arr[x - 1] < limit)`.
 ///
-/// Matched patterns (semicolons between assert and `[` are allowed — the
-/// assert is often a separate statement on the prior line):
-///   Simple: `assert ( GUARD_IDENT (> | !=) 0 )`
-///   Dotted: `assert ( OUTER . INNER (> | !=) 0 )`
+/// Scans up to 24 tokens inside the `assert(` for any simple or dotted
+/// zero-guard pattern, stopping at the first `r_paren` at depth 0.
 fn hasAssertGuard(
     tags: []const std.zig.Token.Tag,
     tree: *const Ast,
@@ -356,37 +393,62 @@ fn hasAssertGuard(
         k -= 1;
         if (tags[k] != .identifier) continue;
         if (!std.mem.eql(u8, tree.tokenSlice(k), "assert")) continue;
+        if (k + 1 >= t or tags[k + 1] != .l_paren) continue;
 
-        // Simple: `assert ( GUARD_IDENT (> | !=) 0 )`
-        if (k + 5 < t and
-            tags[k + 1] == .l_paren and
-            tags[k + 2] == .identifier and
-            (tags[k + 3] == .angle_bracket_right or tags[k + 3] == .bang_equal) and
-            tags[k + 4] == .number_literal and
-            std.mem.eql(u8, tree.tokenSlice(k + 4), "0") and
-            tags[k + 5] == .r_paren)
-        {
-            const guard_id = tree.tokenSlice(k + 2);
-            for (guard_names) |gn| {
-                if (std.mem.eql(u8, guard_id, gn)) return true;
+        // Scan inside assert( ... ) for any IDENT (> | !=) 0 pattern.
+        // Stop at the first unbalanced `)` or after 24 tokens.
+        var depth: u32 = 1;
+        var ct = k + 2;
+        while (ct < t and ct < k + 26) : (ct += 1) {
+            if (tags[ct] == .l_paren) { depth += 1; continue; }
+            if (tags[ct] == .r_paren) {
+                if (depth == 0) break;
+                depth -= 1;
+                if (depth == 0) break;
+                continue;
             }
-        }
+            if (tags[ct] != .identifier) continue;
 
-        // Dotted: `assert ( OUTER . INNER (> | !=) 0 )`
-        if (k + 7 < t and
-            tags[k + 1] == .l_paren and
-            tags[k + 2] == .identifier and
-            tags[k + 3] == .period and
-            tags[k + 4] == .identifier and
-            (tags[k + 5] == .angle_bracket_right or tags[k + 5] == .bang_equal) and
-            tags[k + 6] == .number_literal and
-            std.mem.eql(u8, tree.tokenSlice(k + 6), "0") and
-            tags[k + 7] == .r_paren)
-        {
-            const outer_id = tree.tokenSlice(k + 2);
-            const inner_id = tree.tokenSlice(k + 4);
-            for (guard_names) |gn| {
-                if (std.mem.eql(u8, outer_id, gn) or std.mem.eql(u8, inner_id, gn)) return true;
+            // Dotted: OUTER . INNER (> | !=) 0
+            if (ct + 4 < t and
+                tags[ct + 1] == .period and
+                tags[ct + 2] == .identifier and
+                (tags[ct + 3] == .angle_bracket_right or tags[ct + 3] == .bang_equal) and
+                tags[ct + 4] == .number_literal and
+                std.mem.eql(u8, tree.tokenSlice(ct + 4), "0"))
+            {
+                const outer_id = tree.tokenSlice(ct);
+                const inner_id = tree.tokenSlice(ct + 2);
+                for (guard_names) |gn| {
+                    if (std.mem.eql(u8, outer_id, gn) or std.mem.eql(u8, inner_id, gn)) return true;
+                }
+            }
+
+            // Simple: IDENT (> | !=) 0
+            if (ct + 2 < t and
+                (tags[ct + 1] == .angle_bracket_right or tags[ct + 1] == .bang_equal) and
+                tags[ct + 2] == .number_literal and
+                std.mem.eql(u8, tree.tokenSlice(ct + 2), "0"))
+            {
+                const guard_id = tree.tokenSlice(ct);
+                for (guard_names) |gn| {
+                    if (std.mem.eql(u8, guard_id, gn)) return true;
+                }
+            }
+
+            // OR-short-circuit: `IDENT == 0 keyword_or` — the RHS of the `or`
+            // is only evaluated when IDENT != 0, so subscripts in the RHS are safe.
+            // Covers `assert(offset == 0 or arr[offset - 1] < key)`.
+            if (ct + 3 < t and
+                tags[ct + 1] == .equal_equal and
+                tags[ct + 2] == .number_literal and
+                std.mem.eql(u8, tree.tokenSlice(ct + 2), "0") and
+                tags[ct + 3] == .keyword_or)
+            {
+                const guard_id = tree.tokenSlice(ct);
+                for (guard_names) |gn| {
+                    if (std.mem.eql(u8, guard_id, gn)) return true;
+                }
             }
         }
     }
@@ -426,7 +488,7 @@ fn hasEarlyReturnGuard(
             std.mem.eql(u8, tree.tokenSlice(k + 4), "0") and
             tags[k + 5] == .r_paren)
         {
-            if (hasReturnWithin(tags, k + 6, k + 9, t)) {
+            if (hasExitWithin(tags, k + 6, k + 9, t)) {
                 const guard_id = tree.tokenSlice(k + 2);
                 for (guard_names) |gn| {
                     if (std.mem.eql(u8, guard_id, gn)) return true;
@@ -446,7 +508,7 @@ fn hasEarlyReturnGuard(
             std.mem.eql(u8, tree.tokenSlice(k + 6), "0") and
             tags[k + 7] == .r_paren)
         {
-            if (hasReturnWithin(tags, k + 8, k + 11, t)) {
+            if (hasExitWithin(tags, k + 8, k + 11, t)) {
                 const outer_id = tree.tokenSlice(k + 2);
                 const inner_id = tree.tokenSlice(k + 4);
                 for (guard_names) |gn| {
@@ -458,12 +520,17 @@ fn hasEarlyReturnGuard(
     return false;
 }
 
-/// True if `keyword_return` appears in [from, min(to, bound)) .
-fn hasReturnWithin(tags: []const std.zig.Token.Tag, from: Ast.TokenIndex, to: Ast.TokenIndex, bound: Ast.TokenIndex) bool {
+/// True if `return`, `continue`, or `break` appears in [from, min(to, bound)).
+/// All three exit the current execution path, so when any follows `if (x == 0)`,
+/// the code after the if is only reached when `x != 0`.
+fn hasExitWithin(tags: []const std.zig.Token.Tag, from: Ast.TokenIndex, to: Ast.TokenIndex, bound: Ast.TokenIndex) bool {
     const end = @min(to, bound);
     var i = from;
     while (i < end) : (i += 1) {
-        if (tags[i] == .keyword_return) return true;
+        switch (tags[i]) {
+            .keyword_return, .keyword_continue, .keyword_break => return true,
+            else => {},
+        }
     }
     return false;
 }
@@ -766,6 +833,75 @@ test "index-minus-one-without-zero-guard: runtime access still fires" {
     try testing.expectFires(check, R,
         \\fn f(buf: []const u8, n: usize) u8 {
         \\    return buf[n - 1];
+        \\}
+        \\
+    );
+}
+// ── Else-body guard tests ──────────────────────────────────────────────────
+
+test "index-minus-one-without-zero-guard: else-body guarded by == 0 condition" {
+    try testing.expectNoFire(check,
+        \\fn f(buf: []const u8, n: usize) u8 {
+        \\    return if (n == 0) 0 else buf[n - 1];
+        \\}
+        \\
+    );
+}
+
+test "index-minus-one-without-zero-guard: else-block guarded by == 0 condition" {
+    try testing.expectNoFire(check,
+        \\fn f(buf: []const u8, idx: usize) u8 {
+        \\    if (idx == 0) {
+        \\        return 0;
+        \\    } else {
+        \\        return buf[idx - 1];
+        \\    }
+        \\}
+        \\
+    );
+}
+
+// ── Compound assert guard tests ────────────────────────────────────────────
+
+test "index-minus-one-without-zero-guard: compound assert (and) suppresses" {
+    try testing.expectNoFire(check,
+        \\fn f(a: []const u8, b: []const u8) u8 {
+        \\    assert(a.len > 0 and b.len > 0);
+        \\    return b[b.len - 1];
+        \\}
+        \\
+    );
+}
+
+test "index-minus-one-without-zero-guard: OR-short-circuit assert suppresses" {
+    try testing.expectNoFire(check,
+        \\fn f(buf: []const u8, n: usize) bool {
+        \\    assert(n == 0 or buf[n - 1] == 0);
+        \\    return true;
+        \\}
+        \\
+    );
+}
+
+// ── Continue / break guard tests ───────────────────────────────────────────
+
+test "index-minus-one-without-zero-guard: continue guard suppresses" {
+    try testing.expectNoFire(check,
+        \\fn f(buf: []const u8) void {
+        \\    for (0..buf.len) |i| {
+        \\        if (i == 0) continue;
+        \\        _ = buf[i - 1];
+        \\    }
+        \\}
+        \\
+    );
+}
+
+test "index-minus-one-without-zero-guard: break guard suppresses" {
+    try testing.expectNoFire(check,
+        \\fn f(buf: []const u8, i: usize) void {
+        \\    if (i == 0) break;
+        \\    _ = buf[i - 1];
         \\}
         \\
     );
