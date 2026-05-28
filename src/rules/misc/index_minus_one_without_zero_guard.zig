@@ -34,7 +34,7 @@
 //!      Covers `if (x > 0) { stmt; arr[x-1]; }` and
 //!      `if (x == 0) { ... } else { arr[x-1] }`.
 //!
-//!   3. Assert guard (window 30): scans inside `assert(...)` for
+//!   3. Assert guard (window 50): scans inside `assert(...)` for
 //!      `GUARD_IDENT (> | !=) 0` (simple or dotted), including compound
 //!      conditions (`assert(a > 0 and b.len > 0)`) and OR-short-circuit
 //!      forms (`assert(x == 0 or arr[x-1] < limit)`).
@@ -386,7 +386,7 @@ fn hasAssertGuard(
     guard_names: []const []const u8,
 ) bool {
     if (t < 6) return false;
-    const window: u32 = 30;
+    const window: u32 = 50;
     const start: Ast.TokenIndex = if (t >= window) t - window else 0;
     var k: Ast.TokenIndex = t;
     while (k > start) {
