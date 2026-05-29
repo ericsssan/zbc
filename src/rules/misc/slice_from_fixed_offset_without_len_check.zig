@@ -44,7 +44,16 @@
 //!      `var buf = [_]T{…}`).  Array slicing is compile-time bounds checked,
 //!      so a `buf[N..]` that compiles is always in-bounds — it can never be the
 //!      runtime OOB this rule targets (a `[]T` slice of unconstrained length).
-//!   9. Fire at the `l_bracket` token of the unsafe slice.
+//!   9. Suppression (cross-fn, 1-hop): `const buf = CALLEE(…); buf[N..]` where
+//!      CALLEE's inferred return-length postcondition is >= N.  The postcondition
+//!      is inferred from CALLEE's body (all returns are bounded string literals,
+//!      directly or via a `return switch {…}`).  See `FileCtx`.
+//!  10. Suppression (cross-fn, 2-hop): `buf` is parameter `i` of a private free
+//!      fn and every in-file caller passes an argument of provable length >= N
+//!      at position `i` — a string literal, or a call whose callee's
+//!      return-length postcondition is >= N (e.g. `close_tag[2..]` where callers
+//!      pass `chunk.closingTagForContent()` → returns `"</script"`/`"</style"`).
+//!  11. Fire at the `l_bracket` token of the unsafe slice.
 
 const std = @import("std");
 const Ast = std.zig.Ast;
@@ -71,18 +80,338 @@ pub fn check(
 ) !void {
     if (!config_mod.isEnabled(config, .slice_from_fixed_offset_without_len_check)) return;
     _ = cache;
-    try tokens.forEachFnBody(gpa, tree, problems, checkBody);
+
+    var ctx = try FileCtx.build(gpa, tree);
+    defer ctx.deinit(gpa);
+
+    var proto_buf: [1]Ast.Node.Index = undefined;
+    var fns = tokens.iterFnDecls(tree);
+    while (fns.next(&proto_buf)) |fn_entry| {
+        try checkBody(gpa, tree, &ctx, fn_entry.name_token, fn_entry.proto, fn_entry.body, problems);
+    }
+}
+
+/// Cross-fn analysis tracks at most this many leading parameters per function.
+const MAX_PARAMS = 8;
+
+/// Per-parameter minimum caller-argument length for a free private fn.
+/// `min[i]` = the smallest provable length passed at position `i` across all
+/// in-file call sites; `maxInt` means "no call site observed for that position"
+/// (so no conclusion).  `0` means a caller passed an unbounded argument.
+const ParamBounds = struct {
+    min: [MAX_PARAMS]usize = @splat(std.math.maxInt(usize)),
+};
+
+/// File-level cross-fn context, built once per source file.  String keys are
+/// token slices, stable for the lifetime of the Ast.
+const FileCtx = struct {
+    /// fn name → a conservative lower bound on the length of *every* value the
+    /// function returns.  Present only when all returns are bounded string
+    /// literals (a direct `return "lit"` or a `return switch {…}` whose arms are
+    /// all string literals / diverging).  A name with even one unbounded return
+    /// is absent (poisoned), so a `const x = f(); x[N..]` may be suppressed iff
+    /// `return_minlen[f] >= N`.
+    return_minlen: std.StringHashMapUnmanaged(usize),
+
+    /// free-fn name → per-parameter min caller-argument length.  Populated only
+    /// for **private** (non-`pub`) **free** functions (no `self`/`this`
+    /// receiver) whose name is unique in the file, so the in-file call sites are
+    /// the exhaustive caller set.  Lets a param slice `p[N..]` be suppressed when
+    /// every caller passes an argument of provable length >= N at p's position.
+    param_minlen: std.StringHashMapUnmanaged(ParamBounds),
+
+    fn build(gpa: std.mem.Allocator, tree: *const Ast) !FileCtx {
+        var ctx: FileCtx = .{ .return_minlen = .empty, .param_minlen = .empty };
+        errdefer ctx.deinit(gpa);
+        try ctx.fillReturnMinLen(gpa, tree);
+        try ctx.fillParamMinLen(gpa, tree);
+        return ctx;
+    }
+
+    fn deinit(self: *FileCtx, gpa: std.mem.Allocator) void {
+        self.return_minlen.deinit(gpa);
+        self.param_minlen.deinit(gpa);
+    }
+
+    /// Infer each fn's return-length postcondition.  Names with any unbounded
+    /// return are poisoned (removed) to stay sound under name collisions (e.g.
+    /// two `foo` methods on different types).
+    fn fillReturnMinLen(self: *FileCtx, gpa: std.mem.Allocator, tree: *const Ast) !void {
+        const tags = tree.tokens.items(.tag);
+        var poisoned: std.StringHashMapUnmanaged(void) = .empty;
+        defer poisoned.deinit(gpa);
+
+        var proto_buf: [1]Ast.Node.Index = undefined;
+        var fns = tokens.iterFnDecls(tree);
+        while (fns.next(&proto_buf)) |e| {
+            const name = tree.tokenSlice(e.name_token);
+            if (poisoned.contains(name)) continue;
+            if (inferReturnMinLen(tree, tags, e.body)) |len| {
+                const gop = try self.return_minlen.getOrPut(gpa, name);
+                gop.value_ptr.* = if (gop.found_existing) @min(gop.value_ptr.*, len) else len;
+            } else {
+                try poisoned.put(gpa, name, {});
+                _ = self.return_minlen.remove(name);
+            }
+        }
+    }
+
+    /// Build `param_minlen` for private free fns by inferring, from every
+    /// in-file call site, the min argument length passed at each parameter
+    /// position.  Depends on `return_minlen` (a call argument's length may come
+    /// from the callee's return-length postcondition), so run it second.
+    fn fillParamMinLen(self: *FileCtx, gpa: std.mem.Allocator, tree: *const Ast) !void {
+        const tags = tree.tokens.items(.tag);
+
+        // Pass A — candidate free private fns: name must be unique, non-`pub`,
+        // and have no `self`/`this` receiver (so call args map directly to
+        // params).  Names failing any of these (or appearing twice) are poisoned.
+        var poisoned: std.StringHashMapUnmanaged(void) = .empty;
+        defer poisoned.deinit(gpa);
+        var proto_buf: [1]Ast.Node.Index = undefined;
+        var fns = tokens.iterFnDecls(tree);
+        while (fns.next(&proto_buf)) |e| {
+            const name = tree.tokenSlice(e.name_token);
+            if (poisoned.contains(name)) continue;
+
+            const is_pub = e.proto.visib_token != null;
+            const first = tokens.firstParamName(tree, e.proto);
+            const is_method = first != null and
+                (std.mem.eql(u8, first.?, "self") or std.mem.eql(u8, first.?, "this"));
+            var nparams: u32 = 0;
+            var it = e.proto.iterate(tree);
+            while (it.next()) |_| nparams += 1;
+
+            const disqualified = is_pub or is_method or nparams == 0 or nparams > MAX_PARAMS;
+            if (disqualified or self.param_minlen.contains(name)) {
+                try poisoned.put(gpa, name, {});
+                _ = self.param_minlen.remove(name);
+                continue;
+            }
+            try self.param_minlen.put(gpa, name, .{});
+        }
+
+        // Pass B — visit every call site `NAME(args)` of a candidate (excluding
+        // the definition `fn NAME(`) and fold each argument's length into the
+        // per-position minimum.  Counting extra/spurious call sites only lowers a
+        // minimum, so it is conservative; missing a real caller would not be —
+        // hence the uniqueness/visibility restrictions in Pass A.
+        const n: u32 = @intCast(tree.tokens.len);
+        var i: u32 = 0;
+        while (i + 1 < n) : (i += 1) {
+            if (tags[i] != .identifier) continue;
+            if (tags[i + 1] != .l_paren) continue;
+            if (i > 0 and tags[i - 1] == .keyword_fn) continue; // definition, not a call
+            const bounds = self.param_minlen.getPtr(tree.tokenSlice(i)) orelse continue;
+
+            const lp = i + 1;
+            var d: u32 = 0;
+            var ai: u32 = 0;
+            var astart: u32 = lp + 1;
+            var k: u32 = lp;
+            while (k < n) : (k += 1) {
+                switch (tags[k]) {
+                    .l_paren, .l_brace, .l_bracket => d += 1,
+                    .r_brace, .r_bracket => d -= 1,
+                    .r_paren => {
+                        d -= 1;
+                        if (d == 0) {
+                            if (k > astart and ai < MAX_PARAMS) {
+                                const al = argMinLen(tree, tags, astart, k, &self.return_minlen);
+                                bounds.min[ai] = @min(bounds.min[ai], al);
+                            }
+                            break;
+                        }
+                    },
+                    .comma => if (d == 1) {
+                        if (ai < MAX_PARAMS) {
+                            const al = argMinLen(tree, tags, astart, k, &self.return_minlen);
+                            bounds.min[ai] = @min(bounds.min[ai], al);
+                        }
+                        ai += 1;
+                        astart = k + 1;
+                    },
+                    else => {},
+                }
+            }
+        }
+    }
+};
+
+/// Conservative lower bound on the length of a single call-argument token range
+/// `[start, end)`.  Recognises a pure string-literal argument (its byte length)
+/// and a call argument `[try] …CALLEE(…)` (the callee's return-length
+/// postcondition).  Everything else yields 0 (unknown).
+fn argMinLen(
+    tree: *const Ast,
+    tags: []const std.zig.Token.Tag,
+    start: Ast.TokenIndex,
+    end: Ast.TokenIndex,
+    return_minlen: *const std.StringHashMapUnmanaged(usize),
+) usize {
+    if (start >= end) return 0;
+    var s = start;
+    if (tags[s] == .keyword_try) s += 1;
+    if (s >= end) return 0;
+
+    // Pure string-literal argument.
+    if (tags[s] == .string_literal and s + 1 == end) {
+        return stringLiteralMinByteLen(tree.tokenSlice(s));
+    }
+
+    // Call argument: ends in `)`; callee is the identifier before its `(`.
+    if (tags[end - 1] == .r_paren) {
+        var d: u32 = 0;
+        var k = end - 1;
+        while (k > s) : (k -= 1) {
+            if (tags[k] == .r_paren) {
+                d += 1;
+            } else if (tags[k] == .l_paren) {
+                d -= 1;
+                if (d == 0) break;
+            }
+        }
+        if (tags[k] == .l_paren and k > s and tags[k - 1] == .identifier) {
+            return return_minlen.get(tree.tokenSlice(k - 1)) orelse 0;
+        }
+    }
+    return 0;
+}
+
+/// Conservative lower bound on the length of every value `body` returns, or
+/// null if any return is not a bounded string literal.  Handles a direct
+/// `return "lit"` and a `return switch (…) { arms }` whose arms are all string
+/// literals or diverging (`unreachable` / `@panic` / `@compileError` / nested
+/// `return`).  Anything else (a variable, a slice expr, an `if`-return) yields
+/// null so the caller makes no unsound assumption.
+fn inferReturnMinLen(tree: *const Ast, tags: []const std.zig.Token.Tag, body: Ast.Node.Index) ?usize {
+    const first = tree.firstToken(body);
+    const last = tree.lastToken(body);
+    var best: usize = std.math.maxInt(usize);
+    var saw_value = false;
+    var t: Ast.TokenIndex = first;
+    while (t <= last) : (t += 1) {
+        if (tags[t] == .keyword_fn) {
+            t = skipNestedFn(tags, t, last);
+            continue;
+        }
+        if (tags[t] != .keyword_return) continue;
+        if (t + 1 > last) return null;
+        const v = t + 1;
+        switch (tags[v]) {
+            .semicolon => {}, // `return;` — void, irrelevant to slice length
+            .string_literal => {
+                best = @min(best, stringLiteralMinByteLen(tree.tokenSlice(v)));
+                saw_value = true;
+            },
+            .keyword_switch => {
+                const sw = analyzeReturnSwitch(tree, tags, v, last) orelse return null;
+                best = @min(best, sw);
+                saw_value = true;
+            },
+            else => return null, // unbounded return → no guarantee
+        }
+    }
+    if (!saw_value) return null;
+    return best;
+}
+
+/// Lower bound on the value of a `return switch (…) { arms }` whose arms are all
+/// string literals or diverging.  Returns the minimum literal byte length, or
+/// null if any arm value cannot be bounded.
+fn analyzeReturnSwitch(tree: *const Ast, tags: []const std.zig.Token.Tag, sw_tok: Ast.TokenIndex, last: Ast.TokenIndex) ?usize {
+    var k: Ast.TokenIndex = sw_tok + 1;
+    if (k > last or tags[k] != .l_paren) return null;
+    // Skip the `( condition )`.
+    var pd: u32 = 0;
+    while (k <= last) : (k += 1) {
+        if (tags[k] == .l_paren) {
+            pd += 1;
+        } else if (tags[k] == .r_paren) {
+            pd -= 1;
+            if (pd == 0) {
+                k += 1;
+                break;
+            }
+        }
+    }
+    if (k > last or tags[k] != .l_brace) return null;
+    const brace_open = k;
+    // Brace-match the switch body.
+    var bd: u32 = 0;
+    var end: Ast.TokenIndex = brace_open;
+    {
+        var j: Ast.TokenIndex = brace_open;
+        while (j <= last) : (j += 1) {
+            if (tags[j] == .l_brace) {
+                bd += 1;
+            } else if (tags[j] == .r_brace) {
+                bd -= 1;
+                if (bd == 0) {
+                    end = j;
+                    break;
+                }
+            }
+        }
+        if (bd != 0) return null;
+    }
+    // Scan each arm value (token after `=>` at brace depth 1).
+    var best: usize = std.math.maxInt(usize);
+    var saw = false;
+    var d: u32 = 0;
+    var i: Ast.TokenIndex = brace_open;
+    while (i <= end) : (i += 1) {
+        switch (tags[i]) {
+            .l_brace, .l_paren, .l_bracket => d += 1,
+            .r_brace, .r_paren, .r_bracket => d -= 1,
+            .equal_angle_bracket_right => if (d == 1 and i + 1 <= end) {
+                const v = i + 1;
+                switch (tags[v]) {
+                    .string_literal => {
+                        best = @min(best, stringLiteralMinByteLen(tree.tokenSlice(v)));
+                        saw = true;
+                    },
+                    .keyword_unreachable, .keyword_return => {}, // diverging arm
+                    .builtin => {
+                        const b = tree.tokenSlice(v);
+                        if (!std.mem.eql(u8, b, "@panic") and !std.mem.eql(u8, b, "@compileError")) return null;
+                    },
+                    else => return null, // un-boundable arm value
+                }
+            },
+            else => {},
+        }
+    }
+    if (!saw) return null;
+    return best;
 }
 
 fn checkBody(
     gpa: std.mem.Allocator,
     tree: *const Ast,
+    ctx: *const FileCtx,
+    name_token: Ast.TokenIndex,
+    proto: Ast.full.FnProto,
     body: Ast.Node.Index,
     problems: *std.ArrayListUnmanaged(Problem),
 ) !void {
     const tags = tree.tokens.items(.tag);
     const first = tree.firstToken(body);
     const last = tree.lastToken(body);
+
+    // If this fn is a cross-fn param candidate, gather its parameter names so a
+    // param slice `p[N..]` can be matched to its caller-derived length bound.
+    const param_bounds: ?ParamBounds = ctx.param_minlen.get(tree.tokenSlice(name_token));
+    var param_names: [MAX_PARAMS][]const u8 = undefined;
+    var nparams: u32 = 0;
+    if (param_bounds != null) {
+        var it = proto.iterate(tree);
+        while (it.next()) |p| {
+            if (nparams >= MAX_PARAMS) break;
+            param_names[nparams] = if (p.name_token) |nt| tree.tokenSlice(nt) else "";
+            nparams += 1;
+        }
+    }
 
     var t: Ast.TokenIndex = first;
     while (t + 3 <= last) : (t += 1) {
@@ -158,6 +487,36 @@ fn checkBody(
         // length is unconstrained).  (Tier 3: local declaration tracking.)
         if (isLocalFixedArray(tree, tags, first, t, buf_name)) continue;
 
+        // Suppression (cross-fn, 1-hop): `const buf = CALLEE(…); buf[N..]` where
+        // CALLEE has a return-length postcondition >= N.  `CALLEE` returns slices
+        // of provable min length (see `FileCtx.return_minlen`), so the slice is
+        // in-bounds.
+        if (offsetValue(offset_str)) |off| {
+            if (localInitCallee(tree, tags, first, t, buf_name)) |callee| {
+                if (ctx.return_minlen.get(callee)) |minlen| {
+                    if (minlen >= off) continue;
+                }
+            }
+        }
+
+        // Suppression (cross-fn, 2-hop): `buf` is parameter `i` of this private
+        // free fn, and every in-file caller passes an argument of provable length
+        // >= N at position `i` (a string literal, or a call whose callee's
+        // return-length postcondition is >= N).  See `FileCtx.param_minlen`.
+        if (param_bounds) |pb| {
+            if (offsetValue(offset_str)) |off| {
+                var pi: u32 = 0;
+                var suppressed = false;
+                while (pi < nparams) : (pi += 1) {
+                    if (!std.mem.eql(u8, param_names[pi], buf_name)) continue;
+                    const m = pb.min[pi];
+                    if (m != std.math.maxInt(usize) and m >= off) suppressed = true;
+                    break;
+                }
+                if (suppressed) continue;
+            }
+        }
+
         // Fire at the l_bracket of the unsafe slice.
         try report(gpa, problems, tree, t + 1, buf_name, offset_str);
     }
@@ -191,6 +550,46 @@ fn lenCheckedBefore(
 /// skipped).
 fn offsetValue(offset_str: []const u8) ?usize {
     return std.fmt.parseInt(usize, offset_str, 0) catch null;
+}
+
+/// If `name` is a local declared in `[first, slice_tok)` as exactly one call
+/// expression — `(const|var) name (: T)? = [try] [recv.]CALLEE ( … )` — returns
+/// the callee identifier (the name immediately before the call's `(`).  Returns
+/// null when the initializer is anything other than a single (possibly dotted /
+/// `try`-wrapped) call, so the caller never assumes a postcondition unsoundly.
+fn localInitCallee(
+    tree: *const Ast,
+    tags: []const std.zig.Token.Tag,
+    first: Ast.TokenIndex,
+    slice_tok: Ast.TokenIndex,
+    name: []const u8,
+) ?[]const u8 {
+    if (first + 2 >= slice_tok) return null;
+    var t: Ast.TokenIndex = first;
+    while (t + 2 < slice_tok) : (t += 1) {
+        if (tags[t] != .keyword_const and tags[t] != .keyword_var) continue;
+        if (tags[t + 1] != .identifier) continue;
+        if (!std.mem.eql(u8, tree.tokenSlice(t + 1), name)) continue;
+
+        // Advance to the `=`, allowing an optional `: type` (stop at `;`).
+        var j: Ast.TokenIndex = t + 2;
+        while (j < slice_tok and tags[j] != .equal and tags[j] != .semicolon) : (j += 1) {}
+        if (j >= slice_tok or tags[j] != .equal) return null;
+        j += 1;
+        if (j < slice_tok and tags[j] == .keyword_try) j += 1;
+
+        // Expect a (possibly dotted) name followed by `(`.
+        if (j >= slice_tok or tags[j] != .identifier) return null;
+        var callee = tree.tokenSlice(j);
+        var k: Ast.TokenIndex = j + 1;
+        while (k + 1 < slice_tok and tags[k] == .period and tags[k + 1] == .identifier) {
+            callee = tree.tokenSlice(k + 1);
+            k += 2;
+        }
+        if (k < slice_tok and tags[k] == .l_paren) return callee;
+        return null;
+    }
+    return null;
 }
 
 /// Strongest constant lower bound on `name.len` proven by an access in
@@ -692,6 +1091,153 @@ test "slice-from-fixed-offset-without-len-check: slice derived from a fixed arra
         \\    const sub = arr[0..];
         \\    const tail = sub[7..];
         \\    _ = tail;
+        \\}
+        \\
+    );
+}
+
+// ── Cross-fn 1-hop return-length postcondition ──────────────
+
+test "slice-from-fixed-offset-without-len-check: 1-hop callee returning literals suppresses" {
+    try testing.expectNoFire(check,
+        \\fn tag() []const u8 {
+        \\    return "</script";
+        \\}
+        \\fn f() []const u8 {
+        \\    const t = tag();
+        \\    return t[2..];
+        \\}
+        \\
+    );
+}
+
+test "slice-from-fixed-offset-without-len-check: 1-hop return-switch literals suppresses" {
+    try testing.expectNoFire(check,
+        \\fn tag(kind: u8) []const u8 {
+        \\    return switch (kind) {
+        \\        0 => "</script",
+        \\        1 => "</style",
+        \\        else => unreachable,
+        \\    };
+        \\}
+        \\fn f(kind: u8) []const u8 {
+        \\    const t = tag(kind);
+        \\    return t[2..];
+        \\}
+        \\
+    );
+}
+
+test "slice-from-fixed-offset-without-len-check: 1-hop offset beyond postcondition still fires" {
+    try testing.expectFires(check, R,
+        \\fn tag() []const u8 {
+        \\    return "ab";
+        \\}
+        \\fn f() []const u8 {
+        \\    const t = tag();
+        \\    return t[4..];
+        \\}
+        \\
+    );
+}
+
+test "slice-from-fixed-offset-without-len-check: 1-hop callee with unbounded return still fires" {
+    try testing.expectFires(check, R,
+        \\fn passthrough(x: []const u8) []const u8 {
+        \\    return x;
+        \\}
+        \\fn f(input: []const u8) []const u8 {
+        \\    const t = passthrough(input);
+        \\    return t[2..];
+        \\}
+        \\
+    );
+}
+
+test "slice-from-fixed-offset-without-len-check: 1-hop name collision with unbounded def stays firing" {
+    try testing.expectFires(check, R,
+        \\const A = struct {
+        \\    fn tag(self: A) []const u8 {
+        \\        _ = self;
+        \\        return "</script";
+        \\    }
+        \\};
+        \\const B = struct {
+        \\    payload: []const u8,
+        \\    fn tag(self: B) []const u8 {
+        \\        return self.payload;
+        \\    }
+        \\};
+        \\fn f(b: B) []const u8 {
+        \\    const t = b.tag();
+        \\    return t[2..];
+        \\}
+        \\
+    );
+}
+
+// ── Cross-fn 2-hop param-from-caller propagation ────────────
+
+test "slice-from-fixed-offset-without-len-check: 2-hop param fed only literal-returning calls suppresses" {
+    try testing.expectNoFire(check,
+        \\fn closingTag(kind: u8) []const u8 {
+        \\    return switch (kind) {
+        \\        0 => "</script",
+        \\        else => "</style",
+        \\    };
+        \\}
+        \\fn countTags(content: []const u8, close_tag: []const u8) usize {
+        \\    const suffix = close_tag[2..];
+        \\    _ = content;
+        \\    return suffix.len;
+        \\}
+        \\fn caller(content: []const u8, kind: u8) usize {
+        \\    return countTags(content, closingTag(kind));
+        \\}
+        \\
+    );
+}
+
+test "slice-from-fixed-offset-without-len-check: 2-hop fires when a caller passes an unbounded arg" {
+    try testing.expectFires(check, R,
+        \\fn closingTag() []const u8 {
+        \\    return "</script";
+        \\}
+        \\fn countTags(close_tag: []const u8) usize {
+        \\    return close_tag[2..].len;
+        \\}
+        \\fn callerA() usize {
+        \\    return countTags(closingTag());
+        \\}
+        \\fn callerB(runtime: []const u8) usize {
+        \\    return countTags(runtime);
+        \\}
+        \\
+    );
+}
+
+test "slice-from-fixed-offset-without-len-check: 2-hop string-literal callers suppress" {
+    try testing.expectNoFire(check,
+        \\fn skipDashes(arg: []const u8) []const u8 {
+        \\    return arg[2..];
+        \\}
+        \\fn a() []const u8 {
+        \\    return skipDashes("--foo");
+        \\}
+        \\fn b() []const u8 {
+        \\    return skipDashes("--barbaz");
+        \\}
+        \\
+    );
+}
+
+test "slice-from-fixed-offset-without-len-check: 2-hop does not suppress pub fn (external callers unseen)" {
+    try testing.expectFires(check, R,
+        \\pub fn skipDashes(arg: []const u8) []const u8 {
+        \\    return arg[2..];
+        \\}
+        \\fn a() []const u8 {
+        \\    return skipDashes("--foo");
         \\}
         \\
     );
