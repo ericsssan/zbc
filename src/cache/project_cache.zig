@@ -210,15 +210,32 @@ pub const ProjectCache = struct {
         // Fast path: check the path-resolution cache.  On a hit we skip
         // dirname + join + resolvePosix + two allocs entirely — the common
         // case once a corpus file has been visited once.
-        const cache_key = try std.fmt.allocPrint(
-            self.gpa,
-            "{s}\x00{s}",
-            .{ from_file_path, import_str },
-        );
-        if (self.import_path_cache.get(cache_key)) |cached_abs| {
-            self.gpa.free(cache_key);
-            // modelForAbsolutePathLocked always takes ownership of its argument.
-            return try self.modelForAbsolutePathLocked(try self.gpa.dupe(u8, cached_abs));
+        //
+        // Build the lookup key on the stack (2 × memcpy) to avoid any heap
+        // allocation on cache hits.  Falls back to a heap key for paths that
+        // exceed the stack budget (very rare in practice).
+        const key_len = from_file_path.len + 1 + import_str.len;
+        var key_buf: [512]u8 = undefined;
+        const stack_key: ?[]const u8 = if (key_len <= key_buf.len) blk: {
+            @memcpy(key_buf[0..from_file_path.len], from_file_path);
+            key_buf[from_file_path.len] = 0;
+            @memcpy(key_buf[from_file_path.len + 1 ..][0..import_str.len], import_str);
+            break :blk key_buf[0..key_len];
+        } else null;
+
+        if (stack_key) |sk| {
+            if (self.import_path_cache.get(sk)) |cached_abs| {
+                // modelForAbsolutePathLocked always takes ownership of its argument.
+                return try self.modelForAbsolutePathLocked(try self.gpa.dupe(u8, cached_abs));
+            }
+        } else {
+            // Path too long for stack buffer — heap lookup.
+            const hk = try std.fmt.allocPrint(self.gpa, "{s}\x00{s}", .{ from_file_path, import_str });
+            if (self.import_path_cache.get(hk)) |cached_abs| {
+                self.gpa.free(hk);
+                return try self.modelForAbsolutePathLocked(try self.gpa.dupe(u8, cached_abs));
+            }
+            self.gpa.free(hk);
         }
 
         // Cache miss: resolve the path and populate the cache.
@@ -228,11 +245,13 @@ pub const ProjectCache = struct {
         // Resolve `.` / `..` segments.
         const abs = try std.fs.path.resolve(self.gpa, &.{joined});
 
-        // Store (cache_key → abs) — both now owned by import_path_cache.
+        // Heap-own the key for storage (the stack buffer doesn't outlive this call).
+        const store_key = try std.fmt.allocPrint(self.gpa, "{s}\x00{s}", .{ from_file_path, import_str });
+        // Store (store_key → abs) — both now owned by import_path_cache.
         // On OOM skip caching and pass abs directly (modelForAbsolutePathLocked
         // takes ownership in all cases, so abs is always consumed).
-        self.import_path_cache.put(self.gpa, cache_key, abs) catch {
-            self.gpa.free(cache_key);
+        self.import_path_cache.put(self.gpa, store_key, abs) catch {
+            self.gpa.free(store_key);
             return try self.modelForAbsolutePathLocked(abs);
         };
         // Cache owns abs; pass a copy to modelForAbsolutePathLocked.
