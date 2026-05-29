@@ -37,7 +37,10 @@
 //!      `buf.len >= 1`, the precondition for `buf[1..]`.  Applied only when
 //!      the offset is exactly 1 — a `[0]` access does not prove `len >= N`
 //!      for N > 1.
-//!   7. Fire at the `l_bracket` token of the unsafe slice.
+//!   7. Suppression: a `startsWith*(…, buf, "literal")` guard before the slice
+//!      proves `buf.len >= literal.len`; when that byte length is >= the
+//!      offset, `buf[offset..]` is in-bounds.
+//!   8. Fire at the `l_bracket` token of the unsafe slice.
 
 const std = @import("std");
 const Ast = std.zig.Ast;
@@ -137,6 +140,11 @@ fn checkBody(
         if (std.mem.eql(u8, offset_str, "1") and
             indexZeroAccessedBefore(tree, tags, first, t, buf_name)) continue;
 
+        // Suppression: a `startsWith*(…, buf, "literal")` guard before the
+        // slice proves `buf.len >= literal.len`.  When the prefix's byte
+        // length is >= the slice offset, `buf[offset..]` is safe.
+        if (startsWithGuardBefore(tree, tags, first, t, buf_name, offset_str)) continue;
+
         // Fire at the l_bracket of the unsafe slice.
         try report(gpa, problems, tree, t + 1, buf_name, offset_str);
     }
@@ -190,6 +198,92 @@ fn indexZeroAccessedBefore(
         return true;
     }
     return false;
+}
+
+/// Returns true iff a `startsWith*(…, name, "literal")` call appears in
+/// `[start, end)` whose prefix has a byte length >= the slice `offset_str`.
+///
+/// `mem.startsWith(u8, name, prefix)` (and the `bun.strings.startsWith*`
+/// variants) guarantee `name.len >= prefix.len`.  When `prefix.len >= offset`,
+/// the slice `name[offset..]` is in-bounds.  The matched argument shape is
+/// `IDENT(name) comma string_literal` at the top level of the call's argument
+/// list (so the leading `u8,` of `std.mem.startsWith` is transparently
+/// skipped, and nested calls are ignored).  A `char_literal` second argument
+/// (`startsWithChar(name, c)`) proves `name.len >= 1` and matches offset 1.
+///
+/// Path-insensitive, like the `.len` and `[0]` heuristics: in practice the
+/// guard and the slice sit in the same guarded branch.
+fn startsWithGuardBefore(
+    tree: *const Ast,
+    tags: []const std.zig.Token.Tag,
+    start: Ast.TokenIndex,
+    end: Ast.TokenIndex,
+    name: []const u8,
+    offset_str: []const u8,
+) bool {
+    if (start >= end) return false;
+    const offset = std.fmt.parseInt(usize, offset_str, 0) catch return false;
+    var t: Ast.TokenIndex = start;
+    while (t + 2 < end) : (t += 1) {
+        if (tags[t] != .identifier) continue;
+        if (!std.mem.startsWith(u8, tree.tokenSlice(t), "startsWith")) continue;
+        if (tags[t + 1] != .l_paren) continue;
+
+        // Walk the argument list at paren-depth 1, looking for the buffer
+        // argument followed by a prefix literal.
+        var depth: u32 = 0;
+        var k: Ast.TokenIndex = t + 1;
+        while (k < end) : (k += 1) {
+            if (tags[k] == .l_paren) {
+                depth += 1;
+            } else if (tags[k] == .r_paren) {
+                depth -= 1;
+                if (depth == 0) break;
+            } else if (depth == 1 and
+                k + 2 < end and
+                tags[k] == .identifier and
+                std.mem.eql(u8, tree.tokenSlice(k), name) and
+                tags[k + 1] == .comma)
+            {
+                if (tags[k + 2] == .string_literal) {
+                    if (stringLiteralMinByteLen(tree.tokenSlice(k + 2)) >= offset) return true;
+                } else if (tags[k + 2] == .char_literal and offset == 1) {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+/// Lower bound on the decoded byte length of a Zig string-literal token slice
+/// (quotes included).  Each escape sequence counts as >= 1 byte; `\u{…}` may
+/// decode to more, so the result is a sound lower bound for a `>= offset` test.
+fn stringLiteralMinByteLen(slice: []const u8) usize {
+    if (slice.len < 2) return 0;
+    const content = slice[1 .. slice.len - 1];
+    var i: usize = 0;
+    var count: usize = 0;
+    while (i < content.len) {
+        if (content[i] == '\\') {
+            i += 1;
+            if (i >= content.len) break;
+            switch (content[i]) {
+                'x' => i += 3, // \xNN
+                'u' => { // \u{...}
+                    i += 1;
+                    while (i < content.len and content[i] != '}') i += 1;
+                    i += 1;
+                },
+                else => i += 1, // \n \t \\ \" \' \r etc.
+            }
+            count += 1;
+        } else {
+            i += 1;
+            count += 1;
+        }
+    }
+    return count;
 }
 
 fn report(
@@ -353,6 +447,50 @@ test "slice-from-fixed-offset-without-len-check: buf[0..] slice does not count a
         \\    const head = name[0..];
         \\    _ = head;
         \\    return name[1..];
+        \\}
+        \\
+    );
+}
+
+// ── startsWith-guard length guarantee ───────────────────────
+
+test "slice-from-fixed-offset-without-len-check: startsWith(u8, x, \"--\") suppresses x[2..]" {
+    try testing.expectNoFire(check,
+        \\fn parse(arg: []const u8) []const u8 {
+        \\    if (std.mem.startsWith(u8, arg, "--")) return arg[2..];
+        \\    return arg;
+        \\}
+        \\
+    );
+}
+
+test "slice-from-fixed-offset-without-len-check: namespaced startsWith with long prefix suppresses x[8..]" {
+    try testing.expectNoFire(check,
+        \\fn trim(name_ref: []const u8) []const u8 {
+        \\    if (bun.strings.startsWithCaseInsensitiveAscii(name_ref, "-webkit-")) {
+        \\        return name_ref[8..];
+        \\    }
+        \\    return name_ref;
+        \\}
+        \\
+    );
+}
+
+test "slice-from-fixed-offset-without-len-check: startsWith prefix shorter than offset still fires" {
+    try testing.expectFires(check, R,
+        \\fn parse(arg: []const u8) []const u8 {
+        \\    if (std.mem.startsWith(u8, arg, "-")) return arg[4..];
+        \\    return arg;
+        \\}
+        \\
+    );
+}
+
+test "slice-from-fixed-offset-without-len-check: startsWith on a different buffer still fires" {
+    try testing.expectFires(check, R,
+        \\fn parse(arg: []const u8, other: []const u8) []const u8 {
+        \\    if (std.mem.startsWith(u8, other, "--")) return arg[2..];
+        \\    return arg;
         \\}
         \\
     );
