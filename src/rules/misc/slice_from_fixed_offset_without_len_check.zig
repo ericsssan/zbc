@@ -33,7 +33,11 @@
 //!      distinct from the "parse a fixed prefix from input" bug this rule
 //!      targets (`const tail = line[6..]`). Suppressing it preserves recall on
 //!      the real bug shape while removing the dominant FP class.
-//!   6. Fire at the `l_bracket` token of the unsafe slice.
+//!   6. Suppression: a `buf[0]` index access before the slice proves
+//!      `buf.len >= 1`, the precondition for `buf[1..]`.  Applied only when
+//!      the offset is exactly 1 — a `[0]` access does not prove `len >= N`
+//!      for N > 1.
+//!   7. Fire at the `l_bracket` token of the unsafe slice.
 
 const std = @import("std");
 const Ast = std.zig.Ast;
@@ -125,6 +129,14 @@ fn checkBody(
         // this slice, the programmer already consults the length.
         if (lenCheckedBefore(tree, tags, first, t, buf_name)) continue;
 
+        // Suppression: a `buf[0]` index access before the slice proves
+        // `buf.len >= 1` on that path — exactly the precondition for the
+        // offset-1 slice `buf[1..]`.  Only valid for offset == 1: a `[0]`
+        // access does NOT prove `len >= N` for N > 1, so larger offsets still
+        // fire.
+        if (std.mem.eql(u8, offset_str, "1") and
+            indexZeroAccessedBefore(tree, tags, first, t, buf_name)) continue;
+
         // Fire at the l_bracket of the unsafe slice.
         try report(gpa, problems, tree, t + 1, buf_name, offset_str);
     }
@@ -148,6 +160,33 @@ fn lenCheckedBefore(
         if (tags[t + 1] != .period) continue;
         if (tags[t + 2] != .identifier) continue;
         if (!std.mem.eql(u8, tree.tokenSlice(t + 2), "len")) continue;
+        return true;
+    }
+    return false;
+}
+
+/// Returns true iff `identifier(name) l_bracket number_literal("0") r_bracket`
+/// — i.e. the index access `name[0]` (NOT the slice `name[0..]`) — appears in
+/// the range `[start, end)`.  Such an access proves `name.len >= 1` on that
+/// path, which is the safety precondition for the offset-1 slice `name[1..]`.
+fn indexZeroAccessedBefore(
+    tree: *const Ast,
+    tags: []const std.zig.Token.Tag,
+    start: Ast.TokenIndex,
+    end: Ast.TokenIndex,
+    name: []const u8,
+) bool {
+    if (start >= end) return false;
+    var t: Ast.TokenIndex = start;
+    while (t + 3 < end) : (t += 1) {
+        if (tags[t] != .identifier) continue;
+        if (!std.mem.eql(u8, tree.tokenSlice(t), name)) continue;
+        if (tags[t + 1] != .l_bracket) continue;
+        if (tags[t + 2] != .number_literal) continue;
+        if (!std.mem.eql(u8, tree.tokenSlice(t + 2), "0")) continue;
+        // `name[0]` ends in `r_bracket`; `name[0..]` ends in `ellipsis2` and
+        // must NOT match (it is not a proof that len >= 1).
+        if (tags[t + 3] != .r_bracket) continue;
         return true;
     }
     return false;
@@ -279,6 +318,41 @@ test "slice-from-fixed-offset-without-len-check: field assign sharing local name
         \\const S = struct { buf: []const u8 };
         \\fn f(s: *S, buf: []const u8) void {
         \\    s.buf = buf[2..];
+        \\}
+        \\
+    );
+}
+
+// ── buf[0]-access implicit non-empty guarantee (offset 1 only) ──
+
+test "slice-from-fixed-offset-without-len-check: buf[0] access before offset-1 slice suppresses" {
+    try testing.expectNoFire(check,
+        \\fn f(name: []const u8) []const u8 {
+        \\    if (name[0] == '@') {
+        \\        return name[1..];
+        \\    }
+        \\    return name;
+        \\}
+        \\
+    );
+}
+
+test "slice-from-fixed-offset-without-len-check: buf[0] access does NOT suppress offset-2 slice" {
+    try testing.expectFires(check, R,
+        \\fn f(name: []const u8) []const u8 {
+        \\    _ = name[0];
+        \\    return name[2..];
+        \\}
+        \\
+    );
+}
+
+test "slice-from-fixed-offset-without-len-check: buf[0..] slice does not count as a [0] proof" {
+    try testing.expectFires(check, R,
+        \\fn f(name: []const u8) []const u8 {
+        \\    const head = name[0..];
+        \\    _ = head;
+        \\    return name[1..];
         \\}
         \\
     );
