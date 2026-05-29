@@ -125,3 +125,8 @@ defer zbc.freeProblems(gpa, problems);
 
 Cross-module type resolution is handled internally via ZLS (declared as
 a build-time dependency in `build.zig.zon`).  No setup required.
+
+## Acknowledgements
+
+- [ZLS](https://github.com/zigtools/zls) — used for cross-module type
+  resolution at analysis time.
