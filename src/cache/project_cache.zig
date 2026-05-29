@@ -50,6 +50,11 @@ pub const ProjectCache = struct {
     /// yet"; built_type_index is the latch.
     type_index: std.StringHashMapUnmanaged([]TypeEntry) = .empty,
     type_index_built: bool = false,
+    /// Path-resolution cache: `"from_path\x00import_str"` → resolved
+    /// absolute path (both gpa-owned).  Avoids repeating
+    /// dirname + join + resolvePosix + alloc on every call to
+    /// `modelForRelativeImport` when the model is already cached.
+    import_path_cache: std.StringHashMapUnmanaged([]u8) = .empty,
 
     pub const Entry = struct {
         abs_path: []const u8,
@@ -115,6 +120,12 @@ pub const ProjectCache = struct {
         }
         self.type_index.deinit(self.gpa);
         if (self.project_root) |p| self.gpa.free(p);
+        var iit = self.import_path_cache.iterator();
+        while (iit.next()) |e| {
+            self.gpa.free(e.key_ptr.*);
+            self.gpa.free(e.value_ptr.*);
+        }
+        self.import_path_cache.deinit(self.gpa);
     }
 
     /// Lazily-built global type index.  On first call: walks every
@@ -192,17 +203,40 @@ pub const ProjectCache = struct {
         // Only handle paths ending in `.zig` or starting with
         // `./` / `../`.  Module names route through ZLS.
         if (!isRelativeImport(import_str)) return null;
+
+        self.muLock();
+        defer self.muUnlock();
+
+        // Fast path: check the path-resolution cache.  On a hit we skip
+        // dirname + join + resolvePosix + two allocs entirely — the common
+        // case once a corpus file has been visited once.
+        const cache_key = try std.fmt.allocPrint(
+            self.gpa,
+            "{s}\x00{s}",
+            .{ from_file_path, import_str },
+        );
+        if (self.import_path_cache.get(cache_key)) |cached_abs| {
+            self.gpa.free(cache_key);
+            // modelForAbsolutePathLocked always takes ownership of its argument.
+            return try self.modelForAbsolutePathLocked(try self.gpa.dupe(u8, cached_abs));
+        }
+
+        // Cache miss: resolve the path and populate the cache.
         const dir = std.fs.path.dirname(from_file_path) orelse ".";
         const joined = try std.fs.path.join(self.gpa, &.{ dir, import_str });
         defer self.gpa.free(joined);
-        // Resolve `.` / `..` segments.  std.fs.path.resolve produces
-        // an absolute path when one of its components is absolute,
-        // else a normalised relative path.
+        // Resolve `.` / `..` segments.
         const abs = try std.fs.path.resolve(self.gpa, &.{joined});
-        // `abs` is owned by us.  Stash it in the cache key.
-        self.muLock();
-        defer self.muUnlock();
-        return try self.modelForAbsolutePathLocked(abs);
+
+        // Store (cache_key → abs) — both now owned by import_path_cache.
+        // On OOM skip caching and pass abs directly (modelForAbsolutePathLocked
+        // takes ownership in all cases, so abs is always consumed).
+        self.import_path_cache.put(self.gpa, cache_key, abs) catch {
+            self.gpa.free(cache_key);
+            return try self.modelForAbsolutePathLocked(abs);
+        };
+        // Cache owns abs; pass a copy to modelForAbsolutePathLocked.
+        return try self.modelForAbsolutePathLocked(try self.gpa.dupe(u8, abs));
     }
 
     /// Resolve a module-name @import (e.g. `@import("bun")`,
