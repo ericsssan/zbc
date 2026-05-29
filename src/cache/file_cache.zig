@@ -930,17 +930,16 @@ pub const FileCache = struct {
         // Shared across all per-file FileCache instances — pays the traversal
         // cost at most once globally per (type, method) pair.
         if (self.project) |pc| {
-            if (pc.getMethodSummaryCache(type_name, method_name)) |cached_takes| {
-                // Hit (cached_takes is ?u32 — null means "not found").
-                const takes = cached_takes orelse return null;
+            if (pc.getMethodSummaryCache(type_name, method_name)) |cached| {
+                if (!cached.found) return null;
                 var s: fn_summary.FnSummary = .{};
-                s.takes_ownership_of = takes;
+                s.takes_ownership_of = cached.takes;
                 return s;
             }
         }
 
         const rm = self.findMethodAcrossImports(type_name, method_name) orelse {
-            if (self.project) |pc| pc.putMethodSummaryCache(type_name, method_name, null);
+            if (self.project) |pc| pc.putMethodSummaryCache(type_name, method_name, .{ .found = false });
             return null;
         };
         var buf: [1]Ast.Node.Index = undefined;
@@ -948,7 +947,11 @@ pub const FileCache = struct {
         const body = tokens.bodyOf(rm.tree, rm.method.fn_decl) orelse return null;
         var summary: fn_summary.FnSummary = .{};
         summary.takes_ownership_of = fn_summary.inferDirectTakes(rm.tree, proto, body);
-        if (self.project) |pc| pc.putMethodSummaryCache(type_name, method_name, summary.takes_ownership_of);
+        if (self.project) |pc| pc.putMethodSummaryCache(
+            type_name,
+            method_name,
+            .{ .found = true, .takes = summary.takes_ownership_of },
+        );
         return summary;
     }
 
