@@ -37,9 +37,9 @@
 //!      `buf[K]` proves `len >= K+1`; a closed-end slice `buf[A..M]` proves
 //!      `len >= M`.  When the strongest bound is >= the offset, the slice is
 //!      in-bounds (e.g. `buf[0..4].* = …; buf[4..]`).
-//!   7. Suppression: a `startsWith*(…, buf, "literal")` guard before the slice
-//!      proves `buf.len >= literal.len`; when that byte length is >= the
-//!      offset, `buf[offset..]` is in-bounds.
+//!   7. Suppression: a prefix-check guard `startsWith*/hasPrefix*(…, buf,
+//!      "literal")` before the slice proves `buf.len >= literal.len`; when that
+//!      byte length is >= the offset, `buf[offset..]` is in-bounds.
 //!   8. Suppression: `buf` is a local fixed-size array (`var buf: [K]T` or
 //!      `var buf = [_]T{…}`).  Array slicing is compile-time bounds checked,
 //!      so a `buf[N..]` that compiles is always in-bounds — it can never be the
@@ -145,10 +145,11 @@ fn checkBody(
             if (provenMinLenBefore(tree, tags, first, t, buf_name) >= off) continue;
         }
 
-        // Suppression: a `startsWith*(…, buf, "literal")` guard before the
-        // slice proves `buf.len >= literal.len`.  When the prefix's byte
-        // length is >= the slice offset, `buf[offset..]` is safe.
-        if (startsWithGuardBefore(tree, tags, first, t, buf_name, offset_str)) continue;
+        // Suppression: a prefix-check guard `startsWith*/hasPrefix*(…, buf,
+        // "literal")` before the slice proves `buf.len >= literal.len`.  When
+        // the prefix's byte length is >= the slice offset, `buf[offset..]` is
+        // safe.
+        if (prefixCheckGuardBefore(tree, tags, first, t, buf_name, offset_str)) continue;
 
         // Suppression: `buf` is a local fixed-size array (`var buf: [K]T` or
         // `var buf = [_]T{…}`).  A fixed-array slice is compile-time bounds
@@ -249,20 +250,22 @@ fn provenMinLenBefore(
     return best;
 }
 
-/// Returns true iff a `startsWith*(…, name, "literal")` call appears in
-/// `[start, end)` whose prefix has a byte length >= the slice `offset_str`.
+/// Returns true iff a prefix-check call `PREFIXFN(…, name, "literal")` appears
+/// in `[start, end)` whose prefix has a byte length >= the slice `offset_str`.
 ///
-/// `mem.startsWith(u8, name, prefix)` (and the `bun.strings.startsWith*`
-/// variants) guarantee `name.len >= prefix.len`.  When `prefix.len >= offset`,
-/// the slice `name[offset..]` is in-bounds.  The matched argument shape is
-/// `IDENT(name) comma string_literal` at the top level of the call's argument
-/// list (so the leading `u8,` of `std.mem.startsWith` is transparently
-/// skipped, and nested calls are ignored).  A `char_literal` second argument
-/// (`startsWithChar(name, c)`) proves `name.len >= 1` and matches offset 1.
+/// A prefix check — `mem.startsWith(u8, name, prefix)`, the `bun.strings`
+/// `startsWith*` variants, and the `hasPrefix*` family (`hasPrefixComptime`,
+/// `hasPrefixCaseInsensitive`) — guarantees `name.len >= prefix.len`.  When
+/// `prefix.len >= offset`, the slice `name[offset..]` is in-bounds.  The matched
+/// argument shape is `IDENT(name) comma string_literal` at the top level of the
+/// call's argument list (so the leading `u8,` of `std.mem.startsWith` is
+/// transparently skipped, and nested calls are ignored).  A `char_literal`
+/// second argument (`startsWithChar(name, c)`) proves `name.len >= 1` and
+/// matches offset 1.
 ///
-/// Path-insensitive, like the `.len` and `[0]` heuristics: in practice the
-/// guard and the slice sit in the same guarded branch.
-fn startsWithGuardBefore(
+/// Path-insensitive, like the `.len` and length lower-bound heuristics: in
+/// practice the guard and the slice sit in the same guarded branch.
+fn prefixCheckGuardBefore(
     tree: *const Ast,
     tags: []const std.zig.Token.Tag,
     start: Ast.TokenIndex,
@@ -275,7 +278,9 @@ fn startsWithGuardBefore(
     var t: Ast.TokenIndex = start;
     while (t + 2 < end) : (t += 1) {
         if (tags[t] != .identifier) continue;
-        if (!std.mem.startsWith(u8, tree.tokenSlice(t), "startsWith")) continue;
+        const fname = tree.tokenSlice(t);
+        if (!std.mem.startsWith(u8, fname, "startsWith") and
+            !std.mem.startsWith(u8, fname, "hasPrefix")) continue;
         if (tags[t + 1] != .l_paren) continue;
 
         // Walk the argument list at paren-depth 1, looking for the buffer
@@ -616,6 +621,30 @@ test "slice-from-fixed-offset-without-len-check: startsWith on a different buffe
         \\fn parse(arg: []const u8, other: []const u8) []const u8 {
         \\    if (std.mem.startsWith(u8, other, "--")) return arg[2..];
         \\    return arg;
+        \\}
+        \\
+    );
+}
+
+test "slice-from-fixed-offset-without-len-check: hasPrefixComptime guard suppresses" {
+    try testing.expectNoFire(check,
+        \\fn f(utf8: []const u8) []const u8 {
+        \\    if (strings.hasPrefixComptime(utf8, "\\\\")) {
+        \\        return utf8[2..];
+        \\    }
+        \\    return utf8;
+        \\}
+        \\
+    );
+}
+
+test "slice-from-fixed-offset-without-len-check: hasPrefixComptime with hex-escape BOM suppresses offset 3" {
+    try testing.expectNoFire(check,
+        \\fn f(buffer_slice: []const u8) []const u8 {
+        \\    if (strings.hasPrefixComptime(buffer_slice, "\xef\xbb\xbf")) {
+        \\        return buffer_slice[3..];
+        \\    }
+        \\    return buffer_slice;
         \\}
         \\
     );
