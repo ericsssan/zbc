@@ -33,10 +33,10 @@
 //!      distinct from the "parse a fixed prefix from input" bug this rule
 //!      targets (`const tail = line[6..]`). Suppressing it preserves recall on
 //!      the real bug shape while removing the dominant FP class.
-//!   6. Suppression: a `buf[0]` index access before the slice proves
-//!      `buf.len >= 1`, the precondition for `buf[1..]`.  Applied only when
-//!      the offset is exactly 1 — a `[0]` access does not prove `len >= N`
-//!      for N > 1.
+//!   6. Suppression: a length lower-bound proven before the slice.  An index
+//!      `buf[K]` proves `len >= K+1`; a closed-end slice `buf[A..M]` proves
+//!      `len >= M`.  When the strongest bound is >= the offset, the slice is
+//!      in-bounds (e.g. `buf[0..4].* = …; buf[4..]`).
 //!   7. Suppression: a `startsWith*(…, buf, "literal")` guard before the slice
 //!      proves `buf.len >= literal.len`; when that byte length is >= the
 //!      offset, `buf[offset..]` is in-bounds.
@@ -136,13 +136,14 @@ fn checkBody(
         // this slice, the programmer already consults the length.
         if (lenCheckedBefore(tree, tags, first, t, buf_name)) continue;
 
-        // Suppression: a `buf[0]` index access before the slice proves
-        // `buf.len >= 1` on that path — exactly the precondition for the
-        // offset-1 slice `buf[1..]`.  Only valid for offset == 1: a `[0]`
-        // access does NOT prove `len >= N` for N > 1, so larger offsets still
-        // fire.
-        if (std.mem.eql(u8, offset_str, "1") and
-            indexZeroAccessedBefore(tree, tags, first, t, buf_name)) continue;
+        // Suppression: a length lower-bound established before the slice.
+        // An index access `buf[K]` proves `buf.len >= K+1`; a closed-end slice
+        // `buf[A..M]` (M a literal) proves `buf.len >= M`.  When the strongest
+        // such bound is >= the slice offset, `buf[offset..]` is in-bounds.
+        // (Generalises the old `buf[0]`-for-offset-1 check to any offset.)
+        if (offsetValue(offset_str)) |off| {
+            if (provenMinLenBefore(tree, tags, first, t, buf_name) >= off) continue;
+        }
 
         // Suppression: a `startsWith*(…, buf, "literal")` guard before the
         // slice proves `buf.len >= literal.len`.  When the prefix's byte
@@ -184,31 +185,68 @@ fn lenCheckedBefore(
     return false;
 }
 
-/// Returns true iff `identifier(name) l_bracket number_literal("0") r_bracket`
-/// — i.e. the index access `name[0]` (NOT the slice `name[0..]`) — appears in
-/// the range `[start, end)`.  Such an access proves `name.len >= 1` on that
-/// path, which is the safety precondition for the offset-1 slice `name[1..]`.
-fn indexZeroAccessedBefore(
+/// Parses the slice offset token slice to a value.  Returns null on anything
+/// non-decimal-constant (hex/underscored offsets are rare and conservatively
+/// skipped).
+fn offsetValue(offset_str: []const u8) ?usize {
+    return std.fmt.parseInt(usize, offset_str, 0) catch null;
+}
+
+/// Strongest constant lower bound on `name.len` proven by an access in
+/// `[start, end)`, or 0 if none.
+///
+///   Index access  `name[K]`     → proves `name.len >= K + 1`.
+///   Closed slice   `name[A..M]`  → proves `name.len >= M`   (M a literal).
+///
+/// Open-ended slices `name[K..]` (the very pattern this rule flags) and slices
+/// with a non-literal high bound prove nothing and are ignored, so the result
+/// is a sound lower bound.  Path-insensitive, like the `.len` heuristic.
+fn provenMinLenBefore(
     tree: *const Ast,
     tags: []const std.zig.Token.Tag,
     start: Ast.TokenIndex,
     end: Ast.TokenIndex,
     name: []const u8,
-) bool {
-    if (start >= end) return false;
+) usize {
+    if (start >= end) return 0;
+    var best: usize = 0;
     var t: Ast.TokenIndex = start;
-    while (t + 3 < end) : (t += 1) {
+    while (t + 1 < end) : (t += 1) {
         if (tags[t] != .identifier) continue;
         if (!std.mem.eql(u8, tree.tokenSlice(t), name)) continue;
         if (tags[t + 1] != .l_bracket) continue;
-        if (tags[t + 2] != .number_literal) continue;
-        if (!std.mem.eql(u8, tree.tokenSlice(t + 2), "0")) continue;
-        // `name[0]` ends in `r_bracket`; `name[0..]` ends in `ellipsis2` and
-        // must NOT match (it is not a proof that len >= 1).
-        if (tags[t + 3] != .r_bracket) continue;
-        return true;
+
+        // Find the matching `]` for this subscript, noting an `..` at depth 1.
+        var depth: u32 = 0;
+        var has_ellipsis = false;
+        var k: Ast.TokenIndex = t + 1;
+        while (k < end) : (k += 1) {
+            if (tags[k] == .l_bracket) {
+                depth += 1;
+            } else if (tags[k] == .r_bracket) {
+                depth -= 1;
+                if (depth == 0) break;
+            } else if (depth == 1 and tags[k] == .ellipsis2) {
+                has_ellipsis = true;
+            }
+        }
+        if (k >= end or tags[k] != .r_bracket or k == 0) continue;
+
+        // The bound comes only from a literal immediately before the `]`.
+        if (tags[k - 1] != .number_literal) {
+            t = k;
+            continue;
+        }
+        const num = std.fmt.parseInt(usize, tree.tokenSlice(k - 1), 0) catch {
+            t = k;
+            continue;
+        };
+        // Closed slice `[A..M]` ⇒ len >= M; index `[K]` ⇒ len >= K + 1.
+        const bound: usize = if (has_ellipsis) num else num + 1;
+        if (bound > best) best = bound;
+        t = k;
     }
-    return false;
+    return best;
 }
 
 /// Returns true iff a `startsWith*(…, name, "literal")` call appears in
@@ -473,7 +511,7 @@ test "slice-from-fixed-offset-without-len-check: field assign sharing local name
     );
 }
 
-// ── buf[0]-access implicit non-empty guarantee (offset 1 only) ──
+// ── length lower-bound from index / closed-end-slice accesses ──
 
 test "slice-from-fixed-offset-without-len-check: buf[0] access before offset-1 slice suppresses" {
     try testing.expectNoFire(check,
@@ -503,6 +541,37 @@ test "slice-from-fixed-offset-without-len-check: buf[0..] slice does not count a
         \\    const head = name[0..];
         \\    _ = head;
         \\    return name[1..];
+        \\}
+        \\
+    );
+}
+
+test "slice-from-fixed-offset-without-len-check: closed-end slice buf[0..4] suppresses buf[4..]" {
+    try testing.expectNoFire(check,
+        \\fn f(buf: []u8) []u8 {
+        \\    buf[0..4].* = .{ 0, 0, 0, 0 };
+        \\    return buf[4..];
+        \\}
+        \\
+    );
+}
+
+test "slice-from-fixed-offset-without-len-check: index buf[2] proves len>=3, suppresses buf[2..]" {
+    try testing.expectNoFire(check,
+        \\fn f(arguments: []const Value) void {
+        \\    if (arguments[2].isObject()) {
+        \\        use(arguments[2..]);
+        \\    }
+        \\}
+        \\
+    );
+}
+
+test "slice-from-fixed-offset-without-len-check: bound below offset still fires" {
+    try testing.expectFires(check, R,
+        \\fn f(buf: []u8) []u8 {
+        \\    buf[0..3].* = .{ 0, 0, 0 };
+        \\    return buf[4..];
         \\}
         \\
     );
