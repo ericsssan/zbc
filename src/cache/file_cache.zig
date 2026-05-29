@@ -53,6 +53,12 @@ pub const FileCache = struct {
     /// is analysing.  Used as the from-path for @import resolution
     /// in the ProjectCache.  Empty string means "use cwd".
     file_path: []const u8 = "",
+    /// Result cache for cross-file method lookups.  Key = gpa-owned
+    /// "TypeName\x00methodName" string.  Value = null means "looked
+    /// up, not found"; non-null means found at that ResolvedMethod.
+    /// Avoids re-traversing the @import graph for every call site
+    /// that uses the same (type, method) pair.
+    method_lookup_cache: std.StringHashMapUnmanaged(?ResolvedMethod) = .empty,
 
     pub fn init(gpa: std.mem.Allocator, tree: *const Ast) FileCache {
         return .{ .gpa = gpa, .tree = tree };
@@ -116,17 +122,53 @@ pub const FileCache = struct {
     /// owning tree alongside the MethodInfo.  Used by cross-fn
     /// lifecycle analysis to walk a called fn's body even when the
     /// fn lives in a different file.
+    ///
+    /// Cross-file results are cached keyed by "TypeName\x00method"
+    /// so repeated lookups of the same (type, method) pair across
+    /// many call sites in one file pay the @import-traversal cost
+    /// only once.
     pub fn findMethodAcrossImports(
         self: *FileCache,
         type_name: []const u8,
         method_name: []const u8,
     ) ?ResolvedMethod {
+        // Fast path: type lives in the current file — no traversal.
         const model = self.fileModel() catch return null;
         if (model.findType(type_name)) |ti| {
             if (ti.findMethod(method_name)) |m| return .{ .tree = self.tree, .method = m };
         }
         const pc = self.project orelse return null;
         if (self.file_path.len == 0) return null;
+
+        // Build the cache key.  On OOM, fall through to uncached lookup.
+        const key = std.fmt.allocPrint(
+            self.gpa,
+            "{s}\x00{s}",
+            .{ type_name, method_name },
+        ) catch return findMethodCrossFile(self, pc, type_name, method_name);
+
+        // Cache hit — free the key we just built and return the stored result.
+        if (self.method_lookup_cache.get(key)) |cached| {
+            self.gpa.free(key);
+            return cached;
+        }
+
+        // Cache miss — run the expensive @import traversal.
+        const result = findMethodCrossFile(self, pc, type_name, method_name);
+
+        // Store the result (key now owned by the map on success).
+        self.method_lookup_cache.put(self.gpa, key, result) catch self.gpa.free(key);
+        return result;
+    }
+
+    /// Slow path: @import-graph traversal + global-index fallback.
+    /// Called only on a cache miss in findMethodAcrossImports.
+    fn findMethodCrossFile(
+        self: *FileCache,
+        pc: *project_cache_mod.ProjectCache,
+        type_name: []const u8,
+        method_name: []const u8,
+    ) ?ResolvedMethod {
         if (findMethodViaImports(pc, self.tree, self.file_path, type_name, method_name, 4)) |rm| return rm;
         // Global-index fallback.  Try EVERY type observation matching
         // `type_name` (multiple files may declare a same-named type)
@@ -146,6 +188,9 @@ pub const FileCache = struct {
         while (it.next()) |b| b.deinit();
         self.bindings.deinit(self.gpa);
         self.summaries.deinit(self.gpa);
+        var mit = self.method_lookup_cache.iterator();
+        while (mit.next()) |e| self.gpa.free(e.key_ptr.*);
+        self.method_lookup_cache.deinit(self.gpa);
     }
 
     /// Lazily build (and cache) the FileModel for this file.
