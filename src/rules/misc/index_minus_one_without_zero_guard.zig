@@ -64,61 +64,142 @@ const Problem = problem_mod.Problem;
 const Pos = problem_mod.Pos;
 const R = "index-minus-one-without-zero-guard";
 
-/// Maps callee function name → field name for functions that guarantee the
-/// returned value's `.field.len >= 1`.  Detected by finding:
-///   `const X = CALLEE(...)`  followed (≤80 tokens) by
-///   `assert(X.FIELD.len (> 0 | >= 1 | != 0))`
-/// anywhere in the file.  Keyed on source slices (valid as long as tree lives).
-const CalleeNonEmptyMap = std.StringHashMapUnmanaged([]const u8);
+/// File-level context built once per source file.  All slices are stable for
+/// as long as the Ast lives, so they may be used as hash-map keys.
+const FileCtx = struct {
+    /// callee_name → field_name: functions that guarantee returned value's
+    /// `.field.len >= 1`.  Built from `assert(X.FIELD.len >= 1)` near call sites.
+    callee_nonempty: std.StringHashMapUnmanaged([]const u8),
 
-fn collectCalleeNonEmptySliceFields(
-    gpa: std.mem.Allocator,
-    tree: *const Ast,
-) !CalleeNonEmptyMap {
-    var map: CalleeNonEmptyMap = .empty;
-    errdefer map.deinit(gpa);
-    const ttags = tree.tokens.items(.tag);
-    const n: u32 = @intCast(tree.tokens.len);
-    var i: u32 = 0;
-    while (i + 4 < n) : (i += 1) {
-        // Look for: keyword_const IDENT1 equal IDENT2 l_paren
-        if (ttags[i] != .keyword_const) continue;
-        if (ttags[i + 1] != .identifier) continue;
-        if (ttags[i + 2] != .equal) continue;
-        if (ttags[i + 3] != .identifier) continue;
-        if (ttags[i + 4] != .l_paren) continue;
-        const local_name = tree.tokenSlice(i + 1);
-        const callee_name = tree.tokenSlice(i + 3);
-        // Scan forward for assert(local_name.FIELD.len (> 0 | >= 1 | != 0)).
-        const j_end: u32 = @min(i + 80, n -| 10);
-        var j = i + 5;
-        while (j < j_end) : (j += 1) {
-            if (ttags[j] != .identifier) continue;
-            if (!std.mem.eql(u8, tree.tokenSlice(j), "assert")) continue;
-            if (j + 8 >= n) break;
-            if (ttags[j + 1] != .l_paren) continue;
-            if (ttags[j + 2] != .identifier) continue;
-            if (!std.mem.eql(u8, tree.tokenSlice(j + 2), local_name)) continue;
-            if (ttags[j + 3] != .period) continue;
-            if (ttags[j + 4] != .identifier) continue;
-            if (ttags[j + 5] != .period) continue;
-            if (ttags[j + 6] != .identifier) continue;
-            if (!std.mem.eql(u8, tree.tokenSlice(j + 6), "len")) continue;
-            const cmp = ttags[j + 7];
-            const vt = j + 8;
-            if (ttags[vt] != .number_literal) continue;
-            const val = tree.tokenSlice(vt);
-            const nonzero =
-                ((cmp == .angle_bracket_right or cmp == .bang_equal) and std.mem.eql(u8, val, "0")) or
-                (cmp == .angle_bracket_right_equal and std.mem.eql(u8, val, "1"));
-            if (!nonzero) continue;
-            const field_name = tree.tokenSlice(j + 4);
-            try map.put(gpa, callee_name, field_name);
-            break;
+    /// Struct fields that are monotone-increasing from a positive default:
+    ///   - declared with `name : type = N,` where N ≥ 1
+    ///   - every assignment in the file is `obj.name = @max(...)`
+    /// Such fields are always ≥ 1 at runtime.
+    monotone_pos: std.StringHashMapUnmanaged(void),
+
+    fn build(gpa: std.mem.Allocator, tree: *const Ast) !FileCtx {
+        var ctx: FileCtx = .{
+            .callee_nonempty = .empty,
+            .monotone_pos = .empty,
+        };
+        errdefer ctx.deinit(gpa);
+        try ctx.fillCalleeNonEmpty(gpa, tree);
+        try ctx.fillMonotonePos(gpa, tree);
+        return ctx;
+    }
+
+    fn deinit(self: *FileCtx, gpa: std.mem.Allocator) void {
+        self.callee_nonempty.deinit(gpa);
+        self.monotone_pos.deinit(gpa);
+    }
+
+    /// Detect callee → field where callee guarantees .field.len ≥ 1.
+    /// Scans for `const X = CALLEE(...)` followed by `assert(X.FIELD.len (>0|>=1|!=0))`.
+    fn fillCalleeNonEmpty(self: *FileCtx, gpa: std.mem.Allocator, tree: *const Ast) !void {
+        const ttags = tree.tokens.items(.tag);
+        const n: u32 = @intCast(tree.tokens.len);
+        var i: u32 = 0;
+        while (i + 4 < n) : (i += 1) {
+            if (ttags[i] != .keyword_const) continue;
+            if (ttags[i + 1] != .identifier) continue;
+            if (ttags[i + 2] != .equal) continue;
+            if (ttags[i + 3] != .identifier) continue;
+            if (ttags[i + 4] != .l_paren) continue;
+            const local_name = tree.tokenSlice(i + 1);
+            const callee_name = tree.tokenSlice(i + 3);
+            const j_end: u32 = @min(i + 80, n -| 10);
+            var j = i + 5;
+            while (j < j_end) : (j += 1) {
+                if (ttags[j] != .identifier) continue;
+                if (!std.mem.eql(u8, tree.tokenSlice(j), "assert")) continue;
+                if (j + 8 >= n) break;
+                if (ttags[j + 1] != .l_paren) continue;
+                if (ttags[j + 2] != .identifier) continue;
+                if (!std.mem.eql(u8, tree.tokenSlice(j + 2), local_name)) continue;
+                if (ttags[j + 3] != .period) continue;
+                if (ttags[j + 4] != .identifier) continue;
+                if (ttags[j + 5] != .period) continue;
+                if (ttags[j + 6] != .identifier) continue;
+                if (!std.mem.eql(u8, tree.tokenSlice(j + 6), "len")) continue;
+                const cmp = ttags[j + 7];
+                const vt = j + 8;
+                if (ttags[vt] != .number_literal) continue;
+                const val = tree.tokenSlice(vt);
+                const nonzero =
+                    ((cmp == .angle_bracket_right or cmp == .bang_equal) and std.mem.eql(u8, val, "0")) or
+                    (cmp == .angle_bracket_right_equal and std.mem.eql(u8, val, "1"));
+                if (!nonzero) continue;
+                const field_name = tree.tokenSlice(j + 4);
+                try self.callee_nonempty.put(gpa, callee_name, field_name);
+                break;
+            }
         }
     }
-    return map;
-}
+
+    /// Detect struct fields that are monotone-increasing from a positive default.
+    ///
+    /// Phase 1 — find candidates: `FIELD : TYPE = N ,` where N ≥ 1.
+    ///   Only simple single-identifier types (e.g. `usize`, `u32`) are matched.
+    ///   The trailing `,` distinguishes struct fields from other `= N` patterns.
+    ///
+    /// Phase 2 — validate: every `. FIELD =` assignment in the file must be
+    ///   followed by `@max(` (builtin).  Any other RHS disqualifies the field
+    ///   (it could decrease the value below the default).
+    ///
+    /// Fields that pass both phases are always ≥ N ≥ 1 by induction:
+    ///   base case = default N; step case = @max(expr, FIELD) ≥ FIELD ≥ N.
+    fn fillMonotonePos(self: *FileCtx, gpa: std.mem.Allocator, tree: *const Ast) !void {
+        const ttags = tree.tokens.items(.tag);
+        const n: u32 = @intCast(tree.tokens.len);
+
+        // Phase 1.
+        var i: u32 = 0;
+        while (i + 5 < n) : (i += 1) {
+            if (ttags[i] != .identifier) continue;
+            if (ttags[i + 1] != .colon) continue;
+            if (ttags[i + 2] != .identifier) continue; // simple type (usize, u32, …)
+            if (ttags[i + 3] != .equal) continue;
+            if (ttags[i + 4] != .number_literal) continue;
+            if (ttags[i + 5] != .comma) continue;
+            const default_val = std.fmt.parseUnsigned(u64, tree.tokenSlice(i + 4), 0) catch continue;
+            if (default_val < 1) continue;
+            const field_name = tree.tokenSlice(i);
+            try self.monotone_pos.put(gpa, field_name, {});
+        }
+
+        // Phase 2 — remove any field that has a non-@max assignment anywhere.
+        var to_remove: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer to_remove.deinit(gpa);
+        var it = self.monotone_pos.keyIterator();
+        while (it.next()) |key_ptr| {
+            const field_name = key_ptr.*;
+            var disqualified = false;
+            var j: u32 = 0;
+            while (j + 2 < n) : (j += 1) {
+                // Look for `. FIELD =` (field assignment expression).
+                if (ttags[j] != .period) continue;
+                if (ttags[j + 1] != .identifier) continue;
+                if (!std.mem.eql(u8, tree.tokenSlice(j + 1), field_name)) continue;
+                if (ttags[j + 2] != .equal) continue;
+                // Ensure the `=` is not `==` (comparison).
+                if (j + 3 < n and ttags[j + 3] == .equal) continue;
+                // RHS must be `@max`.
+                if (j + 3 >= n or
+                    ttags[j + 3] != .builtin or
+                    !std.mem.eql(u8, tree.tokenSlice(j + 3), "@max"))
+                {
+                    disqualified = true;
+                    break;
+                }
+            }
+            if (disqualified) try to_remove.append(gpa, field_name);
+        }
+        for (to_remove.items) |k| _ = self.monotone_pos.remove(k);
+    }
+};
+
+/// Maps callee function name → field name for functions that guarantee the
+/// returned value's `.field.len >= 1`.  Kept for type-alias clarity.
 
 pub fn check(
     gpa: std.mem.Allocator,
@@ -129,13 +210,12 @@ pub fn check(
 ) !void {
     if (!config_mod.isEnabled(config, .index_minus_one_without_zero_guard)) return;
     _ = cache;
-    // File-level pre-pass: find callees that guarantee a non-empty slice field.
-    var callee_nonempty = try collectCalleeNonEmptySliceFields(gpa, tree);
-    defer callee_nonempty.deinit(gpa);
+    var ctx = try FileCtx.build(gpa, tree);
+    defer ctx.deinit(gpa);
     var proto_buf: [1]Ast.Node.Index = undefined;
     var fns = tokens.iterFnDecls(tree);
     while (fns.next(&proto_buf)) |fn_entry| {
-        try checkBody(gpa, tree, fn_entry.body, problems, &callee_nonempty);
+        try checkBody(gpa, tree, fn_entry.body, problems, &ctx);
     }
 }
 
@@ -144,7 +224,7 @@ fn checkBody(
     tree: *const Ast,
     body: Ast.Node.Index,
     problems: *std.ArrayListUnmanaged(Problem),
-    callee_nonempty: *const CalleeNonEmptyMap,
+    ctx: *const FileCtx,
 ) !void {
     const tags = tree.tokens.items(.tag);
     const first = tree.firstToken(body);
@@ -154,7 +234,7 @@ fn checkBody(
 
     // AST pre-pass: collect token ranges of if-bodies whose condition
     // contains a zero-guard on some identifier.  Used by `isInGuardedRange`.
-    var guarded = try collectGuardedRanges(gpa, tree, first, last, callee_nonempty);
+    var guarded = try collectGuardedRanges(gpa, tree, first, last, ctx);
     defer guarded.deinit(gpa);
 
     var t: Ast.TokenIndex = first;
@@ -346,7 +426,7 @@ fn collectGuardedRanges(
     tree: *const Ast,
     body_first: Ast.TokenIndex,
     body_last: Ast.TokenIndex,
-    callee_nonempty: *const CalleeNonEmptyMap,
+    ctx: *const FileCtx,
 ) !std.ArrayListUnmanaged(GuardedRange) {
     var out: std.ArrayListUnmanaged(GuardedRange) = .empty;
     const ttags = tree.tokens.items(.tag);
@@ -602,7 +682,7 @@ fn collectGuardedRanges(
             if (ttags[ci + 4] != .l_paren) continue;
             const local_name = tree.tokenSlice(ci + 1);
             const callee_name = tree.tokenSlice(ci + 3);
-            if (callee_nonempty.get(callee_name)) |field_name| {
+            if (ctx.callee_nonempty.get(callee_name)) |field_name| {
                 try out.append(gpa, .{
                     .names = .{ local_name, field_name, "" },
                     .n = 2,
@@ -611,6 +691,93 @@ fn collectGuardedRanges(
                     .last = body_last,
                 });
             }
+        }
+    }
+
+    // ── Cross-pass 4: alloc-with-size-plus-N ─────────────────────────────────
+    // `const LOCAL = try (anything).alloc(TYPE, EXPR + N)` where N ≥ 1 guarantees
+    // LOCAL.len = EXPR + N ≥ 1 (since EXPR is usize ≥ 0 and +N ≥ 1).
+    // Covers `const argv = try gpa.alloc([]const u8, cli.len + 1)` → argv.len ≥ 1.
+    {
+        var ci = body_first;
+        while (ci + 4 <= body_last) : (ci += 1) {
+            if (ttags[ci] != .keyword_const) continue;
+            if (ttags[ci + 1] != .identifier) continue;
+            if (ttags[ci + 2] != .equal) continue;
+            if (ttags[ci + 3] != .keyword_try) continue;
+            const local_name = tree.tokenSlice(ci + 1);
+            // Find `alloc (` within the next 60 tokens.
+            var alloc_paren: u32 = 0;
+            {
+                var j = ci + 4;
+                const j_end = @min(ci + 60, body_last);
+                while (j + 1 <= j_end) : (j += 1) {
+                    if (ttags[j] == .identifier and
+                        std.mem.eql(u8, tree.tokenSlice(j), "alloc") and
+                        ttags[j + 1] == .l_paren)
+                    {
+                        alloc_paren = j + 1;
+                        break;
+                    }
+                }
+            }
+            if (alloc_paren == 0) continue;
+            // Track depth to find the last argument of alloc(...).
+            var depth: u32 = 1;
+            var last_arg_start: u32 = alloc_paren + 1;
+            var close_paren: u32 = 0;
+            {
+                var k = alloc_paren + 1;
+                while (k <= body_last) : (k += 1) {
+                    switch (ttags[k]) {
+                        .l_paren => depth += 1,
+                        .r_paren => {
+                            depth -= 1;
+                            if (depth == 0) { close_paren = k; break; }
+                        },
+                        .comma => if (depth == 1) { last_arg_start = k + 1; },
+                        else => {},
+                    }
+                }
+            }
+            if (close_paren == 0) continue;
+            // Scan last argument [last_arg_start, close_paren) for `+ N` where N ≥ 1.
+            var found = false;
+            {
+                var m = last_arg_start;
+                while (m + 1 < close_paren) : (m += 1) {
+                    if (ttags[m] != .plus) continue;
+                    if (ttags[m + 1] != .number_literal) continue;
+                    const n_val = std.fmt.parseUnsigned(u64, tree.tokenSlice(m + 1), 0) catch continue;
+                    if (n_val >= 1) { found = true; break; }
+                }
+            }
+            if (!found) continue;
+            try out.append(gpa, .{
+                .names = .{ local_name, "", "" },
+                .n = 1,
+                .pair = false,
+                .first = ci,
+                .last = body_last,
+            });
+        }
+    }
+
+    // ── Monotone-positive field guards ────────────────────────────────────────
+    // Fields detected as monotone-increasing-from-positive (struct default ≥ 1,
+    // only @max assignments) are always ≥ 1 at any call site.
+    // Emit a body-wide guarded range for each such field name so that subscripts
+    // like `arr[obj.FIELD - 1]` where FIELD is in the set are suppressed.
+    {
+        var it = ctx.monotone_pos.keyIterator();
+        while (it.next()) |key_ptr| {
+            try out.append(gpa, .{
+                .names = .{ key_ptr.*, "", "" },
+                .n = 1,
+                .pair = false,
+                .first = body_first,
+                .last = body_last,
+            });
         }
     }
 
@@ -1003,6 +1170,11 @@ fn hasInitToOneGuard(
             if (std.mem.eql(u8, id, gn)) { matched = true; break; }
         }
         if (!matched) continue;
+        // Only match LOCAL variable declarations (preceded by `const` or `var`).
+        // Struct field defaults (`field: type = 1,`) and function parameters
+        // must not trigger this guard — the default does not prove the value is
+        // always 1 at runtime (it can be changed after construction).
+        if (k == 0 or (tags[k - 1] != .keyword_const and tags[k - 1] != .keyword_var)) continue;
         // Scan forward up to 5 tokens for `equal number_literal("1")`.
         var j = k + 1;
         while (j < t and j <= k + 5) : (j += 1) {
@@ -1623,6 +1795,70 @@ test "index-minus-one-without-zero-guard: getLastOrNull different base still fir
         \\    if (a.getLastOrNull()) |_| {
         \\        _ = b[b.len - 1];
         \\    }
+        \\}
+        \\
+    );
+}
+
+// ── Cross-pass 4: alloc-plus-N tests ──────────────────────────────────────
+
+test "index-minus-one-without-zero-guard: alloc with +1 size suppresses" {
+    try testing.expectNoFire(check,
+        \\fn f(gpa: anytype, src: []const u8) void {
+        \\    const buf = try gpa.alloc(u8, src.len + 1);
+        \\    _ = buf[buf.len - 1];
+        \\}
+        \\
+    );
+}
+
+test "index-minus-one-without-zero-guard: alloc with +0 size still fires" {
+    try testing.expectFires(check, R,
+        \\fn f(gpa: anytype, src: []const u8) void {
+        \\    const buf = try gpa.alloc(u8, src.len + 0);
+        \\    _ = buf[buf.len - 1];
+        \\}
+        \\
+    );
+}
+
+test "index-minus-one-without-zero-guard: alloc different local still fires" {
+    try testing.expectFires(check, R,
+        \\fn f(gpa: anytype, src: []const u8, other: []const u8) void {
+        \\    _ = try gpa.alloc(u8, src.len + 1);
+        \\    _ = other[other.len - 1];
+        \\}
+        \\
+    );
+}
+
+// ── Monotone-positive field tests ──────────────────────────────────────────
+
+test "index-minus-one-without-zero-guard: monotone @max field suppresses" {
+    try testing.expectNoFire(check,
+        \\const S = struct {
+        \\    limit: usize = 1,
+        \\};
+        \\fn upgrade(s: *S) void {
+        \\    s.limit = @max(s.limit, 2);
+        \\}
+        \\fn use(arr: []const u8, s: S) u8 {
+        \\    return arr[s.limit - 1];
+        \\}
+        \\
+    );
+}
+
+test "index-minus-one-without-zero-guard: non-monotone field still fires" {
+    try testing.expectFires(check, R,
+        \\const S = struct {
+        \\    limit: usize = 1,
+        \\};
+        \\fn downgrade(s: *S) void {
+        \\    s.limit = 0; // non-@max assignment disqualifies
+        \\}
+        \\fn use(arr: []const u8, s: S) u8 {
+        \\    return arr[s.limit - 1];
         \\}
         \\
     );
