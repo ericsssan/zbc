@@ -926,12 +926,29 @@ pub const FileCache = struct {
         type_name: []const u8,
         method_name: []const u8,
     ) !?fn_summary.FnSummary {
-        const rm = self.findMethodAcrossImports(type_name, method_name) orelse return null;
+        // Project-level cache: check before the expensive @import traversal.
+        // Shared across all per-file FileCache instances — pays the traversal
+        // cost at most once globally per (type, method) pair.
+        if (self.project) |pc| {
+            if (pc.getMethodSummaryCache(type_name, method_name)) |cached_takes| {
+                // Hit (cached_takes is ?u32 — null means "not found").
+                const takes = cached_takes orelse return null;
+                var s: fn_summary.FnSummary = .{};
+                s.takes_ownership_of = takes;
+                return s;
+            }
+        }
+
+        const rm = self.findMethodAcrossImports(type_name, method_name) orelse {
+            if (self.project) |pc| pc.putMethodSummaryCache(type_name, method_name, null);
+            return null;
+        };
         var buf: [1]Ast.Node.Index = undefined;
         const proto = tokens.fnProto(rm.tree, &buf, rm.method.fn_decl) orelse return null;
         const body = tokens.bodyOf(rm.tree, rm.method.fn_decl) orelse return null;
         var summary: fn_summary.FnSummary = .{};
         summary.takes_ownership_of = fn_summary.inferDirectTakes(rm.tree, proto, body);
+        if (self.project) |pc| pc.putMethodSummaryCache(type_name, method_name, summary.takes_ownership_of);
         return summary;
     }
 

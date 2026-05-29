@@ -55,6 +55,15 @@ pub const ProjectCache = struct {
     /// dirname + join + resolvePosix + alloc on every call to
     /// `modelForRelativeImport` when the model is already cached.
     import_path_cache: std.StringHashMapUnmanaged([]u8) = .empty,
+    /// Project-wide cross-file method summary cache.
+    /// Key = gpa-owned `"TypeName\x00methodName"`.
+    /// Value = `takes_ownership_of` from `inferDirectTakes` on the
+    /// resolved method body; null means "looked up, method not found
+    /// or takes nothing".  Shared across all per-file FileCache
+    /// instances so the expensive @import-graph traversal in
+    /// `summaryByMethodCrossFile` is paid at most once globally per
+    /// (type, method) pair rather than once per analyzed file.
+    method_summary_cache: std.StringHashMapUnmanaged(?u32) = .empty,
 
     pub const Entry = struct {
         abs_path: []const u8,
@@ -126,6 +135,52 @@ pub const ProjectCache = struct {
             self.gpa.free(e.value_ptr.*);
         }
         self.import_path_cache.deinit(self.gpa);
+        var sit = self.method_summary_cache.iterator();
+        while (sit.next()) |e| self.gpa.free(e.key_ptr.*);
+        self.method_summary_cache.deinit(self.gpa);
+    }
+
+    /// Look up the cached `takes_ownership_of` result for a cross-file
+    /// method lookup.  Returns the outer optional: null = not in cache;
+    /// .some(null) = cached "not found"; .some(.some(n)) = found, param n.
+    /// Caller must hold mu (or accept a racy read — values are immutable
+    /// once written, so a stale miss is safe; only a stale HIT is risky,
+    /// but that can't happen since we only write once per key).
+    pub fn getMethodSummaryCache(
+        self: *ProjectCache,
+        type_name: []const u8,
+        method_name: []const u8,
+    ) ??u32 {
+        var key_buf: [256]u8 = undefined;
+        const key_len = type_name.len + 1 + method_name.len;
+        if (key_len > key_buf.len) return null;
+        @memcpy(key_buf[0..type_name.len], type_name);
+        key_buf[type_name.len] = 0;
+        @memcpy(key_buf[type_name.len + 1 ..][0..method_name.len], method_name);
+        const sk = key_buf[0..key_len];
+        self.muLock();
+        defer self.muUnlock();
+        const entry = self.method_summary_cache.get(sk) orelse return null;
+        return entry; // .some(?u32)
+    }
+
+    /// Store `takes_ownership_of` for a cross-file method lookup.
+    /// No-ops on OOM (the result will be recomputed next time — safe).
+    pub fn putMethodSummaryCache(
+        self: *ProjectCache,
+        type_name: []const u8,
+        method_name: []const u8,
+        takes: ?u32,
+    ) void {
+        self.muLock();
+        defer self.muUnlock();
+        // Allocate heap key for storage.
+        const key = std.fmt.allocPrint(
+            self.gpa,
+            "{s}\x00{s}",
+            .{ type_name, method_name },
+        ) catch return;
+        self.method_summary_cache.put(self.gpa, key, takes) catch self.gpa.free(key);
     }
 
     /// Lazily-built global type index.  On first call: walks every
