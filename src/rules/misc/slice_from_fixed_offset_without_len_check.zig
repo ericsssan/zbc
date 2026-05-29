@@ -26,7 +26,14 @@
 //!   4. Suppression: if the preceding token before `identifier(buf)` is
 //!      `period` (chain: `self.buf[N..]`) — the receiver has more context;
 //!      skip to reduce noise on deeply-chained field accesses.
-//!   5. Fire at the `l_bracket` token of the unsafe slice.
+//!   5. Suppression: self-advance / consume idiom `buf = buf[N..]` (the slice
+//!      is a reassignment of the buffer to a sub-slice of itself). This is the
+//!      iterate/consume shape — guarded in practice by a `buf[0]` access, a
+//!      loop length guard, or a `startsWith` check — and is categorically
+//!      distinct from the "parse a fixed prefix from input" bug this rule
+//!      targets (`const tail = line[6..]`). Suppressing it preserves recall on
+//!      the real bug shape while removing the dominant FP class.
+//!   6. Fire at the `l_bracket` token of the unsafe slice.
 
 const std = @import("std");
 const Ast = std.zig.Ast;
@@ -98,6 +105,21 @@ fn checkBody(
         // (`self.buf[N..]`). The receiver provides more context and static
         // analysis becomes very imprecise without type info (Tier 4).
         if (t > first and tags[t - 1] == .period) continue;
+
+        // Suppression: self-advance / consume idiom `buf = buf[N..]` — the
+        // slice reassigns the buffer to a sub-slice of itself. This is the
+        // iterate/consume shape, not the fixed-prefix-parse shape this rule
+        // targets. The `(t - 3) != period` guard avoids matching a field
+        // assignment whose field happens to share the local's name
+        // (`obj.buf = buf[N..]`).
+        if (t >= first + 2 and
+            tags[t - 1] == .equal and
+            tags[t - 2] == .identifier and
+            std.mem.eql(u8, tree.tokenSlice(t - 2), buf_name) and
+            (t < first + 3 or tags[t - 3] != .period))
+        {
+            continue;
+        }
 
         // Suppression: if `buf_name.len` appears in the fn body BEFORE
         // this slice, the programmer already consults the length.
@@ -211,6 +233,52 @@ test "slice-from-fixed-offset-without-len-check: len consulted anywhere before s
         \\    const n = data.len;
         \\    _ = n;
         \\    return data[4..];
+        \\}
+        \\
+    );
+}
+
+// ── Self-advance / consume idiom suppression ────────────────
+
+test "slice-from-fixed-offset-without-len-check: self-advance buf = buf[1..] does not fire" {
+    try testing.expectNoFire(check,
+        \\fn consume(items: []u32) void {
+        \\    var remain = items;
+        \\    for (items) |it| {
+        \\        remain[0] = it;
+        \\        remain = remain[1..];
+        \\    }
+        \\}
+        \\
+    );
+}
+
+test "slice-from-fixed-offset-without-len-check: self-advance with larger offset does not fire" {
+    try testing.expectNoFire(check,
+        \\fn skip(input: []const u8) []const u8 {
+        \\    var name = input;
+        \\    name = name[4..];
+        \\    return name;
+        \\}
+        \\
+    );
+}
+
+test "slice-from-fixed-offset-without-len-check: assignment to a different var still fires" {
+    try testing.expectFires(check, R,
+        \\fn f(key: []const u8) []const u8 {
+        \\    var out = key[1..];
+        \\    return out;
+        \\}
+        \\
+    );
+}
+
+test "slice-from-fixed-offset-without-len-check: field assign sharing local name still fires" {
+    try testing.expectFires(check, R,
+        \\const S = struct { buf: []const u8 };
+        \\fn f(s: *S, buf: []const u8) void {
+        \\    s.buf = buf[2..];
         \\}
         \\
     );
