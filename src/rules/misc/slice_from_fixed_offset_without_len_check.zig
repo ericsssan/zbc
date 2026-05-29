@@ -53,7 +53,11 @@
 //!      at position `i` — a string literal, or a call whose callee's
 //!      return-length postcondition is >= N (e.g. `close_tag[2..]` where callers
 //!      pass `chunk.closingTagForContent()` → returns `"</script"`/`"</style"`).
-//!  11. Fire at the `l_bracket` token of the unsafe slice.
+//!  11. Suppression: `buf` is a `comptime` parameter.  Zig comptime-evaluates
+//!      every instantiation site, so `buf[N..]` that compiles is always
+//!      in-bounds — the compiler would reject a caller passing a too-short
+//!      literal before the function body ever executes.
+//!  12. Fire at the `l_bracket` token of the unsafe slice.
 
 const std = @import("std");
 const Ast = std.zig.Ast;
@@ -517,6 +521,11 @@ fn checkBody(
             }
         }
 
+        // Suppression: `buf` is a `comptime` parameter.  Every instantiation
+        // is compile-time evaluated — a too-short literal would be a compile
+        // error at the call site, not a runtime OOB.
+        if (isComptimeParam(proto, tree, tags, buf_name)) continue;
+
         // Fire at the l_bracket of the unsafe slice.
         try report(gpa, problems, tree, t + 1, buf_name, offset_str);
     }
@@ -749,6 +758,28 @@ fn isLocalFixedArray(
             const is_inferred = inner == .identifier and std.mem.eql(u8, tree.tokenSlice(j + 2), "_");
             if ((inner == .number_literal or is_inferred) and tags[j + 3] == .r_bracket) return true;
             break;
+        }
+    }
+    return false;
+}
+
+/// Returns true iff `name` is declared as a `comptime` parameter in `proto`.
+/// A comptime parameter has `p.comptime_noalias` set to a `.keyword_comptime`
+/// token.  Slicing a comptime slice is compile-time bounds checked per
+/// instantiation — a caller passing a too-short literal would be a compile
+/// error, not a runtime OOB.
+fn isComptimeParam(
+    proto: Ast.full.FnProto,
+    tree: *const Ast,
+    tags: []const std.zig.Token.Tag,
+    name: []const u8,
+) bool {
+    var it = proto.iterate(tree);
+    while (it.next()) |p| {
+        const nt = p.name_token orelse continue;
+        if (!std.mem.eql(u8, tree.tokenSlice(nt), name)) continue;
+        if (p.comptime_noalias) |tok| {
+            return tags[tok] == .keyword_comptime;
         }
     }
     return false;
@@ -1238,6 +1269,37 @@ test "slice-from-fixed-offset-without-len-check: 2-hop does not suppress pub fn 
         \\}
         \\fn a() []const u8 {
         \\    return skipDashes("--foo");
+        \\}
+        \\
+    );
+}
+
+// ── comptime parameter suppression ────────────────────────────────────────
+
+test "slice-from-fixed-offset-without-len-check: comptime slice param does not fire" {
+    try testing.expectNoFire(check,
+        \\fn eatLiteral(s: []const u8, comptime literal: []const u8) []const u8 {
+        \\    const rest = literal[1..];
+        \\    _ = s;
+        \\    return rest;
+        \\}
+        \\
+    );
+}
+
+test "slice-from-fixed-offset-without-len-check: comptime type param does not fire" {
+    try testing.expectNoFire(check,
+        \\fn eat(comptime fmt: []const u8) void {
+        \\    _ = fmt[2..];
+        \\}
+        \\
+    );
+}
+
+test "slice-from-fixed-offset-without-len-check: non-comptime param with same name still fires" {
+    try testing.expectFires(check, R,
+        \\fn parse(literal: []const u8) []const u8 {
+        \\    return literal[1..];
         \\}
         \\
     );
