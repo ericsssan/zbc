@@ -40,7 +40,11 @@
 //!   7. Suppression: a `startsWith*(…, buf, "literal")` guard before the slice
 //!      proves `buf.len >= literal.len`; when that byte length is >= the
 //!      offset, `buf[offset..]` is in-bounds.
-//!   8. Fire at the `l_bracket` token of the unsafe slice.
+//!   8. Suppression: `buf` is a local fixed-size array (`var buf: [K]T` or
+//!      `var buf = [_]T{…}`).  Array slicing is compile-time bounds checked,
+//!      so a `buf[N..]` that compiles is always in-bounds — it can never be the
+//!      runtime OOB this rule targets (a `[]T` slice of unconstrained length).
+//!   9. Fire at the `l_bracket` token of the unsafe slice.
 
 const std = @import("std");
 const Ast = std.zig.Ast;
@@ -144,6 +148,13 @@ fn checkBody(
         // slice proves `buf.len >= literal.len`.  When the prefix's byte
         // length is >= the slice offset, `buf[offset..]` is safe.
         if (startsWithGuardBefore(tree, tags, first, t, buf_name, offset_str)) continue;
+
+        // Suppression: `buf` is a local fixed-size array (`var buf: [K]T` or
+        // `var buf = [_]T{…}`).  A fixed-array slice is compile-time bounds
+        // checked — if `buf[N..]` compiles then N <= K — so it can never be the
+        // runtime out-of-bounds this rule targets (which is a `[]T` slice whose
+        // length is unconstrained).  (Tier 3: local declaration tracking.)
+        if (isLocalFixedArray(tree, tags, first, t, buf_name)) continue;
 
         // Fire at the l_bracket of the unsafe slice.
         try report(gpa, problems, tree, t + 1, buf_name, offset_str);
@@ -251,6 +262,51 @@ fn startsWithGuardBefore(
                     return true;
                 }
             }
+        }
+    }
+    return false;
+}
+
+/// Returns true iff `name` is declared in `[start, end)` as a local fixed-size
+/// array — i.e. its element count is a compile-time constant.  Two forms:
+///
+///   Array type:    `(const|var) name : [ NUMBER ] …`     (e.g. `[48]u8`)
+///   Array literal: `(const|var) name … = [ (_ | NUMBER) ] …`  (e.g. `[_]u8{…}`)
+///
+/// Slice types (`: []T`), many-item pointers (`: [*]T`), and sentinel slices
+/// (`: [:0]T`) are NOT arrays — they have no `number_literal` immediately after
+/// `[`, so they are correctly excluded.  Slicing a fixed-size array is
+/// compile-time bounds checked, so any `name[N..]` that compiles has N <= K.
+fn isLocalFixedArray(
+    tree: *const Ast,
+    tags: []const std.zig.Token.Tag,
+    start: Ast.TokenIndex,
+    end: Ast.TokenIndex,
+    name: []const u8,
+) bool {
+    if (start >= end) return false;
+    var k: Ast.TokenIndex = start;
+    while (k + 1 < end) : (k += 1) {
+        if (tags[k] != .keyword_const and tags[k] != .keyword_var) continue;
+        if (tags[k + 1] != .identifier) continue;
+        if (!std.mem.eql(u8, tree.tokenSlice(k + 1), name)) continue;
+
+        // Form A — array type annotation: `name : [ NUMBER ]`.
+        if (k + 4 < end and
+            tags[k + 2] == .colon and
+            tags[k + 3] == .l_bracket and
+            tags[k + 4] == .number_literal) return true;
+
+        // Form B — array literal initializer: `name (: type)? = [ (_ | NUMBER) ]`.
+        // Scan forward to the `=` (stopping at the statement's `;`).
+        var j: Ast.TokenIndex = k + 2;
+        while (j + 3 < end and tags[j] != .semicolon) : (j += 1) {
+            if (tags[j] != .equal) continue;
+            if (tags[j + 1] != .l_bracket) break; // initializer is not an array literal
+            const inner = tags[j + 2];
+            const is_inferred = inner == .identifier and std.mem.eql(u8, tree.tokenSlice(j + 2), "_");
+            if ((inner == .number_literal or is_inferred) and tags[j + 3] == .r_bracket) return true;
+            break;
         }
     }
     return false;
@@ -491,6 +547,53 @@ test "slice-from-fixed-offset-without-len-check: startsWith on a different buffe
         \\fn parse(arg: []const u8, other: []const u8) []const u8 {
         \\    if (std.mem.startsWith(u8, other, "--")) return arg[2..];
         \\    return arg;
+        \\}
+        \\
+    );
+}
+
+// ── Local fixed-size array (Tier 3 declaration tracking) ────
+
+test "slice-from-fixed-offset-without-len-check: sized-array local does not fire" {
+    try testing.expectNoFire(check,
+        \\fn f() void {
+        \\    var buf: [48]u8 = undefined;
+        \\    const tail = buf[7..];
+        \\    _ = tail;
+        \\}
+        \\
+    );
+}
+
+test "slice-from-fixed-offset-without-len-check: inferred-length array literal local does not fire" {
+    try testing.expectNoFire(check,
+        \\fn f() void {
+        \\    var decimal_buf = [_]u8{ '.', 0 };
+        \\    const rest = decimal_buf[1..];
+        \\    _ = rest;
+        \\}
+        \\
+    );
+}
+
+test "slice-from-fixed-offset-without-len-check: slice-typed local still fires" {
+    try testing.expectFires(check, R,
+        \\fn f(input: []const u8) void {
+        \\    const buf: []const u8 = input;
+        \\    const tail = buf[7..];
+        \\    _ = tail;
+        \\}
+        \\
+    );
+}
+
+test "slice-from-fixed-offset-without-len-check: slice derived from a fixed array still fires" {
+    try testing.expectFires(check, R,
+        \\fn f() void {
+        \\    var arr: [48]u8 = undefined;
+        \\    const sub = arr[0..];
+        \\    const tail = sub[7..];
+        \\    _ = tail;
         \\}
         \\
     );
