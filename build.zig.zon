@@ -1,12 +1,7 @@
 .{
     .name = .zbc,
     .version = "0.0.1",
-    .dependencies = .{
-        .zls = .{
-            .url = "https://github.com/zigtools/zls/archive/refs/heads/master.tar.gz",
-            .hash = "zls-0.17.0-dev-rmm5fhwjJgCaQB3fCtSi_8xBQvGJJqz9BBeQHjZK9jet",
-        },
-    },
+    .dependencies = .{},
     .minimum_zig_version = "0.17.0-dev.305+bdfbf432d",
     .fingerprint = 0x25570d53f55a8b70,
     .paths = .{
