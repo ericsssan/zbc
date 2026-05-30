@@ -128,6 +128,7 @@ pub fn lowerFunctionFullWithZls(
         break :blk ti.name;
     };
 
+    const line_offsets = try buildLineOffsets(gpa, tree.source);
     var builder: Builder = .{
         .gpa = gpa,
         .tree = tree,
@@ -141,6 +142,7 @@ pub fn lowerFunctionFullWithZls(
         .fn_body_last = tree.lastToken(body_node),
         .fn_body_first = tree.firstToken(body_node),
         .self_type = self_type,
+        .line_offsets = line_offsets,
     };
     defer builder.tempDeinit();
 
@@ -149,6 +151,31 @@ pub fn lowerFunctionFullWithZls(
     try builder.lowerFunctionBody(body_node, &cur_block);
 
     return try builder.finalize(tree, fn_decl, entry_id);
+}
+
+/// Build a sorted list of byte offsets where each line starts.
+/// line_offsets[i] = byte offset of the first character on line i.
+/// Used by posOfToken / endPosOf for O(log lines) position lookups.
+fn buildLineOffsets(gpa: std.mem.Allocator, source: [:0]const u8) ![]u32 {
+    var offsets: std.ArrayListUnmanaged(u32) = .empty;
+    try offsets.append(gpa, 0);
+    for (source, 0..) |c, i| {
+        if (c == '\n') try offsets.append(gpa, @intCast(i + 1));
+    }
+    return offsets.toOwnedSlice(gpa);
+}
+
+/// Binary-search line_offsets for the line containing `byte_offset`.
+/// Returns 0-based line index and 0-based column.
+inline fn byteToLineCol(line_offsets: []const u32, byte_offset: u32) struct { line: u32, col: u32 } {
+    var lo: usize = 0;
+    var hi: usize = line_offsets.len;
+    // Find last index where line_offsets[i] <= byte_offset.
+    while (lo + 1 < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (line_offsets[mid] <= byte_offset) lo = mid else hi = mid;
+    }
+    return .{ .line = @intCast(lo), .col = byte_offset - line_offsets[lo] };
 }
 
 /// Does `text` contain any of `patterns` as a substring?  Used by
@@ -436,8 +463,14 @@ const Builder = struct {
     /// is non-contiguous in source).  Transferred to Cfg at finalize
     /// and freed in Cfg.deinit.
     owned_paths: std.ArrayListUnmanaged([]u8) = .empty,
+    /// Pre-built table of byte offsets where each line starts (line_offsets[i]
+    /// = byte offset of the first char on line i).  Built once per file in
+    /// lowerFunctionFullWithZls; makes posOfToken / endPosOf O(log lines)
+    /// instead of O(source_len).
+    line_offsets: []const u32 = &.{},
 
     fn tempDeinit(self: *Builder) void {
+        if (self.line_offsets.len > 0) self.gpa.free(self.line_offsets);
         for (self.block_stmts.items) |*s| s.deinit(self.gpa);
         self.block_stmts.deinit(self.gpa);
         for (self.block_successors.items) |*s| s.deinit(self.gpa);
@@ -6114,22 +6147,21 @@ const Builder = struct {
         const start = tree.tokens.items(.start)[last];
         const slice = tree.tokenSlice(last);
         const end_byte: u32 = @intCast(start + slice.len);
-        const loc = tree.tokenLocation(0, last);
+        const lc = byteToLineCol(self.line_offsets, start);
         return .{
             .byte = end_byte,
-            .line = @intCast(loc.line + 1),
-            .column = @intCast(loc.column + 1 + slice.len),
+            .line = lc.line + 1,
+            .column = lc.col + 1 + @as(u32, @intCast(slice.len)),
         };
     }
 
     fn posOfToken(self: *Builder, tok: Ast.TokenIndex) SrcPos {
-        const tree = self.tree;
-        const start = tree.tokens.items(.start)[tok];
-        const loc = tree.tokenLocation(0, tok);
+        const start = self.tree.tokens.items(.start)[tok];
+        const lc = byteToLineCol(self.line_offsets, start);
         return .{
             .byte = start,
-            .line = @intCast(loc.line + 1),
-            .column = @intCast(loc.column + 1),
+            .line = lc.line + 1,
+            .column = lc.col + 1,
         };
     }
 
@@ -6140,11 +6172,11 @@ const Builder = struct {
         const start = tree.tokens.items(.start)[tok];
         const slice = tree.tokenSlice(tok);
         const end_byte: u32 = @intCast(start + slice.len);
-        const loc = tree.tokenLocation(0, tok);
+        const lc = byteToLineCol(self.line_offsets, start);
         return .{
             .byte = end_byte,
-            .line = @intCast(loc.line + 1),
-            .column = @intCast(loc.column + 1 + slice.len),
+            .line = lc.line + 1,
+            .column = lc.col + 1 + @as(u32, @intCast(slice.len)),
         };
     }
 
