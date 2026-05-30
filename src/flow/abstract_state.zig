@@ -165,27 +165,39 @@ pub const AbstractState = struct {
 
     pub fn clone(self: *const AbstractState, gpa: std.mem.Allocator) !AbstractState {
         var out: AbstractState = .{};
-        try out.locals.ensureTotalCapacity(gpa, self.locals.count());
-        for (self.locals.keys(), self.locals.values()) |k, v| {
-            out.locals.putAssumeCapacity(k, v);
-        }
-        try out.arenas.ensureTotalCapacity(gpa, self.arenas.count());
-        for (self.arenas.keys(), self.arenas.values()) |k, v| {
-            out.arenas.putAssumeCapacity(k, v);
-        }
-        try out.heaps.ensureTotalCapacity(gpa, self.heaps.count());
-        for (self.heaps.keys(), self.heaps.values()) |k, v| {
-            out.heaps.putAssumeCapacity(k, v);
-        }
-        try out.fields.ensureTotalCapacity(gpa, self.fields.count());
-        for (self.fields.keys(), self.fields.values()) |k, v| {
-            out.fields.putAssumeCapacityContext(k, v, .{});
-        }
-        try out.out_param_writes.ensureTotalCapacity(gpa, self.out_param_writes.count());
-        for (self.out_param_writes.keys(), self.out_param_writes.values()) |k, v| {
-            out.out_param_writes.putAssumeCapacity(k, v);
-        }
+        try out.cloneFrom(self, gpa);
         return out;
+    }
+
+    /// Copy `src` into `self`, reusing existing allocated capacity.
+    /// Maps are cleared then refilled; if capacity is already
+    /// sufficient, no allocator call is made for that map.
+    pub fn cloneFrom(self: *AbstractState, src: *const AbstractState, gpa: std.mem.Allocator) !void {
+        self.locals.clearRetainingCapacity();
+        try self.locals.ensureTotalCapacity(gpa, src.locals.count());
+        for (src.locals.keys(), src.locals.values()) |k, v| {
+            self.locals.putAssumeCapacity(k, v);
+        }
+        self.arenas.clearRetainingCapacity();
+        try self.arenas.ensureTotalCapacity(gpa, src.arenas.count());
+        for (src.arenas.keys(), src.arenas.values()) |k, v| {
+            self.arenas.putAssumeCapacity(k, v);
+        }
+        self.heaps.clearRetainingCapacity();
+        try self.heaps.ensureTotalCapacity(gpa, src.heaps.count());
+        for (src.heaps.keys(), src.heaps.values()) |k, v| {
+            self.heaps.putAssumeCapacity(k, v);
+        }
+        self.fields.clearRetainingCapacity();
+        try self.fields.ensureTotalCapacity(gpa, src.fields.count());
+        for (src.fields.keys(), src.fields.values()) |k, v| {
+            self.fields.putAssumeCapacityContext(k, v, .{});
+        }
+        self.out_param_writes.clearRetainingCapacity();
+        try self.out_param_writes.ensureTotalCapacity(gpa, src.out_param_writes.count());
+        for (src.out_param_writes.keys(), src.out_param_writes.values()) |k, v| {
+            self.out_param_writes.putAssumeCapacity(k, v);
+        }
     }
 };
 

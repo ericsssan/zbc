@@ -70,6 +70,13 @@ pub fn check(
     var iter_guard: u32 = 0;
     const MAX_ITERS: u32 = 200_000;
 
+    // Reuse a single state buffer across both passes to avoid repeated
+    // malloc/free cycles for each worklist pop.  cloneFrom reuses
+    // existing capacity via clearRetainingCapacity + ensureTotalCapacity
+    // — only the first iteration (or capacity growth) allocates.
+    var state: state_mod.AbstractState = .{};
+    defer state.deinit(gpa);
+
     while (worklist.pop()) |block_id| {
         iter_guard += 1;
         if (iter_guard > MAX_ITERS) {
@@ -80,8 +87,7 @@ pub fn check(
         }
 
         const block = cfg.blocks[@intFromEnum(block_id)];
-        var state = try in_states[@intFromEnum(block_id)].clone(gpa);
-        defer state.deinit(gpa);
+        try state.cloneFrom(&in_states[@intFromEnum(block_id)], gpa);
 
         const ctx: transfer.Ctx = .{
             .gpa = gpa,
@@ -109,8 +115,7 @@ pub fn check(
     // emit nothing because their stmt list either references no locals
     // or all lookups miss.
     for (cfg.blocks, 0..) |block, i| {
-        var state = try in_states[i].clone(gpa);
-        defer state.deinit(gpa);
+        try state.cloneFrom(&in_states[i], gpa);
 
         const ctx: transfer.Ctx = .{
             .gpa = gpa,
