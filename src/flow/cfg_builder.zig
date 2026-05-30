@@ -2184,26 +2184,26 @@ const Builder = struct {
                     if (initCallNameIsPointerReturning(tree, init)) is_pointer = true;
                 }
             }
+            // Receiver-pointer heuristic: if the init call's direct
+            // receiver is a known pointer local, the factory/builder
+            // call likely returns a pointer too — e.g. `b.addStep()`
+            // where `b: *std.Build` → result is `*Step.*`.  O(1)
+            // hash lookup — run before ZLS to avoid expensive
+            // cross-file resolution when the answer is already known.
+            if (!is_pointer and init_kind == .unknown) {
+                if (init_opt) |init| {
+                    if (initCallReceiverIsPointerLocal(self, tree, init)) is_pointer = true;
+                }
+            }
             // ZLS fallback: if the init expression resolves to a
             // pointer type at the outermost level, the local is a
-            // pointer.  Catches opaque-pointer-returning calls like
-            // `b.addUpdateSourceFiles()` that return `*T` but whose
-            // name isn't in the heuristic name list above.
+            // pointer.  Catches opaque-pointer-returning calls whose
+            // receiver isn't a locally-tracked pointer.
             if (!is_pointer and init_kind == .unknown) {
                 if (init_opt) |init| {
                     if (self.zls) |z| {
                         if (z.resolvedTypeIsPointer(init) catch false) is_pointer = true;
                     }
-                }
-            }
-            // Receiver-pointer heuristic: if the init call's direct
-            // receiver is a known pointer local, the factory/builder
-            // call likely returns a pointer too — e.g. `b.addStep()`
-            // where `b: *std.Build` → result is `*Step.*`.  ZLS can't
-            // resolve cross-stdlib calls, so this bridges the gap.
-            if (!is_pointer and init_kind == .unknown) {
-                if (init_opt) |init| {
-                    if (initCallReceiverIsPointerLocal(self, tree, init)) is_pointer = true;
                 }
             }
         }

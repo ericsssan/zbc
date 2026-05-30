@@ -434,8 +434,15 @@ fn collectGuardedRanges(
 
     var ni: u32 = 1;
     while (ni < tree.nodes.len) : (ni += 1) {
-        const node: Ast.Node.Index = @enumFromInt(ni);
         const ntag = ntags[ni];
+        // Early tag filter: only for/if nodes emit GuardedRanges.
+        // Skipping firstToken/lastToken for all other nodes avoids
+        // O(N_nodes × N_fns) expensive AST traversal.
+        switch (ntag) {
+            .for_simple, .@"for", .if_simple, .@"if" => {},
+            else => continue,
+        }
+        const node: Ast.Node.Index = @enumFromInt(ni);
 
         const nf = tree.firstToken(node);
         const nl = tree.lastToken(node);
