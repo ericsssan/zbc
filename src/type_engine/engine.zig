@@ -31,11 +31,10 @@ const ToolchainPaths = struct {
 
 var global_toolchain: ToolchainPaths = .{};
 
-/// Process-global cache — discovery runs once on first call.
-/// Safe: called from TypeContext.init which is per-thread (no concurrent
-/// calls to this function because workers are spawned AFTER the first
-/// analyzeEscape call on the main thread has already populated the cache).
-/// If concurrent init is ever needed, add an std.Io.Mutex guard.
+/// Process-global toolchain cache.  NOT thread-safe — must be called
+/// exactly once from the main thread (via type_resolver.warmToolchain)
+/// before any worker threads start, so workers read an already-populated
+/// cache rather than racing to write it.
 pub fn discoverToolchain(io: std.Io, gpa: std.mem.Allocator) ToolchainPaths {
     if (global_toolchain.initialized) return global_toolchain;
     _ = gpa;

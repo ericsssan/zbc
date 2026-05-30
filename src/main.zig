@@ -210,15 +210,20 @@ pub fn main(init: std.process.Init) !void {
     defer gpa.free(workers);
     var next_task: std.atomic.Value(usize) = .init(0);
     const ctx: WorkerCtx = .{ .tasks = tasks, .next = &next_task, .gpa = gpa, .io = io };
+    // Pre-warm toolchain cache on the main thread so worker threads never
+    // race to populate it concurrently (discoverToolchain is not thread-safe).
+    type_resolver_mod.warmToolchain(gpa, io);
+    var spawned: usize = 0;
     for (workers) |*w| {
         w.* = std.Thread.spawn(.{}, workerLoop, .{ctx}) catch
             // If a worker fails to spawn, fall back to serial in
             // the main thread for remaining tasks.
             break;
+        spawned += 1;
     }
     // Main thread also helps drain the queue.
     workerLoop(ctx);
-    for (workers) |w| w.join();
+    for (workers[0..spawned]) |w| w.join();
 
     var all_problems: std.ArrayListUnmanaged(IndexedProblem) = .empty;
     defer all_problems.deinit(gpa);
