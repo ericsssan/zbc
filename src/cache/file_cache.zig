@@ -27,6 +27,7 @@ const fn_summary = @import("../model/fn_summary.zig");
 const tokens = @import("../ast/tokens.zig");
 const zls_resolver_mod = @import("../zls_resolver.zig");
 const project_cache_mod = @import("project_cache.zig");
+const cfg_builder_mod = @import("../flow/cfg_builder.zig");
 
 pub const FileCache = struct {
     gpa: std.mem.Allocator,
@@ -59,6 +60,10 @@ pub const FileCache = struct {
     /// Avoids re-traversing the @import graph for every call site
     /// that uses the same (type, method) pair.
     method_lookup_cache: std.StringHashMapUnmanaged(?ResolvedMethod) = .empty,
+    /// Lazily-built sorted table of byte offsets where each source line
+    /// starts.  Shared across all function analyses in this file so
+    /// cfg_builder's buildLineOffsets() runs at most once per file.
+    line_offsets: []const u32 = &.{},
 
     pub fn init(gpa: std.mem.Allocator, tree: *const Ast) FileCache {
         return .{ .gpa = gpa, .tree = tree };
@@ -188,6 +193,7 @@ pub const FileCache = struct {
     }
 
     pub fn deinit(self: *FileCache) void {
+        if (self.line_offsets.len > 0) self.gpa.free(self.line_offsets);
         if (self.file_model) |*m| m.deinit();
         if (self.summary_arena) |*a| a.deinit();
         var it = self.bindings.valueIterator();
@@ -206,6 +212,14 @@ pub const FileCache = struct {
             self.file_model = try file_model.buildWithPath(self.gpa, self.tree, fp);
         }
         return &self.file_model.?;
+    }
+
+    /// Lazily build (and cache) the line offset table for this file.
+    /// Called once per file; subsequent calls return the cached slice.
+    pub fn getLineOffsets(self: *FileCache) ![]const u32 {
+        if (self.line_offsets.len > 0) return self.line_offsets;
+        self.line_offsets = try cfg_builder_mod.buildLineOffsets(self.gpa, self.tree.source);
+        return self.line_offsets;
     }
 
     /// Lazily build (and cache) LocalBindings for the given fn body.

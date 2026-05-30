@@ -128,7 +128,10 @@ pub fn lowerFunctionFullWithZls(
         break :blk ti.name;
     };
 
-    const line_offsets = try buildLineOffsets(gpa, tree.source);
+    // Use line offsets from FileCache when available (built once per file);
+    // otherwise build fresh and transfer ownership to the builder.
+    const cached_offsets: ?[]const u32 = if (cache) |c| c.getLineOffsets() catch null else null;
+    const line_offsets = cached_offsets orelse try buildLineOffsets(gpa, tree.source);
     var builder: Builder = .{
         .gpa = gpa,
         .tree = tree,
@@ -143,6 +146,7 @@ pub fn lowerFunctionFullWithZls(
         .fn_body_first = tree.firstToken(body_node),
         .self_type = self_type,
         .line_offsets = line_offsets,
+        .owns_line_offsets = cached_offsets == null,
     };
     defer builder.tempDeinit();
 
@@ -156,7 +160,7 @@ pub fn lowerFunctionFullWithZls(
 /// Build a sorted list of byte offsets where each line starts.
 /// line_offsets[i] = byte offset of the first character on line i.
 /// Used by posOfToken / endPosOf for O(log lines) position lookups.
-fn buildLineOffsets(gpa: std.mem.Allocator, source: [:0]const u8) ![]u32 {
+pub fn buildLineOffsets(gpa: std.mem.Allocator, source: [:0]const u8) ![]u32 {
     var offsets: std.ArrayListUnmanaged(u32) = .empty;
     try offsets.append(gpa, 0);
     for (source, 0..) |c, i| {
@@ -468,9 +472,12 @@ const Builder = struct {
     /// lowerFunctionFullWithZls; makes posOfToken / endPosOf O(log lines)
     /// instead of O(source_len).
     line_offsets: []const u32 = &.{},
+    /// True when Builder owns line_offsets and must free it.  False when
+    /// the slice is borrowed from FileCache (which owns and frees it).
+    owns_line_offsets: bool = false,
 
     fn tempDeinit(self: *Builder) void {
-        if (self.line_offsets.len > 0) self.gpa.free(self.line_offsets);
+        if (self.owns_line_offsets and self.line_offsets.len > 0) self.gpa.free(self.line_offsets);
         for (self.block_stmts.items) |*s| s.deinit(self.gpa);
         self.block_stmts.deinit(self.gpa);
         for (self.block_successors.items) |*s| s.deinit(self.gpa);
