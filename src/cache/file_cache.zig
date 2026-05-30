@@ -1291,19 +1291,27 @@ fn findMethodViaImports(
         }
         // Recurse into the sub-model so re-exports / deep namespace
         // chains resolve.  Compute the next "from" path:
-        //   relative imports: resolve against `from_path`'s dir.
+        //   relative imports: try the stack resolver first (zero alloc for
+        //     the common "./foo.zig" and "../bar.zig" cases); fall back to
+        //     heap for unusual mid-path ".." segments.
         //   module imports:   look up the resolved abs path in
         //     ProjectCache's module_paths cache.
-        const next_from_owned: ?[]u8 = blk: {
+        var path_buf: [512]u8 = undefined;
+        var heap_to_free: ?[]u8 = null;
+        defer if (heap_to_free) |h| pc.gpa.free(h);
+        const next_from: []const u8 = nxt: {
             if (project_cache_mod.isRelativeImport(import_str)) {
-                break :blk resolveImportPath(pc.gpa, from_path, import_str) catch null;
+                if (resolveImportPathStack(from_path, import_str, &path_buf)) |s| break :nxt s;
+                const h = resolveImportPath(pc.gpa, from_path, import_str) catch continue;
+                heap_to_free = h;
+                break :nxt h;
             }
-            const cached = pc.module_paths.get(import_str) orelse break :blk null;
-            const p = cached orelse break :blk null;
-            break :blk pc.gpa.dupe(u8, p) catch null;
+            const cached = pc.module_paths.get(import_str) orelse continue;
+            const p = cached orelse continue;
+            const h = pc.gpa.dupe(u8, p) catch continue;
+            heap_to_free = h;
+            break :nxt h;
         };
-        const next_from = next_from_owned orelse continue;
-        defer pc.gpa.free(next_from);
         if (findMethodViaImports(pc, sub_model.tree, next_from, type_name, method_name, depth_left - 1)) |rm| return rm;
     }
     return null;
@@ -1314,6 +1322,44 @@ fn resolveImportPath(gpa: std.mem.Allocator, from_path: []const u8, import_str: 
     const joined = try std.fs.path.join(gpa, &.{ dir, import_str });
     defer gpa.free(joined);
     return try std.fs.path.resolve(gpa, &.{joined});
+}
+
+/// Resolve `import_str` relative to `from_path` using a caller-supplied stack
+/// buffer.  Returns a slice into `buf` for the common `./foo.zig` and
+/// `../bar/baz.zig` cases — zero heap allocations.  Returns null when `buf`
+/// is too small or the import has unusual mid-path `..` segments (caller
+/// should fall back to `resolveImportPath`).
+///
+/// `from_path` must be a canonical absolute path (no `..`); the returned
+/// slice is also canonical for those common cases.
+fn resolveImportPathStack(
+    from_path: []const u8,
+    import_str: []const u8,
+    buf: *[512]u8,
+) ?[]const u8 {
+    var dir: []const u8 = std.fs.path.dirname(from_path) orelse ".";
+    var rel: []const u8 = import_str;
+
+    // Strip any number of leading "./" components.
+    while (std.mem.startsWith(u8, rel, "./")) rel = rel[2..];
+
+    // Resolve each leading "../" component by ascending one directory.
+    while (std.mem.startsWith(u8, rel, "../")) {
+        rel = rel[3..];
+        dir = std.fs.path.dirname(dir) orelse return null;
+    }
+
+    // Any remaining ".." segment is non-trivial (e.g. "sub/../other.zig");
+    // fall back to the heap version.
+    if (std.mem.indexOf(u8, rel, "..") != null) return null;
+
+    // Assemble: dir + "/" + rel.
+    const total = dir.len + 1 + rel.len;
+    if (total > buf.len) return null;
+    @memcpy(buf[0..dir.len], dir);
+    buf[dir.len] = '/';
+    @memcpy(buf[dir.len + 1 ..][0..rel.len], rel);
+    return buf[0..total];
 }
 
 // ── Tests ──────────────────────────────────────────────────
