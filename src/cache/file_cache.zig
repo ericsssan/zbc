@@ -1188,6 +1188,13 @@ fn walkFieldPath(
 /// fine for the rule's purposes (which only needs "has this
 /// method on this type" — re-exports of the SAME type produce
 /// the same answer).
+/// Walk every `@import("./...")` builtin call in `tree` and try
+/// finding `name` in the target file's model.  Recurses up to
+/// `depth_left` more hops to follow re-export aliases.
+///
+/// The recursive call uses `@fieldParentPtr` to recover the
+/// ProjectCache.Entry from the sub-model pointer — zero cost,
+/// no path-resolution allocation, no extra lock acquisition.
 fn findTypeViaImports(
     pc: *project_cache_mod.ProjectCache,
     tree: *const Ast,
@@ -1200,16 +1207,14 @@ fn findTypeViaImports(
     var idx: u32 = 1;
     while (idx < tree.nodes.len) : (idx += 1) {
         const node: Ast.Node.Index = @enumFromInt(idx);
-        const tag = tree.nodeTag(node);
-        const is_builtin_call = switch (tag) {
+        switch (tree.nodeTag(node)) {
             .builtin_call,
             .builtin_call_two,
             .builtin_call_comma,
             .builtin_call_two_comma,
-            => true,
-            else => false,
-        };
-        if (!is_builtin_call) continue;
+            => {},
+            else => continue,
+        }
         const main = tree.nodeMainToken(node);
         if (main >= tree.tokens.len) continue;
         if (tags[main] != .builtin) continue;
@@ -1227,20 +1232,11 @@ fn findTypeViaImports(
         };
         const sub_model = sub_model_opt orelse continue;
         if (sub_model.findType(name)) |ti| return ti;
-        // Recurse — the imported file may re-export the type from a
-        // deeper file via its own @import.  Resolve the next "from"
-        // path for both relative and module-name imports.
-        const next_from_owned: ?[]u8 = blk: {
-            if (project_cache_mod.isRelativeImport(import_str)) {
-                break :blk resolveImportPath(pc.gpa, from_path, import_str) catch null;
-            }
-            const cached = pc.module_paths.get(import_str) orelse break :blk null;
-            const p = cached orelse break :blk null;
-            break :blk pc.gpa.dupe(u8, p) catch null;
-        };
-        const next_from = next_from_owned orelse continue;
-        defer pc.gpa.free(next_from);
-        if (findTypeViaImports(pc, sub_model.tree, next_from, name, depth_left - 1)) |ti| return ti;
+        // Recover the Entry via fieldParentPtr (zero cost, no alloc, no lock).
+        // sub_entry.abs_path is the resolved next_from for the recursive hop.
+        const sub_entry: *const project_cache_mod.ProjectCache.Entry =
+            @fieldParentPtr("model", sub_model);
+        if (findTypeViaImports(pc, &sub_entry.tree, sub_entry.abs_path, name, depth_left - 1)) |ti| return ti;
     }
     return null;
 }
@@ -1258,16 +1254,14 @@ fn findMethodViaImports(
     var idx: u32 = 1;
     while (idx < tree.nodes.len) : (idx += 1) {
         const node: Ast.Node.Index = @enumFromInt(idx);
-        const tag = tree.nodeTag(node);
-        const is_builtin_call = switch (tag) {
+        switch (tree.nodeTag(node)) {
             .builtin_call,
             .builtin_call_two,
             .builtin_call_comma,
             .builtin_call_two_comma,
-            => true,
-            else => false,
-        };
-        if (!is_builtin_call) continue;
+            => {},
+            else => continue,
+        }
         const main = tree.nodeMainToken(node);
         if (main >= tree.tokens.len) continue;
         if (tags[main] != .builtin) continue;
@@ -1277,8 +1271,6 @@ fn findMethodViaImports(
         const lit = tree.tokenSlice(main + 2);
         if (lit.len < 2) continue;
         const import_str = lit[1 .. lit.len - 1];
-        // Resolve either a relative path import OR a module-name
-        // import via the project's build.zig / conventional layout.
         const sub_model_opt: ?*const file_model.FileModel = blk: {
             if (project_cache_mod.isRelativeImport(import_str)) {
                 break :blk pc.modelForRelativeImport(from_path, import_str) catch null;
@@ -1289,78 +1281,14 @@ fn findMethodViaImports(
         if (sub_model.findType(type_name)) |ti| {
             if (ti.findMethod(method_name)) |m| return .{ .tree = sub_model.tree, .method = m };
         }
-        // Recurse into the sub-model so re-exports / deep namespace
-        // chains resolve.  Compute the next "from" path:
-        //   relative imports: try the stack resolver first (zero alloc for
-        //     the common "./foo.zig" and "../bar.zig" cases); fall back to
-        //     heap for unusual mid-path ".." segments.
-        //   module imports:   look up the resolved abs path in
-        //     ProjectCache's module_paths cache.
-        var path_buf: [512]u8 = undefined;
-        var heap_to_free: ?[]u8 = null;
-        defer if (heap_to_free) |h| pc.gpa.free(h);
-        const next_from: []const u8 = nxt: {
-            if (project_cache_mod.isRelativeImport(import_str)) {
-                if (resolveImportPathStack(from_path, import_str, &path_buf)) |s| break :nxt s;
-                const h = resolveImportPath(pc.gpa, from_path, import_str) catch continue;
-                heap_to_free = h;
-                break :nxt h;
-            }
-            const cached = pc.module_paths.get(import_str) orelse continue;
-            const p = cached orelse continue;
-            const h = pc.gpa.dupe(u8, p) catch continue;
-            heap_to_free = h;
-            break :nxt h;
-        };
-        if (findMethodViaImports(pc, sub_model.tree, next_from, type_name, method_name, depth_left - 1)) |rm| return rm;
+        // Recover the Entry via fieldParentPtr — no alloc, no lock, no path resolution.
+        const sub_entry: *const project_cache_mod.ProjectCache.Entry =
+            @fieldParentPtr("model", sub_model);
+        if (findMethodViaImports(pc, &sub_entry.tree, sub_entry.abs_path, type_name, method_name, depth_left - 1)) |rm| return rm;
     }
     return null;
 }
 
-fn resolveImportPath(gpa: std.mem.Allocator, from_path: []const u8, import_str: []const u8) ![]u8 {
-    const dir = std.fs.path.dirname(from_path) orelse ".";
-    const joined = try std.fs.path.join(gpa, &.{ dir, import_str });
-    defer gpa.free(joined);
-    return try std.fs.path.resolve(gpa, &.{joined});
-}
-
-/// Resolve `import_str` relative to `from_path` using a caller-supplied stack
-/// buffer.  Returns a slice into `buf` for the common `./foo.zig` and
-/// `../bar/baz.zig` cases — zero heap allocations.  Returns null when `buf`
-/// is too small or the import has unusual mid-path `..` segments (caller
-/// should fall back to `resolveImportPath`).
-///
-/// `from_path` must be a canonical absolute path (no `..`); the returned
-/// slice is also canonical for those common cases.
-fn resolveImportPathStack(
-    from_path: []const u8,
-    import_str: []const u8,
-    buf: *[512]u8,
-) ?[]const u8 {
-    var dir: []const u8 = std.fs.path.dirname(from_path) orelse ".";
-    var rel: []const u8 = import_str;
-
-    // Strip any number of leading "./" components.
-    while (std.mem.startsWith(u8, rel, "./")) rel = rel[2..];
-
-    // Resolve each leading "../" component by ascending one directory.
-    while (std.mem.startsWith(u8, rel, "../")) {
-        rel = rel[3..];
-        dir = std.fs.path.dirname(dir) orelse return null;
-    }
-
-    // Any remaining ".." segment is non-trivial (e.g. "sub/../other.zig");
-    // fall back to the heap version.
-    if (std.mem.indexOf(u8, rel, "..") != null) return null;
-
-    // Assemble: dir + "/" + rel.
-    const total = dir.len + 1 + rel.len;
-    if (total > buf.len) return null;
-    @memcpy(buf[0..dir.len], dir);
-    buf[dir.len] = '/';
-    @memcpy(buf[dir.len + 1 ..][0..rel.len], rel);
-    return buf[0..total];
-}
 
 // ── Tests ──────────────────────────────────────────────────
 
