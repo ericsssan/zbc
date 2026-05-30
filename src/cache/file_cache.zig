@@ -161,24 +161,34 @@ pub const FileCache = struct {
         return result;
     }
 
-    /// Slow path: @import-graph traversal + global-index fallback.
+    /// Slow path: global type index + @import-graph fallback.
     /// Called only on a cache miss in findMethodAcrossImports.
+    ///
+    /// Strategy: try the global type index (findAllTypesByName) first.
+    /// The first call ever triggers buildTypeIndex (one-time serial cost);
+    /// every subsequent call is an O(1) hash lookup with no AST scanning
+    /// and no per-import lock acquisitions.  The @import-graph traversal
+    /// (findMethodViaImports) is retained only as an OOM fallback.
     fn findMethodCrossFile(
         self: *FileCache,
         pc: *project_cache_mod.ProjectCache,
         type_name: []const u8,
         method_name: []const u8,
     ) ?ResolvedMethod {
-        if (findMethodViaImports(pc, self.tree, self.file_path, type_name, method_name, 4)) |rm| return rm;
-        // Global-index fallback.  Try EVERY type observation matching
-        // `type_name` (multiple files may declare a same-named type)
-        // and return the first that also has the requested method.
-        const entries = pc.findAllTypesByName(self.file_path, type_name) catch return null;
-        for (entries) |te| {
-            const ti = te.typeInfo();
-            if (ti.findMethod(method_name)) |m| return .{ .tree = te.tree(), .method = m };
+        // Primary: global type index.  Triggers buildTypeIndex on the first
+        // call (one-time serial cost while other threads spin); O(1) + O(k)
+        // on all subsequent calls, eliminating the O(n_nodes × depth) AST
+        // traversal that dominated profiling (50 % of one worker's time).
+        const type_entries = pc.findAllTypesByName(self.file_path, type_name) catch null;
+        if (type_entries) |tes| {
+            for (tes) |te| {
+                const ti = te.typeInfo();
+                if (ti.findMethod(method_name)) |m| return .{ .tree = te.tree(), .method = m };
+            }
+            return null;
         }
-        return null;
+        // OOM fallback: traverse @import graph directly.
+        return findMethodViaImports(pc, self.tree, self.file_path, type_name, method_name, 4);
     }
 
     pub fn deinit(self: *FileCache) void {
