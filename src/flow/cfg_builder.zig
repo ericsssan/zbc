@@ -11,7 +11,7 @@ const fn_summary = @import("../model/fn_summary.zig");
 const tokens = @import("../ast/tokens.zig");
 const receiver_mod = @import("../model/method_names.zig");
 const model_mod = @import("../model/file_model.zig");
-const zls_resolver_mod = @import("../zls_resolver.zig");
+const zls_resolver_mod = @import("../type_resolver.zig");
 
 // CFG types re-bound for local convenience.
 const cfg_types = @import("cfg.zig");
@@ -83,7 +83,7 @@ pub fn lowerFunctionFullWithZls(
     fn_decl: Ast.Node.Index,
     config: *const Config,
     cache: ?*file_cache.FileCache,
-    zls: ?*zls_resolver_mod.ZlsResolver,
+    zls: ?*zls_resolver_mod.TypeResolver,
 ) !?Cfg {
     var buf: [1]Ast.Node.Index = undefined;
     const fn_proto = tokens.fnProto(tree, &buf, fn_decl) orelse return null;
@@ -391,7 +391,7 @@ const Builder = struct {
     /// falls back to ZLS when zbc's own type-name tracking can't
     /// resolve a local (cross-module types, generic instantiations,
     /// inferred-from-method-call locals).  null = legacy AST-only path.
-    zls: ?*zls_resolver_mod.ZlsResolver = null,
+    zls: ?*zls_resolver_mod.TypeResolver = null,
     config: *const Config = &config_mod.Default,
     /// The struct/union/enum that contains the fn being lowered.  Set
     /// by the caller of `build` per fn (via `lib.zig`'s walker).

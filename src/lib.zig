@@ -11,7 +11,7 @@ const problem_mod = @import("problem.zig");
 const rule_catalog_mod = @import("rule_catalog.zig");
 const file_cache_mod = @import("cache/file_cache.zig");
 const suppressions_mod = @import("suppressions.zig");
-const zls_resolver_mod = @import("zls_resolver.zig");
+const zls_resolver_mod = @import("type_resolver.zig");
 const project_cache_mod = @import("cache/project_cache.zig");
 
 pub const Config = config_mod.Config;
@@ -28,14 +28,12 @@ pub const Rule = rule_catalog_mod.Rule;
 pub const rule_catalog = rule_catalog_mod.all;
 pub const lookupRule = rule_catalog_mod.lookup;
 pub const trace = @import("trace.zig");
-pub const ZlsContext = zls_resolver_mod.ZlsContext;
-
 pub fn analyzeEscape(
     gpa: std.mem.Allocator,
     io: std.Io,
     path: []const u8,
     config: *const Config,
-    zls_ctx: ?*zls_resolver_mod.ZlsContext,
+    type_ctx: ?*zls_resolver_mod.TypeContext,
 ) ![]Problem {
     trace.setFile(path);
     const src_bytes = try std.Io.Dir.cwd().readFileAlloc(
@@ -57,31 +55,29 @@ pub fn analyzeEscape(
     var problems: std.ArrayListUnmanaged(Problem) = .empty;
     errdefer freeProblemsArrayList(gpa, &problems);
 
-    // ZLS-backed type resolver — cross-module type queries that
-    // zbc's own AST-only tracking can't answer (for-loop captures,
-    // generic instantiations, multi-hop @import aliases, cross-file
-    // method resolution).  Optional; when init fails (e.g. ZLS can't
-    // open the path) we silently fall through to the AST-only path.
-    // Built BEFORE the FileCache so the cache can consult it during
-    // transitive-takes resolution (param-type lookups via ZLS handle
-    // `*lib.T` cross-module params that token-walks can't see).
-    var zls_resolver: zls_resolver_mod.ZlsResolver = undefined;
-    const zls_ok = blk: {
-        if (zls_ctx) |ctx| {
-            zls_resolver.initWithContext(ctx, gpa, path, src) catch |err| {
-                std.log.debug("zls_resolver initWithContext failed for {s}: {}", .{ path, err });
-                break :blk false;
-            };
-        } else {
-            zls_resolver.init(gpa, io, path, src) catch |err| {
-                std.log.debug("zls_resolver init failed for {s}: {}", .{ path, err });
-                break :blk false;
-            };
-        }
+    // Type resolver backed by the extracted type engine.  TypeContext is
+    // per-thread (see main.zig workerLoop); falls through to AST-only
+    // analysis when unavailable or when init fails.
+    var own_ctx: zls_resolver_mod.TypeContext = undefined;
+    var own_ctx_ok = false;
+    const ctx: ?*zls_resolver_mod.TypeContext = if (type_ctx) |c| c else blk: {
+        own_ctx.init(gpa, io) catch break :blk null;
+        own_ctx_ok = true;
+        break :blk &own_ctx;
+    };
+    defer if (own_ctx_ok) own_ctx.deinit();
+
+    var resolver: zls_resolver_mod.TypeResolver = undefined;
+    const resolver_ok = blk: {
+        const c = ctx orelse break :blk false;
+        resolver.init(c, gpa, path, src) catch |err| {
+            std.log.debug("type_resolver init failed for {s}: {}", .{ path, err });
+            break :blk false;
+        };
         break :blk true;
     };
-    defer if (zls_ok) zls_resolver.deinit();
-    const zls_ptr: ?*zls_resolver_mod.ZlsResolver = if (zls_ok) &zls_resolver else null;
+    defer if (resolver_ok) resolver.deinit();
+    const zls_ptr: ?*zls_resolver_mod.TypeResolver = if (resolver_ok) &resolver else null;
 
     // Per-file shared cache, used by both flow analysis (cfg) and
     // pattern rules.  Amortizes FileModel + LocalBindings + FnSummary
@@ -278,7 +274,7 @@ test {
     _ = file_cache_mod;
     _ = suppressions_mod;
     _ = @import("model/fn_summary.zig");
-    _ = @import("zls_resolver.zig");
+    _ = @import("type_resolver.zig");
     _ = @import("ast/tokens.zig");
     _ = @import("ast/scope_iter.zig");
     _ = @import("model/method_names.zig");

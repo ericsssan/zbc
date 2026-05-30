@@ -25,7 +25,7 @@ const file_model = @import("../model/file_model.zig");
 const local_bindings = @import("../model/local_bindings.zig");
 const fn_summary = @import("../model/fn_summary.zig");
 const tokens = @import("../ast/tokens.zig");
-const zls_resolver_mod = @import("../zls_resolver.zig");
+const zls_resolver_mod = @import("../type_resolver.zig");
 const project_cache_mod = @import("project_cache.zig");
 const cfg_builder_mod = @import("../flow/cfg_builder.zig");
 
@@ -44,7 +44,7 @@ pub const FileCache = struct {
     /// the token-walk fallback — handles cross-module types, generic
     /// instantiations, and pointer/optional chains uniformly instead
     /// of via fragile token-pattern proxies.
-    zls: ?*zls_resolver_mod.ZlsResolver = null,
+    zls: ?*zls_resolver_mod.TypeResolver = null,
     /// Optional project-wide cache for cross-file model lookups via
     /// relative `@import("./file.zig")` declarations.  When set,
     /// rules can ask "does <ImportAlias>.<TypeName> have a deinit?"
@@ -69,7 +69,7 @@ pub const FileCache = struct {
         return .{ .gpa = gpa, .tree = tree };
     }
 
-    pub fn setZls(self: *FileCache, zls: ?*zls_resolver_mod.ZlsResolver) void {
+    pub fn setZls(self: *FileCache, zls: ?*zls_resolver_mod.TypeResolver) void {
         self.zls = zls;
     }
 

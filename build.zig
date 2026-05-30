@@ -20,23 +20,15 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // ── ZLS dependency ──────────────────────────────────────
-    // Powers cross-module type resolution in zls_resolver.zig.
-    // ZLS targets Zig master; the version in build.zig.zon is
-    // pinned by hash.
-    //
-    // `version-string` is forwarded explicitly because ZLS's
-    // build.zig runs `git describe` on its source tree to embed a
-    // version — but the extracted dependency tarball isn't a git
-    // repo, so the describe fails and ZLS prints a warning.
-    // Hard-coding silences it; the value matches the version in
-    // build.zig.zon.
-    const zls_dep = b.dependency("zls", .{
+    // ── Type engine module ──────────────────────────────────
+    // Extracted ZLS type-resolution machinery, optimised for
+    // repo-wide batch analysis.  No LSP server, no incremental
+    // update protocol — just the type-resolution core.
+    const engine_mod = b.addModule("type_engine", .{
+        .root_source_file = b.path("src/type_engine/engine.zig"),
         .target = target,
         .optimize = optimize,
-        .@"version-string" = @as([]const u8, "0.17.0-dev"),
     });
-    const zls_mod = zls_dep.module("zls");
 
     // ── Public library module ───────────────────────────────
     // Importable by downstream consumers as `@import("zbc")`.
@@ -45,7 +37,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    lib_mod.addImport("zls", zls_mod);
+    lib_mod.addImport("type_engine", engine_mod);
 
     // ── CLI executable ──────────────────────────────────────
     // Standalone binary; useful for one-off sweeps without
@@ -55,12 +47,11 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    exe_mod.addImport("zls", zls_mod);
+    exe_mod.addImport("type_engine", engine_mod);
     const exe = b.addExecutable(.{
         .name = "zbc",
         .root_module = exe_mod,
     });
-    b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);
     if (b.args) |args| run_cmd.addArgs(args);
@@ -80,7 +71,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    cli_test_mod.addImport("zls", zls_mod);
+    cli_test_mod.addImport("type_engine", engine_mod);
     const cli_tests = b.addTest(.{ .root_module = cli_test_mod });
     test_step.dependOn(&b.addRunArtifact(cli_tests).step);
 }

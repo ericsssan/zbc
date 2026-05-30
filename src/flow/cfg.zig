@@ -35,7 +35,7 @@ const fn_summary = @import("../model/fn_summary.zig");
 const tokens = @import("../ast/tokens.zig");
 const receiver_mod = @import("../model/method_names.zig");
 const model_mod = @import("../model/file_model.zig");
-const zls_resolver_mod = @import("../zls_resolver.zig");
+const zls_resolver_mod = @import("../type_resolver.zig");
 
 pub const Config = config_mod.Config;
 

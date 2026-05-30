@@ -10,7 +10,7 @@ const transfer = @import("cfg_transfer.zig");
 const problem_mod = @import("../problem.zig");
 const config_mod = @import("../config.zig");
 const file_cache_mod = @import("../cache/file_cache.zig");
-const zls_resolver_mod = @import("../zls_resolver.zig");
+const zls_resolver_mod = @import("../type_resolver.zig");
 
 const Cfg = cfg_mod.Cfg;
 const BlockId = cfg_mod.BlockId;
@@ -183,17 +183,22 @@ fn analyze(gpa: std.mem.Allocator, src: []const u8) !std.ArrayListUnmanaged(Prob
     var tree = try Ast.parse(gpa, src_z, .zig);
     defer tree.deinit(gpa);
 
-    // Initialize ZLS for precise type resolution — same path as lib.zig.
-    // If the toolchain isn't discoverable (unusual in a working dev env),
-    // ZLS init fails silently and analysis proceeds without type-aware paths.
     const tio = std.testing.io;
-    var zls_resolver: zls_resolver_mod.ZlsResolver = undefined;
+    var type_ctx: zls_resolver_mod.TypeContext = undefined;
+    const ctx_ok = blk: {
+        type_ctx.init(gpa, tio) catch break :blk false;
+        break :blk true;
+    };
+    defer if (ctx_ok) type_ctx.deinit();
+
+    var zls_resolver: zls_resolver_mod.TypeResolver = undefined;
     const zls_ok = blk: {
-        zls_resolver.init(gpa, tio, "<test>", src_z) catch break :blk false;
+        if (!ctx_ok) break :blk false;
+        zls_resolver.init(&type_ctx, gpa, "<test>", src_z) catch break :blk false;
         break :blk true;
     };
     defer if (zls_ok) zls_resolver.deinit();
-    const zls_ptr: ?*zls_resolver_mod.ZlsResolver = if (zls_ok) &zls_resolver else null;
+    const zls_ptr: ?*zls_resolver_mod.TypeResolver = if (zls_ok) &zls_resolver else null;
 
     var rule_cache = file_cache_mod.FileCache.init(gpa, &tree);
     defer rule_cache.deinit();
