@@ -184,21 +184,14 @@ fn analyze(gpa: std.mem.Allocator, src: []const u8) !std.ArrayListUnmanaged(Prob
     defer tree.deinit(gpa);
 
     const tio = std.testing.io;
-    var type_ctx: zls_resolver_mod.TypeContext = undefined;
-    const ctx_ok = blk: {
-        type_ctx.init(gpa, tio) catch break :blk false;
-        break :blk true;
-    };
-    defer if (ctx_ok) type_ctx.deinit();
+    var own_ctx: zls_resolver_mod.ManagedContext = .{};
+    own_ctx.tryInit(gpa, tio);
+    defer own_ctx.deinit();
 
-    var zls_resolver: zls_resolver_mod.TypeResolver = undefined;
-    const zls_ok = blk: {
-        if (!ctx_ok) break :blk false;
-        zls_resolver.init(&type_ctx, gpa, "<test>", src_z) catch break :blk false;
-        break :blk true;
-    };
-    defer if (zls_ok) zls_resolver.deinit();
-    const zls_ptr: ?*zls_resolver_mod.TypeResolver = if (zls_ok) &zls_resolver else null;
+    var own_resolver: zls_resolver_mod.ManagedResolver = .{};
+    if (own_ctx.get()) |c| own_resolver.tryInit(c, gpa, "<test>", src_z);
+    defer own_resolver.deinit();
+    const zls_ptr = own_resolver.get();
 
     var rule_cache = file_cache_mod.FileCache.init(gpa, &tree);
     defer rule_cache.deinit();

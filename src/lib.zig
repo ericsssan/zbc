@@ -58,26 +58,15 @@ pub fn analyzeEscape(
     // Type resolver backed by the extracted type engine.  TypeContext is
     // per-thread (see main.zig workerLoop); falls through to AST-only
     // analysis when unavailable or when init fails.
-    var own_ctx: zls_resolver_mod.TypeContext = undefined;
-    var own_ctx_ok = false;
-    const ctx: ?*zls_resolver_mod.TypeContext = if (type_ctx) |c| c else blk: {
-        own_ctx.init(gpa, io) catch break :blk null;
-        own_ctx_ok = true;
-        break :blk &own_ctx;
-    };
-    defer if (own_ctx_ok) own_ctx.deinit();
+    var own_ctx: zls_resolver_mod.ManagedContext = .{};
+    if (type_ctx == null) own_ctx.tryInit(gpa, io);
+    defer own_ctx.deinit();
+    const ctx = type_ctx orelse own_ctx.get();
 
-    var resolver: zls_resolver_mod.TypeResolver = undefined;
-    const resolver_ok = blk: {
-        const c = ctx orelse break :blk false;
-        resolver.init(c, gpa, path, src) catch |err| {
-            std.log.debug("type_resolver init failed for {s}: {}", .{ path, err });
-            break :blk false;
-        };
-        break :blk true;
-    };
-    defer if (resolver_ok) resolver.deinit();
-    const zls_ptr: ?*zls_resolver_mod.TypeResolver = if (resolver_ok) &resolver else null;
+    var own_resolver: zls_resolver_mod.ManagedResolver = .{};
+    if (ctx) |c| own_resolver.tryInit(c, gpa, path, src);
+    defer own_resolver.deinit();
+    const zls_ptr = own_resolver.get();
 
     // Per-file shared cache, used by both flow analysis (cfg) and
     // pattern rules.  Amortizes FileModel + LocalBindings + FnSummary

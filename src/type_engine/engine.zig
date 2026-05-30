@@ -35,9 +35,8 @@ var global_toolchain: ToolchainPaths = .{};
 /// exactly once from the main thread (via type_resolver.warmToolchain)
 /// before any worker threads start, so workers read an already-populated
 /// cache rather than racing to write it.
-pub fn discoverToolchain(io: std.Io, gpa: std.mem.Allocator) ToolchainPaths {
+pub fn discoverToolchain(io: std.Io) ToolchainPaths {
     if (global_toolchain.initialized) return global_toolchain;
-    _ = gpa;
     const cache_gpa = std.heap.c_allocator;
     global_toolchain.zig_exe = findZigExe(cache_gpa, io, cache_gpa) catch null;
     global_toolchain.zig_lib = if (global_toolchain.zig_exe) |z|
@@ -96,15 +95,9 @@ fn runCapture(gpa: std.mem.Allocator, io: std.Io, argv: []const []const u8) ![]u
     return result.stdout;
 }
 
-fn findBuildRunner(arena: std.mem.Allocator, io: std.Io) ![]const u8 {
-    const candidates = [_][]const u8{
-        "zig-pkg/zls-0.17.0-dev-rmm5fhwjJgCaQB3fCtSi_8xBQvGJJqz9BBeQHjZK9jet/src/build_runner/build_runner.zig",
-    };
-    for (candidates) |path| {
-        const handle = std.Io.Dir.cwd().openFile(io, path, .{}) catch continue;
-        handle.close(io);
-        return try arena.dupe(u8, path);
-    }
+fn findBuildRunner(_: std.mem.Allocator, _: std.Io) ![]const u8 {
+    // Build-configuration loading is disabled (global_cache_dir = null),
+    // so the build runner path is never used by DocumentStore.
     return error.NotFound;
 }
 
@@ -132,9 +125,9 @@ pub const TypeContext = struct {
         errdefer self.ip.deinit(gpa);
 
         self.diagnostics = .{ .io = io, .allocator = gpa };
-        self.environ_map = .init(std.testing.failing_allocator);
+        self.environ_map = .init(gpa);
 
-        const tc = discoverToolchain(io, gpa);
+        const tc = discoverToolchain(io);
         const zig_lib: ?std.Build.Cache.Directory = if (tc.zig_lib) |p|
             .{ .path = p, .handle = .cwd() }
         else
