@@ -24,6 +24,7 @@
 
 const std = @import("std");
 const lib = @import("lib.zig");
+const zls_resolver_mod = @import("zls_resolver.zig");
 
 /// Silence ZLS's std.log info/debug output — zbc uses ZLS as a type
 /// oracle, not as a language server, so its informational messages
@@ -208,7 +209,7 @@ pub fn main(init: std.process.Init) !void {
     const workers = try gpa.alloc(std.Thread, worker_count);
     defer gpa.free(workers);
     var next_task: std.atomic.Value(usize) = .init(0);
-    const ctx: WorkerCtx = .{ .tasks = tasks, .next = &next_task };
+    const ctx: WorkerCtx = .{ .tasks = tasks, .next = &next_task, .gpa = gpa, .io = io };
     for (workers) |*w| {
         w.* = std.Thread.spawn(.{}, workerLoop, .{ctx}) catch
             // If a worker fails to spawn, fall back to serial in
@@ -411,18 +412,30 @@ fn indexedProblemLess(_: void, a: IndexedProblem, b: IndexedProblem) bool {
 const WorkerCtx = struct {
     tasks: []Task,
     next: *std.atomic.Value(usize),
+    gpa: std.mem.Allocator,
+    io: std.Io,
 };
 
 fn workerLoop(ctx: WorkerCtx) void {
+    // One ZlsContext per thread: stdlib files are parsed once here
+    // and cached in the DocumentStore for all files this thread processes.
+    var zls_ctx: zls_resolver_mod.ZlsContext = undefined;
+    const zls_ok = blk: {
+        zls_ctx.init(ctx.gpa, ctx.io) catch break :blk false;
+        break :blk true;
+    };
+    defer if (zls_ok) zls_ctx.deinit();
+    const zls_ptr: ?*zls_resolver_mod.ZlsContext = if (zls_ok) &zls_ctx else null;
+
     while (true) {
         const i = ctx.next.fetchAdd(1, .monotonic);
         if (i >= ctx.tasks.len) return;
-        runOne(&ctx.tasks[i]) catch {};
+        runOne(&ctx.tasks[i], zls_ptr) catch {};
     }
 }
 
-fn runOne(t: *Task) std.Io.Cancelable!void {
-    const problems = lib.analyzeEscape(t.gpa, t.io, t.path, t.config) catch |err| {
+fn runOne(t: *Task, zls_ctx: ?*zls_resolver_mod.ZlsContext) std.Io.Cancelable!void {
+    const problems = lib.analyzeEscape(t.gpa, t.io, t.path, t.config, zls_ctx) catch |err| {
         t.err = err;
         return;
     };

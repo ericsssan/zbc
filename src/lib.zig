@@ -28,12 +28,14 @@ pub const Rule = rule_catalog_mod.Rule;
 pub const rule_catalog = rule_catalog_mod.all;
 pub const lookupRule = rule_catalog_mod.lookup;
 pub const trace = @import("trace.zig");
+pub const ZlsContext = zls_resolver_mod.ZlsContext;
 
 pub fn analyzeEscape(
     gpa: std.mem.Allocator,
     io: std.Io,
     path: []const u8,
     config: *const Config,
+    zls_ctx: ?*zls_resolver_mod.ZlsContext,
 ) ![]Problem {
     trace.setFile(path);
     const src_bytes = try std.Io.Dir.cwd().readFileAlloc(
@@ -65,10 +67,17 @@ pub fn analyzeEscape(
     // `*lib.T` cross-module params that token-walks can't see).
     var zls_resolver: zls_resolver_mod.ZlsResolver = undefined;
     const zls_ok = blk: {
-        zls_resolver.init(gpa, io, path, src) catch |err| {
-            std.log.debug("zls_resolver init failed for {s}: {}", .{ path, err });
-            break :blk false;
-        };
+        if (zls_ctx) |ctx| {
+            zls_resolver.initWithContext(ctx, gpa, path, src) catch |err| {
+                std.log.debug("zls_resolver initWithContext failed for {s}: {}", .{ path, err });
+                break :blk false;
+            };
+        } else {
+            zls_resolver.init(gpa, io, path, src) catch |err| {
+                std.log.debug("zls_resolver init failed for {s}: {}", .{ path, err });
+                break :blk false;
+            };
+        }
         break :blk true;
     };
     defer if (zls_ok) zls_resolver.deinit();
@@ -245,7 +254,7 @@ test "lib API: analyzeEscape end-to-end flags arena escape" {
     const path = try std.fs.path.join(gpa, &.{ base_dir, "foo.zig" });
     defer gpa.free(path);
 
-    const problems = try analyzeEscape(gpa, tio, path, &DefaultConfig);
+    const problems = try analyzeEscape(gpa, tio, path, &DefaultConfig, null);
     defer freeProblems(gpa, problems);
 
     var found = false;

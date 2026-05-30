@@ -33,13 +33,76 @@ const ToolchainPaths = struct {
 };
 var global_toolchain: ToolchainPaths = .{};
 
-pub const ZlsResolver = struct {
+/// Long-lived per-thread ZLS state.  Holds the DocumentStore, InternPool,
+/// and stdlib/dependency parse caches across many files on the same thread.
+/// Stdlib files are parsed once and their types interned once per thread
+/// rather than once per file.
+///
+/// In-place init is REQUIRED: self-referential pointers
+/// (document_store.config.environ_map → &self.environ_map,
+///  document_store.diagnostics_collection → &self.diagnostics_collection)
+/// must not dangle.  Declare `var ctx: ZlsContext = undefined;` then call
+/// `try ctx.init(...)` — never return or move the struct after init.
+pub const ZlsContext = struct {
     gpa: std.mem.Allocator,
-    arena: std.heap.ArenaAllocator,
     ip: InternPool,
     diagnostics_collection: zls.DiagnosticsCollection,
     environ_map: std.process.Environ.Map,
     document_store: zls.DocumentStore,
+
+    pub fn init(self: *ZlsContext, gpa: std.mem.Allocator, io: std.Io) !void {
+        self.gpa = gpa;
+
+        self.ip = try .init(io, gpa);
+        errdefer self.ip.deinit(gpa);
+
+        self.diagnostics_collection = .{
+            .io = io,
+            .allocator = gpa,
+        };
+        errdefer self.diagnostics_collection.deinit();
+
+        self.environ_map = .init(std.testing.failing_allocator);
+
+        const tc = discoverToolchain(io, gpa);
+        const zig_lib: ?std.Build.Cache.Directory = if (tc.zig_lib) |p|
+            .{ .path = p, .handle = .cwd() }
+        else
+            null;
+
+        self.document_store = .{
+            .io = io,
+            .allocator = gpa,
+            .config = .{
+                .environ_map = &self.environ_map,
+                .zig_exe_path = tc.zig_exe,
+                .zig_lib_dir = zig_lib,
+                .build_runner_path = tc.build_runner,
+                .builtin_path = null,
+                .global_cache_dir = null,
+                .wasi_preopens = {},
+            },
+            .diagnostics_collection = &self.diagnostics_collection,
+        };
+    }
+
+    pub fn deinit(self: *ZlsContext) void {
+        self.document_store.deinit();
+        self.diagnostics_collection.deinit();
+        self.ip.deinit(self.gpa);
+    }
+};
+
+pub const ZlsResolver = struct {
+    gpa: std.mem.Allocator,
+    arena: std.heap.ArenaAllocator,
+    ip: InternPool,
+    /// Owned DocumentStore — only valid when shared_ctx == null (legacy / test path).
+    diagnostics_collection: zls.DiagnosticsCollection,
+    environ_map: std.process.Environ.Map,
+    document_store: zls.DocumentStore,
+    /// When non-null, DocumentStore + InternPool are borrowed from here.
+    shared_ctx: ?*ZlsContext,
     handle: *zls.DocumentStore.Handle,
     analyser: Analyser,
 
@@ -57,6 +120,7 @@ pub const ZlsResolver = struct {
         source: [:0]const u8,
     ) !void {
         self.gpa = gpa;
+        self.shared_ctx = null;
         self.arena = std.heap.ArenaAllocator.init(gpa);
         errdefer self.arena.deinit();
 
@@ -115,12 +179,50 @@ pub const ZlsResolver = struct {
         );
     }
 
+    /// Init borrowing a shared ZlsContext (per-thread DocumentStore + InternPool).
+    /// Both the DocumentStore and InternPool are reused from ctx: stdlib files
+    /// are parsed once and their types interned once per thread.  Per-file
+    /// documents stay open in the DocumentStore for the thread's lifetime so
+    /// InternPool entries referencing them remain valid.
+    pub fn initWithContext(
+        self: *ZlsResolver,
+        ctx: *ZlsContext,
+        gpa: std.mem.Allocator,
+        file_path: []const u8,
+        source: [:0]const u8,
+    ) !void {
+        self.gpa = gpa;
+        self.shared_ctx = ctx;
+        self.arena = std.heap.ArenaAllocator.init(gpa);
+        errdefer self.arena.deinit();
+
+        const handle_uri: zls.Uri = try .fromPath(self.arena.allocator(), file_path);
+        try ctx.document_store.openLspSyncedDocument(handle_uri, source);
+        // Don't close on deinit: the per-file handle stays in the DocumentStore
+        // for the thread's lifetime so InternPool entries referencing it remain valid.
+        self.handle = ctx.document_store.getHandle(handle_uri) orelse return error.HandleMissing;
+
+        self.analyser = Analyser.init(
+            gpa,
+            self.arena.allocator(),
+            &ctx.document_store,
+            &ctx.ip,
+            self.handle,
+        );
+    }
+
     pub fn deinit(self: *ZlsResolver) void {
         self.analyser.deinit();
-        self.document_store.deinit();
-        self.diagnostics_collection.deinit();
-        self.ip.deinit(self.gpa);
-        self.arena.deinit();
+        if (self.shared_ctx != null) {
+            // Owned ip and document_store live in shared_ctx; only free
+            // per-file arena scratch here.
+            self.arena.deinit();
+        } else {
+            self.document_store.deinit();
+            self.diagnostics_collection.deinit();
+            self.ip.deinit(self.gpa);
+            self.arena.deinit();
+        }
     }
 
     /// Resolve `node`'s type and return its bare container-decl name
