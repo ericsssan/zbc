@@ -267,12 +267,16 @@ pub const FileCache = struct {
         proto: Ast.full.FnProto,
         idx: u32,
     ) !?[]const u8 {
-        const z = self.zls orelse return null;
         var i: u32 = 0;
         var it = proto.iterate(self.tree);
         while (it.next()) |p| : (i += 1) {
             if (i != idx) continue;
             const type_node = p.type_expr orelse return null;
+            // Syntactic fast-path: handles `*T`, `?*T`, `T`, `ns.T`, etc.
+            // without invoking ZLS. Covers the vast majority of real-world
+            // parameter types; ZLS is only needed for aliases/generics.
+            if (typeNameFromTypeNode(self.tree, type_node)) |name| return name;
+            const z = self.zls orelse return null;
             return z.typeNameOfNode(type_node) catch null;
         }
         return null;
@@ -862,9 +866,10 @@ pub const FileCache = struct {
             // (precise), then the enclosing struct's type (provably
             // correct for self-receiver), then cross-file variants of
             // both.
+            const param_type = try self.paramContainerName(proto, pi);
             const callee_takes: ?u32 = blk: {
-                if (try self.paramContainerName(proto, pi)) |type_name| {
-                    if (try self.summaryByMethod(type_name, method)) |s| {
+                if (param_type) |tn| {
+                    if (try self.summaryByMethod(tn, method)) |s| {
                         break :blk s.takes_ownership_of;
                     }
                 }
@@ -876,8 +881,8 @@ pub const FileCache = struct {
                 // Cross-file fallback: callee lives in an @import'd file.
                 // Direct-takes inference only — no transitive resolution
                 // for foreign bodies.
-                if (try self.paramContainerName(proto, pi)) |type_name| {
-                    if (try self.summaryByMethodCrossFile(type_name, method)) |xf| {
+                if (param_type) |tn| {
+                    if (try self.summaryByMethodCrossFile(tn, method)) |xf| {
                         break :blk xf.takes_ownership_of;
                     }
                 }
@@ -1167,6 +1172,43 @@ pub const FileCache = struct {
 /// type chain, returning the DEEPEST field's type as a path split.
 /// For a single-segment path "f", returns `<outer>.f`'s type.  For
 /// multi-segment "f.g.h", walks outer.f -> field-type-of-f, then
+/// Extract the bare container name from an AST type-expression node without
+/// invoking ZLS.  Strips leading `?`, `*`, `const` qualifiers, then walks
+/// a dotted identifier chain and returns the last component.
+///
+/// Examples: `*Foo` → "Foo", `?*const ns.Foo` → "Foo", `Foo` → "Foo".
+/// Returns null for slices (`[]T`), function pointers, anonymous structs,
+/// or any shape that doesn't reduce to a plain dotted identifier chain.
+fn typeNameFromTypeNode(tree: *const Ast, type_node: Ast.Node.Index) ?[]const u8 {
+    const first = tree.firstToken(type_node);
+    const last = tree.lastToken(type_node);
+    const tags = tree.tokens.items(.tag);
+    var t: Ast.TokenIndex = first;
+    while (t <= last) : (t += 1) {
+        switch (tags[t]) {
+            .question_mark, .asterisk, .keyword_const => continue,
+            .l_bracket => return null,
+            .identifier => break,
+            else => return null,
+        }
+    }
+    if (t > last) return null;
+    var last_name: ?[]const u8 = null;
+    var expecting_ident = true;
+    while (t <= last) : (t += 1) {
+        const tag = tags[t];
+        if (expecting_ident) {
+            if (tag == .identifier) {
+                last_name = tree.tokenSlice(t);
+                expecting_ident = false;
+            } else return null;
+        } else {
+            if (tag == .period) expecting_ident = true else break;
+        }
+    }
+    return last_name;
+}
+
 /// that.g, then that.h, returning the leaf type.
 ///
 /// Stops + returns null when any intermediate field's type isn't
