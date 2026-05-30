@@ -1013,10 +1013,14 @@ pub const FileCache = struct {
     ) !?[]const u8 {
         const zls = self.zls orelse return null;
         const tree = self.tree;
-        // Scan all AST nodes for one matching the token range.
-        // Bounded by the tree's node count.
+        // For any node: firstToken(n) <= main_token(n) <= lastToken(n).
+        // Filter candidates to main_token in [start_tok, end_tok] before
+        // calling the expensive firstToken/lastToken on each node.
+        const main_toks = tree.nodes.items(.main_token);
         var idx: u32 = 1;
         while (idx < tree.nodes.len) : (idx += 1) {
+            const mt = main_toks[idx];
+            if (mt < start_tok or mt > end_tok) continue;
             const node: Ast.Node.Index = @enumFromInt(idx);
             const ft = tree.firstToken(node);
             const lt = tree.lastToken(node);
