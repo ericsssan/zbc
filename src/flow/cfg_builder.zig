@@ -3495,6 +3495,16 @@ const Builder = struct {
             const name = tree.tokenSlice(tree.nodeMainToken(node));
             if (self.name_to_local.get(name)) |lid| {
                 if (self.locals.items[@intFromEnum(lid)].type_name) |t| return t;
+                // ZLS fallback for this identifier — resolve and STORE the
+                // result in the local so every subsequent call on the same
+                // receiver skips ZLS entirely.
+                if (self.zls) |z| {
+                    if (z.typeNameOfNode(node) catch null) |ty| {
+                        self.locals.items[@intFromEnum(lid)].type_name = ty;
+                        return ty;
+                    }
+                }
+                return null;
             }
         }
         // Fallback: ask ZLS to resolve the node's type.  Catches
