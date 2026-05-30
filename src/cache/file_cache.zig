@@ -93,16 +93,12 @@ pub const FileCache = struct {
         if (model.findType(name)) |ti| return ti;
         const pc = self.project orelse return null;
         if (self.file_path.len == 0) return null;
-        // Try @import-chain walk first (cheap, anchored at this file's
-        // direct imports; succeeds for the common shallow re-export case).
-        if (findTypeViaImports(pc, self.tree, self.file_path, name, 4)) |ti| return ti;
-        // Fall back to the global type index — covers deep namespace
-        // chains the bounded import walk can't reach.  Returns the
-        // FIRST observation; collisions across files yield arbitrary
-        // ordering and the caller doesn't disambiguate.  Acceptable
-        // for the current use-sites (existence checks / method lookup
-        // where the type name alone is descriptive enough).
-        const entries = pc.findAllTypesByName(self.file_path, name) catch return null;
+        // Primary: global type index.  Triggers buildTypeIndex on the first
+        // call (one-time serial cost); O(1) on all subsequent calls.
+        const entries = pc.findAllTypesByName(self.file_path, name) catch {
+            // OOM fallback: traverse @import graph directly.
+            return findTypeViaImports(pc, self.tree, self.file_path, name, 4);
+        };
         if (entries.len == 0) return null;
         return entries[0].typeInfo();
     }
