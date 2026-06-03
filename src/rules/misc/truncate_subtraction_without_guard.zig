@@ -77,7 +77,11 @@ fn checkBody(
         //   t+4: identifier
         //   t+5: r_paren
         if (t + 5 <= last and matchFormA(tags, t)) {
-            try report(gpa, problems, tree, t);
+            const minuend = tree.tokenSlice(t + 2);
+            const subtrahend = tree.tokenSlice(t + 4);
+            if (!hasSubtractionGuard(tags, tree, first, t, minuend, subtrahend)) {
+                try report(gpa, problems, tree, t);
+            }
             continue;
         }
 
@@ -91,10 +95,56 @@ fn checkBody(
         //   t+6: identifier
         //   t+7: r_paren
         if (t + 7 <= last and matchFormB(tags, t)) {
-            try report(gpa, problems, tree, t);
+            // The minuend's "name" for guard-matching is the field identifier
+            // (`recv.FIELD`); a guard `if (recv.FIELD > sub)` references it.
+            const minuend = tree.tokenSlice(t + 4);
+            const subtrahend = tree.tokenSlice(t + 6);
+            if (!hasSubtractionGuard(tags, tree, first, t, minuend, subtrahend)) {
+                try report(gpa, problems, tree, t);
+            }
             continue;
         }
     }
+}
+
+/// Returns true iff a subtraction-safety guard appears in the 80 tokens before
+/// the `@truncate` call.  Recognises (with MIN = minuend, SUB = subtrahend):
+///   `MIN > SUB`, `MIN >= SUB`  (minuend dominates)
+///   `SUB < MIN`, `SUB <= MIN`  (symmetric form)
+/// matched as adjacent `identifier OP identifier` triples.  This is exactly
+/// the guard the rule's fix recommends (`if (a >= b)`), so detecting it
+/// suppresses the now-safe subtraction.
+fn hasSubtractionGuard(
+    tags: []const std.zig.Token.Tag,
+    tree: *const Ast,
+    first: Ast.TokenIndex,
+    anchor: Ast.TokenIndex,
+    minuend: []const u8,
+    subtrahend: []const u8,
+) bool {
+    const back: Ast.TokenIndex = 80;
+    const start: Ast.TokenIndex = if (anchor >= first + back) anchor - back else first;
+    var k = start;
+    while (k + 2 < anchor) : (k += 1) {
+        if (tags[k] != .identifier) continue;
+        if (tags[k + 2] != .identifier) continue;
+        const lhs = tree.tokenSlice(k);
+        const rhs = tree.tokenSlice(k + 2);
+        switch (tags[k + 1]) {
+            // MIN > SUB  /  MIN >= SUB
+            .angle_bracket_right, .angle_bracket_right_equal => {
+                if (std.mem.eql(u8, lhs, minuend) and std.mem.eql(u8, rhs, subtrahend))
+                    return true;
+            },
+            // SUB < MIN  /  SUB <= MIN
+            .angle_bracket_left, .angle_bracket_left_equal => {
+                if (std.mem.eql(u8, lhs, subtrahend) and std.mem.eql(u8, rhs, minuend))
+                    return true;
+            },
+            else => {},
+        }
+    }
+    return false;
 }
 
 fn matchFormA(tags: []const std.zig.Token.Tag, t: Ast.TokenIndex) bool {
@@ -168,6 +218,42 @@ test "truncate-subtraction-without-guard: @truncate of plain identifier does not
     try testing.expectNoFire(check,
         \\fn encode(n: u32) u8 {
         \\    return @truncate(n);
+        \\}
+        \\
+    );
+}
+
+test "truncate-subtraction-without-guard: preceding > guard suppresses" {
+    try testing.expectNoFire(check,
+        \\fn delta(windowSizeValue: u32, oldWindowSize: u32) void {
+        \\    if (windowSizeValue > oldWindowSize) {
+        \\        const increment: u31 = @truncate(windowSizeValue - oldWindowSize);
+        \\        _ = increment;
+        \\    }
+        \\}
+        \\
+    );
+}
+
+test "truncate-subtraction-without-guard: symmetric < guard suppresses" {
+    try testing.expectNoFire(check,
+        \\fn delta(a: u32, b: u32) u8 {
+        \\    if (b <= a) {
+        \\        return @truncate(a - b);
+        \\    }
+        \\    return 0;
+        \\}
+        \\
+    );
+}
+
+test "truncate-subtraction-without-guard: unrelated guard still fires" {
+    try testing.expectFires(check, R,
+        \\fn decode(packet_size: u32, read_size: u32, other: u32) u8 {
+        \\    if (other > 0) {
+        \\        return @truncate(packet_size - read_size);
+        \\    }
+        \\    return 0;
         \\}
         \\
     );
