@@ -62,6 +62,12 @@ pub fn check(
             std.mem.eql(u8, tree.tokenSlice(t + 4), "ptr") and
             tags[t + 5] == .r_paren)
         {
+            // Suppress when the receiver was declared with an explicit alignment
+            // annotation (`recv: []align(N) u8`) or via `alignedAlloc` — in those
+            // cases the alignment is guaranteed by construction and the @alignCast
+            // assertion is always safe.
+            if (!receiverHasUnknownAlignment(tree, tags, t, tree.tokenSlice(t + 2)))
+                continue;
             try report(gpa, problems, tree, t, t + 5);
             continue;
         }
@@ -78,10 +84,50 @@ pub fn check(
             tags[t + 7] == .r_paren and
             tags[t + 8] == .r_paren)
         {
+            if (!receiverHasUnknownAlignment(tree, tags, t, tree.tokenSlice(t + 4)))
+                continue;
             try report(gpa, problems, tree, t, t + 8);
             continue;
         }
     }
+}
+
+/// Returns true (fire) when the receiver's alignment is UNKNOWN (the common
+/// unsafe case), false (suppress) when the receiver is explicitly aligned:
+///   - Parameter with `align(N)` type annotation: `recv: []align(N) u8`
+///   - Local variable from `alignedAlloc(...)` or similar
+/// Scans backward 300 tokens, finds the first non-field-access declaration
+/// of `recv_name`, then checks the 20 tokens after it for `keyword_align`
+/// or an identifier containing "alignedalloc" (case-insensitive).
+fn receiverHasUnknownAlignment(
+    tree: *const Ast,
+    tags: []const std.zig.Token.Tag,
+    anchor: Ast.TokenIndex,
+    recv_name: []const u8,
+) bool {
+    const back: Ast.TokenIndex = 300;
+    const start: Ast.TokenIndex = if (anchor >= back) anchor - back else 0;
+
+    var k = start;
+    while (k < anchor) : (k += 1) {
+        if (tags[k] != .identifier) continue;
+        if (!std.mem.eql(u8, tree.tokenSlice(k), recv_name)) continue;
+        if (k > 0 and tags[k - 1] == .period) continue; // field access, skip
+
+        // Check 20 tokens after the receiver name for alignment signals.
+        const check_end = @min(k + 20, anchor);
+        var j = k + 1;
+        while (j < check_end) : (j += 1) {
+            if (tags[j] == .keyword_align) return false; // explicit alignment
+            if (tags[j] == .identifier) {
+                const s = tree.tokenSlice(j);
+                if (std.ascii.indexOfIgnoreCase(s, "alignedalloc") != null or
+                    std.ascii.indexOfIgnoreCase(s, "alignalloc") != null)
+                    return false; // alignedAlloc call in RHS
+            }
+        }
+    }
+    return true; // no alignment guarantee found → unknown alignment
 }
 
 fn report(
@@ -139,6 +185,36 @@ test "aligncast-on-byte-slice: alignCast on field (non-ptr) does not fire" {
     try testing.expectNoFire(check,
         \\fn cast(s: SomeStruct) *Header {
         \\    return @alignCast(s.data);
+        \\}
+        \\
+    );
+}
+
+test "aligncast-on-byte-slice: explicit align param suppressed" {
+    try testing.expectNoFire(check,
+        \\pub fn free(mem: []align(std.heap.page_size_min) u8) void {
+        \\    windows.VirtualFree(@ptrCast(@alignCast(mem.ptr)), 0, windows.MEM_RELEASE);
+        \\}
+        \\
+    );
+}
+
+test "aligncast-on-byte-slice: alignedAlloc receiver suppressed" {
+    try testing.expectNoFire(check,
+        \\fn makeHeader(alloc: Allocator) !*Header {
+        \\    const buf = try alloc.alignedAlloc(u8, .of(Header), @sizeOf(Header));
+        \\    const h: *Header = @ptrCast(@alignCast(buf.ptr));
+        \\    return h;
+        \\}
+        \\
+    );
+}
+
+test "aligncast-on-byte-slice: unaligned alloc still fires" {
+    try testing.expectFires(check, R,
+        \\fn makeHeader(alloc: Allocator) !*Header {
+        \\    const buf = try alloc.alloc(u8, @sizeOf(Header));
+        \\    return @alignCast(buf.ptr);
         \\}
         \\
     );
