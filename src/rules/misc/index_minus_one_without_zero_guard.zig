@@ -63,6 +63,7 @@ const config_mod = @import("../../config.zig");
 const file_cache_mod = @import("../../cache/file_cache.zig");
 
 const tokens = @import("../../ast/tokens.zig");
+const value_range = @import("../../flow/value_range.zig");
 const testing = @import("../../testing.zig");
 
 const skipNestedFn = tokens.skipNestedFn;
@@ -277,6 +278,12 @@ fn checkBody(
             if (hasEarlyReturnGuard(tags, tree, t, &.{idx_name})) continue;
             if (hasIncrementGuard(tags, tree, t, &.{idx_name})) continue;
             if (hasInitToOneGuard(tags, tree, t, &.{idx_name})) continue;
+            // Sound value-range oracle: provably-nonzero index ⇒ `i - 1` cannot
+            // underflow.  Catches dominating guards the token heuristics above
+            // miss (cross-statement `if (i > 0) {...}`, early-return on zero,
+            // positive-literal init) without their brittleness — the oracle
+            // under-approximates, so it never suppresses a real underflow.
+            if (value_range.provesNonzero(gpa, tree, body, idx_name, t)) continue;
             try report(gpa, problems, tree, t, idx_name);
             continue;
         }
