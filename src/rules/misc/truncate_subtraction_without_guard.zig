@@ -42,16 +42,18 @@ pub fn check(
     problems: *std.ArrayListUnmanaged(Problem),
 ) !void {
     if (!config_mod.isEnabled(config, .truncate_subtraction_without_guard)) return;
-    _ = cache;
-    try tokens.forEachFnBody(gpa, tree, problems, checkBody);
+    try tokens.forEachFnCached(gpa, tree, cache, problems, checkBody);
 }
 
 fn checkBody(
     gpa: std.mem.Allocator,
     tree: *const Ast,
+    cache: *file_cache_mod.FileCache,
+    proto: Ast.full.FnProto,
     body: Ast.Node.Index,
     problems: *std.ArrayListUnmanaged(Problem),
 ) !void {
+    _ = proto;
     const tags = tree.tokens.items(.tag);
     const first = tree.firstToken(body);
     const last = tree.lastToken(body);
@@ -79,6 +81,10 @@ fn checkBody(
         if (t + 5 <= last and matchFormA(tags, t)) {
             const minuend = tree.tokenSlice(t + 2);
             const subtrahend = tree.tokenSlice(t + 4);
+            // SEMANTIC: this rule targets UNSIGNED underflow (`b > a` wraps to a
+            // huge value).  If the operands are SIGNED, `a - b` is well-defined
+            // (yields a negative, not a wrapped-huge value) — not this bug.
+            if (isSignedOperand(cache, t + 2, t + 2)) continue;
             if (!hasSubtractionGuard(tags, tree, first, t, minuend, subtrahend)) {
                 try report(gpa, problems, tree, t);
             }
@@ -99,12 +105,27 @@ fn checkBody(
             // (`recv.FIELD`); a guard `if (recv.FIELD > sub)` references it.
             const minuend = tree.tokenSlice(t + 4);
             const subtrahend = tree.tokenSlice(t + 6);
+            // Signed `recv.field - b` is not unsigned underflow — suppress.
+            if (isSignedOperand(cache, t + 2, t + 4)) continue;
             if (!hasSubtractionGuard(tags, tree, first, t, minuend, subtrahend)) {
                 try report(gpa, problems, tree, t);
             }
             continue;
         }
     }
+}
+
+/// True iff the operand spanning [start_tok, end_tok] resolves to a SIGNED
+/// integer type.  Signed subtraction is well-defined (no unsigned underflow),
+/// so this rule does not apply.  False when the type engine is unavailable or
+/// the operand is unsigned / non-integer.
+fn isSignedOperand(
+    cache: *file_cache_mod.FileCache,
+    start_tok: Ast.TokenIndex,
+    end_tok: Ast.TokenIndex,
+) bool {
+    const info = cache.intInfoOfExpr(start_tok, end_tok) orelse return false;
+    return info.signed;
 }
 
 /// Returns true iff a subtraction-safety guard appears in the 80 tokens before

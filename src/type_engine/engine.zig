@@ -255,6 +255,22 @@ pub const TypeResolver = struct {
         };
     }
 
+    pub const IntInfo = struct { signed: bool, bits: u16 };
+
+    /// Signedness and bit-width of `node`'s type when it resolves to an integer
+    /// type, else null.  Used e.g. to tell signed subtraction (well-defined,
+    /// can't "wrap to a huge value") from unsigned underflow.
+    pub fn intInfo(self: *TypeResolver, node: Ast.Node.Index) !?IntInfo {
+        const ty = (try self.analyser.resolveTypeOfNode(.of(node, self.handle))) orelse return null;
+        return switch (ty.data) {
+            .ip_index => |payload| switch (self.ctx.ip.indexToKey(payload.type)) {
+                .int_type => |i| .{ .signed = i.signedness == .signed, .bits = i.bits },
+                else => null,
+            },
+            else => null,
+        };
+    }
+
     /// For `x.ptr` where `x`'s type resolves to a slice / many-pointer:
     /// returns whether the element type is byte-sized (1-byte alignment —
     /// `u8`/`i8`/`bool`/≤8-bit ints), i.e. `x` is a genuine byte slice whose

@@ -83,6 +83,13 @@ pub const FileCache = struct {
         return z.fixedArrayLen(node) catch null;
     }
 
+    /// Signedness + bit-width of `node`'s integer type, or null when the type
+    /// engine is unavailable / the type isn't an integer.
+    pub fn intInfoOf(self: *FileCache, node: std.zig.Ast.Node.Index) ?zls_resolver_mod.TypeResolver.IntInfo {
+        const z = self.zls orelse return null;
+        return z.intInfo(node) catch null;
+    }
+
     /// For `x.ptr` (x a slice): whether x's element is byte-sized (align 1) —
     /// true=byte slice, false=wider element, null=unresolved/unknown.  Null
     /// when the type engine is unavailable.
@@ -1052,6 +1059,28 @@ pub const FileCache = struct {
             const lt = tree.lastToken(node);
             if (ft != start_tok or lt != end_tok) continue;
             return zls.typeNameOfNode(node) catch null;
+        }
+        return null;
+    }
+
+    /// Signedness + bit-width of the integer-typed expression spanning exactly
+    /// [start_tok, end_tok] (e.g. a `-` operand).  Null when the type engine is
+    /// unavailable, no node matches the span, or the type isn't an integer.
+    pub fn intInfoOfExpr(
+        self: *FileCache,
+        start_tok: Ast.TokenIndex,
+        end_tok: Ast.TokenIndex,
+    ) ?zls_resolver_mod.TypeResolver.IntInfo {
+        const zls = self.zls orelse return null;
+        const tree = self.tree;
+        const main_toks = tree.nodes.items(.main_token);
+        var idx: u32 = 1;
+        while (idx < tree.nodes.len) : (idx += 1) {
+            const mt = main_toks[idx];
+            if (mt < start_tok or mt > end_tok) continue;
+            const node: Ast.Node.Index = @enumFromInt(idx);
+            if (tree.firstToken(node) != start_tok or tree.lastToken(node) != end_tok) continue;
+            return zls.intInfo(node) catch null;
         }
         return null;
     }
