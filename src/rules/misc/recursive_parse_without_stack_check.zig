@@ -94,6 +94,14 @@ fn checkFn(
     // Step 5: check for a stack guard anywhere in the body.
     if (hasStackGuard(tags, tree, first, last)) return;
 
+    // Step 5b (suppression): a visited-set cycle guard
+    // (`if (self.visited.isSet(i)) return;`) means the recursion traverses a
+    // finite, developer-controlled data structure (a module/import graph),
+    // not attacker-controlled syntactic nesting.  Each node is visited once,
+    // so the traversal terminates; this is bounded the same way a stack guard
+    // bounds it.  bun's LinkerGraph.visit / bundle_v2 graph walkers use this.
+    if (hasVisitedSetGuard(tags, tree, first, last)) return;
+
     try report(gpa, problems, tree, rec_tok, fn_name);
 }
 
@@ -217,6 +225,41 @@ fn hasStackGuard(
     return false;
 }
 
+/// True iff `[first, last]` contains a visited-set membership guard — an
+/// access of the form `<visited-ish>.<membership-method>(`, e.g.
+/// `self.visited.isSet(i)`, `seen.contains(x)`, `visiting.getOrPut(n)`.
+/// Such a guard means the recursion walks a finite graph (visiting each node
+/// at most once) rather than descending attacker-controlled input nesting.
+fn hasVisitedSetGuard(
+    tags: []const std.zig.Token.Tag,
+    tree: *const Ast,
+    first: Ast.TokenIndex,
+    last: Ast.TokenIndex,
+) bool {
+    if (first + 2 > last) return false;
+    var t: Ast.TokenIndex = first;
+    while (t + 2 <= last) : (t += 1) {
+        if (tags[t] != .identifier) continue;
+        if (tags[t + 1] != .period) continue;
+        if (tags[t + 2] != .identifier) continue;
+        const set_name = tree.tokenSlice(t);
+        const is_visited_set =
+            std.ascii.indexOfIgnoreCase(set_name, "visited") != null or
+            std.ascii.indexOfIgnoreCase(set_name, "visiting") != null or
+            std.ascii.indexOfIgnoreCase(set_name, "seen") != null;
+        if (!is_visited_set) continue;
+        const method = tree.tokenSlice(t + 2);
+        if (std.mem.eql(u8, method, "isSet") or
+            std.mem.eql(u8, method, "contains") or
+            std.mem.eql(u8, method, "get") or
+            std.mem.eql(u8, method, "getOrPut") or
+            std.mem.eql(u8, method, "has") or
+            std.mem.eql(u8, method, "exists") or
+            std.mem.eql(u8, method, "lookup")) return true;
+    }
+    return false;
+}
+
 fn isStackGuardName(name: []const u8) bool {
     return std.mem.eql(u8, name, "is_safe_to_recurse") or
         std.mem.eql(u8, name, "isSafeToRecurse") or
@@ -334,6 +377,31 @@ test "recursive-parse-fn-without-stack-check: non-parser fn does not fire" {
         \\const Allocator = struct {
         \\    pub fn allocate(a: *Allocator) !void {
         \\        _ = try a.allocate();
+        \\    }
+        \\};
+        \\
+    );
+}
+
+test "recursive-parse-fn-without-stack-check: graph visitor with visited-set guard does not fire" {
+    try testing.expectNoFire(check,
+        \\const Graph = struct {
+        \\    pub fn visit(self: *Graph, index: usize) void {
+        \\        if (self.visited.isSet(index)) return;
+        \\        self.visited.set(index);
+        \\        for (self.edges[index]) |e| self.visit(e);
+        \\    }
+        \\};
+        \\
+    );
+}
+
+test "recursive-parse-fn-without-stack-check: visitor with seen.contains guard does not fire" {
+    try testing.expectNoFire(check,
+        \\const Walker = struct {
+        \\    pub fn visitNode(self: *Walker, n: *Node) void {
+        \\        if (self.seen.contains(n)) return;
+        \\        self.visitNode(n.child);
         \\    }
         \\};
         \\
