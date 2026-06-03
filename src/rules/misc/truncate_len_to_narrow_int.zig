@@ -51,6 +51,22 @@ pub fn check(
         if (!std.mem.eql(u8, tree.tokenSlice(t), "@truncate")) continue;
         if (tags[t + 1] != .l_paren) continue;
 
+        // Suppress `@as(usize, @truncate(X.len))` / `@as(u64, …)`: narrowing a
+        // `usize` length to `usize`/`u64` is an identity conversion on both
+        // 32- and 64-bit targets — no upper bits are discarded, so no data is
+        // lost.  Shape: `@as ( TYPE , @truncate` → t-4 builtin "@as",
+        // t-3 l_paren, t-2 identifier(TYPE), t-1 comma.
+        if (t >= 4 and
+            tags[t - 1] == .comma and
+            tags[t - 2] == .identifier and
+            tags[t - 3] == .l_paren and
+            tags[t - 4] == .builtin and
+            std.mem.eql(u8, tree.tokenSlice(t - 4), "@as"))
+        {
+            const ty = tree.tokenSlice(t - 2);
+            if (std.mem.eql(u8, ty, "usize") or std.mem.eql(u8, ty, "u64")) continue;
+        }
+
         // Form A: @truncate ( identifier . identifier("len") )
         if (tags[t + 2] == .identifier and
             tags[t + 3] == .period and
@@ -115,6 +131,24 @@ test "truncate-len-to-narrow-int: form B fires" {
     try testing.expectFires(check, R,
         \\fn setLen(s: *Header, req: Request) void {
         \\    s.length = @truncate(req.body.len);
+        \\}
+        \\
+    );
+}
+
+test "truncate-len-to-narrow-int: @as(usize, @truncate(len)) is identity, no fire" {
+    try testing.expectNoFire(check,
+        \\fn count(buf: []const u8) usize {
+        \\    return @as(usize, @truncate(buf.len));
+        \\}
+        \\
+    );
+}
+
+test "truncate-len-to-narrow-int: @as(u32, @truncate(len)) still fires" {
+    try testing.expectFires(check, R,
+        \\fn count(buf: []const u8) u32 {
+        \\    return @as(u32, @truncate(buf.len));
         \\}
         \\
     );
