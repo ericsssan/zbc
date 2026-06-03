@@ -53,6 +53,18 @@ pub fn check(
         if (tags[t + 5] != .identifier) continue;
         if (!std.mem.eql(u8, tree.tokenSlice(t + 5), "free")) continue;
 
+        // Only fire when the receiver of `.allocator()` is identifiably an
+        // arena-style allocator.  The pattern `.allocator()` is also used by
+        // plain structs that expose a general-purpose allocator via an
+        // `.allocator()` method — calling `.free()` on those is perfectly
+        // valid.  The receiver identifier (at t-1) must contain "arena"
+        // (case-insensitive) to match the documented TP class.  When t-1 is
+        // not an identifier (e.g. a chained call result), we fire
+        // conservatively.
+        if (t >= 1 and tags[t - 1] == .identifier) {
+            if (std.ascii.indexOfIgnoreCase(tree.tokenSlice(t - 1), "arena") == null) continue;
+        }
+
         try report(gpa, problems, tree, t + 1);
     }
 }
@@ -118,6 +130,24 @@ test "arena-allocator-free-noop: .allocator().alloc does not fire" {
     try testing.expectNoFire(check,
         \\fn alloc(self: *Self, n: usize) ![]u8 {
         \\    return self.arena.allocator().alloc(u8, n);
+        \\}
+        \\
+    );
+}
+
+test "arena-allocator-free-noop: non-arena receiver does not fire" {
+    try testing.expectNoFire(check,
+        \\fn cleanup(dev: *DevServer) void {
+        \\    dev.allocator().free(dev.buffer);
+        \\}
+        \\
+    );
+}
+
+test "arena-allocator-free-noop: gpa receiver does not fire" {
+    try testing.expectNoFire(check,
+        \\fn cleanup(gpa: *std.heap.GeneralPurposeAllocator(.{})) void {
+        \\    gpa.allocator().free(slice);
         \\}
         \\
     );

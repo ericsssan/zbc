@@ -80,6 +80,12 @@ pub fn check(
         // resource — otherwise nothing leaks when a later try fails.
         if (!tryExprAllocates(tree, tags, t + 4, i)) continue;
 
+        // If the surrounding function uses an arena-backed allocator (i.e.
+        // there is a `const X = ARENA.allocator()` within 100 tokens before
+        // this struct literal), every allocation is freed when the arena is
+        // reset — no per-field leak is possible even if a later `try` fails.
+        if (nearbyArenaAllocator(tree, tags, t)) continue;
+
         // Check the next field starts with . identifier = try
         const next = i + 1;
         if (next + 3 > last_tok) continue;
@@ -101,6 +107,15 @@ pub fn check(
 /// `toOwnedSlice`).  These are the calls that hand back an owned resource a
 /// failing later `try` would leak.  Decoders/parsers (`read_*`, `parse*`)
 /// return value types and match no signal, so they are suppressed.
+///
+/// Precision rules to avoid over-signalling:
+///   - "alloc" exactly (the common allocator variable name) only signals when
+///     it is a method call (preceded by `.`) or a direct call (followed by
+///     `(`).  Bare `alloc` passed as an argument does not signal.
+///   - "create" only signals when it is a method call (preceded by `.`), to
+///     exclude top-level factory functions like `createFoo()` that do not
+///     return owned memory.
+///   - "dupe", "clone", "ownedslice" signal in any position.
 fn tryExprAllocates(
     tree: *const Ast,
     tags: []const std.zig.Token.Tag,
@@ -111,11 +126,44 @@ fn tryExprAllocates(
     while (t < end) : (t += 1) {
         if (tags[t] != .identifier and tags[t] != .builtin) continue;
         const s = tree.tokenSlice(t);
-        if (containsIgnoreCase(s, "alloc") or
-            containsIgnoreCase(s, "dupe") or
+        if (containsIgnoreCase(s, "dupe") or
             containsIgnoreCase(s, "clone") or
-            containsIgnoreCase(s, "create") or
             containsIgnoreCase(s, "ownedslice")) return true;
+        // "alloc": only signal for method calls or compound names.
+        if (containsIgnoreCase(s, "alloc")) {
+            if (!std.mem.eql(u8, s, "alloc")) return true; // e.g. "allocPrint", "allocate"
+            // Exactly "alloc": must be a method (preceded by '.') or call (followed by '(')
+            const before_is_dot = t > start and tags[t - 1] == .period;
+            const after_is_paren = t + 1 < end and tags[t + 1] == .l_paren;
+            if (before_is_dot or after_is_paren) return true;
+        }
+        // "create": only signal for method calls (preceded by '.')
+        if (containsIgnoreCase(s, "create") and t > start and tags[t - 1] == .period) return true;
+    }
+    return false;
+}
+
+/// Returns true if within 100 tokens before `anchor` there is a declaration
+/// of the form `IDENT_ARENA . allocator ( )`, indicating the function is
+/// using an arena-backed allocator.  In that case every allocation in this
+/// scope is freed when the arena resets, so no per-field leak is possible.
+fn nearbyArenaAllocator(
+    tree: *const Ast,
+    tags: []const std.zig.Token.Tag,
+    anchor: Ast.TokenIndex,
+) bool {
+    const back: Ast.TokenIndex = 100;
+    const start: Ast.TokenIndex = if (anchor >= back) anchor - back else 0;
+    var k = start;
+    while (k + 4 < anchor) : (k += 1) {
+        if (tags[k] != .identifier) continue;
+        if (std.ascii.indexOfIgnoreCase(tree.tokenSlice(k), "arena") == null) continue;
+        if (tags[k + 1] != .period) continue;
+        if (tags[k + 2] != .identifier) continue;
+        if (!std.mem.eql(u8, tree.tokenSlice(k + 2), "allocator")) continue;
+        if (tags[k + 3] != .l_paren) continue;
+        if (tags[k + 4] != .r_paren) continue;
+        return true;
     }
     return false;
 }
@@ -260,6 +308,43 @@ test "struct-literal-multiple-try: try in nested call args does not fire" {
     try testing.expectNoFire(check,
         \\fn callFn(a: u8, b: u8) void {
         \\    process(a, b);
+        \\}
+        \\
+    );
+}
+
+test "struct-literal-multiple-try: factory fn (create prefix) does not fire" {
+    try testing.expectNoFire(check,
+        \\fn buildStep(b: *Build) !GhosttyI18n {
+        \\    return .{
+        \\        .update_step = try createUpdateStep(b),
+        \\        .steps = try steps.toOwnedSlice(b.allocator),
+        \\    };
+        \\}
+        \\
+    );
+}
+
+test "struct-literal-multiple-try: arena allocator does not fire" {
+    try testing.expectNoFire(check,
+        \\fn deriveFontConfig(arena: ArenaAllocator, config: *const Config) !FontConfig {
+        \\    const alloc = arena.allocator();
+        \\    return .{
+        \\        .@"font-family" = try config.@"font-family".clone(alloc),
+        \\        .@"font-style"  = try config.@"font-style".clone(alloc),
+        \\    };
+        \\}
+        \\
+    );
+}
+
+test "struct-literal-multiple-try: method .create fires" {
+    try testing.expectFires(check, R,
+        \\fn makeNode(gpa: Allocator) !Node {
+        \\    return .{
+        \\        .left  = try gpa.create(LeftNode),
+        \\        .right = try gpa.create(RightNode),
+        \\    };
         \\}
         \\
     );
