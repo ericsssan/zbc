@@ -317,5 +317,12 @@ fn containerName(arena: std.mem.Allocator, container: anytype) !?[]const u8 {
             }
         }
     }
-    return null;
+    // File-root container: the file itself IS the struct (no enclosing
+    // `const NAME = struct {…}`), as in std's `ArenaAllocator.zig`,
+    // `array_list.zig`, etc.  Its name is the file's stem — the convention
+    // ZLS uses.  e.g. `…/heap/ArenaAllocator.zig` → "ArenaAllocator".
+    const fs_path = handle.uri.toFsPath(arena) catch return null;
+    const stem = std.fs.path.stem(fs_path);
+    if (stem.len == 0) return null;
+    return try arena.dupe(u8, stem);
 }
