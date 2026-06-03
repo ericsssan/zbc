@@ -87,10 +87,62 @@ pub fn check(
                 }
             }
 
+            // 3. Valid in-range shapes where the LEFT operand is the UPPER
+            //    bound and the RIGHT operand is the LOWER bound — i.e.
+            //    `x < UPPER and x > LOWER`.  The impossible-range bug (which
+            //    should have used `or`) always has the MIN on the left, so
+            //    these are safe to suppress without losing the TP class:
+            //      (a) `x < maxInt(..) and x > minInt(..)` — maxInt > minInt
+            //          for every integer type, so this is the full-range
+            //          membership test (always valid).
+            //      (b) `x < something.len and x > LOWER` — a `.len` is the
+            //          natural upper bound of an index/slice range; this is a
+            //          bounded-range check, not an and/or confusion.
+            {
+                const left_has_maxint = rangeHasIdent(tree, tags, t + 2, u, "maxInt");
+                const right_end = @min(u + 12, last_tok + 1);
+                const right_has_minint = rangeHasIdent(tree, tags, u + 3, right_end, "minInt");
+                if (left_has_maxint and right_has_minint) break;
+                if (leftBoundIsDotLen(tags, tree, t + 2, u)) break;
+            }
+
             try report(gpa, problems, tree, t, x_name);
             break;
         }
     }
+}
+
+/// True iff the token range [start, end) contains an identifier whose slice
+/// equals `name`.
+fn rangeHasIdent(
+    tree: *const Ast,
+    tags: []const std.zig.Token.Tag,
+    start: Ast.TokenIndex,
+    end: Ast.TokenIndex,
+    name: []const u8,
+) bool {
+    var i = start;
+    while (i < end) : (i += 1) {
+        if (tags[i] == .identifier and std.mem.eql(u8, tree.tokenSlice(i), name)) return true;
+    }
+    return false;
+}
+
+/// True iff the left-bound token range [start, end) contains a `. len` field
+/// access — i.e. the upper bound is a slice/array length.
+fn leftBoundIsDotLen(
+    tags: []const std.zig.Token.Tag,
+    tree: *const Ast,
+    start: Ast.TokenIndex,
+    end: Ast.TokenIndex,
+) bool {
+    var i = start;
+    while (i + 1 < end) : (i += 1) {
+        if (tags[i] == .period and
+            tags[i + 1] == .identifier and
+            std.mem.eql(u8, tree.tokenSlice(i + 1), "len")) return true;
+    }
+    return false;
 }
 
 fn report(
@@ -175,6 +227,33 @@ test "impossible-range-and: right-bound 0 does not fire" {
     try testing.expectNoFire(check,
         \\fn trim(buf: []u8, max: usize) []u8 {
         \\    return if (max < buf.len and max > 0) buf[0..max] else buf;
+        \\}
+        \\
+    );
+}
+
+test "impossible-range-and: maxInt/minInt full-range check does not fire" {
+    try testing.expectNoFire(check,
+        \\fn fits(value: f64) bool {
+        \\    return value < std.math.maxInt(i32) and value > std.math.minInt(i32);
+        \\}
+        \\
+    );
+}
+
+test "impossible-range-and: dot-len upper bound does not fire" {
+    try testing.expectNoFire(check,
+        \\fn scan(content: []const u8, end: usize, beg: usize) bool {
+        \\    return end < content.len and end > beg;
+        \\}
+        \\
+    );
+}
+
+test "impossible-range-and: literal-left + named-max still fires" {
+    try testing.expectFires(check, R,
+        \\fn validate(id: i64) bool {
+        \\    return id < 0 and id > MAX_STREAM_ID;
         \\}
         \\
     );
