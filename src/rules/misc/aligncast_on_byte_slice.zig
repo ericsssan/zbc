@@ -44,10 +44,24 @@ pub fn check(
     problems: *std.ArrayListUnmanaged(Problem),
 ) !void {
     if (!config_mod.isEnabled(config, .aligncast_on_byte_slice)) return;
-    _ = cache;
 
     const tags = tree.tokens.items(.tag);
     const last_tok: Ast.TokenIndex = @intCast(tree.tokens.len -| 1);
+
+    // Map identifier-reference nodes by main token, so the `.ptr` receiver can
+    // be resolved to its slice element type (is it actually a BYTE slice?).
+    // Empty/unused when the type engine is absent.
+    var ident_nodes: std.AutoHashMapUnmanaged(Ast.TokenIndex, Ast.Node.Index) = .empty;
+    defer ident_nodes.deinit(gpa);
+    {
+        var ni: u32 = 0;
+        while (ni < tree.nodes.len) : (ni += 1) {
+            const node: Ast.Node.Index = @enumFromInt(ni);
+            if (tree.nodeTag(node) == .identifier) {
+                try ident_nodes.put(gpa, tree.nodeMainToken(node), node);
+            }
+        }
+    }
 
     var t: Ast.TokenIndex = 0;
     while (t + 5 <= last_tok) : (t += 1) {
@@ -62,6 +76,12 @@ pub fn check(
             std.mem.eql(u8, tree.tokenSlice(t + 4), "ptr") and
             tags[t + 5] == .r_paren)
         {
+            // SEMANTIC: suppress when the receiver resolves to a slice whose
+            // element is NOT byte-sized (`[]u32`, `[]Struct`, …) — its `.ptr`
+            // is already >1-aligned, so this is not the byte-slice bug class
+            // (true to the rule's name).  Byte slices (`[]u8`/`[]const u8`,
+            // element align 1) and unresolved receivers fall through.
+            if (sliceElemNotByteSized(cache, &ident_nodes, t + 2)) continue;
             // Suppress when the receiver was declared with an explicit alignment
             // annotation (`recv: []align(N) u8`) or via `alignedAlloc` — in those
             // cases the alignment is guaranteed by construction and the @alignCast
@@ -84,6 +104,7 @@ pub fn check(
             tags[t + 7] == .r_paren and
             tags[t + 8] == .r_paren)
         {
+            if (sliceElemNotByteSized(cache, &ident_nodes, t + 4)) continue;
             if (!receiverHasUnknownAlignment(tree, tags, t, tree.tokenSlice(t + 4)))
                 continue;
             try report(gpa, problems, tree, t, t + 8);
@@ -128,6 +149,21 @@ fn receiverHasUnknownAlignment(
         }
     }
     return true; // no alignment guarantee found → unknown alignment
+}
+
+/// True iff the receiver identifier at `recv_tok` resolves to a slice whose
+/// element is provably wider than a byte (≥2-byte alignment) — so its `.ptr`
+/// is already aligned and this is NOT a byte-slice `@alignCast`.  False for
+/// byte slices, unresolved receivers, or unknown element alignment (the rule
+/// then proceeds with its syntactic checks).
+fn sliceElemNotByteSized(
+    cache: *file_cache_mod.FileCache,
+    ident_nodes: *const std.AutoHashMapUnmanaged(Ast.TokenIndex, Ast.Node.Index),
+    recv_tok: Ast.TokenIndex,
+) bool {
+    const node = ident_nodes.get(recv_tok) orelse return false;
+    const byte_sized = cache.sourcePtrElemByteSized(node) orelse return false;
+    return !byte_sized;
 }
 
 fn report(

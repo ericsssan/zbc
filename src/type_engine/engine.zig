@@ -255,6 +255,53 @@ pub const TypeResolver = struct {
         };
     }
 
+    /// For `x.ptr` where `x`'s type resolves to a slice / many-pointer:
+    /// returns whether the element type is byte-sized (1-byte alignment —
+    /// `u8`/`i8`/`bool`/≤8-bit ints), i.e. `x` is a genuine byte slice whose
+    /// `.ptr` is only 1-aligned (the `@alignCast`-on-byte-slice bug class).
+    ///   true  → byte slice (align 1) — the cast may misalign.
+    ///   false → element is wider (u16+/pointer) → `.ptr` already >1-aligned,
+    ///           NOT a byte slice; this rule does not apply.
+    ///   null  → unresolved, not a slice, or element of unknown alignment
+    ///           (struct/array) — caller should fall back to syntax.
+    pub fn sourcePtrElemByteSized(self: *TypeResolver, node: Ast.Node.Index) !?bool {
+        const ty = (try self.analyser.resolveTypeOfNode(.of(node, self.handle))) orelse return null;
+        switch (ty.data) {
+            .pointer => |p| {
+                if (p.size == .one) return null;
+                return self.typeIsByteSized(p.elem_ty.*);
+            },
+            .ip_index => |payload| switch (self.ctx.ip.indexToKey(payload.type)) {
+                .pointer_type => |info| {
+                    if (info.flags.size == .one) return null;
+                    return self.ipIsByteSized(info.elem_type);
+                },
+                else => return null,
+            },
+            else => return null,
+        }
+    }
+
+    fn typeIsByteSized(self: *TypeResolver, ty: Analyser.Type) ?bool {
+        return switch (ty.data) {
+            .ip_index => |payload| self.ipIsByteSized(payload.type),
+            .pointer => false, // element is itself a pointer → ≥ pointer-aligned
+            else => null, // struct/container/array → unknown alignment
+        };
+    }
+
+    fn ipIsByteSized(self: *TypeResolver, idx: InternPool.Index) ?bool {
+        return switch (self.ctx.ip.indexToKey(idx)) {
+            .int_type => |i| i.bits <= 8,
+            .simple_type => |s| switch (s) {
+                .bool => true,
+                else => null,
+            },
+            .pointer_type => false,
+            else => null,
+        };
+    }
+
     /// Returns the compile-time element count of `node`'s type when it is a
     /// fixed-size array `[N]T`, a single-pointer to a fixed array `*[N]T` /
     /// `*const [N]T`, or an IP-backed array type.  Returns null for runtime

@@ -83,6 +83,14 @@ pub const FileCache = struct {
         return z.fixedArrayLen(node) catch null;
     }
 
+    /// For `x.ptr` (x a slice): whether x's element is byte-sized (align 1) —
+    /// true=byte slice, false=wider element, null=unresolved/unknown.  Null
+    /// when the type engine is unavailable.
+    pub fn sourcePtrElemByteSized(self: *FileCache, node: std.zig.Ast.Node.Index) ?bool {
+        const z = self.zls orelse return null;
+        return z.sourcePtrElemByteSized(node) catch null;
+    }
+
     /// Container type name of `node`'s resolved type (pointer/optional/array
     /// unwrapped), e.g. "Allocator" for a `std.mem.Allocator` value, or null
     /// when the type engine is unavailable / the type doesn't resolve.
