@@ -60,6 +60,29 @@ pub fn check(
         const recv = tree.tokenSlice(t + 1);
         if (std.mem.eql(u8, recv, "self") or std.mem.eql(u8, recv, "this")) continue;
 
+        // Suppress `assert(recv.items.len == recv.capacity)` + `return recv.items` —
+        // when all capacity is used the caller can `allocator.free(slice)` and it
+        // frees the exact allocation (items.len == capacity means no extra capacity
+        // was allocated beyond what's returned).  Look for `recv . capacity` within
+        // 30 tokens before the return statement.
+        {
+            const back: Ast.TokenIndex = 30;
+            const scan_start: Ast.TokenIndex = if (t >= back) t - back else 0;
+            var k = scan_start;
+            var found_capacity = false;
+            while (k + 2 < t) : (k += 1) {
+                if (tags[k] != .identifier) continue;
+                if (!std.mem.eql(u8, tree.tokenSlice(k), recv)) continue;
+                if (tags[k + 1] != .period) continue;
+                if (tags[k + 2] != .identifier) continue;
+                if (std.mem.eql(u8, tree.tokenSlice(k + 2), "capacity")) {
+                    found_capacity = true;
+                    break;
+                }
+            }
+            if (found_capacity) continue;
+        }
+
         try report(gpa, problems, tree, t);
     }
 }
@@ -125,6 +148,29 @@ test "return-arraylist-items: this.items does not fire" {
         \\const Buf = struct { items: []u8 };
         \\fn getItems(this: *Buf) []u8 {
         \\    return this.items;
+        \\}
+        \\
+    );
+}
+
+test "return-arraylist-items: full-capacity assert suppresses" {
+    try testing.expectNoFire(check,
+        \\fn build(allocator: Allocator) ![]u8 {
+        \\    var array = try std.ArrayList(u8).initCapacity(allocator, 64);
+        \\    try fill(&array);
+        \\    assert(array.items.len == array.capacity);
+        \\    return array.items;
+        \\}
+        \\
+    );
+}
+
+test "return-arraylist-items: no capacity check still fires" {
+    try testing.expectFires(check, R,
+        \\fn build(allocator: Allocator) ![]u8 {
+        \\    var list = try std.ArrayList(u8).initCapacity(allocator, 64);
+        \\    try list.appendSlice(data);
+        \\    return list.items;
         \\}
         \\
     );
