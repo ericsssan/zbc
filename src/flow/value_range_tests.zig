@@ -295,3 +295,61 @@ test "nonempty: unrelated container guard does not prove" {
         \\
     , "arr", "arr"));
 }
+
+// ── len-bound local aliases (n == c.len) ─────────────────────
+
+test "alias: scalar guard proves container nonempty (n=c.len, if n>0, c[c.len-1])" {
+    try std.testing.expect(try proveNonemptyAt(
+        \\fn f(arr: []const u8) u8 {
+        \\    const n = arr.len;
+        \\    if (n > 0) return arr[arr.len - 1];
+        \\    return 0;
+        \\}
+        \\
+    , "arr", "arr"));
+}
+
+test "alias: scalar early-return proves container nonempty" {
+    try std.testing.expect(try proveNonemptyAt(
+        \\fn f(arr: []const u8) u8 {
+        \\    const n = arr.len;
+        \\    if (n == 0) return 0;
+        \\    return arr[arr.len - 1];
+        \\}
+        \\
+    , "arr", "arr"));
+}
+
+test "alias: container guard proves scalar nonzero (n=c.len, if c.len>0, buf[n-1])" {
+    try std.testing.expect(try proveAt(
+        \\fn f(arr: []const u8, buf: []const u8) u8 {
+        \\    const n = arr.len;
+        \\    if (arr.len > 0) return buf[n - 1];
+        \\    return 0;
+        \\}
+        \\
+    , "n", "buf"));
+}
+
+test "alias: container mutated after snapshot is unsafe" {
+    try std.testing.expect(!try proveNonemptyAt(
+        \\fn f(arr: *std.ArrayList(u8)) u8 {
+        \\    const n = arr.len;
+        \\    arr.clearRetainingCapacity();
+        \\    if (n > 0) return arr[arr.len - 1];
+        \\    return 0;
+        \\}
+        \\
+    , "arr", "arr"));
+}
+
+test "alias: unrelated container not proven by scalar guard" {
+    try std.testing.expect(!try proveNonemptyAt(
+        \\fn f(arr: []const u8, other: []const u8) u8 {
+        \\    const n = other.len;
+        \\    if (n > 0) return arr[arr.len - 1];
+        \\    return 0;
+        \\}
+        \\
+    , "arr", "arr"));
+}

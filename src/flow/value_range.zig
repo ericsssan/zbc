@@ -69,30 +69,65 @@ const KeySet = struct {
     }
 };
 
-/// Abstract state: two independent fact sets.
+/// A `const n = c.len` binding: scalar `n` snapshots container `c`'s length.
+/// Lets a guard on either side establish the other's fact (nonzero(n) ⟺
+/// nonempty(c)).  Dropped when `n` is rebound or `c` is mutated.
+const Alias = struct { scalar: []const u8, container: []const u8 };
+
+/// Abstract state: two fact sets + len-alias bindings.
 const State = struct {
     scalars: KeySet = .{}, // locals known != 0
     containers: KeySet = .{}, // container paths known non-empty
+    aliases: std.ArrayListUnmanaged(Alias) = .empty, // n == c.len
 
     fn deinit(self: *State, gpa: std.mem.Allocator) void {
         self.scalars.deinit(gpa);
         self.containers.deinit(gpa);
+        self.aliases.deinit(gpa);
     }
     fn clone(self: *const State, gpa: std.mem.Allocator) !State {
         var out: State = .{};
         try out.scalars.keys.appendSlice(gpa, self.scalars.keys.items);
         try out.containers.keys.appendSlice(gpa, self.containers.keys.items);
+        try out.aliases.appendSlice(gpa, self.aliases.items);
         return out;
     }
     fn intersectWith(self: *State, other: *const State) void {
         self.scalars.intersectWith(&other.scalars);
         self.containers.intersectWith(&other.containers);
+        var i: usize = 0;
+        while (i < self.aliases.items.len) {
+            if (other.hasAlias(self.aliases.items[i])) i += 1 else _ = self.aliases.swapRemove(i);
+        }
     }
     fn replaceWith(self: *State, gpa: std.mem.Allocator, src: *const State) !void {
         self.scalars.keys.clearRetainingCapacity();
         self.containers.keys.clearRetainingCapacity();
+        self.aliases.clearRetainingCapacity();
         try self.scalars.keys.appendSlice(gpa, src.scalars.keys.items);
         try self.containers.keys.appendSlice(gpa, src.containers.keys.items);
+        try self.aliases.appendSlice(gpa, src.aliases.items);
+    }
+    fn hasAlias(self: *const State, a: Alias) bool {
+        for (self.aliases.items) |e|
+            if (std.mem.eql(u8, e.scalar, a.scalar) and std.mem.eql(u8, e.container, a.container)) return true;
+        return false;
+    }
+    fn addAlias(self: *State, gpa: std.mem.Allocator, a: Alias) !void {
+        if (self.hasAlias(a)) return;
+        try self.aliases.append(gpa, a);
+    }
+    fn dropAliasesByScalar(self: *State, scalar: []const u8) void {
+        var i: usize = 0;
+        while (i < self.aliases.items.len) {
+            if (std.mem.eql(u8, self.aliases.items[i].scalar, scalar)) _ = self.aliases.swapRemove(i) else i += 1;
+        }
+    }
+    fn dropAliasesByContainer(self: *State, container: []const u8) void {
+        var i: usize = 0;
+        while (i < self.aliases.items.len) {
+            if (std.mem.eql(u8, self.aliases.items[i].container, container)) _ = self.aliases.swapRemove(i) else i += 1;
+        }
     }
 };
 
@@ -227,8 +262,13 @@ fn analyzeVarDecl(o: *Oracle, node: Ast.Node.Index, st: *State) error{OutOfMemor
     } else {
         st.scalars.remove(name);
     }
-    // Re-binding `name` invalidates any container fact rooted at `name`.
+    // Re-binding `name` invalidates prior facts/aliases keyed on it.
     dropContainersRootedAt(st, name);
+    st.dropAliasesByScalar(name);
+    // Record a `const/var name = <c>.len` length-snapshot alias.
+    if (lenContainerPath(o, init_node)) |cpath| {
+        try st.addAlias(o.gpa, .{ .scalar = name, .container = cpath });
+    }
     return .{};
 }
 
@@ -248,6 +288,9 @@ fn analyzeAssign(o: *Oracle, node: Ast.Node.Index, st: *State) error{OutOfMemory
             st.scalars.remove(name);
         }
         dropContainersRootedAt(st, name);
+        st.dropAliasesByScalar(name);
+        // A re-bind to `c.len` re-establishes the alias.
+        if (lenContainerPath(o, rhs)) |cpath| try st.addAlias(o.gpa, .{ .scalar = name, .container = cpath });
     } else {
         // Assignment through a field/index (`c.items = ...`) — conservatively
         // drop container facts whose path the LHS could alter.
@@ -329,8 +372,20 @@ fn analyzeLoop(o: *Oracle, node: Ast.Node.Index, st: *State, kind: LoopKind) err
 }
 
 fn applyRefine(o: *Oracle, st: *State, scalar: ?[]const u8, container: ?[]const u8) error{OutOfMemory}!void {
-    if (scalar) |s| try st.scalars.add(o.gpa, s);
-    if (container) |c| try st.containers.add(o.gpa, c);
+    if (scalar) |s| {
+        try st.scalars.add(o.gpa, s);
+        // Propagate via `const s = c.len`: s != 0 ⟹ c non-empty.
+        for (st.aliases.items) |a| {
+            if (std.mem.eql(u8, a.scalar, s)) try st.containers.add(o.gpa, a.container);
+        }
+    }
+    if (container) |c| {
+        try st.containers.add(o.gpa, c);
+        // c non-empty ⟹ any snapshot `s = c.len` is != 0.
+        for (st.aliases.items) |a| {
+            if (std.mem.eql(u8, a.container, c)) try st.scalars.add(o.gpa, a.scalar);
+        }
+    }
 }
 
 const Refinement = struct {
@@ -387,13 +442,17 @@ const OperandKey = struct { key: []const u8, is_container: bool };
 fn operandKey(o: *Oracle, node: Ast.Node.Index) ?OperandKey {
     const tree = o.tree;
     if (identName(tree, node)) |name| return .{ .key = name, .is_container = false };
-    if (tree.nodeTag(node) == .field_access) {
-        const data = tree.nodeData(node).node_and_token;
-        if (std.mem.eql(u8, tree.tokenSlice(data[1]), "len")) {
-            return .{ .key = nodeSrc(tree, data[0]), .is_container = true };
-        }
-    }
+    if (lenContainerPath(o, node)) |c| return .{ .key = c, .is_container = true };
     return null;
+}
+
+/// If `node` is `<c>.len`, return the source spelling of `<c>`; else null.
+fn lenContainerPath(o: *Oracle, node: Ast.Node.Index) ?[]const u8 {
+    const tree = o.tree;
+    if (tree.nodeTag(node) != .field_access) return null;
+    const data = tree.nodeData(node).node_and_token;
+    if (!std.mem.eql(u8, tree.tokenSlice(data[1]), "len")) return null;
+    return nodeSrc(tree, data[0]);
 }
 
 /// Apply a comparison `key <cmp> lit` (or flipped) to a refinement.  Encodes
@@ -440,7 +499,7 @@ fn applyCmp(out: *Refinement, ok: OperandKey, cmp: Cmp, lit: u64, flipped: bool)
 
 /// Drop container facts whose root path is mutated within `node`'s tokens.
 fn killMutatedContainers(o: *Oracle, node: Ast.Node.Index, st: *State) void {
-    if (st.containers.keys.items.len == 0) return;
+    if (st.containers.keys.items.len == 0 and st.aliases.items.len == 0) return;
     const tree = o.tree;
     const first = tree.firstToken(node);
     const last = tree.lastToken(node);
@@ -484,7 +543,7 @@ fn dropContainersMutatedInTokens(
     last: Ast.TokenIndex,
     st: *State,
 ) void {
-    if (st.containers.keys.items.len == 0) return;
+    if (st.containers.keys.items.len == 0 and st.aliases.items.len == 0) return;
     const tags = tree.tokens.items(.tag);
     var i: usize = 0;
     while (i < st.containers.keys.items.len) {
@@ -492,6 +551,13 @@ fn dropContainersMutatedInTokens(
         if (containerMutatedInTokens(tree, tags, first, last, path)) {
             _ = st.containers.keys.swapRemove(i);
         } else i += 1;
+    }
+    // A mutated container also stales any `n = c.len` length snapshot.
+    var ai: usize = 0;
+    while (ai < st.aliases.items.len) {
+        if (containerMutatedInTokens(tree, tags, first, last, st.aliases.items[ai].container)) {
+            _ = st.aliases.swapRemove(ai);
+        } else ai += 1;
     }
 }
 
