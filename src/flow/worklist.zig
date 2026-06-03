@@ -22,12 +22,46 @@ pub const Options = struct {
     config: *const config_mod.Config = &config_mod.Default,
 };
 
+/// Returns true when the CFG contains any statement that can affect the
+/// abstract state — arena/heap allocation, deallocation, out-param write,
+/// stack escape, undef, or composite borrow.
+/// Functions where every ExprKind is `.plain`, `.unknown`, or `.field_copy_of`
+/// converge immediately to empty states and can never produce a finding.
+fn hasTrackableStatements(cfg: *const Cfg) bool {
+    for (cfg.blocks) |block| {
+        for (block.stmts) |stmt| {
+            switch (stmt.kind) {
+                .arena_kill, .heap_free, .field_heap_free,
+                .composite_escape, .interior_pointer_destroy,
+                .leak_warning, .partial_union_write => return true,
+                .decl => |d| if (exprKindIsTracked(d.init_kind)) return true,
+                .assign => |a| if (exprKindIsTracked(a.rhs_kind)) return true,
+                .ret => |r| if (exprKindIsTracked(r.value_kind)) return true,
+                .out_param_write => |w| if (exprKindIsTracked(w.value_kind)) return true,
+                .field_assign => |a| if (exprKindIsTracked(a.rhs_kind)) return true,
+                else => {},
+            }
+        }
+    }
+    return false;
+}
+
+fn exprKindIsTracked(k: cfg_mod.ExprKind) bool {
+    return switch (k) {
+        .plain, .unknown, .field_copy_of => false,
+        else => true,
+    };
+}
+
 pub fn check(
     gpa: std.mem.Allocator,
     cfg: *const Cfg,
     opts: Options,
     out: *std.ArrayListUnmanaged(Problem),
 ) !void {
+    // Fast-out: no trackable statements → empty fixed-point, no findings.
+    if (!hasTrackableStatements(cfg)) return;
+
     var in_states = try gpa.alloc(AbstractState, cfg.blocks.len);
     defer {
         for (in_states) |*s| s.deinit(gpa);
