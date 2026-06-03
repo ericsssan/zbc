@@ -89,7 +89,14 @@ fn checkBody(
         // own declaration has a guard builtin in its RHS.  This catches
         // `const cell_width = @round(face_width); … @intFromFloat(cell_width)`.
         if (arg_close == arg_open + 2 and tags[arg_open + 1] == .identifier) {
-            if (declHasGuard(tree, tags, t, tree.tokenSlice(arg_open + 1))) continue;
+            const var_name = tree.tokenSlice(arg_open + 1);
+            if (declHasGuard(tree, tags, t, var_name)) continue;
+            // Also suppress when the surrounding code contains an AND-range guard:
+            // `VAR >= LOW … and … VAR < HIGH` (or the symmetric form).  Both a
+            // lower bound (`>=` / `>`) and an upper bound (`<` / `<=`) with `and`
+            // connecting them prove the value is finite and in-range — NaN fails
+            // every IEEE 754 comparison, so it can't pass both sides of an `and`.
+            if (hasAndRangeGuard(tree, tags, t, var_name)) continue;
         }
 
         try report(gpa, problems, tree, t);
@@ -187,6 +194,54 @@ fn declHasGuard(
     return false;
 }
 
+/// Returns true iff the 200-token window before `anchor` contains BOTH:
+///   - `VAR < x` or `VAR <= x` (upper bound — excludes +Inf and NaN), AND
+///   - `VAR > y` or `VAR >= y` (lower bound — excludes -Inf and NaN),
+/// with `and` (not `or`) between the two comparison sites.
+///
+/// The AND requirement distinguishes a paired range check like
+/// `value >= -2^31 and value < 2^31` (excludes NaN via short-circuit)
+/// from an OR-based exit guard like `value < 0 or value > MAX` which does
+/// NOT exclude NaN (`NaN < 0` = false AND `NaN > MAX` = false → NaN passes).
+fn hasAndRangeGuard(
+    tree: *const Ast,
+    tags: []const std.zig.Token.Tag,
+    anchor: Ast.TokenIndex,
+    var_name: []const u8,
+) bool {
+    const back: Ast.TokenIndex = 200;
+    const start: Ast.TokenIndex = if (anchor >= back) anchor - back else 0;
+
+    var upper_pos: ?Ast.TokenIndex = null; // VAR < x or VAR <= x
+    var lower_pos: ?Ast.TokenIndex = null; // VAR > y or VAR >= y
+
+    var k: Ast.TokenIndex = start;
+    while (k + 1 < anchor) : (k += 1) {
+        if (tags[k] != .identifier) continue;
+        if (!std.mem.eql(u8, tree.tokenSlice(k), var_name)) continue;
+        const op = tags[k + 1];
+        if ((op == .angle_bracket_left or op == .angle_bracket_left_equal) and upper_pos == null)
+            upper_pos = k;
+        if ((op == .angle_bracket_right or op == .angle_bracket_right_equal) and lower_pos == null)
+            lower_pos = k;
+    }
+
+    if (upper_pos == null or lower_pos == null) return false;
+
+    // Scan between the two comparison sites for `and` (good) or `or` (bad).
+    const lo = @min(upper_pos.?, lower_pos.?) + 2;
+    const hi = @max(upper_pos.?, lower_pos.?);
+    if (lo >= hi) return false;
+
+    var has_and = false;
+    k = lo;
+    while (k < hi) : (k += 1) {
+        if (tags[k] == .keyword_and) has_and = true;
+        if (tags[k] == .keyword_or) return false; // OR-based guard doesn't exclude NaN
+    }
+    return has_and;
+}
+
 fn report(
     gpa: std.mem.Allocator,
     problems: *std.ArrayListUnmanaged(Problem),
@@ -262,6 +317,37 @@ test "intfromfloat-without-clamp: clamp identifier suppresses" {
     try testing.expectNoFire(check,
         \\fn clamped(x: f64) i32 {
         \\    return @intFromFloat(std.math.clamp(x, -1e9, 1e9));
+        \\}
+        \\
+    );
+}
+
+test "intfromfloat-without-clamp: and-range guard suppresses" {
+    try testing.expectNoFire(check,
+        \\fn convert(value: f64) ?i32 {
+        \\    if (!(value >= -2147483648.0 and value < 2147483648.0)) return null;
+        \\    const int: i32 = @intFromFloat(value);
+        \\    return int;
+        \\}
+        \\
+    );
+}
+
+test "intfromfloat-without-clamp: or-range guard does not suppress (NaN passes)" {
+    try testing.expectFires(check, R,
+        \\fn setSize(value: f64) !u32 {
+        \\    if (value < 0 or value > 4294967295.0) return error.OutOfRange;
+        \\    return @intFromFloat(value);
+        \\}
+        \\
+    );
+}
+
+test "intfromfloat-without-clamp: single-side guard does not suppress" {
+    try testing.expectFires(check, R,
+        \\fn toUint(x: f64) u32 {
+        \\    if (x > 4294967295.0) return 0;
+        \\    return @intFromFloat(x);
         \\}
         \\
     );
