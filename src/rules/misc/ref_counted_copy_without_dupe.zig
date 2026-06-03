@@ -10,22 +10,35 @@
 //!   oven-sh/bun#30991 — WTF string ref copied without `ref()`.
 //!   oven-sh/bun#30882 — specifier field copied without `dupe_ref()`.
 //!
-//! Detection (purely syntactic, per-fn token walk):
-//!   1. Scan for the struct literal field-init pattern:
-//!        t+0: `.period`
-//!        t+1: `.identifier`  (dest_field)
-//!        t+2: `.equal`
-//!        t+3: `.identifier`  (source_recv)
-//!        t+4: `.period`
-//!        t+5: `.identifier`  (source_field, same text as dest_field)
-//!      AND `dest_field == source_field`.
-//!   2. The field name must contain a substring associated with
-//!      refcounted / owned types:
-//!        "name", "str", "string", "ref", "handle", "buf", "data", "content".
-//!   3. In the window [t-10, t) there must be NO call to a ref-acquire
-//!      method (`isRefAcquireName`) on `source_recv.source_field`
-//!      — i.e. no `source_recv . source_field . <acquire> (` pattern.
-//!   4. Fire at t+1 (the dest_field identifier).
+//! Detection (purely syntactic, two-pass per-file token walk):
+//!
+//!   Pass 1 — evidence collection:
+//!     Scan the entire file for calls of the form:
+//!       `receiver . field_name . <acquire_or_release_method> (`
+//!     where acquire methods: clone/dupeRef/ref/retain/dupe/addRef
+//!           release methods: deinit/deref/free/release/unref/destroy/drop
+//!     For each such `field_name`, record it as "evidenced" — this file
+//!     treats that field as a refcounted or managed type.
+//!
+//!   Pass 2 — copy check (per fn body):
+//!     Scan for the struct literal field-init pattern:
+//!       t+0: `.period`
+//!       t+1: `.identifier`  (dest_field)
+//!       t+2: `.equal`
+//!       t+3: `.identifier`  (source_recv)
+//!       t+4: `.period`
+//!       t+5: `.identifier`  (source_field, same text as dest_field)
+//!     AND `dest_field == source_field`.
+//!     The field name must match the refcounted-substring list.
+//!     The field name must be in the "evidenced" set from Pass 1.
+//!     In the window [t-10, t) there must be no acquire call on source.
+//!     Fire at t+1.
+//!
+//!   Evidence requirement eliminates value-type false positives:
+//!     `Ref = packed struct(u64)` (bun's symbol-table index) has no
+//!     `.ref()`, `.clone()`, `.deinit()` etc. — it is never evidenced.
+//!     WTF::String (`name`, `str`) has `.dupeRef()` and `.deinit()` call
+//!     sites in the same file — it is evidenced and correctly fires.
 
 const std = @import("std");
 const Ast = std.zig.Ast;
@@ -50,6 +63,14 @@ const refcounted_substrings = [_][]const u8{
     "name", "str", "string", "ref", "handle", "buf", "data", "content",
 };
 
+/// State threaded through the two-pass check.
+const CheckState = struct {
+    problems: *std.ArrayListUnmanaged(Problem),
+    /// Field names for which at least one acquire OR release call was found
+    /// in the file.  Only these field names are eligible for copy-checking.
+    evidenced: *const std.StringHashMap(void),
+};
+
 pub fn check(
     gpa: std.mem.Allocator,
     tree: *const Ast,
@@ -59,14 +80,48 @@ pub fn check(
 ) !void {
     if (!config_mod.isEnabled(config, .ref_counted_copy_without_dupe)) return;
     _ = cache;
-    try tokens.forEachFnBody(gpa, tree, problems, checkBody);
+
+    const tags = tree.tokens.items(.tag);
+    const last_tok: Ast.TokenIndex = @intCast(tree.tokens.len -| 1);
+
+    // ── Pass 1: collect evidenced field names ─────────────────────────────
+    // Scan the whole file for `identifier . FIELD . <acquire_or_release> (`.
+    // A field that is never acquire-called OR release-called has no lifecycle
+    // management — it is a plain value type and should not be flagged.
+    var evidenced = std.StringHashMap(void).init(gpa);
+    defer evidenced.deinit();
+
+    if (last_tok >= 5) {
+        var t: Ast.TokenIndex = 0;
+        while (t + 5 <= last_tok) : (t += 1) {
+            if (tags[t] != .identifier) continue;
+            if (tags[t + 1] != .period) continue;
+            if (tags[t + 2] != .identifier) continue;
+            if (tags[t + 3] != .period) continue;
+            if (tags[t + 4] != .identifier) continue;
+            if (tags[t + 5] != .l_paren) continue;
+            const field = tree.tokenSlice(t + 2);
+            if (!isRefcountedFieldName(field)) continue;
+            const method = tree.tokenSlice(t + 4);
+            if (method_names.isRefAcquireName(method) or isRefReleaseName(method)) {
+                try evidenced.put(field, {});
+            }
+        }
+    }
+
+    // If no evidenced fields exist in this file, nothing to flag.
+    if (evidenced.count() == 0) return;
+
+    // ── Pass 2: check for copies without acquire ──────────────────────────
+    var state = CheckState{ .problems = problems, .evidenced = &evidenced };
+    try tokens.forEachFnBody(gpa, tree, &state, checkBody);
 }
 
 fn checkBody(
     gpa: std.mem.Allocator,
     tree: *const Ast,
     body: Ast.Node.Index,
-    problems: *std.ArrayListUnmanaged(Problem),
+    state: *CheckState,
 ) !void {
     const tags = tree.tokens.items(.tag);
     const first = tree.firstToken(body);
@@ -103,21 +158,37 @@ fn checkBody(
         // Field name must suggest a refcounted / owned type.
         if (!isRefcountedFieldName(dest_field)) continue;
 
-        // Suppress when the RHS is `source_recv.source_field.<acquire>(`:
-        //   t+4: period, t+5: source_field, t+6: period, t+7: <method>, t+8: l_paren
-        if (t + 8 <= last and
-            tags[t + 6] == .period and
-            tags[t + 7] == .identifier and
-            tags[t + 8] == .l_paren and
-            method_names.isRefAcquireName(tree.tokenSlice(t + 7))) continue;
+        // Evidence gate: only fire when this file contains at least one
+        // acquire or release call for this field name.  Value types (e.g.
+        // `Ref = packed struct(u64)`) never appear with `.ref.deinit()` or
+        // `.ref.clone()` — they have no lifecycle methods.
+        if (!state.evidenced.contains(dest_field)) continue;
+
+        // Suppress when the RHS is not a bare `source_recv.source_field` but has
+        // any further access — a method call (`recv.field.method(…)`) or sub-field
+        // (`recv.field.subfield`).  In both cases the value assigned is derived
+        // rather than a raw refcount-unsafe copy.
+        //   t+4: period, t+5: source_field, t+6: period  ← any further access
+        if (t + 6 <= last and tags[t + 6] == .period) continue;
 
         // Also check that no ref-acquire is called on source_recv.source_field
         // in the 10 tokens preceding t (backward-scan for manual pre-clone).
         const window_start = t -| 10;
         if (hasRefAcquireCall(tree, tags, window_start, t -| 1, source_recv, source_field)) continue;
 
-        try report(gpa, problems, tree, t + 1, dest_field, source_recv);
+        try report(gpa, state.problems, tree, t + 1, dest_field, source_recv);
     }
+}
+
+/// True iff `name` is a method that RELEASES or deallocates a refcounted value.
+/// Used (alongside isRefAcquireName) to detect field lifecycle evidence.
+fn isRefReleaseName(name: []const u8) bool {
+    return std.mem.eql(u8, name, "deinit") or
+        std.mem.eql(u8, name, "deref") or
+        std.mem.eql(u8, name, "release") or
+        std.mem.eql(u8, name, "unref") or
+        std.mem.eql(u8, name, "destroy") or
+        std.mem.eql(u8, name, "drop");
 }
 
 /// True iff any underscore-delimited word component of `name` exactly matches
@@ -203,8 +274,9 @@ fn report(
 
 // ── Tests ──────────────────────────────────────────────────
 
-test "ref-counted-copy-without-dupe: .name = other.name fires" {
+test "ref-counted-copy-without-dupe: .name = other.name fires (with lifecycle evidence)" {
     try testing.expectFires(check, R,
+        \\fn cleanup(s: anytype) void { s.name.deinit(); }
         \\fn copy(source: anytype) void {
         \\    const result = .{
         \\        .name = source.name,
@@ -215,8 +287,9 @@ test "ref-counted-copy-without-dupe: .name = other.name fires" {
     );
 }
 
-test "ref-counted-copy-without-dupe: .handle = other.handle fires" {
+test "ref-counted-copy-without-dupe: .handle = other.handle fires (with lifecycle evidence)" {
     try testing.expectFires(check, R,
+        \\fn release(h: anytype) void { h.handle.release(); }
         \\fn copy(other: anytype) void {
         \\    const result = .{
         \\        .handle = other.handle,
@@ -229,6 +302,7 @@ test "ref-counted-copy-without-dupe: .handle = other.handle fires" {
 
 test "ref-counted-copy-without-dupe: .name = source.name.clone() does not fire" {
     try testing.expectNoFire(check,
+        \\fn cleanup(s: anytype) void { s.name.deinit(); }
         \\fn copy(source: anytype) void {
         \\    const result = .{
         \\        .name = source.name.clone(),
@@ -263,8 +337,9 @@ test "ref-counted-copy-without-dupe: .id = other.id does not fire" {
     );
 }
 
-test "ref-counted-copy-without-dupe: .str = other.str fires" {
+test "ref-counted-copy-without-dupe: .str = other.str fires (with lifecycle evidence)" {
     try testing.expectFires(check, R,
+        \\fn dealloc(other: anytype) void { other.str.deref(); }
         \\fn copy(other: anytype) void {
         \\    const result = .{
         \\        .str = other.str,
@@ -277,6 +352,7 @@ test "ref-counted-copy-without-dupe: .str = other.str fires" {
 
 test "ref-counted-copy-without-dupe: .name = source.name.dupeRef() does not fire" {
     try testing.expectNoFire(check,
+        \\fn cleanup(s: anytype) void { s.name.deinit(); }
         \\fn copy(source: anytype) void {
         \\    const result = .{
         \\        .name = source.name.dupeRef(),
@@ -317,8 +393,9 @@ test "ref-counted-copy-without-dupe: .react_fast_refresh = other.react_fast_refr
     );
 }
 
-test "ref-counted-copy-without-dupe: .user_data = other.user_data fires (data is whole word)" {
+test "ref-counted-copy-without-dupe: .user_data = other.user_data fires (data, with lifecycle)" {
     try testing.expectFires(check, R,
+        \\fn release(other: anytype) void { other.user_data.deinit(); }
         \\fn copy(other: anytype) void {
         \\    const result = .{ .user_data = other.user_data };
         \\    _ = result;
@@ -341,6 +418,48 @@ test "ref-counted-copy-without-dupe: .user_data_128 = other.user_data_128 does n
     try testing.expectNoFire(check,
         \\fn copy(other: anytype) void {
         \\    const result = .{ .user_data_128 = other.user_data_128 };
+        \\    _ = result;
+        \\}
+        \\
+    );
+}
+
+test "ref-counted-copy-without-dupe: .name = other.name fires when deinit call exists in file" {
+    try testing.expectFires(check, R,
+        \\fn cleanup(s: anytype) void { s.name.deinit(); }
+        \\fn copy(source: anytype) void {
+        \\    const result = .{ .name = source.name };
+        \\    _ = result;
+        \\}
+        \\
+    );
+}
+
+test "ref-counted-copy-without-dupe: .name = other.name does not fire without any lifecycle call" {
+    try testing.expectNoFire(check,
+        \\fn copy(source: anytype) void {
+        \\    const result = .{ .name = source.name };
+        \\    _ = result;
+        \\}
+        \\
+    );
+}
+
+test "ref-counted-copy-without-dupe: .ref = other.ref does not fire (no lifecycle — value type)" {
+    try testing.expectNoFire(check,
+        \\fn copy(st: anytype) void {
+        \\    const result = .{ .ref = st.ref };
+        \\    _ = result;
+        \\}
+        \\
+    );
+}
+
+test "ref-counted-copy-without-dupe: .ref = other.ref fires when ref() call exists" {
+    try testing.expectFires(check, R,
+        \\fn acquire(s: anytype) void { _ = s.ref.ref(); }
+        \\fn copy(st: anytype) void {
+        \\    const result = .{ .ref = st.ref };
         \\    _ = result;
         \\}
         \\
