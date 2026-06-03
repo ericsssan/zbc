@@ -72,6 +72,14 @@ pub fn check(
 
         if (isInTestRange(test_ranges.items, t + 1)) continue;
 
+        // Suppress the FIRST `.next()` on a `std.mem.split*` iterator: split
+        // iterators always yield at least one element (even for empty input),
+        // so the first `.next()` is guaranteed non-null and the `.?` cannot
+        // panic.  Subsequent `.next().?` calls on the same iterator are NOT
+        // covered — they depend on the input having enough fields.
+        if (t >= 1 and tags[t - 1] == .identifier and
+            isFirstNextOnSplitIterator(tree, tags, t, tree.tokenSlice(t - 1))) continue;
+
         try report(gpa, problems, tree, t + 1);
     }
 }
@@ -130,6 +138,72 @@ fn isInTestRange(ranges: []const Range, tok: Ast.TokenIndex) bool {
     return false;
 }
 
+/// True iff `recv` is declared (within a bounded backward window) as a
+/// `std.mem.split*` iterator AND the `.next()` at `next_period` is the FIRST
+/// `.next()` call on `recv` since that declaration.
+///
+/// `std.mem.splitScalar/splitSequence/splitAny` (and their `Backwards`
+/// variants) are documented to always return at least one item, so the first
+/// `.next()` cannot be null.  `tokenize*` is deliberately excluded — it can
+/// return null on its first call for empty / all-delimiter input.
+fn isFirstNextOnSplitIterator(
+    tree: *const Ast,
+    tags: []const std.zig.Token.Tag,
+    next_period: Ast.TokenIndex,
+    recv: []const u8,
+) bool {
+    const window: Ast.TokenIndex = 500;
+    const lo: Ast.TokenIndex = if (next_period >= window) next_period - window else 0;
+
+    // Find the nearest `(const|var) recv` declaration scanning backward.
+    var decl: ?Ast.TokenIndex = null;
+    var k = next_period;
+    while (k > lo) {
+        k -= 1;
+        if (tags[k] != .identifier) continue;
+        if (!std.mem.eql(u8, tree.tokenSlice(k), recv)) continue;
+        if (k == 0) break;
+        if (tags[k - 1] == .keyword_const or tags[k - 1] == .keyword_var) {
+            decl = k;
+            break;
+        }
+    }
+    const decl_tok = decl orelse return false;
+
+    // The RHS (decl .. semicolon) must name a `split*` constructor.
+    var has_split = false;
+    var j = decl_tok + 1;
+    while (j < next_period and tags[j] != .semicolon) : (j += 1) {
+        if (tags[j] != .identifier) continue;
+        if (isSplitConstructor(tree.tokenSlice(j))) {
+            has_split = true;
+            break;
+        }
+    }
+    if (!has_split) return false;
+
+    // First-next check: no earlier `recv . next (` between the decl and this use.
+    var i = decl_tok + 1;
+    while (i + 2 < next_period) : (i += 1) {
+        if (tags[i] != .identifier or !std.mem.eql(u8, tree.tokenSlice(i), recv)) continue;
+        if (tags[i + 1] == .period and
+            tags[i + 2] == .identifier and
+            std.mem.eql(u8, tree.tokenSlice(i + 2), "next")) return false; // an earlier next() exists
+    }
+    return true;
+}
+
+fn isSplitConstructor(name: []const u8) bool {
+    return std.mem.eql(u8, name, "split") or
+        std.mem.eql(u8, name, "splitScalar") or
+        std.mem.eql(u8, name, "splitSequence") or
+        std.mem.eql(u8, name, "splitAny") or
+        std.mem.eql(u8, name, "splitBackwards") or
+        std.mem.eql(u8, name, "splitBackwardsScalar") or
+        std.mem.eql(u8, name, "splitBackwardsSequence") or
+        std.mem.eql(u8, name, "splitBackwardsAny");
+}
+
 fn report(
     gpa: std.mem.Allocator,
     problems: *std.ArrayListUnmanaged(Problem),
@@ -186,6 +260,38 @@ test "forced-unwrap-iterator-next: next with arg does not fire" {
     try testing.expectNoFire(check,
         \\fn readFirst(iter: anytype) u32 {
         \\    return iter.next(1);
+        \\}
+        \\
+    );
+}
+
+test "forced-unwrap-iterator-next: first next on splitScalar does not fire" {
+    try testing.expectNoFire(check,
+        \\fn firstField(text: []const u8) []const u8 {
+        \\    var parts = std.mem.splitScalar(u8, text, ',');
+        \\    return parts.next().?;
+        \\}
+        \\
+    );
+}
+
+test "forced-unwrap-iterator-next: second next on splitScalar still fires" {
+    try testing.expectFires(check, R,
+        \\fn secondField(text: []const u8) []const u8 {
+        \\    var parts = std.mem.splitScalar(u8, text, ',');
+        \\    const a = parts.next().?;
+        \\    _ = a;
+        \\    return parts.next().?;
+        \\}
+        \\
+    );
+}
+
+test "forced-unwrap-iterator-next: first next on tokenize still fires" {
+    try testing.expectFires(check, R,
+        \\fn firstTok(text: []const u8) []const u8 {
+        \\    var it = std.mem.tokenizeScalar(u8, text, ',');
+        \\    return it.next().?;
         \\}
         \\
     );
