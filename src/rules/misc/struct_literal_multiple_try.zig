@@ -45,11 +45,25 @@ pub fn check(
     problems: *std.ArrayListUnmanaged(Problem),
 ) !void {
     if (!config_mod.isEnabled(config, .struct_literal_multiple_try)) return;
-    _ = cache;
 
     const tags = tree.tokens.items(.tag);
     if (tree.tokens.len < 8) return;
     const last_tok: Ast.TokenIndex = @intCast(tree.tokens.len -| 1);
+
+    // Map identifier-reference nodes by main token, so the first-try
+    // expression's operands can be resolved to their types (e.g. is an operand
+    // a `std.mem.Allocator`?).  Empty/unused when the type engine is absent.
+    var ident_nodes: std.AutoHashMapUnmanaged(Ast.TokenIndex, Ast.Node.Index) = .empty;
+    defer ident_nodes.deinit(gpa);
+    {
+        var ni: u32 = 0;
+        while (ni < tree.nodes.len) : (ni += 1) {
+            const node: Ast.Node.Index = @enumFromInt(ni);
+            if (tree.nodeTag(node) == .identifier) {
+                try ident_nodes.put(gpa, tree.nodeMainToken(node), node);
+            }
+        }
+    }
 
     var t: Ast.TokenIndex = 0;
     while (t + 7 <= last_tok) : (t += 1) {
@@ -77,8 +91,15 @@ pub fn check(
         if (tags[i] != .comma) continue; // hit a closing delimiter — skip
 
         // The first try-expression (t+4 .. comma) must allocate an owned
-        // resource — otherwise nothing leaks when a later try fails.
-        if (!tryExprAllocates(tree, tags, t + 4, i)) continue;
+        // resource — otherwise nothing leaks when a later try fails.  The
+        // SEMANTIC signal (`firstTryUsesAllocator`) recognizes that the call
+        // takes/uses a `std.mem.Allocator` value (the type-based ownership
+        // signal — `gpa.alloc`, `list.toOwnedSlice(gpa)`, `el.deepClone(alloc)`
+        // all reference an Allocator; a borrowed `getView()` does not).  The
+        // syntactic name proxy still catches internal-alloc calls with no
+        // visible allocator operand (`x.clone()`).
+        if (!firstTryUsesAllocator(cache, &ident_nodes, tags, t + 4, i) and
+            !tryExprAllocates(tree, tags, t + 4, i)) continue;
 
         // If the surrounding function uses an arena-backed allocator (i.e.
         // there is a `const X = ARENA.allocator()` within 100 tokens before
@@ -99,6 +120,31 @@ pub fn check(
 
         try report(gpa, problems, tree, next, field1, field2);
     }
+}
+
+/// SEMANTIC allocation signal: returns true iff some identifier operand in the
+/// first-try expression `[start, end)` resolves to type `std.mem.Allocator`.
+/// A call that takes/uses an allocator produces caller-owned memory — the
+/// value the abandoned struct literal would leak.  This is the type-based
+/// replacement for the call-NAME proxy (`alloc`/`dupe`/`toOwnedSlice`/…):
+/// it catches allocator-passing calls regardless of how they're named
+/// (`try buildThing(gpa)`), and a borrowed-result call (no allocator operand)
+/// correctly does not signal.  No-op (false) when the type engine is absent.
+fn firstTryUsesAllocator(
+    cache: *file_cache_mod.FileCache,
+    ident_nodes: *const std.AutoHashMapUnmanaged(Ast.TokenIndex, Ast.Node.Index),
+    tags: []const std.zig.Token.Tag,
+    start: Ast.TokenIndex,
+    end: Ast.TokenIndex,
+) bool {
+    var t = start;
+    while (t < end) : (t += 1) {
+        if (tags[t] != .identifier) continue;
+        const node = ident_nodes.get(t) orelse continue;
+        const tyname = cache.typeNameOfNode(node) orelse continue;
+        if (std.mem.eql(u8, tyname, "Allocator")) return true;
+    }
+    return false;
 }
 
 /// Returns true iff the token range [start, end) contains an identifier or

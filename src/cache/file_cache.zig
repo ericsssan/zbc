@@ -83,6 +83,14 @@ pub const FileCache = struct {
         return z.fixedArrayLen(node) catch null;
     }
 
+    /// Container type name of `node`'s resolved type (pointer/optional/array
+    /// unwrapped), e.g. "Allocator" for a `std.mem.Allocator` value, or null
+    /// when the type engine is unavailable / the type doesn't resolve.
+    pub fn typeNameOfNode(self: *FileCache, node: std.zig.Ast.Node.Index) ?[]const u8 {
+        const z = self.zls orelse return null;
+        return z.typeNameOfNode(node) catch null;
+    }
+
     pub fn setProject(
         self: *FileCache,
         project: ?*project_cache_mod.ProjectCache,
