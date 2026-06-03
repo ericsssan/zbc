@@ -256,6 +256,7 @@ test {
     _ = problem_mod;
     _ = @import("flow/abstract_state.zig");
     _ = @import("flow/cfg_transfer.zig");
+    _ = @import("flow/value_range.zig");
     // Pattern rules are registered in rule_catalog_mod alongside the
     // catalog metadata; pulling it in refAllDecls'es every rule
     // module so inline tests run.
