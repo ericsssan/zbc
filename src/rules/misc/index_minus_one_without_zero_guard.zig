@@ -418,7 +418,10 @@ fn hasAndGuard(
     guard_names: []const []const u8,
 ) bool {
     if (t < 5) return false;
-    const window: u32 = 15;
+    // Window 30: large enough for compound OR conditions like
+    // `while (end > 0 and (arr[end-1] == x or arr[end-1] == y or arr[end-1] == z))`
+    // where late subscripts are ~25+ tokens from the `and`.
+    const window: u32 = 30;
     const start: Ast.TokenIndex = if (t >= window) t - window else 0;
     var k: Ast.TokenIndex = t;
     while (k > start) {
