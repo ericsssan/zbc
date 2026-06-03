@@ -97,6 +97,12 @@ fn checkBody(
             // connecting them prove the value is finite and in-range — NaN fails
             // every IEEE 754 comparison, so it can't pass both sides of an `and`.
             if (hasAndRangeGuard(tree, tags, t, var_name)) continue;
+            // Suppress when `@floor(VAR)` or `@trunc(VAR)` appears in a runtime
+            // computation (not inside assert) within 200 tokens before.  The
+            // `x - @floor(x) == 0` (is-integer) check excludes NaN and ±Inf:
+            //   @floor(NaN)=NaN, NaN-NaN=NaN, NaN==0 → false → not integer
+            //   @floor(±Inf)=±Inf, ±Inf-±Inf=NaN, NaN==0 → false → not integer
+            if (hasFloorRuntimeCheck(tree, tags, t, var_name)) continue;
         }
 
         try report(gpa, problems, tree, t);
@@ -190,6 +196,47 @@ fn declHasGuard(
                     std.mem.eql(u8, s, "clamp") or std.mem.eql(u8, s, "lossyCast")) return true;
             }
         }
+    }
+    return false;
+}
+
+/// Returns true iff `@floor(VAR_NAME)` or `@trunc(VAR_NAME)` appears in a
+/// runtime computation (not inside `assert(...)`) within 200 tokens before
+/// `@intFromFloat(VAR_NAME)`.  This guards the "is-integer check" pattern:
+///   const floored = @floor(x);
+///   const is_integer = (x - floored) == 0;
+///   if (x < MAX and is_integer) { @intFromFloat(x) }
+/// The is-integer check excludes NaN and ±Inf because `@floor(NaN)` = NaN,
+/// `NaN - NaN` = NaN, and `NaN == 0` = false; and `@floor(±Inf)` = ±Inf,
+/// `±Inf - ±Inf` = NaN.  Only runtime @floor (not assert-guarded) counts.
+fn hasFloorRuntimeCheck(
+    tree: *const Ast,
+    tags: []const std.zig.Token.Tag,
+    anchor: Ast.TokenIndex,
+    var_name: []const u8,
+) bool {
+    const back: Ast.TokenIndex = 200;
+    const start: Ast.TokenIndex = if (anchor >= back) anchor - back else 0;
+
+    var k = start;
+    while (k + 3 < anchor) : (k += 1) {
+        if (tags[k] != .builtin) continue;
+        const s = tree.tokenSlice(k);
+        if (!std.mem.eql(u8, s, "@floor") and !std.mem.eql(u8, s, "@trunc")) continue;
+        if (tags[k + 1] != .l_paren) continue;
+        if (tags[k + 2] != .identifier) continue;
+        if (!std.mem.eql(u8, tree.tokenSlice(k + 2), var_name)) continue;
+        if (tags[k + 3] != .r_paren) continue;
+
+        // Reject if this @floor(VAR) is the direct argument to assert(...):
+        //   assert(@floor(x) == x) — only a debug check, not runtime.
+        if (k >= 2 and
+            tags[k - 1] == .l_paren and
+            tags[k - 2] == .identifier and
+            std.mem.eql(u8, tree.tokenSlice(k - 2), "assert"))
+            continue;
+
+        return true;
     }
     return false;
 }
@@ -348,6 +395,31 @@ test "intfromfloat-without-clamp: single-side guard does not suppress" {
         \\fn toUint(x: f64) u32 {
         \\    if (x > 4294967295.0) return 0;
         \\    return @intFromFloat(x);
+        \\}
+        \\
+    );
+}
+
+test "intfromfloat-without-clamp: runtime floor check suppresses" {
+    try testing.expectNoFire(check,
+        \\fn printNonNeg(p: *Printer, float: f64) void {
+        \\    const floored: f64 = @floor(float);
+        \\    const remainder: f64 = float - floored;
+        \\    const is_integer = remainder == 0;
+        \\    if (float < 1e15 and is_integer) {
+        \\        const val = @intFromFloat(float);
+        \\        _ = val;
+        \\    }
+        \\}
+        \\
+    );
+}
+
+test "intfromfloat-without-clamp: assert-only floor does not suppress" {
+    try testing.expectFires(check, R,
+        \\fn addFloatToInt(int: *u32, float: f64) void {
+        \\    assert(@floor(float) == float);
+        \\    int.* = int.* +| @intFromFloat(float);
         \\}
         \\
     );
