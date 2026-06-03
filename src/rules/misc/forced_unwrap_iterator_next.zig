@@ -72,6 +72,16 @@ pub fn check(
 
         if (isInTestRange(test_ranges.items, t + 1)) continue;
 
+        // Suppress `assert(RECV.next().?)` — the forced-unwrap is an
+        // invariant assertion (programmer-verified that the element exists);
+        // it behaves like a test assertion and a panic is a code bug, not
+        // user input reaching an unchecked path.
+        // Pattern (from t): t-2 = l_paren, t-3 = identifier("assert").
+        if (t >= 3 and
+            tags[t - 2] == .l_paren and
+            tags[t - 3] == .identifier and
+            std.mem.eql(u8, tree.tokenSlice(t - 3), "assert")) continue;
+
         // Suppress the FIRST `.next()` on a `std.mem.split*` iterator: split
         // iterators always yield at least one element (even for empty input),
         // so the first `.next()` is guaranteed non-null and the `.?` cannot
@@ -353,6 +363,24 @@ test "forced-unwrap-iterator-next: still fires in fn before a test block" {
         \\test "after" {
         \\    var it = makeIter();
         \\    _ = it.next().?;
+        \\}
+        \\
+    );
+}
+
+test "forced-unwrap-iterator-next: assert context suppressed" {
+    try testing.expectNoFire(check,
+        \\fn checkInvariant(it: *SomeIterator) void {
+        \\    assert(it.next().? == expected_first);
+        \\}
+        \\
+    );
+}
+
+test "forced-unwrap-iterator-next: non-assert call still fires" {
+    try testing.expectFires(check, R,
+        \\fn process(it: *SomeIterator) void {
+        \\    log(it.next().?);
         \\}
         \\
     );

@@ -152,7 +152,7 @@ fn nearbyArenaAllocator(
     tags: []const std.zig.Token.Tag,
     anchor: Ast.TokenIndex,
 ) bool {
-    const back: Ast.TokenIndex = 100;
+    const back: Ast.TokenIndex = 200;
     const start: Ast.TokenIndex = if (anchor >= back) anchor - back else 0;
     var k = start;
     while (k + 4 < anchor) : (k += 1) {
