@@ -85,6 +85,12 @@ fn checkBody(
 
         // Suppress if the argument contains a clamp/min/max/rounding builtin.
         if (argHasClampGuard(tree, tags, arg_open, arg_close)) continue;
+        // For single-identifier arguments, also check whether the variable's
+        // own declaration has a guard builtin in its RHS.  This catches
+        // `const cell_width = @round(face_width); … @intFromFloat(cell_width)`.
+        if (arg_close == arg_open + 2 and tags[arg_open + 1] == .identifier) {
+            if (declHasGuard(tree, tags, t, tree.tokenSlice(arg_open + 1))) continue;
+        }
 
         try report(gpa, problems, tree, t);
     }
@@ -129,6 +135,53 @@ fn argHasClampGuard(
                 std.mem.eql(u8, s, "trunc") or
                 // std.math.lossyCast is an explicit safe conversion.
                 std.mem.eql(u8, s, "lossyCast")) return true;
+        }
+        // A float literal in the argument (e.g. `v / 100.0 * dim`) suggests
+        // the computation involves bounded scaling — suppress.
+        if (tags[t] == .number_literal and
+            std.mem.indexOf(u8, tree.tokenSlice(t), ".") != null) return true;
+    }
+    return false;
+}
+
+/// For a single-identifier argument `@intFromFloat(VAR)`, scan backward up to
+/// 500 tokens to find `const/var VAR = <rhs>` and check whether the RHS
+/// contains a guard builtin.  Catches patterns like:
+///   const cell_width = @round(face_width);
+///   …
+///   .cell_width = @intFromFloat(cell_width),
+fn declHasGuard(
+    tree: *const Ast,
+    tags: []const std.zig.Token.Tag,
+    anchor: Ast.TokenIndex,
+    var_name: []const u8,
+) bool {
+    const back: Ast.TokenIndex = 500;
+    const start: Ast.TokenIndex = if (anchor >= back) anchor - back else 0;
+    var k = anchor;
+    while (k > start + 1) {
+        k -= 1;
+        if (tags[k] != .identifier) continue;
+        if (!std.mem.eql(u8, tree.tokenSlice(k), var_name)) continue;
+        if (tags[k - 1] != .keyword_const and tags[k - 1] != .keyword_var) continue;
+        // Found declaration; scan RHS for guard builtins (up to semicolon).
+        var j = k + 1;
+        const rhs_end = @min(k + 100, anchor);
+        while (j < rhs_end) : (j += 1) {
+            if (tags[j] == .semicolon) break;
+            if (tags[j] == .builtin) {
+                const s = tree.tokenSlice(j);
+                if (std.mem.eql(u8, s, "@min") or std.mem.eql(u8, s, "@max") or
+                    std.mem.eql(u8, s, "@round") or std.mem.eql(u8, s, "@floor") or
+                    std.mem.eql(u8, s, "@ceil") or std.mem.eql(u8, s, "@trunc") or
+                    std.mem.eql(u8, s, "@floatFromInt")) return true;
+            }
+            if (tags[j] == .identifier) {
+                const s = tree.tokenSlice(j);
+                if (std.mem.eql(u8, s, "floor") or std.mem.eql(u8, s, "ceil") or
+                    std.mem.eql(u8, s, "round") or std.mem.eql(u8, s, "trunc") or
+                    std.mem.eql(u8, s, "clamp") or std.mem.eql(u8, s, "lossyCast")) return true;
+            }
         }
     }
     return false;
