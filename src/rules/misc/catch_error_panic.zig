@@ -27,6 +27,8 @@
 //!   Fire at the `keyword_catch` token.
 //!   `catch unreachable` does NOT fire (no pipe-identifier-pipe).
 //!   `catch |_| @panic(...)` fires — the discard form is equally suspicious.
+//!   Suppression: function bodies whose first token falls inside a `test { … }`
+//!   block are skipped — panicking on error is reasonable in test infrastructure.
 
 const std = @import("std");
 const Ast = std.zig.Ast;
@@ -44,6 +46,12 @@ const Problem = problem_mod.Problem;
 const Pos = problem_mod.Pos;
 const R = "catch-error-panic";
 
+const Range = struct { start: Ast.TokenIndex, end: Ast.TokenIndex };
+const State = struct {
+    problems: *std.ArrayListUnmanaged(Problem),
+    test_ranges: *const std.ArrayListUnmanaged(Range),
+};
+
 pub fn check(
     gpa: std.mem.Allocator,
     tree: *const Ast,
@@ -53,18 +61,31 @@ pub fn check(
 ) !void {
     if (!config_mod.isEnabled(config, .catch_error_panic)) return;
     _ = cache;
-    try tokens.forEachFnBody(gpa, tree, problems, checkBody);
+
+    var test_ranges: std.ArrayListUnmanaged(Range) = .empty;
+    defer test_ranges.deinit(gpa);
+    {
+        const tags = tree.tokens.items(.tag);
+        try collectTestRanges(gpa, tags, &test_ranges);
+    }
+
+    var state = State{ .problems = problems, .test_ranges = &test_ranges };
+    try tokens.forEachFnBody(gpa, tree, &state, checkBody);
 }
 
 fn checkBody(
     gpa: std.mem.Allocator,
     tree: *const Ast,
     body: Ast.Node.Index,
-    problems: *std.ArrayListUnmanaged(Problem),
+    state: *State,
 ) !void {
     const tags = tree.tokens.items(.tag);
     const first = tree.firstToken(body);
     const last = tree.lastToken(body);
+
+    // Skip function bodies inside test blocks — panic-on-error is acceptable
+    // in test infrastructure where verbose failure is the goal.
+    if (isInTestRange(state.test_ranges.items, first)) return;
 
     if (first + 5 > last) return;
 
@@ -85,7 +106,7 @@ fn checkBody(
             std.mem.eql(u8, tree.tokenSlice(t + 4), "@panic") and
             tags[t + 5] == .l_paren)
         {
-            try report(gpa, problems, tree, t, t + 5);
+            try report(gpa, state.problems, tree, t, t + 5);
             continue;
         }
 
@@ -101,7 +122,7 @@ fn checkBody(
             std.mem.eql(u8, tree.tokenSlice(t + 8), "panic") and
             tags[t + 9] == .l_paren)
         {
-            try report(gpa, problems, tree, t, t + 9);
+            try report(gpa, state.problems, tree, t, t + 9);
             continue;
         }
     }
@@ -127,6 +148,41 @@ fn report(
         .end = Pos.fromTokenEnd(tree, end_tok),
         .message = msg,
     });
+}
+
+fn collectTestRanges(
+    gpa: std.mem.Allocator,
+    tags: []const std.zig.Token.Tag,
+    out: *std.ArrayListUnmanaged(Range),
+) !void {
+    const n: u32 = @intCast(tags.len);
+    var i: Ast.TokenIndex = 0;
+    while (i < n) : (i += 1) {
+        if (tags[i] != .keyword_test) continue;
+        var j = i + 1;
+        while (j < n and tags[j] != .l_brace) : (j += 1) {
+            if (tags[j] == .semicolon or tags[j] == .r_brace) break;
+        }
+        if (j >= n or tags[j] != .l_brace) continue;
+        var depth: u32 = 0;
+        var k = j;
+        while (k < n) : (k += 1) {
+            if (tags[k] == .l_brace) depth += 1 else if (tags[k] == .r_brace) {
+                depth -= 1;
+                if (depth == 0) break;
+            }
+        }
+        if (k >= n) break;
+        try out.append(gpa, .{ .start = i, .end = k });
+        i = k;
+    }
+}
+
+fn isInTestRange(ranges: []const Range, tok: Ast.TokenIndex) bool {
+    for (ranges) |r| {
+        if (tok >= r.start and tok <= r.end) return true;
+    }
+    return false;
 }
 
 // ── Tests ──────────────────────────────────────────────────
