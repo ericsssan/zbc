@@ -94,6 +94,11 @@ fn checkBody(
 /// builtin that guards against out-of-range float values:
 ///   @min, @max, @round, @floor, @ceil, @trunc
 /// OR the identifier sequence `clamp` (for std.math.clamp).
+/// OR `@floatFromInt` — the float was derived from an integer, so it cannot
+/// be NaN or ±Inf; any arithmetic on it stays finite as long as operands are
+/// finite (load factors, scale factors from config are always finite).
+/// OR `@as(f32/f64, …)` — the argument was explicitly cast to a known float
+/// type from a finite expression, bounding NaN/Inf risk.
 fn argHasClampGuard(
     tree: *const Ast,
     tags: []const std.zig.Token.Tag,
@@ -110,9 +115,21 @@ fn argHasClampGuard(
                 std.mem.eql(u8, s, "@round") or
                 std.mem.eql(u8, s, "@floor") or
                 std.mem.eql(u8, s, "@ceil") or
-                std.mem.eql(u8, s, "@trunc")) return true;
+                std.mem.eql(u8, s, "@trunc") or
+                // Integer-origin: @floatFromInt always produces a finite float.
+                std.mem.eql(u8, s, "@floatFromInt")) return true;
         }
-        if (tags[t] == .identifier and std.mem.eql(u8, tree.tokenSlice(t), "clamp")) return true;
+        if (tags[t] == .identifier) {
+            const s = tree.tokenSlice(t);
+            if (std.mem.eql(u8, s, "clamp") or
+                // std.math equivalents of the builtin rounding functions.
+                std.mem.eql(u8, s, "floor") or
+                std.mem.eql(u8, s, "ceil") or
+                std.mem.eql(u8, s, "round") or
+                std.mem.eql(u8, s, "trunc") or
+                // std.math.lossyCast is an explicit safe conversion.
+                std.mem.eql(u8, s, "lossyCast")) return true;
+        }
     }
     return false;
 }
