@@ -1,130 +1,134 @@
-//! Standalone intra-procedural value-range oracle (Track B, v1: nonzero).
+//! Standalone intra-procedural value-range oracle (Track B).
 //!
-//! Answers one sound question for a single function body:
-//!   "Is unsigned local `target` provably != 0 at token `use_token`,
-//!    on every path that reaches it?"
+//! Answers two sound questions for a single function body, on every path that
+//! reaches a given use token:
+//!   - `provesNonzero(local)`   — is unsigned scalar `local` provably != 0?
+//!   - `provesNonempty(path)`   — is container `path` provably non-empty
+//!                                 (i.e. `path.len >= 1`)?
 //!
-//! This is the fact `index-minus-one-without-zero-guard` needs: for an
-//! unsigned `i`, `i != 0` ⟺ `i >= 1` ⟺ `i - 1` cannot underflow.  A sound
-//! "yes" lets the rule suppress; "no"/"unknown" keeps it firing.
+//! Both are the facts `index-minus-one-without-zero-guard` needs: for an
+//! unsigned `i`, `i != 0` ⟺ `i - 1` cannot underflow; for a container `c`,
+//! `c.len != 0` ⟺ `c.len - 1` cannot underflow.
 //!
-//! Design — a structured forward abstract interpretation over the AST, with
-//! a tiny domain (a set of provably-nonzero local names) and proper join at
-//! if/else merges.  It is deliberately NOT built on `src/flow/`'s CFG: that
-//! CFG discards branch truthiness (cfg_builder.zig: "We don't model the
-//! condition's truthiness"), which is exactly the information value-range
-//! needs.  Keeping this standalone avoids destabilizing the working
-//! escape/UAF/double-free worklist; it can be promoted into a shared CFG
-//! domain later if warranted.
+//! Design — a structured forward abstract interpretation over the AST.  ONE
+//! control-flow walk threads a `State` carrying two independent fact sets
+//! (nonzero scalars, non-empty containers), so if/else merge, divergence, and
+//! loop handling are written once.  It is deliberately NOT built on
+//! `src/flow/`'s CFG: that CFG discards branch truthiness (cfg_builder: "We
+//! don't model the condition's truthiness") — exactly the information
+//! value-range needs — and its state/worklist are hardwired to the lifetime
+//! lattice.  Standalone keeps the working escape/UAF/double-free analysis
+//! untouched; promotable into a shared CFG domain later.
 //!
-//! Soundness stance: the domain UNDER-approximates "definitely nonzero".
-//! Every transfer either preserves a fact only when provably valid or drops
-//! it.  Any uncertainty (unrecognized assignment, loop mutation, unmodeled
-//! construct) collapses to "unknown" → the oracle returns false → the rule
-//! fires.  False negatives in the oracle (saying "unknown" when actually
-//! nonzero) only cost recall on suppression (a retained true-or-false
-//! positive), never a missed real bug.
+//! Soundness: each set UNDER-approximates "definitely true".  Every transfer
+//! preserves a fact only when provably valid, else drops it; any uncertainty
+//! (unrecognized assignment, container mutation, loop body, unmodeled
+//! construct) → fact absent → query returns false → the rule fires.  Oracle
+//! false-negatives only cost suppression recall, never a missed bug.
 //!
-//! Modeled:
-//!   - `const/var x = <init>;` and `x = <rhs>;` — add x iff RHS is a
-//!     positive integer literal; otherwise remove x (conservative).
-//!   - `if (COND) THEN [else ELSE]` — refine inside arms from COND
-//!     (`x > 0`, `x != 0`, `x >= 1`, `0 < x`, and their `x == 0` / `x <= 0`
-//!     / `x < 1` else-duals; `and`-chains contribute their then-refinements);
-//!     merge arm outputs by intersection, honouring divergent arms
-//!     (return/break/continue/unreachable/@panic).
-//!   - `while`/`for` — sound-conservative: drop every local assigned anywhere
-//!     in the loop body before flowing past / into it (the value at a use
-//!     could come from any iteration).
-//!
-//! Not modeled (conservatively → unknown): switch payloads, labeled blocks
-//! as values, arithmetic other than positive-literal assignment, aliasing.
+//! Scalar facts:    added by `x = <positive int literal>`; refined inside arms
+//!                  by `x > 0` / `x != 0` / `x >= 1` / `0 < x` (+ `== 0` else
+//!                  duals); dropped on any other assignment to x.
+//! Container facts: refined inside arms by `c.len > 0` / `!= 0` / `>= 1` /
+//!                  `0 < c.len` (+ `== 0` else duals); dropped when `c` is
+//!                  mutated (append/insert/resize/clear/pop/remove/… or
+//!                  reassigned).  Never added by straight-line code (growth is
+//!                  not tracked) — only guards establish non-emptiness.
 
 const std = @import("std");
 const Ast = std.zig.Ast;
 
-/// A set of local names known to be nonzero on the current path.  Names are
-/// source slices (stable for the tree's lifetime).  Small in practice; linear
-/// scan is fine.
-const NonzeroSet = struct {
-    names: std.ArrayListUnmanaged([]const u8) = .empty,
+/// A set of string keys (source slices, stable for the tree's lifetime).
+const KeySet = struct {
+    keys: std.ArrayListUnmanaged([]const u8) = .empty,
 
-    fn deinit(self: *NonzeroSet, gpa: std.mem.Allocator) void {
-        self.names.deinit(gpa);
+    fn deinit(self: *KeySet, gpa: std.mem.Allocator) void {
+        self.keys.deinit(gpa);
     }
-
-    fn contains(self: *const NonzeroSet, name: []const u8) bool {
-        for (self.names.items) |n| if (std.mem.eql(u8, n, name)) return true;
+    fn contains(self: *const KeySet, k: []const u8) bool {
+        for (self.keys.items) |e| if (std.mem.eql(u8, e, k)) return true;
         return false;
     }
-
-    fn add(self: *NonzeroSet, gpa: std.mem.Allocator, name: []const u8) !void {
-        if (self.contains(name)) return;
-        try self.names.append(gpa, name);
+    fn add(self: *KeySet, gpa: std.mem.Allocator, k: []const u8) !void {
+        if (self.contains(k)) return;
+        try self.keys.append(gpa, k);
     }
-
-    fn remove(self: *NonzeroSet, name: []const u8) void {
+    fn remove(self: *KeySet, k: []const u8) void {
         var i: usize = 0;
-        while (i < self.names.items.len) {
-            if (std.mem.eql(u8, self.names.items[i], name)) {
-                _ = self.names.swapRemove(i);
+        while (i < self.keys.items.len) {
+            if (std.mem.eql(u8, self.keys.items[i], k)) {
+                _ = self.keys.swapRemove(i);
             } else i += 1;
         }
     }
-
-    fn clone(self: *const NonzeroSet, gpa: std.mem.Allocator) !NonzeroSet {
-        var out: NonzeroSet = .{};
-        try out.names.appendSlice(gpa, self.names.items);
-        return out;
-    }
-
-    /// In-place intersection: keep only names present in `other`.
-    fn intersectWith(self: *NonzeroSet, other: *const NonzeroSet) void {
+    fn intersectWith(self: *KeySet, other: *const KeySet) void {
         var i: usize = 0;
-        while (i < self.names.items.len) {
-            if (other.contains(self.names.items[i])) {
-                i += 1;
-            } else {
-                _ = self.names.swapRemove(i);
-            }
+        while (i < self.keys.items.len) {
+            if (other.contains(self.keys.items[i])) i += 1 else _ = self.keys.swapRemove(i);
         }
     }
 };
 
-/// Result of analyzing a statement sequence.
+/// Abstract state: two independent fact sets.
+const State = struct {
+    scalars: KeySet = .{}, // locals known != 0
+    containers: KeySet = .{}, // container paths known non-empty
+
+    fn deinit(self: *State, gpa: std.mem.Allocator) void {
+        self.scalars.deinit(gpa);
+        self.containers.deinit(gpa);
+    }
+    fn clone(self: *const State, gpa: std.mem.Allocator) !State {
+        var out: State = .{};
+        try out.scalars.keys.appendSlice(gpa, self.scalars.keys.items);
+        try out.containers.keys.appendSlice(gpa, self.containers.keys.items);
+        return out;
+    }
+    fn intersectWith(self: *State, other: *const State) void {
+        self.scalars.intersectWith(&other.scalars);
+        self.containers.intersectWith(&other.containers);
+    }
+    fn replaceWith(self: *State, gpa: std.mem.Allocator, src: *const State) !void {
+        self.scalars.keys.clearRetainingCapacity();
+        self.containers.keys.clearRetainingCapacity();
+        try self.scalars.keys.appendSlice(gpa, src.scalars.keys.items);
+        try self.containers.keys.appendSlice(gpa, src.containers.keys.items);
+    }
+};
+
 const Flow = struct {
-    /// The target's nonzero-ness at `use_token`, once the use is reached.
-    /// null means the use was not in this sub-tree.
     answer: ?bool = null,
-    /// True if this path diverges (return/break/continue/unreachable/panic)
-    /// before reaching its natural end — so its out-set should not
-    /// participate in a downstream merge.
     diverged: bool = false,
 };
+
+const Query = enum { nonzero_scalar, nonempty_container };
 
 const Oracle = struct {
     gpa: std.mem.Allocator,
     tree: *const Ast,
+    query: Query,
     target: []const u8,
     use_token: Ast.TokenIndex,
-    /// Recursion / work guard — bail to "unknown" on pathological inputs.
     budget: u32 = 50_000,
 
     fn tokenInNode(self: *Oracle, node: Ast.Node.Index) bool {
-        const first = self.tree.firstToken(node);
-        const last = self.tree.lastToken(node);
-        return self.use_token >= first and self.use_token <= last;
+        return self.use_token >= self.tree.firstToken(node) and
+            self.use_token <= self.tree.lastToken(node);
     }
-
     fn spend(self: *Oracle) bool {
         if (self.budget == 0) return false;
         self.budget -= 1;
         return true;
     }
+    fn answerAt(self: *Oracle, st: *const State) bool {
+        return switch (self.query) {
+            .nonzero_scalar => st.scalars.contains(self.target),
+            .nonempty_container => st.containers.contains(self.target),
+        };
+    }
 };
 
-/// Public entry point.  Returns true iff `target` is provably nonzero at
-/// `use_token` on every path reaching it.  Conservative: false on any doubt.
+/// Is unsigned scalar `target` provably != 0 at `use_token`?
 pub fn provesNonzero(
     gpa: std.mem.Allocator,
     tree: *const Ast,
@@ -132,130 +136,131 @@ pub fn provesNonzero(
     target: []const u8,
     use_token: Ast.TokenIndex,
 ) bool {
+    return run(gpa, tree, body_node, .nonzero_scalar, target, use_token);
+}
+
+/// Is container `target` (a source-spelling like "arr" or "self.items")
+/// provably non-empty (len >= 1) at `use_token`?
+pub fn provesNonempty(
+    gpa: std.mem.Allocator,
+    tree: *const Ast,
+    body_node: Ast.Node.Index,
+    target: []const u8,
+    use_token: Ast.TokenIndex,
+) bool {
+    return run(gpa, tree, body_node, .nonempty_container, target, use_token);
+}
+
+fn run(
+    gpa: std.mem.Allocator,
+    tree: *const Ast,
+    body_node: Ast.Node.Index,
+    query: Query,
+    target: []const u8,
+    use_token: Ast.TokenIndex,
+) bool {
     var oracle: Oracle = .{
         .gpa = gpa,
         .tree = tree,
+        .query = query,
         .target = target,
         .use_token = use_token,
     };
-    var set: NonzeroSet = .{};
-    defer set.deinit(gpa);
-    const flow = analyzeNode(&oracle, body_node, &set) catch return false;
+    var st: State = .{};
+    defer st.deinit(gpa);
+    const flow = analyzeNode(&oracle, body_node, &st) catch return false;
     return flow.answer orelse false;
 }
 
-/// Analyze a single statement/expression node, mutating `set` to its
-/// straight-line output effect.  If the node contains `use_token`, descends
-/// and sets `flow.answer`.
-fn analyzeNode(o: *Oracle, node: Ast.Node.Index, set: *NonzeroSet) error{OutOfMemory}!Flow {
+fn analyzeNode(o: *Oracle, node: Ast.Node.Index, st: *State) error{OutOfMemory}!Flow {
     if (!o.spend()) return .{};
     const tree = o.tree;
     switch (tree.nodeTag(node)) {
         .block, .block_semicolon, .block_two, .block_two_semicolon => {
             var buf: [2]Ast.Node.Index = undefined;
-            const stmts = blockStmts(tree, node, &buf);
-            return analyzeSeq(o, stmts, set);
+            return analyzeSeq(o, blockStmts(tree, node, &buf), st);
         },
-
-        .@"if", .if_simple => return analyzeIf(o, node, set),
-
-        .@"while", .while_simple, .while_cont => return analyzeLoop(o, node, set, .while_),
-        .@"for", .for_simple => return analyzeLoop(o, node, set, .for_),
-
-        .simple_var_decl, .local_var_decl, .aligned_var_decl => {
-            return analyzeVarDecl(o, node, set);
-        },
-
-        .assign => return analyzeAssign(o, node, set),
-
+        .@"if", .if_simple => return analyzeIf(o, node, st),
+        .@"while", .while_simple, .while_cont => return analyzeLoop(o, node, st, .while_),
+        .@"for", .for_simple => return analyzeLoop(o, node, st, .for_),
+        .simple_var_decl, .local_var_decl, .aligned_var_decl => return analyzeVarDecl(o, node, st),
+        .assign => return analyzeAssign(o, node, st),
         .@"return", .@"break", .@"continue", .unreachable_literal => {
-            // Diverges.  If the use is inside the (return) expression, answer
-            // from the current set first.
             var flow: Flow = .{ .diverged = true };
-            if (o.tokenInNode(node)) flow.answer = set.contains(o.target);
+            if (o.tokenInNode(node)) flow.answer = o.answerAt(st);
             return flow;
         },
-
         else => {
-            // Unmodeled construct.  If it contains the use, we cannot prove
-            // anything → unknown (false).  Otherwise it has no modeled effect
-            // on the nonzero set (conservative: leave set unchanged — but to
-            // stay sound we must also account for hidden mutations of target;
-            // a call could mutate via pointer.  We conservatively DROP target
-            // if the construct mentions it as anything other than a read we
-            // recognize).  Simplest sound rule: if the node references target
-            // at all and isn't a recognized read, drop it.
-            if (o.tokenInNode(node)) return .{ .answer = set.contains(o.target) };
-            // A bare expression statement (call etc.) could mutate target
-            // through a pointer; we cannot see that, so be conservative only
-            // when it's an assignment-like form (handled above).  Plain
-            // expression statements do not rebind a local by value, so the
-            // nonzero fact for `target` (a value local) survives.
+            if (o.tokenInNode(node)) return .{ .answer = o.answerAt(st) };
+            // A non-containing expression statement (e.g. a call) may mutate a
+            // tracked container in place — drop any it touches.  Scalars (value
+            // locals) are unaffected by such statements.
+            killMutatedContainers(o, node, st);
             return .{};
         },
     }
 }
 
-/// Analyze a sequence of statements in order, threading `set`.
-fn analyzeSeq(o: *Oracle, stmts: []const Ast.Node.Index, set: *NonzeroSet) error{OutOfMemory}!Flow {
+fn analyzeSeq(o: *Oracle, stmts: []const Ast.Node.Index, st: *State) error{OutOfMemory}!Flow {
     for (stmts) |s| {
-        const flow = try analyzeNode(o, s, set);
-        if (flow.answer != null) return flow; // use found; done
-        if (flow.diverged) return flow; // unreachable past here
+        const flow = try analyzeNode(o, s, st);
+        if (flow.answer != null) return flow;
+        if (flow.diverged) return flow;
     }
     return .{};
 }
 
-fn analyzeVarDecl(o: *Oracle, node: Ast.Node.Index, set: *NonzeroSet) error{OutOfMemory}!Flow {
+fn analyzeVarDecl(o: *Oracle, node: Ast.Node.Index, st: *State) error{OutOfMemory}!Flow {
     const tree = o.tree;
     const decl = tree.fullVarDecl(node) orelse return .{};
-    const name_tok = decl.ast.mut_token + 1; // `const`/`var` then NAME
-    const name = tree.tokenSlice(name_tok);
+    const name = tree.tokenSlice(decl.ast.mut_token + 1);
     const init_node = decl.ast.init_node.unwrap() orelse {
-        set.remove(name);
+        st.scalars.remove(name);
         return .{};
     };
-    // If the use is inside the initializer, answer with the pre-decl set.
     if (o.tokenInNode(init_node)) {
-        const flow = try analyzeNode(o, init_node, set);
+        const flow = try analyzeNode(o, init_node, st);
         if (flow.answer != null) return flow;
     }
     if (isPositiveIntLiteral(tree, init_node)) {
-        try set.add(o.gpa, name);
+        try st.scalars.add(o.gpa, name);
     } else {
-        set.remove(name);
+        st.scalars.remove(name);
     }
+    // Re-binding `name` invalidates any container fact rooted at `name`.
+    dropContainersRootedAt(st, name);
     return .{};
 }
 
-fn analyzeAssign(o: *Oracle, node: Ast.Node.Index, set: *NonzeroSet) error{OutOfMemory}!Flow {
+fn analyzeAssign(o: *Oracle, node: Ast.Node.Index, st: *State) error{OutOfMemory}!Flow {
     const tree = o.tree;
     const data = tree.nodeData(node).node_and_node;
     const lhs = data[0];
     const rhs = data[1];
-    // Use inside RHS?  Answer pre-assignment.
     if (o.tokenInNode(rhs)) {
-        const flow = try analyzeNode(o, rhs, set);
+        const flow = try analyzeNode(o, rhs, st);
         if (flow.answer != null) return flow;
     }
-    // Only track plain-identifier LHS targets.
-    if (tree.nodeTag(lhs) != .identifier) return .{};
-    const name = tree.tokenSlice(tree.nodeMainToken(lhs));
-    if (isPositiveIntLiteral(tree, rhs)) {
-        try set.add(o.gpa, name);
+    if (identName(tree, lhs)) |name| {
+        if (isPositiveIntLiteral(tree, rhs)) {
+            try st.scalars.add(o.gpa, name);
+        } else {
+            st.scalars.remove(name);
+        }
+        dropContainersRootedAt(st, name);
     } else {
-        set.remove(name);
+        // Assignment through a field/index (`c.items = ...`) — conservatively
+        // drop container facts whose path the LHS could alter.
+        killMutatedContainers(o, node, st);
     }
     return .{};
 }
 
-fn analyzeIf(o: *Oracle, node: Ast.Node.Index, set: *NonzeroSet) error{OutOfMemory}!Flow {
+fn analyzeIf(o: *Oracle, node: Ast.Node.Index, st: *State) error{OutOfMemory}!Flow {
     const tree = o.tree;
     const if_data = tree.fullIf(node) orelse return .{};
     const cond = if_data.ast.cond_expr;
-
-    // Use inside the condition itself → answer with the entry set.
-    if (o.tokenInNode(cond)) return .{ .answer = set.contains(o.target) };
+    if (o.tokenInNode(cond)) return .{ .answer = o.answerAt(st) };
 
     var refine: Refinement = .{};
     collectRefinement(o, cond, &refine);
@@ -263,54 +268,42 @@ fn analyzeIf(o: *Oracle, node: Ast.Node.Index, set: *NonzeroSet) error{OutOfMemo
     const then_node = if_data.ast.then_expr;
     const else_opt = if_data.ast.else_expr.unwrap();
 
-    // THEN arm: entry set ∪ then-refinements.
-    var then_set = try set.clone(o.gpa);
-    defer then_set.deinit(o.gpa);
-    if (refine.then_nonzero) |n| try then_set.add(o.gpa, n);
-    if (o.tokenInNode(then_node)) {
-        return try analyzeNode(o, then_node, &then_set);
-    }
-    const then_flow = try analyzeNode(o, then_node, &then_set);
+    var then_st = try st.clone(o.gpa);
+    defer then_st.deinit(o.gpa);
+    try applyRefine(o, &then_st, refine.then_scalar, refine.then_container);
+    if (o.tokenInNode(then_node)) return try analyzeNode(o, then_node, &then_st);
+    const then_flow = try analyzeNode(o, then_node, &then_st);
 
-    // ELSE arm (or empty fall-through).
-    var else_set = try set.clone(o.gpa);
-    defer else_set.deinit(o.gpa);
-    if (refine.else_nonzero) |n| try else_set.add(o.gpa, n);
+    var else_st = try st.clone(o.gpa);
+    defer else_st.deinit(o.gpa);
+    try applyRefine(o, &else_st, refine.else_scalar, refine.else_container);
     var else_flow: Flow = .{};
     if (else_opt) |else_node| {
-        if (o.tokenInNode(else_node)) {
-            return try analyzeNode(o, else_node, &else_set);
-        }
-        else_flow = try analyzeNode(o, else_node, &else_set);
+        if (o.tokenInNode(else_node)) return try analyzeNode(o, else_node, &else_st);
+        else_flow = try analyzeNode(o, else_node, &else_st);
     }
 
-    // Merge arm outputs into `set` for downstream statements.
-    // Divergent arm contributes nothing; if both diverge, downstream is dead.
     if (then_flow.diverged and else_flow.diverged) {
         return .{ .diverged = true };
     } else if (then_flow.diverged) {
-        try replaceSet(o, set, &else_set);
+        try st.replaceWith(o.gpa, &else_st);
     } else if (else_flow.diverged) {
-        try replaceSet(o, set, &then_set);
+        try st.replaceWith(o.gpa, &then_st);
     } else {
-        then_set.intersectWith(&else_set);
-        try replaceSet(o, set, &then_set);
+        then_st.intersectWith(&else_st);
+        try st.replaceWith(o.gpa, &then_st);
     }
     return .{};
 }
 
 const LoopKind = enum { while_, for_ };
 
-fn analyzeLoop(o: *Oracle, node: Ast.Node.Index, set: *NonzeroSet, kind: LoopKind) error{OutOfMemory}!Flow {
+fn analyzeLoop(o: *Oracle, node: Ast.Node.Index, st: *State, kind: LoopKind) error{OutOfMemory}!Flow {
     const tree = o.tree;
-    // Sound-conservative: any local assigned inside the loop body could hold
-    // a different-iteration value at a use, so drop those facts before
-    // flowing into / past the loop.  We do not attempt a fixpoint in v1.
-    dropLoopAssigned(o, node, set);
+    // Conservative: drop facts for anything mutated in the loop body (a use's
+    // value could come from any iteration).  No fixpoint in v1.
+    dropLoopMutated(o, node, st);
 
-    // If the use is inside the loop, analyze the relevant sub-node with the
-    // (already-conservative) set.  We still apply in-loop straight-line and
-    // guard refinements that dominate the use within one iteration.
     const body_node: ?Ast.Node.Index = switch (kind) {
         .while_ => if (tree.fullWhile(node)) |w| w.ast.then_expr else null,
         .for_ => if (tree.fullFor(node)) |f| f.ast.then_expr else null,
@@ -319,134 +312,250 @@ fn analyzeLoop(o: *Oracle, node: Ast.Node.Index, set: *NonzeroSet, kind: LoopKin
         .while_ => if (tree.fullWhile(node)) |w| w.ast.cond_expr else null,
         .for_ => null,
     };
-    if (cond_node) |c| {
-        if (o.tokenInNode(c)) return .{ .answer = set.contains(o.target) };
-    }
+    if (cond_node) |c| if (o.tokenInNode(c)) return .{ .answer = o.answerAt(st) };
     if (body_node) |b| {
         if (o.tokenInNode(b)) {
-            var body_set = try set.clone(o.gpa);
-            defer body_set.deinit(o.gpa);
-            // A `while (i > 0)` condition refines the body.
+            var body_st = try st.clone(o.gpa);
+            defer body_st.deinit(o.gpa);
             if (cond_node) |c| {
                 var refine: Refinement = .{};
                 collectRefinement(o, c, &refine);
-                if (refine.then_nonzero) |n| try body_set.add(o.gpa, n);
+                try applyRefine(o, &body_st, refine.then_scalar, refine.then_container);
             }
-            return try analyzeNode(o, b, &body_set);
+            return try analyzeNode(o, b, &body_st);
         }
     }
-    // Use is after the loop: facts already conservatively dropped.
     return .{};
 }
 
-/// Replace `dst`'s contents with a clone of `src`.
-fn replaceSet(o: *Oracle, dst: *NonzeroSet, src: *const NonzeroSet) error{OutOfMemory}!void {
-    dst.names.clearRetainingCapacity();
-    try dst.names.appendSlice(o.gpa, src.names.items);
+fn applyRefine(o: *Oracle, st: *State, scalar: ?[]const u8, container: ?[]const u8) error{OutOfMemory}!void {
+    if (scalar) |s| try st.scalars.add(o.gpa, s);
+    if (container) |c| try st.containers.add(o.gpa, c);
 }
 
 const Refinement = struct {
-    then_nonzero: ?[]const u8 = null,
-    else_nonzero: ?[]const u8 = null,
+    then_scalar: ?[]const u8 = null,
+    else_scalar: ?[]const u8 = null,
+    then_container: ?[]const u8 = null,
+    else_container: ?[]const u8 = null,
 };
 
-/// Extract a nonzero refinement from a condition expression.  Recognizes a
-/// single comparison and `and`-chains (whose then-branch implies each
-/// conjunct).  Conservative: leaves fields null when unrecognized.
+/// Parse a condition for nonzero-scalar / non-empty-container refinements.
 fn collectRefinement(o: *Oracle, cond: Ast.Node.Index, out: *Refinement) void {
     if (!o.spend()) return;
     const tree = o.tree;
-    switch (tree.nodeTag(cond)) {
-        .bool_and => {
-            // `(A) and (B)` true ⟹ both A and B; collect each conjunct's
-            // then-refinement.  (No else-refinement: !(A and B) implies neither.)
-            const data = tree.nodeData(cond).node_and_node;
-            var a: Refinement = .{};
-            var b: Refinement = .{};
-            collectRefinement(o, data[0], &a);
-            collectRefinement(o, data[1], &b);
-            if (out.then_nonzero == null) out.then_nonzero = a.then_nonzero orelse b.then_nonzero;
-        },
-        .greater_than => {
-            // `x > 0` ⟹ x nonzero (then);  `0 < x` handled by less_than.
-            const data = tree.nodeData(cond).node_and_node;
-            if (identName(tree, data[0])) |x| {
-                if (isIntLiteralValue(tree, data[1], 0)) out.then_nonzero = x;
-            }
-        },
-        .less_than => {
-            // `0 < x` ⟹ x nonzero (then).  `x < 1` ⟹ x == 0 (else nonzero).
-            const data = tree.nodeData(cond).node_and_node;
-            if (isIntLiteralValue(tree, data[0], 0)) {
-                if (identName(tree, data[1])) |x| out.then_nonzero = x;
-            } else if (identName(tree, data[0])) |x| {
-                if (isIntLiteralValue(tree, data[1], 1)) out.else_nonzero = x;
-            }
-        },
-        .greater_or_equal => {
-            // `x >= 1` ⟹ x nonzero (then).  `0 >= x` ⟹ x == 0 (else).
-            const data = tree.nodeData(cond).node_and_node;
-            if (identName(tree, data[0])) |x| {
-                if (isIntLiteralValue(tree, data[1], 1)) out.then_nonzero = x;
-            } else if (isIntLiteralValue(tree, data[0], 0)) {
-                if (identName(tree, data[1])) |x| out.else_nonzero = x;
-            }
-        },
-        .less_or_equal => {
-            // `x <= 0` ⟹ x == 0 (else nonzero).  `1 <= x` ⟹ x nonzero (then).
-            const data = tree.nodeData(cond).node_and_node;
-            if (identName(tree, data[0])) |x| {
-                if (isIntLiteralValue(tree, data[1], 0)) out.else_nonzero = x;
-            } else if (isIntLiteralValue(tree, data[0], 1)) {
-                if (identName(tree, data[1])) |x| out.then_nonzero = x;
-            }
-        },
-        .bang_equal => {
-            // `x != 0` ⟹ x nonzero (then).
-            const data = tree.nodeData(cond).node_and_node;
-            if (identName(tree, data[0])) |x| {
-                if (isIntLiteralValue(tree, data[1], 0)) out.then_nonzero = x;
-            } else if (isIntLiteralValue(tree, data[0], 0)) {
-                if (identName(tree, data[1])) |x| out.then_nonzero = x;
-            }
-        },
-        .equal_equal => {
-            // `x == 0` ⟹ x == 0 (else nonzero).
-            const data = tree.nodeData(cond).node_and_node;
-            if (identName(tree, data[0])) |x| {
-                if (isIntLiteralValue(tree, data[1], 0)) out.else_nonzero = x;
-            } else if (isIntLiteralValue(tree, data[0], 0)) {
-                if (identName(tree, data[1])) |x| out.else_nonzero = x;
-            }
-        },
-        else => {},
+    const tag = tree.nodeTag(cond);
+    if (tag == .bool_and) {
+        const d = tree.nodeData(cond).node_and_node;
+        var a: Refinement = .{};
+        var b: Refinement = .{};
+        collectRefinement(o, d[0], &a);
+        collectRefinement(o, d[1], &b);
+        if (out.then_scalar == null) out.then_scalar = a.then_scalar orelse b.then_scalar;
+        if (out.then_container == null) out.then_container = a.then_container orelse b.then_container;
+        return;
+    }
+    const cmp: Cmp = switch (tag) {
+        .greater_than => .gt,
+        .less_than => .lt,
+        .greater_or_equal => .ge,
+        .less_or_equal => .le,
+        .bang_equal => .ne,
+        .equal_equal => .eq,
+        else => return,
+    };
+    const d = tree.nodeData(cond).node_and_node;
+    // Determine (operand, literal) orientation.
+    const lhs_key = operandKey(o, d[0]);
+    const rhs_key = operandKey(o, d[1]);
+    if (lhs_key) |lk| {
+        if (isIntLiteralValue(tree, d[1], 0)) applyCmp(out, lk, cmp, 0, false);
+        if (isIntLiteralValue(tree, d[1], 1)) applyCmp(out, lk, cmp, 1, false);
+    } else if (rhs_key) |rk| {
+        // literal on the left → flip orientation
+        if (isIntLiteralValue(tree, d[0], 0)) applyCmp(out, rk, cmp, 0, true);
+        if (isIntLiteralValue(tree, d[0], 1)) applyCmp(out, rk, cmp, 1, true);
     }
 }
 
-/// Drop every local assigned anywhere inside the loop's body from `set`.
-fn dropLoopAssigned(o: *Oracle, loop_node: Ast.Node.Index, set: *NonzeroSet) void {
+const Cmp = enum { gt, lt, ge, le, ne, eq };
+
+const OperandKey = struct { key: []const u8, is_container: bool };
+
+/// Classify a comparison operand as either a scalar local `x` or a container
+/// length `c.len` (→ container key = source spelling of `c`).
+fn operandKey(o: *Oracle, node: Ast.Node.Index) ?OperandKey {
+    const tree = o.tree;
+    if (identName(tree, node)) |name| return .{ .key = name, .is_container = false };
+    if (tree.nodeTag(node) == .field_access) {
+        const data = tree.nodeData(node).node_and_token;
+        if (std.mem.eql(u8, tree.tokenSlice(data[1]), "len")) {
+            return .{ .key = nodeSrc(tree, data[0]), .is_container = true };
+        }
+    }
+    return null;
+}
+
+/// Apply a comparison `key <cmp> lit` (or flipped) to a refinement.  Encodes
+/// the nonzero/non-empty truth of each arm.  `flipped` means literal was on
+/// the left (`lit <cmp> key`).
+fn applyCmp(out: *Refinement, ok: OperandKey, cmp: Cmp, lit: u64, flipped: bool) void {
+    // Normalize to `key OP lit`.
+    const op: Cmp = if (!flipped) cmp else switch (cmp) {
+        .gt => .lt,
+        .lt => .gt,
+        .ge => .le,
+        .le => .ge,
+        .ne => .ne,
+        .eq => .eq,
+    };
+    // Determine which arm proves "key is nonzero / nonempty".
+    // Positive (then) facts and negative (else) facts:
+    var then_true = false; // key>0 holds in THEN
+    var else_true = false; // key>0 holds in ELSE
+    if (lit == 0) {
+        switch (op) {
+            .gt, .ne => then_true = true, // key > 0 / key != 0
+            .eq, .le => else_true = true, // key == 0 / key <= 0  ⟹ else: key > 0
+            else => {},
+        }
+    } else if (lit == 1) {
+        switch (op) {
+            .ge => then_true = true, // key >= 1
+            .lt => else_true = true, // key < 1 ⟹ key == 0 ⟹ else: key > 0
+            else => {},
+        }
+    }
+    if (then_true) {
+        if (ok.is_container) {
+            if (out.then_container == null) out.then_container = ok.key;
+        } else if (out.then_scalar == null) out.then_scalar = ok.key;
+    }
+    if (else_true) {
+        if (ok.is_container) {
+            if (out.else_container == null) out.else_container = ok.key;
+        } else if (out.else_scalar == null) out.else_scalar = ok.key;
+    }
+}
+
+/// Drop container facts whose root path is mutated within `node`'s tokens.
+fn killMutatedContainers(o: *Oracle, node: Ast.Node.Index, st: *State) void {
+    if (st.containers.keys.items.len == 0) return;
+    const tree = o.tree;
+    const first = tree.firstToken(node);
+    const last = tree.lastToken(node);
+    dropContainersMutatedInTokens(tree, first, last, st);
+}
+
+fn dropLoopMutated(o: *Oracle, loop_node: Ast.Node.Index, st: *State) void {
     const tree = o.tree;
     const first = tree.firstToken(loop_node);
     const last = tree.lastToken(loop_node);
-    // Token-level scan for `NAME =` / `NAME +=` / etc. assignment targets and
-    // `NAME` in for/while payload captures.  Conservative: any identifier
-    // immediately followed by an assignment operator is treated as mutated.
     const tags = tree.tokens.items(.tag);
+    // Scalars: any `NAME <assign-op>` inside the loop.
     var t = first;
     while (t < last) : (t += 1) {
         if (tags[t] != .identifier) continue;
-        switch (tags[t + 1]) {
-            .equal,
-            .plus_equal,
-            .minus_equal,
-            .asterisk_equal,
-            .slash_equal,
-            .percent_equal,
-            .plus_percent_equal,
-            .minus_percent_equal,
-            => set.remove(tree.tokenSlice(t)),
-            else => {},
+        if (isAssignOp(tags[t + 1])) st.scalars.remove(tree.tokenSlice(t));
+    }
+    dropContainersMutatedInTokens(tree, first, last, st);
+}
+
+/// Mutating container methods (grow/shrink/clear).
+fn isMutatingMethod(name: []const u8) bool {
+    const muts = [_][]const u8{
+        "append",      "appendSlice",        "appendAssumeCapacity", "appendNTimes",
+        "insert",      "insertSlice",        "resize",               "shrinkAndFree",
+        "shrinkRetainingCapacity",          "clearRetainingCapacity", "clearAndFree",
+        "pop",         "popOrNull",          "orderedRemove",        "swapRemove",
+        "addOne",      "addOneAssumeCapacity", "addManyAsArray",     "addManyAsSlice",
+        "ensureTotalCapacity",              "ensureUnusedCapacity", "writer",
+        "deinit",      "toOwnedSlice",
+    };
+    for (muts) |m| if (std.mem.eql(u8, name, m)) return true;
+    return false;
+}
+
+/// For each tracked container path, drop it if the token range mutates it:
+/// `<path> . <mutating-method> (` or `<path> <assign-op>` or `<path> . X =`.
+fn dropContainersMutatedInTokens(
+    tree: *const Ast,
+    first: Ast.TokenIndex,
+    last: Ast.TokenIndex,
+    st: *State,
+) void {
+    if (st.containers.keys.items.len == 0) return;
+    const tags = tree.tokens.items(.tag);
+    var i: usize = 0;
+    while (i < st.containers.keys.items.len) {
+        const path = st.containers.keys.items[i];
+        if (containerMutatedInTokens(tree, tags, first, last, path)) {
+            _ = st.containers.keys.swapRemove(i);
+        } else i += 1;
+    }
+}
+
+/// True iff `path` (a source spelling like "arr" or "self.items") is mutated
+/// in [first,last]: a call `path.<mut>(`, `path <assign>`, or `path.<f> =`.
+fn containerMutatedInTokens(
+    tree: *const Ast,
+    tags: []const std.zig.Token.Tag,
+    first: Ast.TokenIndex,
+    last: Ast.TokenIndex,
+    path: []const u8,
+) bool {
+    var t = first;
+    while (t + 1 <= last) : (t += 1) {
+        // Match the path as a contiguous source run beginning at token t.
+        const after = matchPathTokens(tree, t, last, path) orelse continue;
+        // after = token index just past the matched path.
+        if (after > last) return false;
+        switch (tags[after]) {
+            .period => {
+                // path.<ident>(  → method call; treat as mutation if the
+                // method is mutating, OR `path.<ident> =` (field write).
+                if (after + 1 <= last and tags[after + 1] == .identifier) {
+                    const m = tree.tokenSlice(after + 1);
+                    if (after + 2 <= last and tags[after + 2] == .l_paren and isMutatingMethod(m)) return true;
+                    if (after + 2 <= last and isAssignOp(tags[after + 2])) return true;
+                }
+            },
+            else => if (isAssignOp(tags[after])) return true,
         }
+    }
+    return false;
+}
+
+/// If the source spelling `path` matches the contiguous token run starting at
+/// `t`, return the token index just past it; else null.  Handles dotted paths
+/// like "self.items" (identifier period identifier).
+fn matchPathTokens(tree: *const Ast, t: Ast.TokenIndex, last: Ast.TokenIndex, path: []const u8) ?Ast.TokenIndex {
+    var cur = t;
+    var rest = path;
+    while (rest.len > 0) {
+        if (cur > last) return null;
+        if (tree.tokens.items(.tag)[cur] == .identifier) {
+            const slice = tree.tokenSlice(cur);
+            if (!std.mem.startsWith(u8, rest, slice)) return null;
+            rest = rest[slice.len..];
+            cur += 1;
+        } else if (rest[0] == '.') {
+            if (tree.tokens.items(.tag)[cur] != .period) return null;
+            rest = rest[1..];
+            cur += 1;
+        } else return null;
+    }
+    return cur;
+}
+
+fn dropContainersRootedAt(st: *State, root: []const u8) void {
+    var i: usize = 0;
+    while (i < st.containers.keys.items.len) {
+        const p = st.containers.keys.items[i];
+        // root match: p == root, or p starts with `root.`
+        const rooted = std.mem.eql(u8, p, root) or
+            (p.len > root.len and std.mem.startsWith(u8, p, root) and p[root.len] == '.');
+        if (rooted) _ = st.containers.keys.swapRemove(i) else i += 1;
     }
 }
 
@@ -457,18 +566,41 @@ fn identName(tree: *const Ast, node: Ast.Node.Index) ?[]const u8 {
     return tree.tokenSlice(tree.nodeMainToken(node));
 }
 
+fn isAssignOp(tag: std.zig.Token.Tag) bool {
+    return switch (tag) {
+        .equal,
+        .plus_equal,
+        .minus_equal,
+        .asterisk_equal,
+        .slash_equal,
+        .percent_equal,
+        .plus_percent_equal,
+        .minus_percent_equal,
+        => true,
+        else => false,
+    };
+}
+
 fn isPositiveIntLiteral(tree: *const Ast, node: Ast.Node.Index) bool {
     if (tree.nodeTag(node) != .number_literal) return false;
-    const s = tree.tokenSlice(tree.nodeMainToken(node));
-    const v = std.fmt.parseInt(u64, s, 0) catch return false;
+    const v = std.fmt.parseInt(u64, tree.tokenSlice(tree.nodeMainToken(node)), 0) catch return false;
     return v > 0;
 }
 
 fn isIntLiteralValue(tree: *const Ast, node: Ast.Node.Index, want: u64) bool {
     if (tree.nodeTag(node) != .number_literal) return false;
-    const s = tree.tokenSlice(tree.nodeMainToken(node));
-    const v = std.fmt.parseInt(u64, s, 0) catch return false;
+    const v = std.fmt.parseInt(u64, tree.tokenSlice(tree.nodeMainToken(node)), 0) catch return false;
     return v == want;
+}
+
+/// Source substring spanning a node (for canonical container-path keys).
+fn nodeSrc(tree: *const Ast, node: Ast.Node.Index) []const u8 {
+    const starts = tree.tokens.items(.start);
+    const ft = tree.firstToken(node);
+    const lt = tree.lastToken(node);
+    const start: usize = starts[ft];
+    const end: usize = starts[lt] + tree.tokenSlice(lt).len;
+    return tree.source[start..end];
 }
 
 fn blockStmts(
@@ -491,8 +623,6 @@ fn blockStmts(
     };
 }
 
-// ── Tests ───────────────────────────────────────────────────
-// Tests live in value_range_tests.zig to keep this file navigable.
 test {
     _ = @import("value_range_tests.zig");
 }

@@ -318,6 +318,10 @@ fn checkBody(
             if (hasIncrementGuard(tags, tree, t, &.{ outer_name, idx_name })) continue;
             if (hasInitToOneGuard(tags, tree, t, &.{ outer_name, idx_name })) continue;
             if (hasPriorArithmeticGuard(tags, tree, t, &.{ outer_name, idx_name })) continue;
+            // Value-range oracle: when the index is `outer.len`, a dominating
+            // proof that `outer` is non-empty makes `outer.len - 1` safe.
+            if (std.mem.eql(u8, idx_name, "len") and
+                value_range.provesNonempty(gpa, tree, body, outer_name, t)) continue;
             try report(gpa, problems, tree, t, idx_name);
             continue;
         }
@@ -353,6 +357,15 @@ fn checkBody(
             if (hasAssertGuard(tags, tree, t, &.{ recv_name, field_name, "len" })) continue;
             if (hasEarlyReturnGuard(tags, tree, t, &.{ recv_name, field_name, "len" })) continue;
             if (hasZeroAccessGuard(tags, tree, t, &.{ recv_name, field_name })) continue;
+            // Value-range oracle: index is `recv.field.len`; a dominating proof
+            // that container `recv.field` is non-empty makes `…len - 1` safe.
+            // Build the container path as the exact source spelling (matches
+            // the oracle's source-substring keys).
+            {
+                const starts = tree.tokens.items(.start);
+                const path = tree.source[starts[t + 1] .. starts[t + 3] + tree.tokenSlice(t + 3).len];
+                if (value_range.provesNonempty(gpa, tree, body, path, t)) continue;
+            }
             try reportC(gpa, problems, tree, t, recv_name, field_name);
             continue;
         }

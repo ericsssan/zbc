@@ -198,3 +198,100 @@ test "nonzero: reassignment after guard clears fact" {
         \\
     , "i", "buf"));
 }
+
+// ── container non-empty ──────────────────────────────────────
+
+/// Query `provesNonempty(container)` at the `[` token after identifier `arr`.
+fn proveNonemptyAt(src: [:0]const u8, container: []const u8, arr: []const u8) !bool {
+    const gpa = std.testing.allocator;
+    var tree = try Ast.parse(gpa, src, .zig);
+    defer tree.deinit(gpa);
+    const body = firstFnBody(&tree) orelse return error.NoFnBody;
+    const lbracket = subscriptLBracket(&tree, arr) orelse return error.NoSubscript;
+    return value_range.provesNonempty(gpa, &tree, body, container, lbracket);
+}
+
+test "nonempty: bare arr.len-1 is unknown (fires)" {
+    try std.testing.expect(!try proveNonemptyAt(
+        \\fn f(arr: []const u8) u8 {
+        \\    return arr[arr.len - 1];
+        \\}
+        \\
+    , "arr", "arr"));
+}
+
+test "nonempty: arr.len > 0 guard" {
+    try std.testing.expect(try proveNonemptyAt(
+        \\fn f(arr: []const u8) u8 {
+        \\    if (arr.len > 0) return arr[arr.len - 1];
+        \\    return 0;
+        \\}
+        \\
+    , "arr", "arr"));
+}
+
+test "nonempty: early return on empty (divergence)" {
+    try std.testing.expect(try proveNonemptyAt(
+        \\fn f(arr: []const u8) u8 {
+        \\    if (arr.len == 0) return 0;
+        \\    return arr[arr.len - 1];
+        \\}
+        \\
+    , "arr", "arr"));
+}
+
+test "nonempty: arr.len != 0 guard" {
+    try std.testing.expect(try proveNonemptyAt(
+        \\fn f(arr: []const u8) u8 {
+        \\    if (arr.len != 0) return arr[arr.len - 1];
+        \\    return 0;
+        \\}
+        \\
+    , "arr", "arr"));
+}
+
+test "nonempty: dotted path self.items" {
+    try std.testing.expect(try proveNonemptyAt(
+        \\fn f(self: *Foo) u8 {
+        \\    if (self.items.len > 0) return self.items[self.items.len - 1];
+        \\    return 0;
+        \\}
+        \\
+    , "self.items", "items"));
+}
+
+test "nonempty: clear after guard is unsafe" {
+    try std.testing.expect(!try proveNonemptyAt(
+        \\fn f(arr: *std.ArrayList(u8)) u8 {
+        \\    if (arr.len > 0) {
+        \\        arr.clearRetainingCapacity();
+        \\        return arr[arr.len - 1];
+        \\    }
+        \\    return 0;
+        \\}
+        \\
+    , "arr", "arr"));
+}
+
+test "nonempty: reassignment after guard is unsafe" {
+    try std.testing.expect(!try proveNonemptyAt(
+        \\fn f(arr: []const u8, other: []const u8) u8 {
+        \\    if (arr.len > 0) {
+        \\        arr = other;
+        \\        return arr[arr.len - 1];
+        \\    }
+        \\    return 0;
+        \\}
+        \\
+    , "arr", "arr"));
+}
+
+test "nonempty: unrelated container guard does not prove" {
+    try std.testing.expect(!try proveNonemptyAt(
+        \\fn f(arr: []const u8, other: []const u8) u8 {
+        \\    if (other.len > 0) return arr[arr.len - 1];
+        \\    return 0;
+        \\}
+        \\
+    , "arr", "arr"));
+}
