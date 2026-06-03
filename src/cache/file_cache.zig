@@ -73,6 +73,16 @@ pub const FileCache = struct {
         self.zls = zls;
     }
 
+    /// Compile-time element count of `node`'s type when it resolves to a
+    /// fixed-size array `[N]T` (or single-pointer to one).  Returns null when
+    /// the type engine is unavailable (token-only mode) or the type is a
+    /// runtime slice / non-array.  A non-null result is an exact, compiler-
+    /// guaranteed bound — safe to use for slice in-bounds reasoning.
+    pub fn fixedArrayLenOf(self: *FileCache, node: std.zig.Ast.Node.Index) ?u64 {
+        const z = self.zls orelse return null;
+        return z.fixedArrayLen(node) catch null;
+    }
+
     pub fn setProject(
         self: *FileCache,
         project: ?*project_cache_mod.ProjectCache,

@@ -250,6 +250,45 @@ pub const TypeResolver = struct {
             else => false,
         };
     }
+
+    /// Returns the compile-time element count of `node`'s type when it is a
+    /// fixed-size array `[N]T`, a single-pointer to a fixed array `*[N]T` /
+    /// `*const [N]T`, or an IP-backed array type.  Returns null for runtime
+    /// slices (`[]T`), many-pointers, or any type whose length is not a
+    /// compile-time constant.
+    ///
+    /// Sound for bounds reasoning: a non-null result is an exact, compiler-
+    /// guaranteed length, so `arr[offset..]` is in-bounds iff offset <= N.
+    pub fn fixedArrayLen(self: *TypeResolver, node: Ast.Node.Index) !?u64 {
+        const ty_maybe = try self.analyser.resolveTypeOfNode(.of(node, self.handle));
+        const ty = ty_maybe orelse return null;
+        return self.fixedArrayLenOfType(ty, 0);
+    }
+
+    fn fixedArrayLenOfType(self: *TypeResolver, ty: Analyser.Type, depth: u8) ?u64 {
+        if (depth > 4) return null;
+        return switch (ty.data) {
+            .array => |a| a.elem_count,
+            // `*[N]T` / `*const [N]T` — a single pointer to a fixed array.
+            // Slicing the pointer (`p[off..]`) is bounds-checked against N.
+            .pointer => |p| if (p.size == .one)
+                self.fixedArrayLenOfType(p.elem_ty.*, depth + 1)
+            else
+                null,
+            .ip_index => |payload| switch (self.ctx.ip.indexToKey(payload.type)) {
+                .array_type => |info| info.len,
+                .pointer_type => |info| if (info.flags.size == .one)
+                    switch (self.ctx.ip.indexToKey(info.elem_type)) {
+                        .array_type => |arr| arr.len,
+                        else => null,
+                    }
+                else
+                    null,
+                else => null,
+            },
+            else => null,
+        };
+    }
 };
 
 fn containerName(arena: std.mem.Allocator, container: anytype) !?[]const u8 {

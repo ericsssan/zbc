@@ -83,15 +83,34 @@ pub fn check(
     problems: *std.ArrayListUnmanaged(Problem),
 ) !void {
     if (!config_mod.isEnabled(config, .slice_from_fixed_offset_without_len_check)) return;
-    _ = cache;
 
     var ctx = try FileCtx.build(gpa, tree);
     defer ctx.deinit(gpa);
 
+    // Map each slice expression's `[` token → its operand AST node, so the
+    // token-walk firing site (keyed on the l_bracket token) can recover the
+    // operand node and ask the type engine for its fixed-array length.  Built
+    // once per file; empty/unused when the type resolver is absent.
+    var slice_ops: std.AutoHashMapUnmanaged(Ast.TokenIndex, Ast.Node.Index) = .empty;
+    defer slice_ops.deinit(gpa);
+    {
+        var ni: u32 = 0;
+        while (ni < tree.nodes.len) : (ni += 1) {
+            const node: Ast.Node.Index = @enumFromInt(ni);
+            switch (tree.nodeTag(node)) {
+                .slice_open, .slice, .slice_sentinel => {
+                    const sl = tree.fullSlice(node) orelse continue;
+                    try slice_ops.put(gpa, tree.nodeMainToken(node), sl.ast.sliced);
+                },
+                else => {},
+            }
+        }
+    }
+
     var proto_buf: [1]Ast.Node.Index = undefined;
     var fns = tokens.iterFnDecls(tree);
     while (fns.next(&proto_buf)) |fn_entry| {
-        try checkBody(gpa, tree, &ctx, fn_entry.name_token, fn_entry.proto, fn_entry.body, problems);
+        try checkBody(gpa, tree, cache, &ctx, &slice_ops, fn_entry.name_token, fn_entry.proto, fn_entry.body, problems);
     }
 }
 
@@ -393,7 +412,9 @@ fn analyzeReturnSwitch(tree: *const Ast, tags: []const std.zig.Token.Tag, sw_tok
 fn checkBody(
     gpa: std.mem.Allocator,
     tree: *const Ast,
+    cache: *file_cache_mod.FileCache,
     ctx: *const FileCtx,
+    slice_ops: *const std.AutoHashMapUnmanaged(Ast.TokenIndex, Ast.Node.Index),
     name_token: Ast.TokenIndex,
     proto: Ast.full.FnProto,
     body: Ast.Node.Index,
@@ -490,6 +511,20 @@ fn checkBody(
         // runtime out-of-bounds this rule targets (which is a `[]T` slice whose
         // length is unconstrained).  (Tier 3: local declaration tracking.)
         if (isLocalFixedArray(tree, tags, first, t, buf_name)) continue;
+
+        // Suppression (type engine): the operand resolves to a fixed-size array
+        // `[K]T` (or single-pointer `*[K]T`) with K >= offset.  Unlike the
+        // token-based local-array check above, this also covers parameters,
+        // struct fields, and call results whose type is a fixed array — the
+        // length is a compiler-guaranteed constant, so `buf[offset..]` that
+        // compiles is always in-bounds.  No-op when the resolver is absent.
+        if (offsetValue(offset_str)) |off| {
+            if (slice_ops.get(t + 1)) |operand_node| {
+                if (cache.fixedArrayLenOf(operand_node)) |alen| {
+                    if (alen >= off) continue;
+                }
+            }
+        }
 
         // Suppression (cross-fn, 1-hop): `const buf = CALLEE(…); buf[N..]` where
         // CALLEE has a return-length postcondition >= N.  `CALLEE` returns slices
