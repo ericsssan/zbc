@@ -71,7 +71,25 @@ fn checkFn(
     if (hasDepthParam(tree, proto)) return;
 
     // Step 4: find a self-recursive call in the body.
-    const rec_tok = findRecursiveCall(tree, tags, first, last, fn_name) orelse return;
+    // Extract the first non-comptime parameter name so the method-form detector
+    // can distinguish `self.parse()` (recursive self-call) from calls on
+    // other objects.  Comptime type parameters (e.g. `comptime T: type`) are
+    // excluded — they are type-dispatch args, not self-receivers.
+    var first_param_name: ?[]const u8 = null;
+    {
+        const tok_tags = tree.tokens.items(.tag);
+        var pit = proto.iterate(tree);
+        if (pit.next()) |p| {
+            const is_comptime = if (p.comptime_noalias) |cn|
+                tok_tags[cn] == .keyword_comptime
+            else
+                false;
+            if (!is_comptime) {
+                if (p.name_token) |nt| first_param_name = tree.tokenSlice(nt);
+            }
+        }
+    }
+    const rec_tok = findRecursiveCall(tree, tags, first, last, fn_name, first_param_name) orelse return;
 
     // Step 5: check for a stack guard anywhere in the body.
     if (hasStackGuard(tags, tree, first, last)) return;
@@ -120,12 +138,20 @@ fn hasDepthParam(tree: *const Ast, proto: Ast.full.FnProto) bool {
 /// Detects:
 ///   Method form: `period identifier(fn_name) l_paren`
 ///   Bare form:   `identifier(fn_name) l_paren` where t-1 != period
+///
+/// Suppression for method form:
+///   - Multi-level qualified paths (`mod.sub.fn_name`) are skipped — they
+///     refer to a different module's function, not a recursive self-call.
+///   - The receiver (token before `.`) must be `self`, `this`, `ctx`, or
+///     match `first_param_name` (the fn's own self parameter).  Any other
+///     receiver (e.g. a local `parser` variable) is a different object.
 fn findRecursiveCall(
     tree: *const Ast,
     tags: []const std.zig.Token.Tag,
     first: Ast.TokenIndex,
     last: Ast.TokenIndex,
     fn_name: []const u8,
+    first_param_name: ?[]const u8,
 ) ?Ast.TokenIndex {
     if (first + 1 > last) return null;
     var t: Ast.TokenIndex = first;
@@ -141,7 +167,26 @@ fn findRecursiveCall(
         if (!std.mem.eql(u8, tree.tokenSlice(t), fn_name)) continue;
 
         // Method form: preceded by `.`
-        if (t > first and tags[t - 1] == .period) return t;
+        if (t > first and tags[t - 1] == .period) {
+            // Skip multi-level qualified paths: `mod.sub.NAME(…)`.
+            // If t-3 is also `.`, this is `a.b.NAME` — a different module.
+            if (t >= 3 and tags[t - 3] == .period) continue;
+            // Skip generic/constructed receivers: `Type(T).NAME(…)`.
+            // If t-2 is `)`, the receiver is a computed expression, not self.
+            if (t >= 2 and tags[t - 2] == .r_paren) continue;
+            // Require the receiver to match the fn's own self-parameter or a
+            // conventional receiver name.  Other receivers are different objects.
+            if (t >= 2 and tags[t - 2] == .identifier) {
+                const recv = tree.tokenSlice(t - 2);
+                const is_self =
+                    std.mem.eql(u8, recv, "self") or
+                    std.mem.eql(u8, recv, "this") or
+                    std.mem.eql(u8, recv, "ctx") or
+                    (first_param_name != null and std.mem.eql(u8, recv, first_param_name.?));
+                if (!is_self) continue;
+            }
+            return t;
+        }
 
         // Bare form: NOT preceded by `.`
         if (t == first or tags[t - 1] != .period) return t;
