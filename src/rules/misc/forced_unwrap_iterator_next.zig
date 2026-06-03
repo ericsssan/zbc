@@ -57,7 +57,7 @@ pub fn check(
 
     var test_ranges: std.ArrayListUnmanaged(Range) = .empty;
     defer test_ranges.deinit(gpa);
-    try collectTestRanges(gpa, tags, &test_ranges);
+    try collectTestRanges(gpa, tree, tags, &test_ranges);
 
     var t: Ast.TokenIndex = 0;
     while (t + 5 <= last_tok) : (t += 1) {
@@ -98,26 +98,40 @@ pub fn check(
 /// through its body's closing `r_brace` (inclusive).
 const Range = struct { start: Ast.TokenIndex, end: Ast.TokenIndex };
 
-/// Collects the token range of every `test` declaration in the file (top-level
-/// or container-nested).  Zig grammar:
-///   `KEYWORD_test (STRINGLITERAL / IDENTIFIER)? Block`
-/// so the first `l_brace` after `keyword_test` opens the body; we brace-match
-/// from there to find the closing `r_brace`.  Ranges are pairwise disjoint
-/// (tests cannot nest), so a linear containment check suffices.
+/// Collects the token range of every `test` declaration and every `fn testXxx`
+/// test-utility function in the file.  Covers:
+///   `KEYWORD_test (STRINGLITERAL / IDENTIFIER)? Block`  — test declarations
+///   `KEYWORD_fn IDENTIFIER(testXxx...) PARAMS RETTYPE Block` — test helpers
+/// where `testXxx` means the name starts with lowercase "test" followed by an
+/// uppercase letter (camelCase convention for Zig test utilities).
+/// Ranges are pairwise disjoint (tests cannot nest), so a linear containment
+/// check suffices.
 fn collectTestRanges(
     gpa: std.mem.Allocator,
+    tree: *const Ast,
     tags: []const std.zig.Token.Tag,
     out: *std.ArrayListUnmanaged(Range),
 ) !void {
     const n: u32 = @intCast(tags.len);
     var i: Ast.TokenIndex = 0;
     while (i < n) : (i += 1) {
-        if (tags[i] != .keyword_test) continue;
+        const is_test_decl = tags[i] == .keyword_test;
+        const is_test_fn = blk: {
+            if (tags[i] != .keyword_fn) break :blk false;
+            if (i + 1 >= n or tags[i + 1] != .identifier) break :blk false;
+            const name = tree.tokenSlice(i + 1);
+            // Match fn names that start with "test" (lowercase) followed by
+            // an uppercase letter — the Zig convention for test helper fns.
+            if (name.len < 5) break :blk false;
+            if (!std.mem.startsWith(u8, name, "test")) break :blk false;
+            break :blk std.ascii.isUpper(name[4]);
+        };
+        if (!is_test_decl and !is_test_fn) continue;
 
-        // Find the body's opening `l_brace` (skipping an optional name token).
+        // Find the body's opening `l_brace` (skipping header tokens).
         var j = i + 1;
         while (j < n and tags[j] != .l_brace) : (j += 1) {
-            // Defensive: a well-formed test header has no `;`/`}` before `{`.
+            // Defensive: a well-formed header has no `;`/`}` before `{`.
             if (tags[j] == .semicolon or tags[j] == .r_brace) break;
         }
         if (j >= n or tags[j] != .l_brace) continue;
@@ -136,7 +150,7 @@ fn collectTestRanges(
         if (k >= n) break; // unbalanced — only possible on a malformed tree
 
         try out.append(gpa, .{ .start = i, .end = k });
-        i = k; // resume past this test body
+        i = k; // resume past this body
     }
 }
 
@@ -381,6 +395,25 @@ test "forced-unwrap-iterator-next: non-assert call still fires" {
     try testing.expectFires(check, R,
         \\fn process(it: *SomeIterator) void {
         \\    log(it.next().?);
+        \\}
+        \\
+    );
+}
+
+test "forced-unwrap-iterator-next: fn testXxx body suppressed" {
+    try testing.expectNoFire(check,
+        \\fn testParse(params: []const u16) Attribute {
+        \\    var p: Parser = .{ .params = params };
+        \\    return p.next().?;
+        \\}
+        \\
+    );
+}
+
+test "forced-unwrap-iterator-next: fn not starting with test still fires" {
+    try testing.expectFires(check, R,
+        \\fn parse(p: *Parser) Attribute {
+        \\    return p.next().?;
         \\}
         \\
     );
