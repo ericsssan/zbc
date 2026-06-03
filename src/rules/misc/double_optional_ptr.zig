@@ -49,6 +49,23 @@ pub fn check(
         if (tags[t + 2] != .question_mark) continue;
         if (tags[t + 3] != .identifier) continue;
 
+        // Suppress `field: ?*?T = null` — a struct field with an explicit
+        // default is always intentional: the outer `?` is the "no-storage"
+        // sentinel and the inner `?T` is the "not-yet-populated" sentinel.
+        // Scan forward past any qualified-name tokens (`.identifier`) to
+        // find `=` (struct default) before `,` / `;` / `)` (end of param).
+        {
+            var s = t + 3;
+            const has_default = while (s <= @min(t + 12, last_tok)) : (s += 1) {
+                switch (tags[s]) {
+                    .equal => break true,
+                    .comma, .semicolon, .r_paren, .r_brace => break false,
+                    else => {},
+                }
+            } else false;
+            if (has_default) continue;
+        }
+
         try report(gpa, problems, tree, t);
     }
 }
@@ -111,6 +128,31 @@ test "double-optional-ptr: plain *T does not fire" {
         \\fn readValue(ptr: *u32) u32 {
         \\    return ptr.*;
         \\}
+        \\
+    );
+}
+
+test "double-optional-ptr: struct field with null default suppressed" {
+    try testing.expectNoFire(check,
+        \\const LintContext = struct {
+        \\    checker_storage: ?*?Checker = null,
+        \\};
+        \\
+    );
+}
+
+test "double-optional-ptr: struct field with qualified type + null default suppressed" {
+    try testing.expectNoFire(check,
+        \\const Ctx = struct {
+        \\    tag_csr_out: ?*?js_buffer.TagNodeCsrResult = null,
+        \\};
+        \\
+    );
+}
+
+test "double-optional-ptr: function param without default still fires" {
+    try testing.expectFires(check, R,
+        \\extern fn napi_fn(env: napi_env, result: ?*?SomeType) napi_status;
         \\
     );
 }
