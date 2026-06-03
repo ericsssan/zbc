@@ -286,6 +286,26 @@ test "nonempty: reassignment after guard is unsafe" {
     , "arr", "arr"));
 }
 
+test "nonempty: early-return with OR guard (len==0 or empty)" {
+    try std.testing.expect(try proveNonemptyAt(
+        \\fn tail(self: *Foo) u8 {
+        \\    if (self.buffer.len == 0 or self.empty()) return 0;
+        \\    return self.buffer[(self.index) % self.buffer.len];
+        \\}
+        \\
+    , "self.buffer", "buffer"));
+}
+
+test "nonzero: early-return with OR guard (i==0 or other)" {
+    try std.testing.expect(try proveAt(
+        \\fn f(i: usize, c: bool, buf: []const u8) u8 {
+        \\    if (i == 0 or c) return 0;
+        \\    return buf[i - 1];
+        \\}
+        \\
+    , "i", "buf"));
+}
+
 test "nonempty: unrelated container guard does not prove" {
     try std.testing.expect(!try proveNonemptyAt(
         \\fn f(arr: []const u8, other: []const u8) u8 {

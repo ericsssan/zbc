@@ -401,6 +401,7 @@ fn collectRefinement(o: *Oracle, cond: Ast.Node.Index, out: *Refinement) void {
     const tree = o.tree;
     const tag = tree.nodeTag(cond);
     if (tag == .bool_and) {
+        // `(A) and (B)` true ⟹ both A and B ⟹ union of their THEN-refinements.
         const d = tree.nodeData(cond).node_and_node;
         var a: Refinement = .{};
         var b: Refinement = .{};
@@ -408,6 +409,19 @@ fn collectRefinement(o: *Oracle, cond: Ast.Node.Index, out: *Refinement) void {
         collectRefinement(o, d[1], &b);
         if (out.then_scalar == null) out.then_scalar = a.then_scalar orelse b.then_scalar;
         if (out.then_container == null) out.then_container = a.then_container orelse b.then_container;
+        return;
+    }
+    if (tag == .bool_or) {
+        // `(A) or (B)` false ⟹ !A and !B ⟹ union of their ELSE-refinements.
+        // This is the canonical early-return-on-empty guard:
+        //   if (c.len == 0 or c.empty()) return;   // fall-through ⟹ c non-empty
+        const d = tree.nodeData(cond).node_and_node;
+        var a: Refinement = .{};
+        var b: Refinement = .{};
+        collectRefinement(o, d[0], &a);
+        collectRefinement(o, d[1], &b);
+        if (out.else_scalar == null) out.else_scalar = a.else_scalar orelse b.else_scalar;
+        if (out.else_container == null) out.else_container = a.else_container orelse b.else_container;
         return;
     }
     const cmp: Cmp = switch (tag) {
