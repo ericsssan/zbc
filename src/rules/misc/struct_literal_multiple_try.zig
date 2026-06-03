@@ -17,6 +17,13 @@
 //!   — find the first `.field = try` 4-token prefix, skip to the next `,` at
 //!   depth 0, then check whether the following tokens are `. identifier = try`.
 //!   Fire at the second `.` token (the start of the second field assignment).
+//!
+//!   The leak only matters if the FIRST `try` actually allocates an owned
+//!   resource (the second `try` failing is what leaks the first's allocation).
+//!   So the first try-expression must contain an allocation signal —
+//!   `alloc`, `dupe`, `clone`, `create`, or `toOwnedSlice`.  Decoder/parser
+//!   tries (`read_int`, `read_enum`, `parseUnsigned`) return value types and
+//!   leak nothing, so they are suppressed.
 
 const std = @import("std");
 const Ast = std.zig.Ast;
@@ -69,6 +76,10 @@ pub fn check(
         if (i > last_tok) continue;
         if (tags[i] != .comma) continue; // hit a closing delimiter — skip
 
+        // The first try-expression (t+4 .. comma) must allocate an owned
+        // resource — otherwise nothing leaks when a later try fails.
+        if (!tryExprAllocates(tree, tags, t + 4, i)) continue;
+
         // Check the next field starts with . identifier = try
         const next = i + 1;
         if (next + 3 > last_tok) continue;
@@ -82,6 +93,45 @@ pub fn check(
 
         try report(gpa, problems, tree, next, field1, field2);
     }
+}
+
+/// Returns true iff the token range [start, end) contains an identifier or
+/// builtin whose slice (case-insensitively) contains an allocation signal:
+/// `alloc`, `dupe`, `clone`, `create`, or `ownedslice` (covers
+/// `toOwnedSlice`).  These are the calls that hand back an owned resource a
+/// failing later `try` would leak.  Decoders/parsers (`read_*`, `parse*`)
+/// return value types and match no signal, so they are suppressed.
+fn tryExprAllocates(
+    tree: *const Ast,
+    tags: []const std.zig.Token.Tag,
+    start: Ast.TokenIndex,
+    end: Ast.TokenIndex,
+) bool {
+    var t = start;
+    while (t < end) : (t += 1) {
+        if (tags[t] != .identifier and tags[t] != .builtin) continue;
+        const s = tree.tokenSlice(t);
+        if (containsIgnoreCase(s, "alloc") or
+            containsIgnoreCase(s, "dupe") or
+            containsIgnoreCase(s, "clone") or
+            containsIgnoreCase(s, "create") or
+            containsIgnoreCase(s, "ownedslice")) return true;
+    }
+    return false;
+}
+
+/// Case-insensitive substring test (`needle` must be lowercase).
+fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0 or haystack.len < needle.len) return false;
+    var i: usize = 0;
+    outer: while (i + needle.len <= haystack.len) : (i += 1) {
+        var j: usize = 0;
+        while (j < needle.len) : (j += 1) {
+            if (std.ascii.toLower(haystack[i + j]) != needle[j]) continue :outer;
+        }
+        return true;
+    }
+    return false;
 }
 
 fn report(
@@ -151,6 +201,55 @@ test "struct-literal-multiple-try: fires in return with named init" {
         \\    return Node{
         \\        .name  = try gpa.dupe(u8, "hello"),
         \\        .value = try gpa.dupe(u8, "world"),
+        \\    };
+        \\}
+        \\
+    );
+}
+
+test "struct-literal-multiple-try: decoder tries (no allocation) do not fire" {
+    try testing.expectNoFire(check,
+        \\fn readHeader(self: *Decoder) !FrameHeader {
+        \\    return .{
+        \\        .type = try self.read_enum(FrameType),
+        \\        .channel = try self.read_enum(Channel),
+        \\        .size = try self.read_int(u32),
+        \\    };
+        \\}
+        \\
+    );
+}
+
+test "struct-literal-multiple-try: parseUnsigned tries do not fire" {
+    try testing.expectNoFire(check,
+        \\fn parseVersion(arg_major: []const u8, arg_minor: []const u8) !Version {
+        \\    return .{
+        \\        .major = try std.fmt.parseUnsigned(u8, arg_major, 10),
+        \\        .minor = try std.fmt.parseUnsigned(u8, arg_minor, 10),
+        \\    };
+        \\}
+        \\
+    );
+}
+
+test "struct-literal-multiple-try: alloc.alloc tries fire" {
+    try testing.expectFires(check, R,
+        \\fn makeLexer(alloc: Allocator, n_words: usize) !Lexer {
+        \\    return .{
+        \\        .ident      = try alloc.alloc(u64, n_words),
+        \\        .newline    = try alloc.alloc(u64, n_words),
+        \\    };
+        \\}
+        \\
+    );
+}
+
+test "struct-literal-multiple-try: deepClone tries fire" {
+    try testing.expectFires(check, R,
+        \\fn cloneIf(allocator: Allocator, el: *If) !If {
+        \\    return .{
+        \\        .test_ = try el.test_.deepClone(allocator),
+        \\        .yes = try el.yes.deepClone(allocator),
         \\    };
         \\}
         \\
