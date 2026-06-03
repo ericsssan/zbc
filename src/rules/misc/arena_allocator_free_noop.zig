@@ -35,7 +35,6 @@ pub fn check(
     problems: *std.ArrayListUnmanaged(Problem),
 ) !void {
     if (!config_mod.isEnabled(config, .arena_allocator_free_noop)) return;
-    _ = cache;
 
     const tags = tree.tokens.items(.tag);
     if (tree.tokens.len < 6) return;
@@ -53,20 +52,40 @@ pub fn check(
         if (tags[t + 5] != .identifier) continue;
         if (!std.mem.eql(u8, tree.tokenSlice(t + 5), "free")) continue;
 
-        // Only fire when the receiver of `.allocator()` is identifiably an
-        // arena-style allocator.  The pattern `.allocator()` is also used by
-        // plain structs that expose a general-purpose allocator via an
-        // `.allocator()` method — calling `.free()` on those is perfectly
-        // valid.  The receiver identifier (at t-1) must contain "arena"
-        // (case-insensitive) to match the documented TP class.  When t-1 is
-        // not an identifier (e.g. a chained call result), we fire
-        // conservatively.
+        // The receiver of `.allocator()` is the dotted path ending at t-1.
+        // SEMANTIC decision: resolve the receiver's TYPE and fire iff it is an
+        // arena-style allocator whose `.free()` is a no-op.  `.allocator()` is
+        // also exposed by general-purpose allocators / wrapper structs, whose
+        // `.free()` is perfectly valid — those must not fire regardless of how
+        // the receiver is named.  When the type engine is unavailable
+        // (token-only mode / unit tests), fall back to the name proxy
+        // (receiver name contains "arena"); a non-identifier receiver
+        // (call/index result) fires conservatively as before.
         if (t >= 1 and tags[t - 1] == .identifier) {
-            if (std.ascii.indexOfIgnoreCase(tree.tokenSlice(t - 1), "arena") == null) continue;
+            const recv_last = t - 1;
+            var recv_first = recv_last;
+            while (recv_first >= 2 and
+                tags[recv_first - 1] == .period and
+                tags[recv_first - 2] == .identifier) : (recv_first -= 2)
+            {}
+            if (cache.typeNameOfExpr(recv_first, recv_last) catch null) |tyname| {
+                // Type resolved — decide on the real type, ignore the name.
+                if (!isNoopFreeAllocatorType(tyname)) continue;
+            } else {
+                // Unresolved — fall back to the syntactic name proxy.
+                if (std.ascii.indexOfIgnoreCase(tree.tokenSlice(recv_last), "arena") == null) continue;
+            }
         }
 
         try report(gpa, problems, tree, t + 1);
     }
+}
+
+/// Allocator types whose `.free()` is a no-op (memory is reclaimed only by
+/// the allocator's own teardown/reset), so calling `.free()` on a value
+/// obtained from one is misleading dead code.
+fn isNoopFreeAllocatorType(type_name: []const u8) bool {
+    return std.mem.eql(u8, type_name, "ArenaAllocator");
 }
 
 fn report(
