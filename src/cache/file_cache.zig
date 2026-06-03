@@ -83,6 +83,14 @@ pub const FileCache = struct {
         return z.fixedArrayLen(node) catch null;
     }
 
+    /// For a type-name reference node `T`: whether `T` denotes a pointer/
+    /// optional type (true), a value type (false), or couldn't resolve (null).
+    /// Null when the type engine is unavailable.
+    pub fn typeRefIsPointerLike(self: *FileCache, node: std.zig.Ast.Node.Index) ?bool {
+        const z = self.zls orelse return null;
+        return z.typeRefIsPointerLike(node) catch null;
+    }
+
     /// Signedness + bit-width of `node`'s integer type, or null when the type
     /// engine is unavailable / the type isn't an integer.
     pub fn intInfoOf(self: *FileCache, node: std.zig.Ast.Node.Index) ?zls_resolver_mod.TypeResolver.IntInfo {

@@ -255,6 +255,30 @@ pub const TypeResolver = struct {
         };
     }
 
+    /// For a TYPE-NAME reference node `T` (e.g. the inner `T` of a `?*?T`
+    /// annotation): does `T` denote a pointer or optional type?  Resolves the
+    /// reference to its denoted type (a type-value) and inspects its structure.
+    ///   true  → `T` is a pointer/optional (so `?*?T` is a valid nullable-ptr-
+    ///           to-optional-ptr, not the duplicated-`?`-on-a-value bug)
+    ///   false → `T` denotes a non-pointer value type
+    ///   null  → couldn't resolve
+    pub fn typeRefIsPointerLike(self: *TypeResolver, node: Ast.Node.Index) !?bool {
+        const ty = (try self.analyser.resolveTypeOfNode(.of(node, self.handle))) orelse return null;
+        switch (ty.data) {
+            .pointer, .optional => return true,
+            .ip_index => |payload| {
+                // For a type-VALUE (`is_type_val`), the denoted type is in
+                // `index` (the value); `type` is the meta-type `type`.
+                const denoted = if (ty.is_type_val) (payload.index orelse return null) else payload.type;
+                return switch (self.ctx.ip.indexToKey(denoted)) {
+                    .pointer_type, .optional_type => true,
+                    else => false,
+                };
+            },
+            else => return null,
+        }
+    }
+
     pub const IntInfo = struct { signed: bool, bits: u16 };
 
     /// Signedness and bit-width of `node`'s type when it resolves to an integer

@@ -36,10 +36,23 @@ pub fn check(
     problems: *std.ArrayListUnmanaged(Problem),
 ) !void {
     if (!config_mod.isEnabled(config, .double_optional_ptr)) return;
-    _ = cache;
 
     const tags = tree.tokens.items(.tag);
     const last_tok: Ast.TokenIndex = @intCast(tree.tokens.len -| 1);
+
+    // Map identifier nodes by main token so the inner `T` of `?*?T` can be
+    // resolved to its denoted type.  Empty/unused without the type engine.
+    var ident_nodes: std.AutoHashMapUnmanaged(Ast.TokenIndex, Ast.Node.Index) = .empty;
+    defer ident_nodes.deinit(gpa);
+    {
+        var ni: u32 = 0;
+        while (ni < tree.nodes.len) : (ni += 1) {
+            const node: Ast.Node.Index = @enumFromInt(ni);
+            if (tree.nodeTag(node) == .identifier) {
+                try ident_nodes.put(gpa, tree.nodeMainToken(node), node);
+            }
+        }
+    }
 
     var t: Ast.TokenIndex = 0;
     while (t + 3 <= last_tok) : (t += 1) {
@@ -64,6 +77,16 @@ pub fn check(
                 }
             } else false;
             if (has_default) continue;
+        }
+
+        // SEMANTIC: suppress when the inner `T` denotes a pointer/optional type.
+        // `?*?T` with pointer-like `T` is a valid "nullable pointer to optional
+        // pointer" out-parameter (e.g. Win32 `?*?BSTR`, `BSTR = *u16`), not the
+        // duplicated-`?`-on-a-value-type bug.  No-op without the type engine.
+        if (ident_nodes.get(t + 3)) |t_node| {
+            if (cache.typeRefIsPointerLike(t_node)) |ptrlike| {
+                if (ptrlike) continue;
+            }
         }
 
         try report(gpa, problems, tree, t);
