@@ -55,6 +55,10 @@ pub fn check(
 
         const a = tree.tokenSlice(t + 1);
         const b = tree.tokenSlice(t + 3);
+        // Suppress when either operand is declared with float arithmetic nearby.
+        // For float types (f32/f64/f128), addition cannot overflow in the integer
+        // sense — `(r + g) / 2` on f32 pixel values is not a midpoint-overflow bug.
+        if (hasFloatDecl(tags, tree, t, a) or hasFloatDecl(tags, tree, t, b)) continue;
         try report(gpa, problems, tree, t, a, b);
     }
 }
@@ -80,6 +84,54 @@ fn report(
         .end = Pos.fromTokenEnd(tree, lparen_tok + 6),
         .message = msg,
     });
+}
+
+/// Returns true when the nearest `const/var VAR_NAME = …` declaration visible
+/// before `anchor` contains a float marker in its initialiser: a `@floatFromInt`
+/// or `@floatCast` builtin, a float type identifier (`f32`, `f64`, `f128`,
+/// `f16`), or a number literal that contains a `.` (e.g. `255.0`).
+/// Scans backward up to 150 tokens to find the declaration, then forward up
+/// to 60 tokens into the initialiser for the marker.
+fn hasFloatDecl(
+    tags: []const std.zig.Token.Tag,
+    tree: *const Ast,
+    anchor: Ast.TokenIndex,
+    var_name: []const u8,
+) bool {
+    const back_window: Ast.TokenIndex = 150;
+    const fwd_window: Ast.TokenIndex = 60;
+    const start: Ast.TokenIndex = if (anchor >= back_window) anchor - back_window else 0;
+    var k = anchor;
+    while (k > start + 1) {
+        k -= 1;
+        if (tags[k] != .identifier) continue;
+        if (!std.mem.eql(u8, tree.tokenSlice(k), var_name)) continue;
+        if (tags[k - 1] != .keyword_const and tags[k - 1] != .keyword_var) continue;
+        // Found `const/var VAR_NAME`; scan forward for float markers.
+        const decl_end = @min(k + fwd_window, anchor);
+        var j = k + 1;
+        while (j < decl_end) : (j += 1) {
+            switch (tags[j]) {
+                .builtin => {
+                    const s = tree.tokenSlice(j);
+                    if (std.mem.eql(u8, s, "@floatFromInt") or
+                        std.mem.eql(u8, s, "@floatCast")) return true;
+                },
+                .identifier => {
+                    const s = tree.tokenSlice(j);
+                    if (std.mem.eql(u8, s, "f32") or
+                        std.mem.eql(u8, s, "f64") or
+                        std.mem.eql(u8, s, "f128") or
+                        std.mem.eql(u8, s, "f16")) return true;
+                },
+                .number_literal => {
+                    if (std.mem.indexOf(u8, tree.tokenSlice(j), ".") != null) return true;
+                },
+                else => {},
+            }
+        }
+    }
+    return false;
 }
 
 // ── Tests ──────────────────────────────────────────────────
@@ -131,6 +183,18 @@ test "midpoint-addition-overflow: variable divisor does not fire" {
     try testing.expectNoFire(check,
         \\fn avg(a: usize, b: usize, n: usize) usize {
         \\    return (a + b) / n;
+        \\}
+        \\
+    );
+}
+
+test "midpoint-addition-overflow: f32 pixel operands do not fire" {
+    try testing.expectNoFire(check,
+        \\fn encode(rgba: []const u8) void {
+        \\    const al: f32 = @as(f32, @floatFromInt(rgba[3])) / 255.0;
+        \\    const r = @as(f32, @floatFromInt(rgba[0])) * al;
+        \\    const g = @as(f32, @floatFromInt(rgba[1])) * al;
+        \\    _ = (r + g) / 2;
         \\}
         \\
     );

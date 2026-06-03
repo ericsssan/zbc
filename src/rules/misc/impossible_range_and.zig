@@ -20,8 +20,13 @@
 //!   at positions +1 and +2 relative to `keyword_and`.
 //!   Fire at the `identifier(X)` anchor token.
 //!
-//!   Suppression: the reversed form `x > A and x < B` (valid in-range check)
-//!   is NOT flagged — only the `< … and … >` order fires.
+//!   Suppression:
+//!   - The reversed form `x > A and x < B` (valid in-range check) is NOT flagged.
+//!   - When B is the literal `0`: `x < N and x > 0` is the standard in-range
+//!     guard and is suppressed.
+//!   - When both A and B are integer literals: fire only when A ≤ B (making the
+//!     AND truly impossible).  When A > B (e.g. `x < 76 and x > 65`), the range
+//!     (65, 76) is valid and the pattern is suppressed.
 
 const std = @import("std");
 const Ast = std.zig.Ast;
@@ -66,6 +71,21 @@ pub fn check(
             if (tags[u + 1] != .identifier) continue;
             if (!std.mem.eql(u8, tree.tokenSlice(u + 1), x_name)) continue;
             if (tags[u + 2] != .angle_bracket_right) continue;
+
+            // Suppress valid ranges.
+            // 1. `x < N and x > 0` — right bound is 0, a common in-range guard.
+            // 2. Both bounds are integer literals: fire only when left ≤ right
+            //    (impossible range).  When left > right the range is valid.
+            if (u + 3 <= last_tok and tags[u + 3] == .number_literal) {
+                const right_str = tree.tokenSlice(u + 3);
+                if (std.mem.eql(u8, right_str, "0")) break; // valid: x < N and x > 0
+                if (tags[t + 2] == .number_literal) {
+                    const left_str = tree.tokenSlice(t + 2);
+                    const lv = std.fmt.parseUnsigned(u64, left_str, 0) catch null;
+                    const rv = std.fmt.parseUnsigned(u64, right_str, 0) catch null;
+                    if (lv != null and rv != null and lv.? > rv.?) break; // valid range
+                }
+            }
 
             try report(gpa, problems, tree, t, x_name);
             break;
@@ -137,6 +157,24 @@ test "impossible-range-and: different variables do not fire" {
     try testing.expectNoFire(check,
         \\fn check(a: i64, b: i64) bool {
         \\    return a < 0 and b > 255;
+        \\}
+        \\
+    );
+}
+
+test "impossible-range-and: literal valid range does not fire (left > right)" {
+    try testing.expectNoFire(check,
+        \\fn isAsciiUpper(code: u8) bool {
+        \\    return code < 76 and code > 65;
+        \\}
+        \\
+    );
+}
+
+test "impossible-range-and: right-bound 0 does not fire" {
+    try testing.expectNoFire(check,
+        \\fn trim(buf: []u8, max: usize) []u8 {
+        \\    return if (max < buf.len and max > 0) buf[0..max] else buf;
         \\}
         \\
     );

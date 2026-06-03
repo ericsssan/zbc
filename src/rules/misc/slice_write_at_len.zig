@@ -14,6 +14,14 @@
 //!   Form B: `IDENT . FIELD [ IDENT . FIELD . len ] =`      (11 tokens)
 //!   Both forms fire only when `=` (assignment) immediately follows `]`,
 //!   distinguishing writes from reads.
+//!
+//!   Suppression:
+//!   - Form A is suppressed when the token immediately before `IDENT` is `.`
+//!     (e.g. `outer.field[field.len] = …`): the indexed slice is `outer.field`
+//!     whose length differs from `field.len`.
+//!   - Both forms are suppressed when `allocSentinel(` or a sentinel array-type
+//!     annotation (`: 0 ]`) appears in the 80-token backward window, indicating
+//!     that the slice is `[:0]T` and `buf[buf.len]` is the valid sentinel slot.
 
 const std = @import("std");
 const Ast = std.zig.Ast;
@@ -54,6 +62,11 @@ pub fn check(
             std.mem.eql(u8, tree.tokenSlice(t), tree.tokenSlice(t + 2)) and
             std.mem.eql(u8, tree.tokenSlice(t + 4), "len"))
         {
+            // Suppress when IDENT is a field access (outer.IDENT[IDENT.len]).
+            // The actual slice is `outer.IDENT`, whose length may exceed IDENT.len.
+            if (t > 0 and tags[t - 1] == .period) continue;
+            // Suppress sentinel-terminated slices: buf[buf.len] = sentinel is valid.
+            if (hasSentinelContext(tags, tree, t)) continue;
             try reportA(gpa, problems, tree, t);
             continue;
         }
@@ -75,10 +88,38 @@ pub fn check(
             std.mem.eql(u8, tree.tokenSlice(t + 2), tree.tokenSlice(t + 6)) and
             std.mem.eql(u8, tree.tokenSlice(t + 8), "len"))
         {
+            if (hasSentinelContext(tags, tree, t)) continue;
             try reportB(gpa, problems, tree, t);
             continue;
         }
     }
+}
+
+/// Returns true when the 80-token backward window from `anchor` contains either
+/// an `allocSentinel(` call or a sentinel array-type annotation (`: 0 ]`).
+/// Both patterns indicate the slice is sentinel-terminated and `slice[slice.len]`
+/// is the valid sentinel slot, not an out-of-bounds write.
+fn hasSentinelContext(
+    tags: []const std.zig.Token.Tag,
+    tree: *const Ast,
+    anchor: Ast.TokenIndex,
+) bool {
+    const window: Ast.TokenIndex = 80;
+    const start: Ast.TokenIndex = if (anchor >= window) anchor - window else 0;
+    var k = anchor;
+    while (k > start) {
+        k -= 1;
+        if (tags[k] == .identifier and std.mem.eql(u8, tree.tokenSlice(k), "allocSentinel"))
+            return true;
+        // `: 0 ]` — sentinel type annotation like [N:0]T
+        if (k + 2 < anchor and
+            tags[k] == .colon and
+            tags[k + 1] == .number_literal and
+            std.mem.eql(u8, tree.tokenSlice(k + 1), "0") and
+            tags[k + 2] == .r_bracket)
+            return true;
+    }
+    return false;
 }
 
 fn reportA(
@@ -177,6 +218,37 @@ test "slice-write-at-len: different fields do not fire (Form B)" {
     try testing.expectNoFire(check,
         \\fn write(a: *S, b: *S) void {
         \\    a.items[b.items.len] = 0;
+        \\}
+        \\
+    );
+}
+
+test "slice-write-at-len: field access base does not fire (outer.field[field.len])" {
+    try testing.expectNoFire(check,
+        \\fn nullTerminate(result: *Result, arguments: []const [*:0]const u8) void {
+        \\    result.arguments[arguments.len] = null;
+        \\}
+        \\
+    );
+}
+
+test "slice-write-at-len: sentinel array type suppresses" {
+    try testing.expectNoFire(check,
+        \\fn makePath(comptime literal: []const u8) *const [literal.len:0]u8 {
+        \\    var buf: [literal.len:0]u8 = undefined;
+        \\    buf[buf.len] = 0;
+        \\    return &buf;
+        \\}
+        \\
+    );
+}
+
+test "slice-write-at-len: allocSentinel suppresses" {
+    try testing.expectNoFire(check,
+        \\fn decode(alloc: std.mem.Allocator, data: []const u8, size: usize) !void {
+        \\    var buf = try alloc.allocSentinel(u8, size, 0);
+        \\    defer alloc.free(buf);
+        \\    buf[buf.len] = 0;
         \\}
         \\
     );
