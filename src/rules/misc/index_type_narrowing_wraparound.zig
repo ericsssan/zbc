@@ -92,6 +92,10 @@ fn checkBody(
 
         // Condition 1: initialiser contains `.len`.
         if (exprContainsLen(tree, t + 5, sc -| 1)) {
+            // Suppress when the `.len` is clamped to the target type's max via
+            // `@min(.len, maxInt(TYPE))` or `@min(.len, max_<TYPE>)`.  The clamp
+            // guarantees the value fits TYPE, so the `@intCast` cannot wrap.
+            if (exprClampsToType(tree, tags, t + 5, sc -| 1, type_text)) continue;
             try report(gpa, problems, tree, t + 3, name, type_text);
             continue;
         }
@@ -102,6 +106,50 @@ fn checkBody(
             try report(gpa, problems, tree, t + 3, name, type_text);
         }
     }
+}
+
+/// True iff the initialiser range [start, end] clamps the value to fit
+/// `type_text` via a `@min(...)` whose bound is the target type's maximum:
+///   `@min(.., maxInt(TYPE))`   — `maxInt` `(` `TYPE` `)`
+///   `@min(.., max_<TYPE>)`     — identifier literally "max_" ++ TYPE
+/// Requires BOTH a `@min` builtin and a matching maxInt bound in range, so a
+/// mismatched clamp (e.g. `@min(len, max_i32)` assigned to `i16`) still fires.
+fn exprClampsToType(
+    tree: *const Ast,
+    tags: []const std.zig.Token.Tag,
+    start: Ast.TokenIndex,
+    end: Ast.TokenIndex,
+    type_text: []const u8,
+) bool {
+    if (start > end) return false;
+
+    var has_min = false;
+    var has_bound = false;
+    var t: Ast.TokenIndex = start;
+    while (t <= end) : (t += 1) {
+        if (tags[t] == .builtin and std.mem.eql(u8, tree.tokenSlice(t), "@min")) {
+            has_min = true;
+            continue;
+        }
+        if (tags[t] == .identifier) {
+            const s = tree.tokenSlice(t);
+            // `maxInt(TYPE)` — identifier "maxInt" followed by `( TYPE )`.
+            if (std.mem.eql(u8, s, "maxInt") and t + 2 <= end and
+                tags[t + 1] == .l_paren and tags[t + 2] == .identifier and
+                std.mem.eql(u8, tree.tokenSlice(t + 2), type_text))
+            {
+                has_bound = true;
+                continue;
+            }
+            // `max_<TYPE>` constant, e.g. `max_i32` for an `i32` target.
+            if (std.mem.startsWith(u8, s, "max_") and
+                std.mem.eql(u8, s["max_".len..], type_text))
+            {
+                has_bound = true;
+            }
+        }
+    }
+    return has_min and has_bound;
 }
 
 /// True iff type_text is one of the narrow signed integer types we
@@ -253,6 +301,48 @@ test "index-type-narrowing-wraparound: i16 with no len and not used as index doe
     try testing.expectNoFire(check,
         \\fn f() void {
         \\    var i: i16 = 42;
+        \\    _ = i;
+        \\}
+        \\
+    );
+}
+
+test "index-type-narrowing-wraparound: @min clamp with max_i32 const does not fire" {
+    try testing.expectNoFire(check,
+        \\const max_i32 = std.math.maxInt(i32);
+        \\fn addr(buf: []u8) void {
+        \\    var length: i32 = @intCast(@min(buf.len, max_i32));
+        \\    _ = length;
+        \\}
+        \\
+    );
+}
+
+test "index-type-narrowing-wraparound: @min clamp with maxInt(i32) does not fire" {
+    try testing.expectNoFire(check,
+        \\fn addr(buf: []u8) void {
+        \\    var length: i32 = @intCast(@min(buf.len, std.math.maxInt(i32)));
+        \\    _ = length;
+        \\}
+        \\
+    );
+}
+
+test "index-type-narrowing-wraparound: mismatched clamp type still fires" {
+    try testing.expectFires(check, R,
+        \\const max_i32 = std.math.maxInt(i32);
+        \\fn addr(buf: []u8) void {
+        \\    var length: i16 = @intCast(@min(buf.len, max_i32));
+        \\    _ = length;
+        \\}
+        \\
+    );
+}
+
+test "index-type-narrowing-wraparound: subtraction without clamp still fires" {
+    try testing.expectFires(check, R,
+        \\fn f(decoded_pathname: []const u8) void {
+        \\    var i: i16 = @as(i16, @intCast(decoded_pathname.len)) - 1;
         \\    _ = i;
         \\}
         \\
