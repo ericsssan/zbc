@@ -565,6 +565,11 @@ pub const Invariant = enum {
     /// `if (buf.len < N) return error.TruncatedInput;` before the slice.
     /// Catches oven-sh/bun#31227 / #31264 class.
     slice_from_fixed_offset_without_len_check,
+    /// `x / c.len` or `x % c.len` where container `c` is not proven non-empty.
+    /// Integer division/modulo by zero (empty `c`) is safety-checked illegal
+    /// behaviour.  Suppressed when a dominating guard proves `c.len != 0` or
+    /// `c` is a fixed array `[N]T`, N >= 1.
+    divmod_by_len_without_nonempty_guard,
     /// `-value << N` where `value` is a signed integer variable and no
     /// `std.math.minInt` guard appears in the fn body.  When
     /// `value == minInt`, negation overflows in two's complement (wraps
@@ -848,7 +853,7 @@ pub const Invariant = enum {
     clamp_wrong_direction,
 };
 
-pub const all_invariants: [115]Invariant = .{
+pub const all_invariants: [116]Invariant = .{
     .arena_escape,
     .stack_escape,
     .use_undefined,
@@ -916,6 +921,7 @@ pub const all_invariants: [115]Invariant = .{
     .escape_skip_without_bounds_recheck,
     .recursive_parse_without_stack_check,
     .slice_from_fixed_offset_without_len_check,
+    .divmod_by_len_without_nonempty_guard,
     .negate_then_shift_without_minint_check,
     .readint_unchecked_position_assignment,
     .arraylist_sentinel_write_without_capacity,

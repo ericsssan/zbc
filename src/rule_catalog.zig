@@ -361,6 +361,11 @@ pub const all = [_]Rule{
         .body = @embedFile("rules/misc/slice-from-fixed-offset-without-len-check.md"),
     },
     .{
+        .id = "divmod-by-len-without-nonempty-guard",
+        .title = "`x / c.len` or `x % c.len` where `c` may be empty — integer division/modulo by zero (panics in Debug/Safe, UB in ReleaseFast)",
+        .body = @embedFile("rules/misc/divmod-by-len-without-nonempty-guard.md"),
+    },
+    .{
         .id = "negate-then-shift-without-minint-check",
         .title = "`-value << N` without `minInt` guard — overflow when value == minInt(T), producing garbage or UB in ReleaseFast",
         .body = @embedFile("rules/misc/negate-then-shift-without-minint-check.md"),
@@ -624,6 +629,7 @@ const optional_fallback_wrong_side_mod = @import("rules/misc/optional_fallback_w
 const escape_skip_without_bounds_recheck_mod = @import("rules/misc/escape_skip_without_bounds_recheck.zig");
 const recursive_parse_without_stack_check_mod = @import("rules/misc/recursive_parse_without_stack_check.zig");
 const slice_from_fixed_offset_without_len_check_mod = @import("rules/misc/slice_from_fixed_offset_without_len_check.zig");
+const divmod_by_len_without_nonempty_guard_mod = @import("rules/misc/divmod_by_len_without_nonempty_guard.zig");
 const negate_then_shift_without_minint_check_mod = @import("rules/misc/negate_then_shift_without_minint_check.zig");
 const readint_unchecked_position_assignment_mod = @import("rules/misc/readint_unchecked_position_assignment.zig");
 const arraylist_sentinel_write_without_capacity_mod = @import("rules/collection/arraylist_sentinel_write_without_capacity.zig");
@@ -741,6 +747,7 @@ const escape_detectors = [_]Detector{
     .{ .id = "escape-skip-without-bounds-recheck",          .check = escape_skip_without_bounds_recheck_mod.check },
     .{ .id = "recursive-parse-fn-without-stack-check",      .check = recursive_parse_without_stack_check_mod.check },
     .{ .id = "slice-from-fixed-offset-without-len-check",   .check = slice_from_fixed_offset_without_len_check_mod.check },
+    .{ .id = "divmod-by-len-without-nonempty-guard",        .check = divmod_by_len_without_nonempty_guard_mod.check },
     .{ .id = "negate-then-shift-without-minint-check",      .check = negate_then_shift_without_minint_check_mod.check },
     .{ .id = "readint-unchecked-position-assignment",       .check = readint_unchecked_position_assignment_mod.check },
     .{ .id = "arraylist-sentinel-write-without-capacity",  .check = arraylist_sentinel_write_without_capacity_mod.check },
@@ -907,6 +914,7 @@ test "registry: pull in every rule module so inline tests run" {
     _ = escape_skip_without_bounds_recheck_mod;
     _ = recursive_parse_without_stack_check_mod;
     _ = slice_from_fixed_offset_without_len_check_mod;
+    _ = divmod_by_len_without_nonempty_guard_mod;
     _ = negate_then_shift_without_minint_check_mod;
     _ = readint_unchecked_position_assignment_mod;
     _ = arraylist_sentinel_write_without_capacity_mod;
