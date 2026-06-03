@@ -20,19 +20,26 @@
 //!
 //! Suppression (six checks, all applied):
 //!
-//!   1. Same-expression `and`-guard (window 15): `GUARD_IDENT (> | !=) 0
+//!   1. Same-expression `and`-guard (window 15): `GUARD_IDENT (> N | >= N | !=) 0
 //!      keyword_and` immediately before the array identifier.
-//!      Covers `x > 0 and buf[x - 1]`.
+//!      Covers `x > 0`, `x >= 1`, `x > 1`, `x != 0` and buf[x - 1]`.
 //!
-//!   2. If/for-body guard (AST pre-pass, `collectGuardedRanges`):
+//!      Also handles `or`-short-circuit: `GUARD_IDENT (== 0 | < N) keyword_or`
+//!      where `== 0` short-circuits leaving IDENT ≠ 0, and `< N` (N≥1) short-
+//!      circuits leaving IDENT ≥ N ≥ 1.  Covers `len < 2 or arr[len - 1]`.
+//!
+//!   2. If/for/while-body guard (AST pre-pass, `collectGuardedRanges`):
 //!      Scans `if_simple`/`if` nodes via `tree.fullIf`:
-//!      • `IDENT (> | !=) 0` in condition → records `then_expr` range.
+//!      • `IDENT (> N | >= N | !=) 0` in condition → records `then_expr` range.
 //!      • `IDENT == 0` in condition → records `else_expr` range.
 //!      Scans `for_simple`/`for` nodes via `tree.fullFor`:
 //!      • Single input `K..N` with K ≥ 1 → capture ≥ 1, records body range.
 //!        Covers `for (1..n) |i| arr[i-1]` and `for (2..n) |i| arr[i-1]`.
 //!      • Single input is a literal array with all values > 0 → capture > 0.
 //!        Covers `inline for ([_]usize{7,6,5,4,3,2,1}) |i| arr[i-1]`.
+//!      Scans `while_simple`/`while_cont`/`while` nodes via `tree.fullWhile`:
+//!      • `IDENT (> N | >= N | !=) 0` in condition → records body range.
+//!        Covers `while (i > 0) { arr[i - 1] }` and `while (len > 0) { arr[len-1] }`.
 //!      Token-range containment is exact for all body shapes.
 //!
 //!   3. Assert guard (window 50): scans inside `assert(...)` for
@@ -358,15 +365,52 @@ fn hasComptimeContext(tags: []const std.zig.Token.Tag, t: Ast.TokenIndex) bool {
     return false;
 }
 
+/// True for a decimal integer literal that is ≥ 0 (non-negative).
+/// e.g. "0", "1", "42" → true.  Negative strings or non-decimal text → false.
+fn isNonNegativeLiteral(s: []const u8) bool {
+    if (s.len == 0) return false;
+    for (s) |c| if (!std.ascii.isDigit(c)) return false;
+    return true;
+}
+
+/// True for a decimal integer literal that is ≥ 1 (strictly positive).
+/// e.g. "1", "42" → true.  "0", negative, or non-decimal → false.
+fn isPositiveLiteral(s: []const u8) bool {
+    return isNonNegativeLiteral(s) and !std.mem.eql(u8, s, "0");
+}
+
+/// Returns true when a guard token sequence implying `IDENT ≥ 1` is present.
+/// Specifically, checks whether the three tokens at [ident_tok, cmp_tok, val_tok]
+/// form one of:
+///   IDENT >  N  (N ≥ 0 → IDENT ≥ 1)
+///   IDENT >= N  (N ≥ 1 → IDENT ≥ 1)
+///   IDENT != 0
+fn isPositiveGuardTriple(
+    tags: []const std.zig.Token.Tag,
+    tree: *const Ast,
+    ident_tok: Ast.TokenIndex,
+    cmp_tok: Ast.TokenIndex,
+    val_tok: Ast.TokenIndex,
+) bool {
+    if (tags[ident_tok] != .identifier) return false;
+    if (tags[val_tok] != .number_literal) return false;
+    const val = tree.tokenSlice(val_tok);
+    return switch (tags[cmp_tok]) {
+        .angle_bracket_right => isNonNegativeLiteral(val), // x > N (N≥0)
+        .angle_bracket_right_equal => isPositiveLiteral(val), // x >= N (N≥1)
+        .bang_equal => std.mem.eql(u8, val, "0"), // x != 0
+        else => false,
+    };
+}
+
 /// Returns true when a same-expression `and`-guard for one of `guard_names` is
 /// present in the 15 tokens immediately before the `[` at position `t`.
 ///
 /// Matched token pattern (reading backward from `t`):
-///   ... GUARD_IDENT (> | !=) 0 keyword_and ARRAY_IDENT [t]
+///   ... GUARD_IDENT (> | >= | !=) VALUE keyword_and ARRAY_IDENT [t]
 ///
-/// GUARD_IDENT must match one of `guard_names`.  Covers `x > 0 and buf[x - 1]`
-/// and `prefix.len > 0 and arr[prefix.len - 1]` (guard_names includes both
-/// "prefix" and "len" for Form B).
+/// VALUE is a decimal integer: `> N` (any N≥0) or `>= N` (N≥1) or `!= 0`.
+/// Covers `x > 0 and buf[x - 1]`, `x >= 1 and buf[x - 1]`, `x > 1 and buf[x - 1]`.
 fn hasAndGuard(
     tags: []const std.zig.Token.Tag,
     tree: *const Ast,
@@ -381,10 +425,7 @@ fn hasAndGuard(
         k -= 1;
         if (tags[k] != .keyword_and) continue;
         if (k < 3) continue;
-        if (tags[k - 1] != .number_literal) continue;
-        if (!std.mem.eql(u8, tree.tokenSlice(k - 1), "0")) continue;
-        if (tags[k - 2] != .angle_bracket_right and tags[k - 2] != .bang_equal) continue;
-        if (tags[k - 3] != .identifier) continue;
+        if (!isPositiveGuardTriple(tags, tree, k - 3, k - 2, k - 1)) continue;
         const guard_id = tree.tokenSlice(k - 3);
         for (guard_names) |gn| {
             if (std.mem.eql(u8, guard_id, gn)) return true;
@@ -396,11 +437,11 @@ fn hasAndGuard(
 /// Returns true when a same-expression `or`-guard for one of `guard_names` is
 /// present in the 15 tokens immediately before the `[` at position `t`.
 ///
-/// Matched token pattern (reading backward from `t`):
+/// Two matched patterns (reading backward from `t`):
 ///   ... GUARD_IDENT == 0 keyword_or ARRAY_IDENT [t]
-///
-/// Covers `i == 0 or buf[i - 1]` where the `== 0` disjunct short-circuits:
-/// the subscript only evaluates when `i != 0`.
+///       (i == 0 disjunct short-circuits; subscript only evaluates when i != 0)
+///   ... GUARD_IDENT < N keyword_or ARRAY_IDENT [t]  (N ≥ 1)
+///       (len < 2 disjunct short-circuits; subscript only evaluates when len ≥ N ≥ 1)
 fn hasOrGuard(
     tags: []const std.zig.Token.Tag,
     tree: *const Ast,
@@ -416,8 +457,13 @@ fn hasOrGuard(
         if (tags[k] != .keyword_or) continue;
         if (k < 3) continue;
         if (tags[k - 1] != .number_literal) continue;
-        if (!std.mem.eql(u8, tree.tokenSlice(k - 1), "0")) continue;
-        if (tags[k - 2] != .equal_equal) continue;
+        const val = tree.tokenSlice(k - 1);
+        const cmp = tags[k - 2];
+        // IDENT == 0 or: subscript guarded because evaluated only when IDENT != 0
+        // IDENT < N or (N≥1): subscript guarded because evaluated only when IDENT ≥ N ≥ 1
+        const is_guard = (cmp == .equal_equal and std.mem.eql(u8, val, "0")) or
+            (cmp == .angle_bracket_left and isPositiveLiteral(val));
+        if (!is_guard) continue;
         if (tags[k - 3] != .identifier) continue;
         const guard_id = tree.tokenSlice(k - 3);
         for (guard_names) |gn| {
@@ -472,11 +518,12 @@ fn collectGuardedRanges(
     var ni: u32 = 1;
     while (ni < tree.nodes.len) : (ni += 1) {
         const ntag = ntags[ni];
-        // Early tag filter: only for/if nodes emit GuardedRanges.
+        // Early tag filter: only for/if/while nodes emit GuardedRanges.
         // Skipping firstToken/lastToken for all other nodes avoids
         // O(N_nodes × N_fns) expensive AST traversal.
         switch (ntag) {
-            .for_simple, .@"for", .if_simple, .@"if" => {},
+            .for_simple, .@"for", .if_simple, .@"if",
+            .while_simple, .while_cont, .@"while" => {},
             else => continue,
         }
         const node: Ast.Node.Index = @enumFromInt(ni);
@@ -527,6 +574,55 @@ fn collectGuardedRanges(
             continue;
         }
 
+        // ── While-node analysis ───────────────────────────────────────────
+        // `while (IDENT > 0)`, `while (IDENT >= 1)`, `while (IDENT != 0)`
+        // guarantee IDENT ≥ 1 throughout the loop body.
+        // Also handles dotted: `while (a.len > 0)`.
+        if (ntag == .while_simple or ntag == .while_cont or ntag == .@"while") {
+            const wd = tree.fullWhile(node) orelse continue;
+            const wf = tree.firstToken(wd.ast.cond_expr);
+            const wl = tree.lastToken(wd.ast.cond_expr);
+            const body_first_w = tree.firstToken(wd.ast.then_expr);
+            const body_last_w = tree.lastToken(wd.ast.then_expr);
+            var ct2 = wf;
+            while (ct2 <= wl) : (ct2 += 1) {
+                if (ttags[ct2] != .identifier) continue;
+                // Dotted: OUTER . INNER cmp VALUE
+                if (ct2 + 4 <= wl and
+                    ttags[ct2 + 1] == .period and
+                    ttags[ct2 + 2] == .identifier and
+                    ttags[ct2 + 4] == .number_literal)
+                {
+                    if (isPositiveGuardTriple(ttags, tree, ct2, ct2 + 3, ct2 + 4)) {
+                        try out.append(gpa, .{
+                            .names = .{ tree.tokenSlice(ct2), tree.tokenSlice(ct2 + 2), "" },
+                            .n = 2,
+                            .pair = true,
+                            .first = body_first_w,
+                            .last = body_last_w,
+                        });
+                        ct2 += 4;
+                        continue;
+                    }
+                }
+                // Simple: IDENT cmp VALUE
+                if (ct2 + 2 <= wl and ttags[ct2 + 2] == .number_literal) {
+                    if (isPositiveGuardTriple(ttags, tree, ct2, ct2 + 1, ct2 + 2)) {
+                        try out.append(gpa, .{
+                            .names = .{ tree.tokenSlice(ct2), "", "" },
+                            .n = 1,
+                            .pair = false,
+                            .first = body_first_w,
+                            .last = body_last_w,
+                        });
+                        ct2 += 2;
+                        continue;
+                    }
+                }
+            }
+            continue;
+        }
+
         // ── If-node analysis ──────────────────────────────────────────────
         if (ntag != .if_simple and ntag != .@"if") continue;
 
@@ -563,17 +659,17 @@ fn collectGuardedRanges(
         var ct = cf;
         while (ct <= cl) : (ct += 1) {
             if (ttags[ct] != .identifier) continue;
-            // Dotted: OUTER . INNER cmp 0
+            // Dotted: OUTER . INNER cmp VALUE
             if (ct + 4 <= cl and
                 ttags[ct + 1] == .period and
                 ttags[ct + 2] == .identifier and
-                ttags[ct + 4] == .number_literal and
-                std.mem.eql(u8, tree.tokenSlice(ct + 4), "0"))
+                ttags[ct + 4] == .number_literal)
             {
                 const cmp = ttags[ct + 3];
+                const val = tree.tokenSlice(ct + 4);
                 const outer = tree.tokenSlice(ct);
                 const inner = tree.tokenSlice(ct + 2);
-                if (cmp == .angle_bracket_right or cmp == .bang_equal) {
+                if (isPositiveGuardTriple(ttags, tree, ct, ct + 3, ct + 4)) {
                     try out.append(gpa, .{
                         .names = .{ outer, inner, "" },
                         .n = 2,
@@ -581,7 +677,7 @@ fn collectGuardedRanges(
                         .first = tree.firstToken(ifd.ast.then_expr),
                         .last = tree.lastToken(ifd.ast.then_expr),
                     });
-                } else if (cmp == .equal_equal) {
+                } else if (cmp == .equal_equal and std.mem.eql(u8, val, "0")) {
                     if (ifd.ast.else_expr.unwrap()) |else_node| {
                         try out.append(gpa, .{
                             .names = .{ outer, inner, "" },
@@ -595,14 +691,12 @@ fn collectGuardedRanges(
                 ct += 4;
                 continue;
             }
-            // Simple: IDENT cmp 0
-            if (ct + 2 <= cl and
-                ttags[ct + 2] == .number_literal and
-                std.mem.eql(u8, tree.tokenSlice(ct + 2), "0"))
-            {
+            // Simple: IDENT cmp VALUE
+            if (ct + 2 <= cl and ttags[ct + 2] == .number_literal) {
                 const cmp = ttags[ct + 1];
+                const val = tree.tokenSlice(ct + 2);
                 const ident = tree.tokenSlice(ct);
-                if (cmp == .angle_bracket_right or cmp == .bang_equal) {
+                if (isPositiveGuardTriple(ttags, tree, ct, ct + 1, ct + 2)) {
                     try out.append(gpa, .{
                         .names = .{ ident, "", "" },
                         .n = 1,
@@ -610,7 +704,7 @@ fn collectGuardedRanges(
                         .first = tree.firstToken(ifd.ast.then_expr),
                         .last = tree.lastToken(ifd.ast.then_expr),
                     });
-                } else if (cmp == .equal_equal) {
+                } else if (cmp == .equal_equal and std.mem.eql(u8, val, "0")) {
                     if (ifd.ast.else_expr.unwrap()) |else_node| {
                         try out.append(gpa, .{
                             .names = .{ ident, "", "" },
@@ -1935,6 +2029,80 @@ test "index-minus-one-without-zero-guard: non-monotone field still fires" {
         \\}
         \\fn use(arr: []const u8, s: S) u8 {
         \\    return arr[s.limit - 1];
+        \\}
+        \\
+    );
+}
+
+test "index-minus-one-without-zero-guard: >= 1 and-guard suppresses" {
+    try testing.expectNoFire(check,
+        \\fn f(s: []const u8, pad: u8) bool {
+        \\    return s.len >= 1 and s[s.len - 1] == pad;
+        \\}
+        \\
+    );
+}
+
+test "index-minus-one-without-zero-guard: > 1 and-guard suppresses" {
+    try testing.expectNoFire(check,
+        \\fn f(s: []const u8) u8 {
+        \\    if (s.len > 1 and s[s.len - 1] == 0) return 1;
+        \\    return 0;
+        \\}
+        \\
+    );
+}
+
+test "index-minus-one-without-zero-guard: len < 2 or-guard suppresses" {
+    try testing.expectNoFire(check,
+        \\fn f(raw: []const u8) bool {
+        \\    if (raw.len < 2 or raw[raw.len - 1] != 'n') return false;
+        \\    return true;
+        \\}
+        \\
+    );
+}
+
+test "index-minus-one-without-zero-guard: >= 0 and-guard does not suppress" {
+    try testing.expectFires(check, R,
+        \\fn f(n: usize, buf: []u8) u8 {
+        \\    return if (n >= 0 and buf[n - 1] == 0) 1 else 0;
+        \\}
+        \\
+    );
+}
+
+test "index-minus-one-without-zero-guard: while > 0 body suppresses" {
+    try testing.expectNoFire(check,
+        \\fn f(buf: []i32, n: usize) void {
+        \\    var i = n;
+        \\    while (i > 0) : (i -= 1) {
+        \\        _ = buf[i - 1];
+        \\    }
+        \\}
+        \\
+    );
+}
+
+test "index-minus-one-without-zero-guard: while items.len > 0 body suppresses" {
+    try testing.expectNoFire(check,
+        \\fn f(stack: *std.ArrayList(u32)) u32 {
+        \\    while (stack.items.len > 0) {
+        \\        return stack.items[stack.items.len - 1];
+        \\    }
+        \\    return 0;
+        \\}
+        \\
+    );
+}
+
+test "index-minus-one-without-zero-guard: while cond without zero-guard still fires" {
+    try testing.expectFires(check, R,
+        \\fn f(buf: []u8, n: usize) u8 {
+        \\    // while condition doesn't constrain n > 0
+        \\    var done = false;
+        \\    while (!done) { done = true; }
+        \\    return buf[n - 1];
         \\}
         \\
     );

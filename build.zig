@@ -53,6 +53,8 @@ pub fn build(b: *std.Build) void {
         .root_module = exe_mod,
     });
 
+    b.installArtifact(exe);
+
     const run_cmd = b.addRunArtifact(exe);
     const run_step = b.step("run", "Run zbc CLI");
     run_step.dependOn(&run_cmd.step);
