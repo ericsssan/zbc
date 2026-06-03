@@ -68,11 +68,15 @@ fn findZigExe(arena: std.mem.Allocator, io: std.Io, gpa: std.mem.Allocator) ![]c
 fn findZigLibDir(arena: std.mem.Allocator, io: std.Io, gpa: std.mem.Allocator, zig_exe: []const u8) ![]const u8 {
     const env_out = try runCapture(gpa, io, &.{ zig_exe, "env" });
     defer gpa.free(env_out);
-    const needle = "\"lib_dir\":\"";
-    const start = std.mem.indexOf(u8, env_out, needle) orelse return error.NotFound;
-    const after = start + needle.len;
-    const end = std.mem.indexOfScalarPos(u8, env_out, after, '"') orelse return error.NotFound;
-    return try arena.dupe(u8, env_out[after..end]);
+    // `zig env` output format: older Zig emitted JSON (`"lib_dir":"…"`);
+    // Zig 0.17-dev switched to ZON (`.lib_dir = "…"`).  Locate the `lib_dir`
+    // key, then take the value as the text between the next two double quotes —
+    // robust to both formats and to spacing.
+    const key = std.mem.indexOf(u8, env_out, "lib_dir") orelse return error.NotFound;
+    const q1 = std.mem.indexOfScalarPos(u8, env_out, key + "lib_dir".len, '"') orelse return error.NotFound;
+    const q2 = std.mem.indexOfScalarPos(u8, env_out, q1 + 1, '"') orelse return error.NotFound;
+    if (q2 <= q1 + 1) return error.NotFound;
+    return try arena.dupe(u8, env_out[q1 + 1 .. q2]);
 }
 
 fn runCapture(gpa: std.mem.Allocator, io: std.Io, argv: []const []const u8) ![]u8 {
