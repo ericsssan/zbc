@@ -264,6 +264,7 @@ fn checkBody(
         {
             const idx_name = tree.tokenSlice(t + 1);
             if (hasAndGuard(tags, tree, t, &.{idx_name})) continue;
+            if (hasOrGuard(tags, tree, t, &.{idx_name})) continue;
             if (isInGuardedRange(guarded.items, t, &.{idx_name})) continue;
             if (hasAssertGuard(tags, tree, t, &.{idx_name})) continue;
             if (hasEarlyReturnGuard(tags, tree, t, &.{idx_name})) continue;
@@ -295,6 +296,7 @@ fn checkBody(
             // `constants.X` is a comptime namespace in Zig; subscripts are safe.
             if (std.mem.eql(u8, outer_name, "constants")) continue;
             if (hasAndGuard(tags, tree, t, &.{ outer_name, idx_name })) continue;
+            if (hasOrGuard(tags, tree, t, &.{ outer_name, idx_name })) continue;
             if (isInGuardedRange(guarded.items, t, &.{ outer_name, idx_name })) continue;
             if (hasAssertGuard(tags, tree, t, &.{ outer_name, idx_name })) continue;
             if (hasEarlyReturnGuard(tags, tree, t, &.{ outer_name, idx_name })) continue;
@@ -332,6 +334,7 @@ fn checkBody(
             const field_name = tree.tokenSlice(t + 3);
             if (std.mem.eql(u8, recv_name, "constants")) continue;
             if (hasAndGuard(tags, tree, t, &.{ recv_name, field_name, "len" })) continue;
+            if (hasOrGuard(tags, tree, t, &.{ recv_name, field_name, "len" })) continue;
             if (isInGuardedRange(guarded.items, t, &.{ recv_name, field_name, "len" })) continue;
             if (hasAssertGuard(tags, tree, t, &.{ recv_name, field_name, "len" })) continue;
             if (hasEarlyReturnGuard(tags, tree, t, &.{ recv_name, field_name, "len" })) continue;
@@ -381,6 +384,40 @@ fn hasAndGuard(
         if (tags[k - 1] != .number_literal) continue;
         if (!std.mem.eql(u8, tree.tokenSlice(k - 1), "0")) continue;
         if (tags[k - 2] != .angle_bracket_right and tags[k - 2] != .bang_equal) continue;
+        if (tags[k - 3] != .identifier) continue;
+        const guard_id = tree.tokenSlice(k - 3);
+        for (guard_names) |gn| {
+            if (std.mem.eql(u8, guard_id, gn)) return true;
+        }
+    }
+    return false;
+}
+
+/// Returns true when a same-expression `or`-guard for one of `guard_names` is
+/// present in the 15 tokens immediately before the `[` at position `t`.
+///
+/// Matched token pattern (reading backward from `t`):
+///   ... GUARD_IDENT == 0 keyword_or ARRAY_IDENT [t]
+///
+/// Covers `i == 0 or buf[i - 1]` where the `== 0` disjunct short-circuits:
+/// the subscript only evaluates when `i != 0`.
+fn hasOrGuard(
+    tags: []const std.zig.Token.Tag,
+    tree: *const Ast,
+    t: Ast.TokenIndex,
+    guard_names: []const []const u8,
+) bool {
+    if (t < 5) return false;
+    const window: u32 = 15;
+    const start: Ast.TokenIndex = if (t >= window) t - window else 0;
+    var k: Ast.TokenIndex = t;
+    while (k > start) {
+        k -= 1;
+        if (tags[k] != .keyword_or) continue;
+        if (k < 3) continue;
+        if (tags[k - 1] != .number_literal) continue;
+        if (!std.mem.eql(u8, tree.tokenSlice(k - 1), "0")) continue;
+        if (tags[k - 2] != .equal_equal) continue;
         if (tags[k - 3] != .identifier) continue;
         const guard_id = tree.tokenSlice(k - 3);
         for (guard_names) |gn| {
@@ -1834,6 +1871,38 @@ test "index-minus-one-without-zero-guard: alloc different local still fires" {
         \\fn f(gpa: anytype, src: []const u8, other: []const u8) void {
         \\    _ = try gpa.alloc(u8, src.len + 1);
         \\    _ = other[other.len - 1];
+        \\}
+        \\
+    );
+}
+
+// ── Or-guard (same-expression short-circuit) tests ────────────────────────
+
+test "index-minus-one-without-zero-guard: same-expression i==0 or-guard suppresses" {
+    try testing.expectNoFire(check,
+        \\fn f(src: []const u8, i: usize) bool {
+        \\    if (i == 0 or src[i - 1] == '\n') return true;
+        \\    return false;
+        \\}
+        \\
+    );
+}
+
+test "index-minus-one-without-zero-guard: or-guard with != still fires (wrong sense)" {
+    try testing.expectFires(check, R,
+        \\fn f(src: []const u8, i: usize) bool {
+        \\    if (i != 0 or src[i - 1] == '\n') return true;
+        \\    return false;
+        \\}
+        \\
+    );
+}
+
+test "index-minus-one-without-zero-guard: or-guard on different ident still fires" {
+    try testing.expectFires(check, R,
+        \\fn f(src: []const u8, i: usize, j: usize) bool {
+        \\    if (j == 0 or src[i - 1] == '\n') return true;
+        \\    return false;
         \\}
         \\
     );

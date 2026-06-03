@@ -75,8 +75,54 @@ fn checkBody(
         if (tags[t + 4] != .number_literal) continue;
         if (!std.mem.eql(u8, tree.tokenSlice(t + 4), "0")) continue;
 
-        try report(gpa, problems, tree, t + 3, tree.tokenSlice(t + 2));
+        // Suppress when the loop variable has a declared signed type — for
+        // signed integers (i32, i64, isize, etc.) `>= 0` is the correct
+        // termination guard and the decrement cannot wrap.
+        const var_name = tree.tokenSlice(t + 2);
+        if (hasSignedTypeDecl(tags, tree, t, var_name)) continue;
+
+        try report(gpa, problems, tree, t + 3, var_name);
     }
+}
+
+/// Returns true when a `var`/`const` declaration for `var_name` with a signed
+/// integer type (`i8`..`i128`, `isize`) appears within 80 tokens before
+/// `while_tok`.  Also matches function parameters of the form `var_name: iXX`.
+fn hasSignedTypeDecl(
+    tags: []const std.zig.Token.Tag,
+    tree: *const Ast,
+    while_tok: Ast.TokenIndex,
+    var_name: []const u8,
+) bool {
+    if (while_tok < 3) return false;
+    const window: u32 = 80;
+    const start: Ast.TokenIndex = if (while_tok >= window) while_tok - window else 0;
+    var k: Ast.TokenIndex = while_tok;
+    while (k > start) {
+        k -= 1;
+        if (tags[k] != .identifier) continue;
+        if (!std.mem.eql(u8, tree.tokenSlice(k), var_name)) continue;
+        // `var/const NAME : TYPE` — local declaration
+        if (k >= 1 and (tags[k - 1] == .keyword_var or tags[k - 1] == .keyword_const) and
+            k + 2 < while_tok and tags[k + 1] == .colon and tags[k + 2] == .identifier)
+        {
+            if (isSignedIntType(tree.tokenSlice(k + 2))) return true;
+        }
+        // `NAME : TYPE` — function parameter (preceded by `(` or `,`)
+        if (k >= 1 and (tags[k - 1] == .l_paren or tags[k - 1] == .comma) and
+            k + 2 < while_tok and tags[k + 1] == .colon and tags[k + 2] == .identifier)
+        {
+            if (isSignedIntType(tree.tokenSlice(k + 2))) return true;
+        }
+    }
+    return false;
+}
+
+fn isSignedIntType(name: []const u8) bool {
+    if (std.mem.eql(u8, name, "isize")) return true;
+    if (name.len < 2 or name[0] != 'i') return false;
+    for (name[1..]) |c| if (!std.ascii.isDigit(c)) return false;
+    return true;
 }
 
 fn report(
@@ -145,6 +191,41 @@ test "usize-geq-zero-loop: while (i >= 1) does not fire" {
         \\    while (i >= 1) : (i -= 1) {
         \\        _ = s[i - 1];
         \\    }
+        \\}
+        \\
+    );
+}
+
+test "usize-geq-zero-loop: signed i32 variable does not fire" {
+    try testing.expectNoFire(check,
+        \\fn f(n: u32) i32 {
+        \\    var j: i32 = @as(i32, @intCast(n)) - 1;
+        \\    while (j >= 0) : (j -= 1) {
+        \\        _ = j;
+        \\    }
+        \\    return -1;
+        \\}
+        \\
+    );
+}
+
+test "usize-geq-zero-loop: signed i64 variable does not fire" {
+    try testing.expectNoFire(check,
+        \\fn f(name_tok: usize) void {
+        \\    var t: i64 = @intCast(name_tok);
+        \\    while (t >= 0) : (t -= 1) {
+        \\        _ = t;
+        \\    }
+        \\}
+        \\
+    );
+}
+
+test "usize-geq-zero-loop: signed isize variable does not fire" {
+    try testing.expectNoFire(check,
+        \\fn f(n: usize) void {
+        \\    var i: isize = @intCast(n);
+        \\    while (i >= 0) : (i -= 1) {}
         \\}
         \\
     );
