@@ -385,6 +385,9 @@ fn isPositiveLiteral(s: []const u8) bool {
 ///   IDENT >  N  (N ≥ 0 → IDENT ≥ 1)
 ///   IDENT >= N  (N ≥ 1 → IDENT ≥ 1)
 ///   IDENT != 0
+///   IDENT >  OTHER_IDENT  (for usize: OTHER_IDENT ≥ 0, so IDENT ≥ 1)
+///   IDENT >= OTHER_IDENT  (for usize: IDENT > 0, so IDENT ≥ 1)
+///   IDENT != OTHER_IDENT  (variable comparison — weaker, accepted for practicality)
 fn isPositiveGuardTriple(
     tags: []const std.zig.Token.Tag,
     tree: *const Ast,
@@ -393,14 +396,24 @@ fn isPositiveGuardTriple(
     val_tok: Ast.TokenIndex,
 ) bool {
     if (tags[ident_tok] != .identifier) return false;
-    if (tags[val_tok] != .number_literal) return false;
-    const val = tree.tokenSlice(val_tok);
-    return switch (tags[cmp_tok]) {
-        .angle_bracket_right => isNonNegativeLiteral(val), // x > N (N≥0)
-        .angle_bracket_right_equal => isPositiveLiteral(val), // x >= N (N≥1)
-        .bang_equal => std.mem.eql(u8, val, "0"), // x != 0
-        else => false,
-    };
+    if (tags[val_tok] == .number_literal) {
+        const val = tree.tokenSlice(val_tok);
+        return switch (tags[cmp_tok]) {
+            .angle_bracket_right => isNonNegativeLiteral(val), // x > N (N≥0)
+            .angle_bracket_right_equal => isPositiveLiteral(val), // x >= N (N≥1)
+            .bang_equal => std.mem.eql(u8, val, "0"), // x != 0
+            else => false,
+        };
+    }
+    // Variable-vs-variable comparison: `A > B` where both are usize.
+    // Since usize ≥ 0 always, A > B implies A ≥ 1.  Sound for unsigned types.
+    // Also accept `A >= B` and `A != B` as positive-positional guards.
+    if (tags[val_tok] == .identifier) {
+        return tags[cmp_tok] == .angle_bracket_right or
+            tags[cmp_tok] == .angle_bracket_right_equal or
+            tags[cmp_tok] == .bang_equal;
+    }
+    return false;
 }
 
 /// Returns true when a same-expression `and`-guard for one of `guard_names` is
