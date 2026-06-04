@@ -21,7 +21,10 @@ const Ast = std.zig.Ast;
 const problem_mod = @import("../../problem.zig");
 const config_mod = @import("../../config.zig");
 const file_cache_mod = @import("../../cache/file_cache.zig");
+const tokens = @import("../../ast/tokens.zig");
 const testing = @import("../../testing.zig");
+
+const skipNestedFn = tokens.skipNestedFn;
 
 const Problem = problem_mod.Problem;
 const Pos = problem_mod.Pos;
@@ -35,13 +38,29 @@ pub fn check(
     problems: *std.ArrayListUnmanaged(Problem),
 ) !void {
     if (!config_mod.isEnabled(config, .aligncast_on_optional_unwrap)) return;
+    try tokens.forEachFnCached(gpa, tree, cache, problems, checkBody);
+}
+
+fn checkBody(
+    gpa: std.mem.Allocator,
+    tree: *const Ast,
+    cache: *file_cache_mod.FileCache,
+    proto: Ast.full.FnProto,
+    body: Ast.Node.Index,
+    problems: *std.ArrayListUnmanaged(Problem),
+) !void {
     _ = cache;
-
     const tags = tree.tokens.items(.tag);
-    const last_tok: Ast.TokenIndex = @intCast(tree.tokens.len -| 1);
+    const first = tree.firstToken(body);
+    const last = tree.lastToken(body);
+    if (first + 5 > last) return;
 
-    var t: Ast.TokenIndex = 0;
-    while (t + 5 <= last_tok) : (t += 1) {
+    var t: Ast.TokenIndex = first;
+    while (t + 5 <= last) : (t += 1) {
+        if (tags[t] == .keyword_fn) {
+            t = skipNestedFn(tags, t, last);
+            continue;
+        }
         // Pattern: @alignCast ( identifier . ? )
         if (tags[t] != .builtin) continue;
         if (!std.mem.eql(u8, tree.tokenSlice(t), "@alignCast")) continue;
@@ -51,8 +70,37 @@ pub fn check(
         if (tags[t + 4] != .question_mark) continue;
         if (tags[t + 5] != .r_paren) continue;
 
+        // Suppress the C-callback userdata-recovery idiom: when the unwrapped
+        // operand is a `?*anyopaque` parameter, the framework invokes the
+        // callback with the non-null pointer the caller registered, so
+        // `@ptrCast(@alignCast(ctx.?))` is the standard (contractually safe)
+        // way to recover the typed `self`.  Genuinely-nullable typed optionals
+        // (`?*Foo` locals/params from fallible lookups) still fire.
+        if (paramIsOptAnyopaque(tree, proto, tree.tokenSlice(t + 2))) continue;
+
         try report(gpa, problems, tree, t);
     }
+}
+
+/// True iff `name` is a parameter of `proto` whose type is `?*anyopaque` or
+/// `?*const anyopaque` — the opaque callback-context type.
+fn paramIsOptAnyopaque(tree: *const Ast, proto: Ast.full.FnProto, name: []const u8) bool {
+    const tags = tree.tokens.items(.tag);
+    var it = proto.iterate(tree);
+    while (it.next()) |param| {
+        const nt = param.name_token orelse continue;
+        if (!std.mem.eql(u8, tree.tokenSlice(nt), name)) continue;
+        const te = param.type_expr orelse return false;
+        const ft = tree.firstToken(te);
+        const lt = tree.lastToken(te);
+        // `?` … `*` … `anyopaque`
+        if (tags[ft] != .question_mark) return false;
+        if (tags[lt] != .identifier or !std.mem.eql(u8, tree.tokenSlice(lt), "anyopaque")) return false;
+        var k = ft;
+        while (k <= lt) : (k += 1) if (tags[k] == .asterisk) return true;
+        return false;
+    }
+    return false;
 }
 
 fn report(
@@ -79,11 +127,33 @@ fn report(
 
 // ── Tests ──────────────────────────────────────────────────
 
-test "aligncast-on-optional-unwrap: fires on @alignCast(x.?)" {
-    try testing.expectFires(check, R,
+test "aligncast-on-optional-unwrap: ?*anyopaque callback ctx idiom does not fire" {
+    // The C-callback userdata-recovery idiom: the framework passes the
+    // registered non-null pointer, so `@alignCast(ctx.?)` is contractually safe.
+    try testing.expectNoFire(check,
         \\fn dispatchCallback(ctx: ?*anyopaque) void {
         \\    const self: *Handler = @ptrCast(@alignCast(ctx.?));
         \\    self.handle();
+        \\}
+        \\
+    );
+}
+
+test "aligncast-on-optional-unwrap: ?*const anyopaque callback ctx idiom does not fire" {
+    try testing.expectNoFire(check,
+        \\fn dispatchCallback(data: ?*const anyopaque) void {
+        \\    const self: *const Handler = @ptrCast(@alignCast(data.?));
+        \\    self.handle();
+        \\}
+        \\
+    );
+}
+
+test "aligncast-on-optional-unwrap: genuinely-nullable typed optional param still fires" {
+    try testing.expectFires(check, R,
+        \\fn use(p: ?*Foo) void {
+        \\    const f: *Foo = @alignCast(p.?);
+        \\    f.run();
         \\}
         \\
     );
