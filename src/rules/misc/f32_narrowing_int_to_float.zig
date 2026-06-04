@@ -51,7 +51,6 @@ pub fn check(
     problems: *std.ArrayListUnmanaged(Problem),
 ) !void {
     if (!config_mod.isEnabled(config, .f32_narrowing_int_to_float)) return;
-    _ = cache;
 
     const tags = tree.tokens.items(.tag);
     const last_tok: Ast.TokenIndex = @intCast(tree.tokens.len -| 1);
@@ -69,6 +68,14 @@ pub fn check(
         if (!std.mem.eql(u8, tree.tokenSlice(t + 4), "@floatFromInt")) continue;
         if (tags[t + 5] != .l_paren) continue;
 
+        // SEMANTIC: resolve the source integer's width.  `f32` represents every
+        // integer in [-2²⁴, 2²⁴] exactly, so any source of ≤24 bits (u8/u16/i16/
+        // u24/i24 …) converts losslessly — no rounding, not this bug.  This
+        // subsumes the syntactic proxies below (colour channels are u8, masks/
+        // divisors bound to ≤16 bits) and generalises to any narrow type/alias.
+        // No-op without the type engine, so the token proxies remain as fallback.
+        if (sourceExactInF32(cache, tags, t + 5, last_tok)) continue;
+
         // Suppress when the argument ends with `& MASK` where MASK ≤ 0xFFFF.
         if (hasSmallBitAndMask(tags, tree, t + 6, last_tok)) continue;
         // Suppress colour-channel field access: RECV.{r,g,b,a,red,green,blue,alpha}.
@@ -79,6 +86,46 @@ pub fn check(
 
         try report(gpa, problems, tree, t);
     }
+}
+
+/// True iff the `@floatFromInt` argument resolves to an integer type of ≤24
+/// bits, which `f32` represents exactly (every integer in [-2²⁴, 2²⁴] is
+/// exactly representable, and a ≤24-bit value never exceeds that range).  Such
+/// a conversion is lossless, so the rule does not apply.
+///
+/// `lparen_tok` is the `(` of `@floatFromInt`; the argument spans from the next
+/// token to the token before the matching `)`.  Returns false when the type
+/// engine is unavailable, the parens are unbalanced/empty, or the source isn't
+/// a ≤24-bit integer (in which case the syntactic suppressions still apply).
+fn sourceExactInF32(
+    cache: *file_cache_mod.FileCache,
+    tags: []const std.zig.Token.Tag,
+    lparen_tok: Ast.TokenIndex,
+    last_tok: Ast.TokenIndex,
+) bool {
+    if (tags[lparen_tok] != .l_paren) return false;
+    // Find the `)` matching the `@floatFromInt` `(` by paren-depth balance.
+    var depth: u32 = 0;
+    var close: Ast.TokenIndex = lparen_tok;
+    var k = lparen_tok;
+    while (k <= last_tok) : (k += 1) {
+        switch (tags[k]) {
+            .l_paren => depth += 1,
+            .r_paren => {
+                depth -= 1;
+                if (depth == 0) {
+                    close = k;
+                    break;
+                }
+            },
+            else => {},
+        }
+    }
+    if (depth != 0) return false;
+    const arg_start = lparen_tok + 1;
+    if (close == 0 or close - 1 < arg_start) return false; // empty `()`
+    const info = cache.intInfoOfExpr(arg_start, close - 1) orelse return false;
+    return info.bits <= 24;
 }
 
 /// Returns true when the @floatFromInt argument ends with `& MASK` where
