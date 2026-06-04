@@ -40,6 +40,12 @@ pub fn check(
     if (tree.tokens.len < 5) return;
     const last_tok: Ast.TokenIndex = @intCast(tree.tokens.len -| 1);
 
+    // AST pre-pass: token ranges where a variable is proven `<= 0` by a sign
+    // guard.  Inside such a range `-x` is non-negative, so `@intCast(-x)` is
+    // safe (the negate-the-magnitude idiom, e.g. `if (errno < 0) @intCast(-errno)`).
+    var neg = try collectNegGuardedRanges(gpa, tree);
+    defer neg.deinit(gpa);
+
     var t: Ast.TokenIndex = 0;
     while (t + 4 <= last_tok) : (t += 1) {
         // Pattern: @intCast ( - identifier )
@@ -50,8 +56,92 @@ pub fn check(
         if (tags[t + 3] != .identifier) continue;
         if (tags[t + 4] != .r_paren) continue;
 
+        // Suppress when `x` is proven `<= 0` by an enclosing sign guard
+        // (`if (x < 0) … @intCast(-x)` / `if (x >= 0) … else @intCast(-x)`):
+        // then `-x >= 0` cannot overflow on the cast.  NOTE: this trades away
+        // the minInt edge WITHIN such a guard (`-minInt` still overflows), but
+        // the documented TP (zig#23318) is UNGUARDED and still fires.
+        if (inNegGuardedRange(neg.items, tree.tokenSlice(t + 3), t)) continue;
+
         try report(gpa, problems, tree, t);
     }
+}
+
+const NegRange = struct { name: []const u8, start: Ast.TokenIndex, end: Ast.TokenIndex };
+
+const GuardArm = enum { then, els };
+
+/// If `cond` is a sign comparison against literal `0` on a bare identifier,
+/// return the variable name and which arm proves it `<= 0`.
+fn condSignGuard(tree: *const Ast, cond: Ast.Node.Index) ?struct { name: []const u8, arm: GuardArm } {
+    const Cmp = enum { lt, le, gt, ge };
+    const cmp: Cmp = switch (tree.nodeTag(cond)) {
+        .less_than => .lt,
+        .less_or_equal => .le,
+        .greater_than => .gt,
+        .greater_or_equal => .ge,
+        else => return null,
+    };
+    const d = tree.nodeData(cond).node_and_node;
+    // `V <cmp> 0`
+    if (identNodeName(tree, d[0])) |name| {
+        if (isZeroLiteral(tree, d[1])) return switch (cmp) {
+            .lt, .le => .{ .name = name, .arm = .then }, // V<0 / V<=0  → then: V<=0
+            .gt, .ge => .{ .name = name, .arm = .els }, // V>0 / V>=0  → else: V<=0
+        };
+    }
+    // `0 <cmp> V`
+    if (identNodeName(tree, d[1])) |name| {
+        if (isZeroLiteral(tree, d[0])) return switch (cmp) {
+            .gt, .ge => .{ .name = name, .arm = .then }, // 0>V / 0>=V  → then: V<=0
+            .lt, .le => .{ .name = name, .arm = .els }, // 0<V / 0<=V  → else: V<=0
+        };
+    }
+    return null;
+}
+
+fn collectNegGuardedRanges(gpa: std.mem.Allocator, tree: *const Ast) !std.ArrayListUnmanaged(NegRange) {
+    var out: std.ArrayListUnmanaged(NegRange) = .empty;
+    errdefer out.deinit(gpa);
+    const ntags = tree.nodes.items(.tag);
+    var ni: u32 = 1;
+    while (ni < tree.nodes.len) : (ni += 1) {
+        switch (ntags[ni]) {
+            .if_simple, .@"if" => {},
+            else => continue,
+        }
+        const node: Ast.Node.Index = @enumFromInt(ni);
+        const iff = tree.fullIf(node) orelse continue;
+        const g = condSignGuard(tree, iff.ast.cond_expr) orelse continue;
+        const arm_node = switch (g.arm) {
+            .then => iff.ast.then_expr,
+            .els => iff.ast.else_expr.unwrap() orelse continue,
+        };
+        try out.append(gpa, .{
+            .name = g.name,
+            .start = tree.firstToken(arm_node),
+            .end = tree.lastToken(arm_node),
+        });
+    }
+    return out;
+}
+
+fn inNegGuardedRange(ranges: []const NegRange, name: []const u8, tok: Ast.TokenIndex) bool {
+    for (ranges) |r| {
+        if (tok >= r.start and tok <= r.end and std.mem.eql(u8, r.name, name)) return true;
+    }
+    return false;
+}
+
+fn identNodeName(tree: *const Ast, node: Ast.Node.Index) ?[]const u8 {
+    if (tree.nodeTag(node) != .identifier) return null;
+    return tree.tokenSlice(tree.nodeMainToken(node));
+}
+
+fn isZeroLiteral(tree: *const Ast, node: Ast.Node.Index) bool {
+    if (tree.nodeTag(node) != .number_literal) return false;
+    const v = std.fmt.parseInt(u64, tree.tokenSlice(tree.nodeMainToken(node)), 0) catch return false;
+    return v == 0;
 }
 
 fn report(
@@ -118,6 +208,52 @@ test "intcast-of-negated-signed: @abs is the correct form, does not fire" {
     try testing.expectNoFire(check,
         \\fn magnitude(x: i64) u64 {
         \\    return @abs(x);
+        \\}
+        \\
+    );
+}
+
+test "intcast-of-negated-signed: then-branch of `if (x < 0)` does not fire (errno idiom)" {
+    try testing.expectNoFire(check,
+        \\fn check(fd: i32) void {
+        \\    const result = setsockopt(fd);
+        \\    if (result < 0) {
+        \\        const err: i32 = @intCast(-result);
+        \\        log(err);
+        \\    }
+        \\}
+        \\
+    );
+}
+
+test "intcast-of-negated-signed: else-branch of `if (x >= 0)` does not fire (slide idiom)" {
+    try testing.expectNoFire(check,
+        \\fn adjust(pc: u64, slide: i64) u64 {
+        \\    return if (slide >= 0)
+        \\        pc -| @as(u64, @intCast(slide))
+        \\    else
+        \\        pc + @as(u64, @intCast(-slide));
+        \\}
+        \\
+    );
+}
+
+test "intcast-of-negated-signed: unguarded negation still fires (zig#23318 class)" {
+    try testing.expectFires(check, R,
+        \\fn formatDuration(ns: i64) u64 {
+        \\    return @as(u64, @intCast(-ns));
+        \\}
+        \\
+    );
+}
+
+test "intcast-of-negated-signed: negation of a DIFFERENT var than the guard still fires" {
+    try testing.expectFires(check, R,
+        \\fn f(a: i64, b: i64) u64 {
+        \\    if (a < 0) {
+        \\        return @as(u64, @intCast(-b));
+        \\    }
+        \\    return 0;
         \\}
         \\
     );
