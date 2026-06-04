@@ -142,8 +142,8 @@ fn receiverHasUnknownAlignment(
             if (tags[j] == .keyword_align) return false; // explicit alignment
             if (tags[j] == .identifier) {
                 const s = tree.tokenSlice(j);
-                if (std.ascii.indexOfIgnoreCase(s, "alignedalloc") != null or
-                    std.ascii.indexOfIgnoreCase(s, "alignalloc") != null)
+                if (std.ascii.findIgnoreCase(s, "alignedalloc") != null or
+                    std.ascii.findIgnoreCase(s, "alignalloc") != null)
                     return false; // alignedAlloc call in RHS
             }
         }

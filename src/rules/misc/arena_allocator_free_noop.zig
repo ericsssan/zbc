@@ -73,7 +73,7 @@ pub fn check(
                 if (!isNoopFreeAllocatorType(tyname)) continue;
             } else {
                 // Unresolved — fall back to the syntactic name proxy.
-                if (std.ascii.indexOfIgnoreCase(tree.tokenSlice(recv_last), "arena") == null) continue;
+                if (std.ascii.findIgnoreCase(tree.tokenSlice(recv_last), "arena") == null) continue;
             }
         }
 

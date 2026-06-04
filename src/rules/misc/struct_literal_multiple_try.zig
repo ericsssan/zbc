@@ -203,7 +203,7 @@ fn nearbyArenaAllocator(
     var k = start;
     while (k + 4 < anchor) : (k += 1) {
         if (tags[k] != .identifier) continue;
-        if (std.ascii.indexOfIgnoreCase(tree.tokenSlice(k), "arena") == null) continue;
+        if (std.ascii.findIgnoreCase(tree.tokenSlice(k), "arena") == null) continue;
         if (tags[k + 1] != .period) continue;
         if (tags[k + 2] != .identifier) continue;
         if (!std.mem.eql(u8, tree.tokenSlice(k + 2), "allocator")) continue;

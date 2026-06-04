@@ -244,9 +244,9 @@ fn hasVisitedSetGuard(
         if (tags[t + 2] != .identifier) continue;
         const set_name = tree.tokenSlice(t);
         const is_visited_set =
-            std.ascii.indexOfIgnoreCase(set_name, "visited") != null or
-            std.ascii.indexOfIgnoreCase(set_name, "visiting") != null or
-            std.ascii.indexOfIgnoreCase(set_name, "seen") != null;
+            std.ascii.findIgnoreCase(set_name, "visited") != null or
+            std.ascii.findIgnoreCase(set_name, "visiting") != null or
+            std.ascii.findIgnoreCase(set_name, "seen") != null;
         if (!is_visited_set) continue;
         const method = tree.tokenSlice(t + 2);
         if (std.mem.eql(u8, method, "isSet") or
