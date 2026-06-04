@@ -37,6 +37,7 @@
 
 const std = @import("std");
 const Ast = std.zig.Ast;
+const file_cache_mod = @import("../cache/file_cache.zig");
 
 /// A set of string keys (source slices, stable for the tree's lifetime).
 const KeySet = struct {
@@ -144,6 +145,10 @@ const Oracle = struct {
     query: Query,
     target: []const u8,
     use_token: Ast.TokenIndex,
+    /// Optional type engine, used only to confirm a comparison operand is an
+    /// UNSIGNED integer (so `key > operand` soundly implies `key >= 1`).  Null
+    /// in unit tests → the type-gated `>` generalization simply doesn't apply.
+    cache: ?*file_cache_mod.FileCache = null,
     budget: u32 = 50_000,
 
     fn tokenInNode(self: *Oracle, node: Ast.Node.Index) bool {
@@ -163,15 +168,17 @@ const Oracle = struct {
     }
 };
 
-/// Is unsigned scalar `target` provably != 0 at `use_token`?
+/// Is unsigned scalar `target` provably != 0 at `use_token`?  `cache` (optional)
+/// supplies the type engine for the unsigned-operand `>` generalization.
 pub fn provesNonzero(
     gpa: std.mem.Allocator,
     tree: *const Ast,
     body_node: Ast.Node.Index,
     target: []const u8,
     use_token: Ast.TokenIndex,
+    cache: ?*file_cache_mod.FileCache,
 ) bool {
-    return run(gpa, tree, body_node, .nonzero_scalar, target, use_token);
+    return run(gpa, tree, body_node, .nonzero_scalar, target, use_token, cache);
 }
 
 /// Is container `target` (a source-spelling like "arr" or "self.items")
@@ -182,8 +189,9 @@ pub fn provesNonempty(
     body_node: Ast.Node.Index,
     target: []const u8,
     use_token: Ast.TokenIndex,
+    cache: ?*file_cache_mod.FileCache,
 ) bool {
-    return run(gpa, tree, body_node, .nonempty_container, target, use_token);
+    return run(gpa, tree, body_node, .nonempty_container, target, use_token, cache);
 }
 
 fn run(
@@ -193,6 +201,7 @@ fn run(
     query: Query,
     target: []const u8,
     use_token: Ast.TokenIndex,
+    cache: ?*file_cache_mod.FileCache,
 ) bool {
     var oracle: Oracle = .{
         .gpa = gpa,
@@ -200,6 +209,7 @@ fn run(
         .query = query,
         .target = target,
         .use_token = use_token,
+        .cache = cache,
     };
     var st: State = .{};
     defer st.deinit(gpa);
@@ -440,16 +450,48 @@ fn collectRefinement(o: *Oracle, cond: Ast.Node.Index, out: *Refinement) void {
     if (lhs_key) |lk| {
         if (isIntLiteralValue(tree, d[1], 0)) applyCmp(out, lk, cmp, 0, false);
         if (isIntLiteralValue(tree, d[1], 1)) applyCmp(out, lk, cmp, 1, false);
+        // GENERALIZED strict lower bound: `key > X` where X is provably >= 0
+        // (non-negative literal, a `.len`, or an UNSIGNED-typed operand per the
+        // type engine).  Then `key > X >= 0` implies `key >= 1` in the THEN arm.
+        // Zig permits mixed-sign comparison, so a possibly-negative X would make
+        // this unsound — hence the non-negativity check.  Covers the shift-loop
+        // idiom `while (j > i + 1) : (j -= 1) arr[j] = arr[j-1]` (i unsigned).
+        if (cmp == .gt and operandProvablyNonneg(o, d[1])) setThenNonzero(out, lk);
     } else if (rhs_key) |rk| {
         // literal on the left → flip orientation
         if (isIntLiteralValue(tree, d[0], 0)) applyCmp(out, rk, cmp, 0, true);
         if (isIntLiteralValue(tree, d[0], 1)) applyCmp(out, rk, cmp, 1, true);
+        // `X < key`  ⟺  `key > X`  → key >= 1 in the THEN arm (X provably >= 0).
+        if (cmp == .lt and operandProvablyNonneg(o, d[0])) setThenNonzero(out, rk);
     }
 }
 
 const Cmp = enum { gt, lt, ge, le, ne, eq };
 
 const OperandKey = struct { key: []const u8, is_container: bool };
+
+/// True iff `node` (a comparison operand) is provably >= 0, so that
+/// `key > node` soundly implies `key >= 1`:
+///   - a bare number literal (the AST represents `-5` as a negation node, so a
+///     `.number_literal` is always non-negative);
+///   - a `.len` field access (slice/array length is always >= 0);
+///   - an integer expression the type engine resolves to an UNSIGNED type.
+fn operandProvablyNonneg(o: *Oracle, node: Ast.Node.Index) bool {
+    const tree = o.tree;
+    if (tree.nodeTag(node) == .number_literal) return true;
+    if (lenContainerPath(o, node) != null) return true;
+    if (o.cache) |c| {
+        if (c.intInfoOf(node)) |info| return !info.signed;
+    }
+    return false;
+}
+
+/// Record that `ok` is nonzero / non-empty in the THEN arm.
+fn setThenNonzero(out: *Refinement, ok: OperandKey) void {
+    if (ok.is_container) {
+        if (out.then_container == null) out.then_container = ok.key;
+    } else if (out.then_scalar == null) out.then_scalar = ok.key;
+}
 
 /// Classify a comparison operand as either a scalar local `x` or a container
 /// length `c.len` (→ container key = source spelling of `c`).

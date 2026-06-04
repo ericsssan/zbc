@@ -14,7 +14,7 @@ fn proveAt(src: [:0]const u8, target: []const u8, arr: []const u8) !bool {
 
     const body = firstFnBody(&tree) orelse return error.NoFnBody;
     const lbracket = subscriptLBracket(&tree, arr) orelse return error.NoSubscript;
-    return value_range.provesNonzero(gpa, &tree, body, target, lbracket);
+    return value_range.provesNonzero(gpa, &tree, body, target, lbracket, null);
 }
 
 fn firstFnBody(tree: *const Ast) ?Ast.Node.Index {
@@ -54,6 +54,30 @@ test "nonzero: i > 0 guard in then-arm" {
     try std.testing.expect(try proveAt(
         \\fn f(i: usize, buf: []const u8) u8 {
         \\    if (i > 0) {
+        \\        return buf[i - 1];
+        \\    }
+        \\    return 0;
+        \\}
+        \\
+    , "i", "buf"));
+}
+
+test "nonzero: i > <non-negative literal> guard (generalized lower bound)" {
+    try std.testing.expect(try proveAt(
+        \\fn f(i: usize, buf: []const u8) u8 {
+        \\    if (i > 5) {
+        \\        return buf[i - 1];
+        \\    }
+        \\    return 0;
+        \\}
+        \\
+    , "i", "buf"));
+}
+
+test "nonzero: i > other.len guard (.len operand is provably >= 0)" {
+    try std.testing.expect(try proveAt(
+        \\fn f(i: usize, buf: []const u8, other: []const u8) u8 {
+        \\    if (i > other.len) {
         \\        return buf[i - 1];
         \\    }
         \\    return 0;
@@ -208,7 +232,7 @@ fn proveNonemptyAt(src: [:0]const u8, container: []const u8, arr: []const u8) !b
     defer tree.deinit(gpa);
     const body = firstFnBody(&tree) orelse return error.NoFnBody;
     const lbracket = subscriptLBracket(&tree, arr) orelse return error.NoSubscript;
-    return value_range.provesNonempty(gpa, &tree, body, container, lbracket);
+    return value_range.provesNonempty(gpa, &tree, body, container, lbracket, null);
 }
 
 test "nonempty: bare arr.len-1 is unknown (fires)" {

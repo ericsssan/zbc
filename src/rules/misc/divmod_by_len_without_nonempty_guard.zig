@@ -112,7 +112,7 @@ fn checkBody(
 
         // Suppress: container proven non-empty by a dominating guard.
         const path = tree.source[tree.tokens.items(.start)[div.container_first] .. tree.tokens.items(.start)[div.container_last] + tree.tokenSlice(div.container_last).len];
-        if (value_range.provesNonempty(gpa, tree, body, path, div.len_tok)) continue;
+        if (value_range.provesNonempty(gpa, tree, body, path, div.len_tok, cache)) continue;
 
         try report(gpa, problems, tree, t, div.container_first, div.len_tok, path);
     }

@@ -217,13 +217,12 @@ pub fn check(
     problems: *std.ArrayListUnmanaged(Problem),
 ) !void {
     if (!config_mod.isEnabled(config, .index_minus_one_without_zero_guard)) return;
-    _ = cache;
     var ctx = try FileCtx.build(gpa, tree);
     defer ctx.deinit(gpa);
     var proto_buf: [1]Ast.Node.Index = undefined;
     var fns = tokens.iterFnDecls(tree);
     while (fns.next(&proto_buf)) |fn_entry| {
-        try checkBody(gpa, tree, fn_entry.body, problems, &ctx);
+        try checkBody(gpa, tree, fn_entry.body, problems, &ctx, cache);
     }
 }
 
@@ -233,6 +232,7 @@ fn checkBody(
     body: Ast.Node.Index,
     problems: *std.ArrayListUnmanaged(Problem),
     ctx: *const FileCtx,
+    cache: *file_cache_mod.FileCache,
 ) !void {
     const tags = tree.tokens.items(.tag);
     const first = tree.firstToken(body);
@@ -283,7 +283,7 @@ fn checkBody(
             // miss (cross-statement `if (i > 0) {...}`, early-return on zero,
             // positive-literal init) without their brittleness — the oracle
             // under-approximates, so it never suppresses a real underflow.
-            if (value_range.provesNonzero(gpa, tree, body, idx_name, t)) continue;
+            if (value_range.provesNonzero(gpa, tree, body, idx_name, t, cache)) continue;
             try report(gpa, problems, tree, t, idx_name);
             continue;
         }
@@ -321,7 +321,7 @@ fn checkBody(
             // Value-range oracle: when the index is `outer.len`, a dominating
             // proof that `outer` is non-empty makes `outer.len - 1` safe.
             if (std.mem.eql(u8, idx_name, "len") and
-                value_range.provesNonempty(gpa, tree, body, outer_name, t)) continue;
+                value_range.provesNonempty(gpa, tree, body, outer_name, t, cache)) continue;
             try report(gpa, problems, tree, t, idx_name);
             continue;
         }
@@ -364,7 +364,7 @@ fn checkBody(
             {
                 const starts = tree.tokens.items(.start);
                 const path = tree.source[starts[t + 1] .. starts[t + 3] + tree.tokenSlice(t + 3).len];
-                if (value_range.provesNonempty(gpa, tree, body, path, t)) continue;
+                if (value_range.provesNonempty(gpa, tree, body, path, t, cache)) continue;
             }
             try reportC(gpa, problems, tree, t, recv_name, field_name);
             continue;
