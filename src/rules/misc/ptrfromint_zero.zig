@@ -56,8 +56,32 @@ pub fn check(
         if (!std.mem.eql(u8, tree.tokenSlice(t + 2), "0")) continue;
         if (tags[t + 3] != .r_paren) continue;
 
+        // Suppress when the target pointer type is `allowzero` (e.g.
+        // `@as(*allowzero u0, @ptrFromInt(0))`, a C-varargs null sentinel).
+        // `allowzero` pointers may legally hold address 0, so the rule's
+        // premise (a non-nullable pointer must never be 0) does not apply.
+        if (targetIsAllowzero(tags, t)) continue;
+
         try report(gpa, problems, tree, t);
     }
+}
+
+/// True iff an `allowzero` qualifier appears in the pointer-type context
+/// enclosing this `@ptrFromInt(0)` — scanning backward to the nearest
+/// statement boundary (`;` / `{` / `}`).  Covers the `@as(*allowzero T, …)`
+/// cast form and the `var p: *allowzero T = …` declaration form.
+fn targetIsAllowzero(tags: []const std.zig.Token.Tag, t: std.zig.Ast.TokenIndex) bool {
+    var k = t;
+    var steps: u32 = 0;
+    while (k > 0 and steps < 24) : (steps += 1) {
+        k -= 1;
+        switch (tags[k]) {
+            .keyword_allowzero => return true,
+            .semicolon, .l_brace, .r_brace => return false,
+            else => {},
+        }
+    }
+    return false;
 }
 
 fn report(
@@ -105,6 +129,34 @@ test "ptrfromint-zero: non-zero literal does not fire" {
     try testing.expectNoFire(check,
         \\fn fixedAddr() *u32 {
         \\    return @ptrFromInt(0x1000_0000);
+        \\}
+        \\
+    );
+}
+
+test "ptrfromint-zero: allowzero cast target does not fire" {
+    try testing.expectNoFire(check,
+        \\fn nullSentinel() *allowzero u0 {
+        \\    return @as(*allowzero u0, @ptrFromInt(0));
+        \\}
+        \\
+    );
+}
+
+test "ptrfromint-zero: allowzero var-decl target does not fire" {
+    try testing.expectNoFire(check,
+        \\fn nullSentinel() void {
+        \\    const p: *allowzero u8 = @ptrFromInt(0);
+        \\    _ = p;
+        \\}
+        \\
+    );
+}
+
+test "ptrfromint-zero: non-allowzero @as still fires" {
+    try testing.expectFires(check, R,
+        \\fn bad() *u8 {
+        \\    return @as(*u8, @ptrFromInt(0));
         \\}
         \\
     );

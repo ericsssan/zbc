@@ -39,16 +39,18 @@ pub fn check(
     problems: *std.ArrayListUnmanaged(Problem),
 ) !void {
     if (!config_mod.isEnabled(config, .uv_return_value_intcast_truncation)) return;
-    _ = cache;
-    try tokens.forEachFnBody(gpa, tree, problems, checkBody);
+    try tokens.forEachFnCached(gpa, tree, cache, problems, checkBody);
 }
 
 fn checkBody(
     gpa: std.mem.Allocator,
     tree: *const Ast,
+    cache: *file_cache_mod.FileCache,
+    proto: Ast.full.FnProto,
     body: Ast.Node.Index,
     problems: *std.ArrayListUnmanaged(Problem),
 ) !void {
+    _ = proto;
     const tags = tree.tokens.items(.tag);
     const first = tree.firstToken(body);
     const last = tree.lastToken(body);
@@ -75,7 +77,13 @@ fn checkBody(
             tags[t + 6] == .r_paren and
             tags[t + 7] == .r_paren)
         {
-            try report(gpa, problems, tree, t, t + 7);
+            // SEMANTIC: suppress when `.int()` returns an integer NARROWER than
+            // `c_int` (32-bit).  The bug is `c_int` hiding a 64-bit `ssize_t`;
+            // a `.int()` returning u4/u8/u16 is a packed-flags accessor (e.g.
+            // ghostty `CsiUMods.int()`→u4), not the libuv truncation.  `c_int`
+            // is a simple_type → intInfoOfExpr returns null → still fires.
+            if (!intReturnNarrowerThanCInt(cache, t + 2, t + 6))
+                try report(gpa, problems, tree, t, t + 7);
             continue;
         }
 
@@ -91,10 +99,25 @@ fn checkBody(
             tags[t + 8] == .r_paren and
             tags[t + 9] == .r_paren)
         {
-            try report(gpa, problems, tree, t, t + 9);
+            if (!intReturnNarrowerThanCInt(cache, t + 2, t + 8))
+                try report(gpa, problems, tree, t, t + 9);
             continue;
         }
     }
+}
+
+/// True iff the call expression spanning [start, end] (`recv.int()` /
+/// `recv.field.int()`) resolves to an integer type narrower than `c_int`
+/// (< 32 bits) — i.e. a packed-flags accessor, not libuv's `c_int` return.
+/// False when unresolved (`c_int` is a simple_type → null) or ≥32-bit, so the
+/// libuv truncation bug keeps firing.  No-op without the type engine.
+fn intReturnNarrowerThanCInt(
+    cache: *file_cache_mod.FileCache,
+    start: Ast.TokenIndex,
+    end: Ast.TokenIndex,
+) bool {
+    const info = cache.intInfoOfExpr(start, end) orelse return false;
+    return info.bits < 32;
 }
 
 fn report(
