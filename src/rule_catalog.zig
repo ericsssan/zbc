@@ -211,11 +211,6 @@ pub const all = [_]Rule{
         .body = @embedFile("rules/misc/publish-then-touch-self.md"),
     },
     .{
-        .id = "assert-on-untrusted-input",
-        .title = "`assert(...)` in a parser/decoder against untrusted-input parameter — crafted bytes panic the process",
-        .body = @embedFile("rules/misc/assert-on-untrusted-input.md"),
-    },
-    .{
         .id = "missing-deinit-on-composed-owner",
         .title = "outer `deinit` doesn't call `<self>.<field>.deinit()` for a field whose type has a deinit — inner resources leak",
         .body = @embedFile("rules/cleanup/missing-deinit-on-composed-owner.md"),
@@ -279,11 +274,6 @@ pub const all = [_]Rule{
         .id = "self-pointer-in-returned-value",
         .title = "`<local>.<field> = &<local>; return <local>` — self-referential pointer in returned-by-value struct dangles",
         .body = @embedFile("rules/invariants/self-pointer-in-returned-value.md"),
-    },
-    .{
-        .id = "todo-panic-in-production",
-        .title = "`@panic(\"TODO …\")` marker left in production code — crashes users when the branch is reached",
-        .body = @embedFile("rules/invariants/todo-panic-in-production.md"),
     },
     .{
         .id = "ref-before-ownership-transfer",
@@ -446,11 +436,6 @@ pub const all = [_]Rule{
         .body = @embedFile("rules/misc/intcast-signed-timestamp.md"),
     },
     .{
-        .id = "usize-geq-zero-loop",
-        .title = "`while (i >= 0)` with unsigned `i` — condition always true; `i -= 1` wraps to `maxInt(usize)` (panic or infinite loop)",
-        .body = @embedFile("rules/misc/usize-geq-zero-loop.md"),
-    },
-    .{
         .id = "truncate-subtraction-without-guard",
         .title = "`@truncate(a - b)` without `a >= b` guard — unsigned underflow wraps before truncation, yielding garbage",
         .body = @embedFile("rules/misc/truncate-subtraction-without-guard.md"),
@@ -489,11 +474,6 @@ pub const all = [_]Rule{
         .id = "tryget-orelse-unreachable",
         .title = "`tryGet() orelse unreachable` — `tryGet()` returns null for finalized JSRef objects; `unreachable` becomes SIGILL after finalization",
         .body = @embedFile("rules/misc/tryget-orelse-unreachable.md"),
-    },
-    .{
-        .id = "joinabsstringbuf-without-checked-variant",
-        .title = "`joinAbsStringBuf(...)` — unchecked variant silently writes past fixed-size buffers on overflow; use `joinAbsStringBufChecked` which falls back to heap",
-        .body = @embedFile("rules/misc/joinabsstringbuf-without-checked-variant.md"),
     },
     .{
         .id = "aligncast-on-byte-slice",
@@ -585,7 +565,6 @@ pub const Detector = struct {
 const aliased_heap_dupe_mod = @import("rules/heap/aliased_heap_dupe.zig");
 const arraylist_element_ptr_mod = @import("rules/collection/arraylist_element_ptr.zig");
 const arraylist_items_slice_mod = @import("rules/collection/arraylist_items_slice.zig");
-const assert_on_untrusted_input_mod = @import("rules/misc/assert_on_untrusted_input.zig");
 const asymmetric_field_free_mod = @import("rules/cleanup/asymmetric_field_free.zig");
 const borrowed_slice_into_out_param_mod = @import("rules/borrow/borrowed_slice_into_out_param.zig");
 const borrowed_slice_into_stack_buffer_returned_mod = @import("rules/borrow/borrowed_slice_into_stack_buffer_returned.zig");
@@ -604,7 +583,6 @@ const hashmap_iter_mutation_mod = @import("rules/collection/hashmap_iter_mutatio
 const iterator_invalidation_mutation_mod = @import("rules/collection/iterator_invalidation_mutation.zig");
 const thread_spawn_local_pointer_mod = @import("rules/misc/thread_spawn_local_pointer.zig");
 const self_pointer_in_returned_value_mod = @import("rules/borrow/self_pointer_in_returned_value.zig");
-const todo_panic_in_production_mod = @import("rules/misc/todo_panic_in_production.zig");
 const memset_undef_after_len_truncation_mod = @import("rules/collection/memset_undef_after_len_truncation.zig");
 const missing_deinit_on_composed_owner_mod = @import("rules/cleanup/missing_deinit_on_composed_owner.zig");
 const missing_errdefer_between_tries_mod = @import("rules/errdefer/missing_errdefer_between_tries.zig");
@@ -646,7 +624,6 @@ const intcast_clamp_uses_max_mod = @import("rules/misc/intcast_clamp_uses_max.zi
 const forced_unwrap_iterator_next_mod = @import("rules/misc/forced_unwrap_iterator_next.zig");
 const impossible_range_and_mod = @import("rules/misc/impossible_range_and.zig");
 const intcast_signed_timestamp_mod = @import("rules/misc/intcast_signed_timestamp.zig");
-const usize_geq_zero_loop_mod = @import("rules/misc/usize_geq_zero_loop.zig");
 const truncate_subtraction_without_guard_mod = @import("rules/misc/truncate_subtraction_without_guard.zig");
 const initcapacity_plain_add_overflow_mod = @import("rules/misc/initcapacity_plain_add_overflow.zig");
 const index_minus_one_without_zero_guard_mod = @import("rules/misc/index_minus_one_without_zero_guard.zig");
@@ -655,7 +632,6 @@ const catch_error_panic_mod = @import("rules/misc/catch_error_panic.zig");
 const toutf8_inline_slice_borrow_mod = @import("rules/misc/toutf8_inline_slice_borrow.zig");
 const uv_return_value_intcast_truncation_mod = @import("rules/misc/uv_return_value_intcast_truncation.zig");
 const tryget_orelse_unreachable_mod = @import("rules/misc/tryget_orelse_unreachable.zig");
-const joinabsstringbuf_without_checked_variant_mod = @import("rules/misc/joinabsstringbuf_without_checked_variant.zig");
 const aligncast_on_byte_slice_mod = @import("rules/misc/aligncast_on_byte_slice.zig");
 const truncate_len_to_narrow_int_mod = @import("rules/misc/truncate_len_to_narrow_int.zig");
 const field_self_assign_with_cast_mod = @import("rules/misc/field_self_assign_with_cast.zig");
@@ -717,7 +693,6 @@ const escape_detectors = [_]Detector{
     .{ .id = "unreleased-factory-handle",                  .check = unreleased_factory_handle_mod.check },
     .{ .id = "memset-undef-after-len-truncation",          .check = memset_undef_after_len_truncation_mod.check },
     .{ .id = "publish-then-touch-self",                    .check = publish_then_touch_self_mod.check },
-    .{ .id = "assert-on-untrusted-input",                  .check = assert_on_untrusted_input_mod.check },
     .{ .id = "missing-deinit-on-composed-owner",           .check = missing_deinit_on_composed_owner_mod.check },
     .{ .id = "owned-field-no-outer-cleanup",               .check = owned_field_no_outer_cleanup_mod.check },
     .{ .id = "borrowed-slice-into-out-param",              .check = borrowed_slice_into_out_param_mod.check },
@@ -731,7 +706,6 @@ const escape_detectors = [_]Detector{
     .{ .id = "iterator-invalidation-mutation",             .check = iterator_invalidation_mutation_mod.check },
     .{ .id = "thread-spawn-local-pointer",                 .check = thread_spawn_local_pointer_mod.check },
     .{ .id = "self-pointer-in-returned-value",             .check = self_pointer_in_returned_value_mod.check },
-    .{ .id = "todo-panic-in-production",                   .check = todo_panic_in_production_mod.check },
     .{ .id = "ref-before-ownership-transfer",              .check = ref_before_ownership_transfer_mod.check },
     .{ .id = "opt-capture-ptr-after-field-clear",          .check = opt_capture_ptr_after_field_clear_mod.check },
     .{ .id = "tagged-union-payload-early-exit",            .check = tagged_union_payload_early_exit_mod.check },
@@ -764,7 +738,6 @@ const escape_detectors = [_]Detector{
     .{ .id = "forced-unwrap-iterator-next",              .check = forced_unwrap_iterator_next_mod.check },
     .{ .id = "impossible-range-and",                    .check = impossible_range_and_mod.check },
     .{ .id = "intcast-signed-timestamp",                .check = intcast_signed_timestamp_mod.check },
-    .{ .id = "usize-geq-zero-loop",                     .check = usize_geq_zero_loop_mod.check },
     .{ .id = "truncate-subtraction-without-guard",      .check = truncate_subtraction_without_guard_mod.check },
     .{ .id = "initcapacity-plain-add-overflow",         .check = initcapacity_plain_add_overflow_mod.check },
     .{ .id = "index-minus-one-without-zero-guard",      .check = index_minus_one_without_zero_guard_mod.check },
@@ -773,7 +746,6 @@ const escape_detectors = [_]Detector{
     .{ .id = "toutf8-inline-slice-borrow",              .check = toutf8_inline_slice_borrow_mod.check },
     .{ .id = "uv-return-value-intcast-truncation",      .check = uv_return_value_intcast_truncation_mod.check },
     .{ .id = "tryget-orelse-unreachable",               .check = tryget_orelse_unreachable_mod.check },
-    .{ .id = "joinabsstringbuf-without-checked-variant", .check = joinabsstringbuf_without_checked_variant_mod.check },
     .{ .id = "aligncast-on-byte-slice",                 .check = aligncast_on_byte_slice_mod.check },
     .{ .id = "truncate-len-to-narrow-int",              .check = truncate_len_to_narrow_int_mod.check },
     .{ .id = "field-self-assign-with-cast",             .check = field_self_assign_with_cast_mod.check },
@@ -860,7 +832,6 @@ test "registry: pull in every rule module so inline tests run" {
     _ = aliased_heap_dupe_mod;
     _ = arraylist_element_ptr_mod;
     _ = arraylist_items_slice_mod;
-    _ = assert_on_untrusted_input_mod;
     _ = asymmetric_field_free_mod;
     _ = borrowed_slice_into_out_param_mod;
     _ = borrowed_slice_into_stack_buffer_returned_mod;
@@ -875,7 +846,6 @@ test "registry: pull in every rule module so inline tests run" {
     _ = iterator_invalidation_mutation_mod;
     _ = thread_spawn_local_pointer_mod;
     _ = self_pointer_in_returned_value_mod;
-    _ = todo_panic_in_production_mod;
     _ = fd_write_after_close_mod;
     _ = free_then_try_realloc_mod;
     _ = free_without_null_then_check_mod;
@@ -931,7 +901,6 @@ test "registry: pull in every rule module so inline tests run" {
     _ = forced_unwrap_iterator_next_mod;
     _ = impossible_range_and_mod;
     _ = intcast_signed_timestamp_mod;
-    _ = usize_geq_zero_loop_mod;
     _ = truncate_subtraction_without_guard_mod;
     _ = initcapacity_plain_add_overflow_mod;
     _ = index_minus_one_without_zero_guard_mod;
@@ -940,7 +909,6 @@ test "registry: pull in every rule module so inline tests run" {
     _ = toutf8_inline_slice_borrow_mod;
     _ = uv_return_value_intcast_truncation_mod;
     _ = tryget_orelse_unreachable_mod;
-    _ = joinabsstringbuf_without_checked_variant_mod;
     _ = aligncast_on_byte_slice_mod;
     _ = truncate_len_to_narrow_int_mod;
     _ = field_self_assign_with_cast_mod;

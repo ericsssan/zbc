@@ -263,13 +263,6 @@ pub const Invariant = enum {
     /// in returned-by-value struct" footgun common when porting
     /// C / Rust code that uses intrusive self-references.
     self_pointer_in_returned_value,
-    /// `@panic("TODO ...")` / `@panic("unimplemented")` /
-    /// `@panic("FIXME ...")` / etc. left in code that may run
-    /// in release builds.  TODO-panics are a development
-    /// scaffold; reaching them in production crashes the user's
-    /// process.  Either return an explicit error or gate the
-    /// branch out at compile time.
-    todo_panic_in_production,
     /// `const gop = try map.getOrPut(key);` followed by
     /// `gop.value_ptr.*` used as a READ without a prior check of
     /// `gop.found_existing`.  When `found_existing == false` the map
@@ -380,13 +373,6 @@ pub const Invariant = enum {
     /// before the access lands → cross-thread UAF.  Catches
     /// oven-sh/bun#29128 + #31177 + #30185 class.
     publish_then_touch_self,
-    /// `assert(<expr>)` in a parser/decoder fn where `<expr>`
-    /// references untrusted-input parameters (`buffer`, `bytes`,
-    /// `data`, `message`, `block`, ...).  Crafted input panics the
-    /// process.  TigerStyle: asserts are for INTERNAL invariants;
-    /// external input requires `if (!<cond>) return error.Invalid;`.
-    /// Catches tigerbeetle/tigerbeetle#3709 + #3726 + #2980 class.
-    assert_on_untrusted_input,
     /// Outer struct's `deinit` doesn't call `<self>.<field>.deinit(...)`
     /// for a field whose type (same file) ALSO exposes a deinit.
     /// The inner's owned non-memory resources (file handles,
@@ -681,15 +667,6 @@ pub const Invariant = enum {
     /// ReleaseFast.  Use `@intCast(@max(0, std.time.milliTimestamp()))`.
     /// Catches oven-sh/bun#10365 (PRNG seed from raw milliTimestamp).
     intcast_signed_timestamp,
-    /// `while (i >= 0)` where `i` is a `usize` (or any other unsigned type) —
-    /// the condition is always `true` because unsigned values can never be
-    /// negative.  The loop never exits through this guard; the subsequent
-    /// `i -= 1` wraps to `maxInt(usize)` (panic in Debug, silent runaway in
-    /// ReleaseFast).  Fix: use `while (i > 0)` or restructure the loop to
-    /// decrement before comparing.
-    /// Catches oven-sh/bun#11491 (glob.zig reverse scan) and
-    /// oven-sh/bun#24561 (hosted_git_info.zig) class.
-    usize_geq_zero_loop,
     /// `@truncate(a - b)` or `@truncate(recv.field - other)` where the
     /// unsigned subtraction is not guarded by `a >= b`.  When `b > a` the
     /// subtraction wraps to a huge value BEFORE `@truncate` narrows it,
@@ -741,11 +718,6 @@ pub const Invariant = enum {
     /// finalized objects; `unreachable` produces SIGILL after finalization.
     /// Catches oven-sh/bun#29210 (valkey client SIGILL after finalize).
     tryget_orelse_unreachable,
-    /// `joinAbsStringBuf(...)` — unchecked variant does not detect buffer
-    /// overflow and silently writes past fixed-size stack/threadlocal buffers;
-    /// use `joinAbsStringBufChecked` which falls back to heap on overflow.
-    /// Catches oven-sh/bun#28585 (pathToFileURL OOB write on long paths).
-    joinabsstringbuf_without_checked_variant,
     /// `@alignCast(expr.ptr)` — asserting alignment on a raw byte-slice pointer
     /// is unsafe; panics non-deterministically for network/file data at odd
     /// byte offsets.  Use `std.mem.readInt` or `@memcpy` into an aligned local.
@@ -853,7 +825,7 @@ pub const Invariant = enum {
     clamp_wrong_direction,
 };
 
-pub const all_invariants: [116]Invariant = .{
+pub const all_invariants: [112]Invariant = .{
     .arena_escape,
     .stack_escape,
     .use_undefined,
@@ -891,7 +863,6 @@ pub const all_invariants: [116]Invariant = .{
     .unreleased_factory_handle,
     .memset_undef_after_len_truncation,
     .publish_then_touch_self,
-    .assert_on_untrusted_input,
     .missing_deinit_on_composed_owner,
     .owned_field_no_outer_cleanup,
     .borrowed_slice_into_out_param,
@@ -903,7 +874,6 @@ pub const all_invariants: [116]Invariant = .{
     .iterator_invalidation_mutation,
     .thread_spawn_local_pointer,
     .self_pointer_in_returned_value,
-    .todo_panic_in_production,
     .getorput_unguarded_value_read,
     .hashmap_iter_mutation,
     .ref_before_ownership_transfer,
@@ -938,7 +908,6 @@ pub const all_invariants: [116]Invariant = .{
     .forced_unwrap_iterator_next,
     .impossible_range_and,
     .intcast_signed_timestamp,
-    .usize_geq_zero_loop,
     .truncate_subtraction_without_guard,
     .initcapacity_plain_add_overflow,
     .index_minus_one_without_zero_guard,
@@ -947,7 +916,6 @@ pub const all_invariants: [116]Invariant = .{
     .toutf8_inline_slice_borrow,
     .uv_return_value_intcast_truncation,
     .tryget_orelse_unreachable,
-    .joinabsstringbuf_without_checked_variant,
     .aligncast_on_byte_slice,
     .truncate_len_to_narrow_int,
     .field_self_assign_with_cast,
