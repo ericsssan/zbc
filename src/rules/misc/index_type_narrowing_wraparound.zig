@@ -1,5 +1,5 @@
 //! Detects loop-index or buffer-size variables declared with a narrow
-//! signed integer type (`i8`, `i16`, `i32`) whose initialiser comes from
+//! signed integer type (any `iN` with `N < 64`) whose initialiser comes from
 //! a `.len` expression, or that are subsequently used as an array index.
 //!
 //! Real-world shape: oven-sh/bun#31129 (url_path), oven-sh/bun#31339
@@ -9,12 +9,12 @@
 //! loop body never executes (or runs backward).
 //!
 //! Detection (purely syntactic, per-fn token walk):
-//!   1. Find `var NAME : TYPE = EXPR` where TYPE ∈ {`i8`, `i16`, `i32`}.
+//!   1. Find `var NAME : TYPE = EXPR` where TYPE is a signed `iN`, `N < 64`.
 //!      Token pattern:
 //!        t+0: `.keyword_var`
 //!        t+1: `.identifier`   (NAME)
 //!        t+2: `.colon`
-//!        t+3: `.identifier`   with text in {"i8", "i16", "i32"}
+//!        t+3: `.identifier`   with text `iN` where 1 <= N < 64
 //!        t+4: `.equal`
 //!   2. Fire when the initialiser EXPR (tokens after `=` up to `;`)
 //!      contains `.len` — i.e. a `period` followed immediately by an
@@ -152,19 +152,25 @@ fn exprClampsToType(
     return has_min and has_bound;
 }
 
-/// True iff type_text is one of the narrow signed integer types we
-/// care about.
+/// True iff `s` is a SIGNED integer type narrower than the `usize` index
+/// space — `i1` … `i63` — any of which can wrap when used to index a
+/// collection larger than its maximum.  Generalises the former hardcoded
+/// {i8,i16,i32} list to also cover i24/i48/etc.  `isize` (pointer-width) and
+/// `i64`+ are excluded (they cannot be over-indexed in practice).
 fn isNarrowSignedType(s: []const u8) bool {
-    return std.mem.eql(u8, s, "i8") or
-        std.mem.eql(u8, s, "i16") or
-        std.mem.eql(u8, s, "i32");
+    if (s.len < 2 or s[0] != 'i') return false;
+    const bits = std.fmt.parseInt(u16, s[1..], 10) catch return false;
+    return bits >= 1 and bits < 64;
 }
 
-/// Max value for the narrow type — used in the diagnostic message.
+/// Max value for the narrow type `iN` — `2^(N-1) - 1` — used in the
+/// diagnostic message.  Only called for types `isNarrowSignedType` accepted,
+/// so `1 <= N < 64`.
 fn maxValueForType(s: []const u8) i64 {
-    if (std.mem.eql(u8, s, "i8")) return 127;
-    if (std.mem.eql(u8, s, "i16")) return 32767;
-    return 2147483647; // i32
+    const bits = std.fmt.parseInt(u16, s[1..], 10) catch return 0;
+    if (bits == 0 or bits >= 64) return 0;
+    const shift: u6 = @intCast(bits - 1);
+    return (@as(i64, 1) << shift) - 1;
 }
 
 /// True iff the token range `[start, end]` contains `.len` —
@@ -262,6 +268,26 @@ test "index-type-narrowing-wraparound: i8 init from .len fires" {
         \\fn f(arr: []const u8) void {
         \\    var k: i8 = @intCast(arr.len);
         \\    _ = k;
+        \\}
+        \\
+    );
+}
+
+test "index-type-narrowing-wraparound: i24 init from .len fires (generalized width)" {
+    try testing.expectFires(check, R,
+        \\fn f(arr: []const u8) void {
+        \\    var i: i24 = @intCast(arr.len) - 1;
+        \\    _ = i;
+        \\}
+        \\
+    );
+}
+
+test "index-type-narrowing-wraparound: isize does not fire" {
+    try testing.expectNoFire(check,
+        \\fn f(arr: []const u8) void {
+        \\    var i: isize = @intCast(arr.len) - 1;
+        \\    _ = i;
         \\}
         \\
     );
