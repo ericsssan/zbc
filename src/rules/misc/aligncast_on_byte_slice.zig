@@ -82,6 +82,12 @@ pub fn check(
             // (true to the rule's name).  Byte slices (`[]u8`/`[]const u8`,
             // element align 1) and unresolved receivers fall through.
             if (sliceElemNotByteSized(cache, &ident_nodes, t + 2)) continue;
+            // SEMANTIC: suppress when the receiver is `std.mem.Allocator` —
+            // `.ptr` on an Allocator is the vtable context pointer (`*anyopaque`),
+            // NOT a byte-slice pointer.  Casting it back to the concrete type
+            // (after checking the vtable) is the standard type-recovery idiom and
+            // is safe when the vtable guard is present.
+            if (receiverIsAllocator(cache, &ident_nodes, t + 2)) continue;
             // Suppress when the receiver was declared with an explicit alignment
             // annotation (`recv: []align(N) u8`) or via `alignedAlloc` — in those
             // cases the alignment is guaranteed by construction and the @alignCast
@@ -105,6 +111,7 @@ pub fn check(
             tags[t + 8] == .r_paren)
         {
             if (sliceElemNotByteSized(cache, &ident_nodes, t + 4)) continue;
+            if (receiverIsAllocator(cache, &ident_nodes, t + 4)) continue;
             if (!receiverHasUnknownAlignment(tree, tags, t, tree.tokenSlice(t + 4)))
                 continue;
             try report(gpa, problems, tree, t, t + 8);
@@ -164,6 +171,20 @@ fn sliceElemNotByteSized(
     const node = ident_nodes.get(recv_tok) orelse return false;
     const byte_sized = cache.sourcePtrElemByteSized(node) orelse return false;
     return !byte_sized;
+}
+
+/// True iff the receiver at `recv_tok` resolves to `std.mem.Allocator` —
+/// whose `.ptr` field is a `*anyopaque` vtable context pointer, not a byte
+/// slice; casting it back to the concrete struct type is the standard
+/// type-recovery idiom and is NOT the byte-slice alignment-assertion bug.
+fn receiverIsAllocator(
+    cache: *file_cache_mod.FileCache,
+    ident_nodes: *const std.AutoHashMapUnmanaged(Ast.TokenIndex, Ast.Node.Index),
+    recv_tok: Ast.TokenIndex,
+) bool {
+    const node = ident_nodes.get(recv_tok) orelse return false;
+    const tyname = cache.typeNameOfNode(node) orelse return false;
+    return std.mem.eql(u8, tyname, "Allocator");
 }
 
 fn report(
