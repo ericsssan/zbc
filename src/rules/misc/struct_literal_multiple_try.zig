@@ -123,13 +123,13 @@ pub fn check(
 }
 
 /// SEMANTIC allocation signal: returns true iff some identifier operand in the
-/// first-try expression `[start, end)` resolves to type `std.mem.Allocator`.
-/// A call that takes/uses an allocator produces caller-owned memory — the
-/// value the abandoned struct literal would leak.  This is the type-based
-/// replacement for the call-NAME proxy (`alloc`/`dupe`/`toOwnedSlice`/…):
-/// it catches allocator-passing calls regardless of how they're named
-/// (`try buildThing(gpa)`), and a borrowed-result call (no allocator operand)
-/// correctly does not signal.  No-op (false) when the type engine is absent.
+/// first-try expression `[start, end)` resolves to type `std.mem.Allocator`
+/// AND is in receiver position (followed by `.`).  Requiring receiver position
+/// avoids signalling on pool/builder patterns like `pool.put(allocator, bytes)`
+/// where the allocator is passed as an argument — the allocation goes into
+/// the pool's internal buffer, not directly to the caller, so there is no
+/// individual per-field leak from the struct-literal failure.
+/// No-op (false) when the type engine is absent.
 fn firstTryUsesAllocator(
     cache: *file_cache_mod.FileCache,
     ident_nodes: *const std.AutoHashMapUnmanaged(Ast.TokenIndex, Ast.Node.Index),
@@ -142,7 +142,11 @@ fn firstTryUsesAllocator(
         if (tags[t] != .identifier) continue;
         const node = ident_nodes.get(t) orelse continue;
         const tyname = cache.typeNameOfNode(node) orelse continue;
-        if (std.mem.eql(u8, tyname, "Allocator")) return true;
+        if (!std.mem.eql(u8, tyname, "Allocator")) continue;
+        // Allocator must be in receiver position (followed by '.') — e.g.
+        // `gpa.alloc(T, n)`.  If followed by ',' or ')' the allocator is
+        // an argument to a pool/builder and does not individually leak.
+        if (t + 1 < end and tags[t + 1] == .period) return true;
     }
     return false;
 }
@@ -155,12 +159,13 @@ fn firstTryUsesAllocator(
 /// return value types and match no signal, so they are suppressed.
 ///
 /// Precision rules to avoid over-signalling:
-///   - "alloc" exactly (the common allocator variable name) only signals when
-///     it is a method call (preceded by `.`) or a direct call (followed by
-///     `(`).  Bare `alloc` passed as an argument does not signal.
-///   - "create" only signals when it is a method call (preceded by `.`), to
-///     exclude top-level factory functions like `createFoo()` that do not
-///     return owned memory.
+///   - "alloc" in any form (the common allocator variable name, allocPrint,
+///     allocate, …) only signals when in method-call position (preceded by
+///     `.`) or direct-call position (followed by `(`).  Bare `allocator`
+///     passed as an argument to a pool or builder — e.g.
+///     `pool.put(allocator, bytes)` — does NOT signal because the
+///     allocation goes into the pool's internal buffer, not to the caller.
+///   - "create" only signals for method calls (preceded by `.`).
 ///   - "dupe", "clone", "ownedslice" signal in any position.
 fn tryExprAllocates(
     tree: *const Ast,
@@ -175,10 +180,10 @@ fn tryExprAllocates(
         if (containsIgnoreCase(s, "dupe") or
             containsIgnoreCase(s, "clone") or
             containsIgnoreCase(s, "ownedslice")) return true;
-        // "alloc": only signal for method calls or compound names.
+        // "alloc" in any form: require method-call (preceded by '.') or
+        // direct-call (followed by '(') position to exclude allocator
+        // variable names passed as arguments.
         if (containsIgnoreCase(s, "alloc")) {
-            if (!std.mem.eql(u8, s, "alloc")) return true; // e.g. "allocPrint", "allocate"
-            // Exactly "alloc": must be a method (preceded by '.') or call (followed by '(')
             const before_is_dot = t > start and tags[t - 1] == .period;
             const after_is_paren = t + 1 < end and tags[t + 1] == .l_paren;
             if (before_is_dot or after_is_paren) return true;
@@ -390,6 +395,23 @@ test "struct-literal-multiple-try: method .create fires" {
         \\    return .{
         \\        .left  = try gpa.create(LeftNode),
         \\        .right = try gpa.create(RightNode),
+        \\    };
+        \\}
+        \\
+    );
+}
+
+test "struct-literal-multiple-try: pool.put(allocator, bytes) does not fire" {
+    // pool.put(allocator, bytes) passes the allocator as an ARGUMENT to a
+    // pool/builder — all puts go into the pool's internal buffer and are freed
+    // as a unit when the pool is destroyed.  The `allocator` variable name
+    // contains "alloc" but is NOT in receiver position, so neither the
+    // type-based nor name-based allocation signals should fire.
+    try testing.expectNoFire(check,
+        \\fn writeRecord(allocator: Allocator, pool: *PoolBuilder, ln: Line) !Record {
+        \\    return Record{
+        \\        .source = try pool.put(allocator, ln.source),
+        \\        .tokens = try pool.put(allocator, ln.tokens),
         \\    };
         \\}
         \\
