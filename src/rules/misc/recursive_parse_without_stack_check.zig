@@ -75,6 +75,12 @@ fn checkFn(
     // can distinguish `self.parse()` (recursive self-call) from calls on
     // other objects.  Comptime type parameters (e.g. `comptime T: type`) are
     // excluded — they are type-dispatch args, not self-receivers.
+    //
+    // Also: if the FIRST parameter is comptime, the function is a
+    // compile-time generic dispatch (e.g. `fn parse(comptime T: type, …)`
+    // or `fn parseKey(comptime check_export: bool, …)`).  Each instantiation
+    // is a distinct function at runtime, so a call with a different comptime
+    // argument is NOT a runtime recursive call — suppress.
     var first_param_name: ?[]const u8 = null;
     {
         const tok_tags = tree.tokens.items(.tag);
@@ -84,9 +90,8 @@ fn checkFn(
                 tok_tags[cn] == .keyword_comptime
             else
                 false;
-            if (!is_comptime) {
-                if (p.name_token) |nt| first_param_name = tree.tokenSlice(nt);
-            }
+            if (is_comptime) return; // comptime-dispatch generic, not runtime recursion
+            if (p.name_token) |nt| first_param_name = tree.tokenSlice(nt);
         }
     }
     const rec_tok = findRecursiveCall(tree, tags, first, last, fn_name, first_param_name) orelse return;
@@ -254,6 +259,7 @@ fn hasVisitedSetGuard(
         const is_visited_set =
             std.ascii.findIgnoreCase(set_name, "visited") != null or
             std.ascii.findIgnoreCase(set_name, "visiting") != null or
+            std.ascii.findIgnoreCase(set_name, "visits") != null or
             std.ascii.findIgnoreCase(set_name, "seen") != null;
         if (!is_visited_set) continue;
         const method = tree.tokenSlice(t + 2);
@@ -472,6 +478,52 @@ test "recursive-parse-fn-without-stack-check: scan fn without guard fires" {
         \\const Lexer = struct {
         \\    pub fn scanToken(l: *Lexer) void {
         \\        l.scanToken();
+        \\    }
+        \\};
+        \\
+    );
+}
+
+test "recursive-parse-fn-without-stack-check: comptime type dispatch does not fire" {
+    // `fn parse(comptime T: type, …)` — each call instantiates a DIFFERENT
+    // function at compile time; there is no runtime recursion.
+    try testing.expectNoFire(check,
+        \\pub inline fn parse(comptime T: type, input: *Parser) Result(T) {
+        \\    if (comptime @typeInfo(T) == .pointer) {
+        \\        const TT = std.meta.Child(T);
+        \\        return switch (parse(TT, input)) {
+        \\            .result => |v| .{ .result = v },
+        \\            .err => |e| .{ .err = e },
+        \\        };
+        \\    }
+        \\    return .{ .result = undefined };
+        \\}
+        \\
+    );
+}
+
+test "recursive-parse-fn-without-stack-check: comptime bool as first param does not fire" {
+    // `fn parseKey(comptime check_export: bool, …)` with comptime FIRST —
+    // each instantiation is a distinct function; calling with false != true.
+    try testing.expectNoFire(check,
+        \\pub fn parseKey(comptime check_export: bool, input: *Parser) ?[]const u8 {
+        \\    if (comptime check_export) {
+        \\        return parseKey(false, input);
+        \\    }
+        \\    return null;
+        \\}
+        \\
+    );
+}
+
+test "recursive-parse-fn-without-stack-check: visits.isSet guard does not fire" {
+    // Variable named 'visits' (plural) should suppress like 'visited'.
+    try testing.expectNoFire(check,
+        \\const Walker = struct {
+        \\    pub fn visit(self: *Walker, index: u32, visits: *BitSet) void {
+        \\        if (visits.isSet(index)) return;
+        \\        visits.set(index);
+        \\        self.visit(index + 1, visits);
         \\    }
         \\};
         \\
