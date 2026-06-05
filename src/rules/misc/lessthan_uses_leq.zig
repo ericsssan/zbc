@@ -142,3 +142,48 @@ test "lessthan-uses-leq: leq outside lessThan does not fire" {
         \\
     );
 }
+
+test "lessthan-uses-leq: top-level fn (not method) fires" {
+    // Rule fires regardless of whether lessThan is a method or a free function.
+    try testing.expectFires(check, R,
+        \\fn lessThan(a: u32, b: u32) bool {
+        \\    return a <= b;
+        \\}
+        \\
+    );
+}
+
+test "lessthan-uses-leq: leq inside nested block fires" {
+    // `<=` inside a nested if block still counts — rule tracks brace depth.
+    try testing.expectFires(check, R,
+        \\const Cmp = struct {
+        \\    fn lessThan(_: void, a: Item, b: Item) bool {
+        \\        if (a.primary == b.primary) {
+        \\            return a.secondary <= b.secondary;
+        \\        }
+        \\        return a.primary < b.primary;
+        \\    }
+        \\};
+        \\
+    );
+}
+
+test "lessthan-uses-leq: lessThanOrEqual name does not fire" {
+    // The rule matches only the exact token "lessThan", not longer names.
+    try testing.expectNoFire(check,
+        \\fn lessThanOrEqual(a: u32, b: u32) bool {
+        \\    return a <= b;
+        \\}
+        \\
+    );
+}
+
+test "lessthan-uses-leq: greaterOrEqual inside lessThan does not fire" {
+    // The rule only checks for `<=`, not `>=`.
+    try testing.expectNoFire(check,
+        \\fn lessThan(a: u32, b: u32) bool {
+        \\    return !(a >= b);
+        \\}
+        \\
+    );
+}

@@ -124,3 +124,37 @@ test "resize-result-discarded: realloc does not fire" {
         \\
     );
 }
+
+test "resize-result-discarded: different method name does not fire" {
+    // `resizeContext` is not `resize` — rule matches exact method name only.
+    try testing.expectNoFire(check,
+        \\fn grow(alloc: Allocator, buf: *[]u8, n: usize, ctx: anytype) void {
+        \\    _ = alloc.resizeContext(buf.*, n, ctx);
+        \\}
+        \\
+    );
+}
+
+test "resize-result-discarded: captured result does not fire" {
+    // Assigning to a named variable (not `_`) does not trigger the rule.
+    try testing.expectNoFire(check,
+        \\fn grow(gpa: std.mem.Allocator, buf: *[]u8, new_len: usize) !void {
+        \\    const ok = gpa.resize(buf.*, new_len);
+        \\    if (!ok) buf.* = try gpa.realloc(buf.*, new_len);
+        \\}
+        \\
+    );
+}
+
+test "resize-result-discarded: two discarded resizes both fire" {
+    const gpa = std.testing.allocator;
+    var problems = try testing.runRule(gpa, check,
+        \\fn growBoth(a: std.mem.Allocator, x: *[]u8, y: *[]u8, n: usize) void {
+        \\    _ = a.resize(x.*, n);
+        \\    _ = a.resize(y.*, n);
+        \\}
+        \\
+    );
+    defer testing.freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 2), problems.items.len);
+}

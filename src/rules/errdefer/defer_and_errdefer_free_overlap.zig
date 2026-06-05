@@ -98,14 +98,7 @@ fn checkBody(
             continue;
         }
         if (tags[t] != .keyword_errdefer) continue;
-        // Optional `|err|` capture.
-        var body_start: Ast.TokenIndex = t + 1;
-        if (body_start <= last and tags[body_start] == .pipe) {
-            var p: Ast.TokenIndex = body_start + 1;
-            while (p <= last and tags[p] != .pipe) : (p += 1) {}
-            if (p > last) continue;
-            body_start = p + 1;
-        }
+        const body_start: Ast.TokenIndex = t + 1;
         if (body_start > last or tags[body_start] != .l_brace) {
             // Inline form: a single statement.  This rule
             // requires a block form (free + restore is 2+
@@ -252,4 +245,85 @@ test "defer-and-errdefer-free-overlap: no subsequent try doesn't fire" {
     );
     defer freeProblems(gpa, &problems);
     try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
+test "defer-and-errdefer-free-overlap: restore of different name doesn't fire" {
+    // The errdefer restores `other_buf` but the deferred free targets `data_old`.
+    // Because the names differ, the rule correctly does NOT fire.
+    const gpa = std.testing.allocator;
+    var problems = try testing.runRule(gpa, check,
+        \\const std = @import("std");
+        \\const Self = struct {
+        \\    data: []u8,
+        \\    extra: []u8,
+        \\    pub fn grow(self: *Self, alloc: std.mem.Allocator) !void {
+        \\        const data_old = self.data;
+        \\        const extra_old = self.extra;
+        \\        self.data = try alloc.alloc(u8, 64);
+        \\        defer alloc.free(data_old);
+        \\        errdefer {
+        \\            alloc.free(self.data);
+        \\            self.extra = extra_old;
+        \\        }
+        \\        try self.populate();
+        \\    }
+        \\    fn populate(self: *Self) !void { _ = self; }
+        \\};
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
+test "defer-and-errdefer-free-overlap: errdefer block with no free inside doesn't fire" {
+    // Restore without a paired free inside the errdefer body — the rule
+    // requires both a restore AND a free inside the errdefer block.
+    const gpa = std.testing.allocator;
+    var problems = try testing.runRule(gpa, check,
+        \\const std = @import("std");
+        \\const Self = struct {
+        \\    data: []u8,
+        \\    pub fn grow(self: *Self, alloc: std.mem.Allocator) !void {
+        \\        const data_old = self.data;
+        \\        self.data = try alloc.alloc(u8, 64);
+        \\        defer alloc.free(data_old);
+        \\        errdefer {
+        \\            self.data = data_old;
+        \\        }
+        \\        try self.populate();
+        \\    }
+        \\    fn populate(self: *Self) !void { _ = self; }
+        \\};
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
+test "defer-and-errdefer-free-overlap: destroy in errdefer body also fires" {
+    // `destroy` is also a paired-cleanup name — the swap-and-resurrect bug
+    // applies equally when the errdefer uses destroy instead of free.
+    const gpa = std.testing.allocator;
+    var problems = try testing.runRule(gpa, check,
+        \\const std = @import("std");
+        \\const Self = struct {
+        \\    node: *Node,
+        \\    pub fn grow(self: *Self, alloc: std.mem.Allocator) !void {
+        \\        const old_node = self.node;
+        \\        self.node = try alloc.create(Node);
+        \\        defer alloc.free(old_node);
+        \\        errdefer {
+        \\            alloc.destroy(self.node);
+        \\            self.node = old_node;
+        \\        }
+        \\        try self.link();
+        \\    }
+        \\    fn link(self: *Self) !void { _ = self; }
+        \\};
+        \\const Node = struct {};
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expect(problems.items.len >= 1);
+    try std.testing.expectEqualStrings("defer-and-errdefer-free-overlap", problems.items[0].rule_id);
 }

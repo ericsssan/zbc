@@ -228,3 +228,44 @@ test "exit-callback-cross-thread: callback not defined in this file doesn't fire
         \\
     );
 }
+
+test "exit-callback-cross-thread: method call add_exit_callback doesn't fire" {
+    // `self.add_exit_callback(cb)` — preceded by `.`, rule skips method calls.
+    try testing.expectNoFire(check,
+        \\fn cleanup(self: *State) void {
+        \\    self.ctx = 0;
+        \\}
+        \\pub fn init(self: *Handler) void {
+        \\    self.add_exit_callback(cleanup);
+        \\}
+        \\
+    );
+}
+
+test "exit-callback-cross-thread: callback with no self field access doesn't fire" {
+    // Callback only touches a global/static, not instance state — no race.
+    try testing.expectNoFire(check,
+        \\var g_done: bool = false;
+        \\fn cleanup() void {
+        \\    g_done = true;
+        \\}
+        \\pub fn setup() void {
+        \\    add_exit_callback(cleanup);
+        \\}
+        \\
+    );
+}
+
+test "exit-callback-cross-thread: isMainThread guard doesn't fire" {
+    // camelCase variant of the guard name.
+    try testing.expectNoFire(check,
+        \\fn cleanup(self: *State) void {
+        \\    if (!isMainThread()) return;
+        \\    self.context = 0;
+        \\}
+        \\pub fn setup(self: *State) void {
+        \\    add_exit_callback(cleanup);
+        \\}
+        \\
+    );
+}
