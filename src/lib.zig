@@ -178,16 +178,16 @@ fn filterSuppressed(
 /// sibling `.zig` files reached via relative `@import("./X.zig")`
 /// declarations.  Initialised on first analyzeEscape call,
 /// persists for the process lifetime — multi-file sweeps reuse
-/// the loaded models.  Lives on the heap (c_allocator) so test
+/// the loaded models.  Lives on the heap (page_allocator) so test
 /// gpa boundaries don't reclaim it.
 var global_project: ?*project_cache_mod.ProjectCache = null;
 
 fn getProjectCache(gpa: std.mem.Allocator, io: std.Io) *project_cache_mod.ProjectCache {
     _ = gpa;
     if (global_project) |p| return p;
-    const c = std.heap.c_allocator;
-    const p = c.create(project_cache_mod.ProjectCache) catch unreachable;
-    p.* = project_cache_mod.ProjectCache.init(c, io);
+    const pa = std.heap.page_allocator;
+    const p = pa.create(project_cache_mod.ProjectCache) catch unreachable;
+    p.* = project_cache_mod.ProjectCache.init(pa, io);
     global_project = p;
     return p;
 }
@@ -197,7 +197,7 @@ fn getProjectCache(gpa: std.mem.Allocator, io: std.Io) *project_cache_mod.Projec
 pub fn clearProjectCacheForTesting() void {
     if (global_project) |p| {
         p.deinit();
-        std.heap.c_allocator.destroy(p);
+        std.heap.page_allocator.destroy(p);
         global_project = null;
     }
 }

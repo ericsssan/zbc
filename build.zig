@@ -53,6 +53,7 @@ pub fn build(b: *std.Build) void {
         .root_module = exe_mod,
     });
 
+    exe_mod.link_libc = true; // project_cache.zig uses std.c.realpath on non-absolute paths
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);
@@ -63,6 +64,7 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run zbc tests");
 
     // Library tests (lib.zig refAllDecls every submodule).
+    lib_mod.link_libc = true; // project_cache.zig uses std.c.realpath
     const lib_tests = b.addTest(.{ .root_module = lib_mod });
     test_step.dependOn(&b.addRunArtifact(lib_tests).step);
 
@@ -73,6 +75,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     cli_test_mod.addImport("type_engine", engine_mod);
+    cli_test_mod.link_libc = true; // transitively pulls in project_cache.zig
     const cli_tests = b.addTest(.{ .root_module = cli_test_mod });
     test_step.dependOn(&b.addRunArtifact(cli_tests).step);
 
@@ -83,6 +86,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     fuzz_mod.addImport("type_engine", engine_mod);
+    fuzz_mod.link_libc = true; // file_cache.zig → project_cache.zig → std.c.realpath
     const fuzz_tests = b.addTest(.{ .root_module = fuzz_mod });
     test_step.dependOn(&b.addRunArtifact(fuzz_tests).step);
 
@@ -104,6 +108,7 @@ pub fn build(b: *std.Build) void {
         .optimize = .Debug,
     });
     fuzz_exe_mod.addImport("type_engine", engine_mod);
+    fuzz_exe_mod.link_libc = true; // file_cache.zig → project_cache.zig → std.c.realpath
     const fuzz_exe = b.addExecutable(.{ .name = "fuzz-zbc", .root_module = fuzz_exe_mod });
     b.installArtifact(fuzz_exe);
     fuzz_step.dependOn(&b.addInstallArtifact(fuzz_exe, .{}).step);
