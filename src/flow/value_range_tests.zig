@@ -86,6 +86,17 @@ test "nonzero: i > other.len guard (.len operand is provably >= 0)" {
     , "i", "buf"));
 }
 
+test "nonzero: `x += 1` makes an unsigned x nonzero (post-increment look-back)" {
+    try std.testing.expect(try proveAt(
+        \\fn f(buf: []const u8) u8 {
+        \\    var i: usize = 0;
+        \\    i += 1;
+        \\    return buf[i - 1];
+        \\}
+        \\
+    , "i", "buf"));
+}
+
 test "nonzero: i != 0 guard" {
     try std.testing.expect(try proveAt(
         \\fn f(i: usize, buf: []const u8) u8 {

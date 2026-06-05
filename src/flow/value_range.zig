@@ -230,6 +230,7 @@ fn analyzeNode(o: *Oracle, node: Ast.Node.Index, st: *State) error{OutOfMemory}!
         .@"for", .for_simple => return analyzeLoop(o, node, st, .for_),
         .simple_var_decl, .local_var_decl, .aligned_var_decl => return analyzeVarDecl(o, node, st),
         .assign => return analyzeAssign(o, node, st),
+        .assign_add => return analyzeCompoundAdd(o, node, st),
         .@"return", .@"break", .@"continue", .unreachable_literal => {
             var flow: Flow = .{ .diverged = true };
             if (o.tokenInNode(node)) flow.answer = o.answerAt(st);
@@ -304,6 +305,35 @@ fn analyzeAssign(o: *Oracle, node: Ast.Node.Index, st: *State) error{OutOfMemory
     } else {
         // Assignment through a field/index (`c.items = ...`) — conservatively
         // drop container facts whose path the LHS could alter.
+        killMutatedContainers(o, node, st);
+    }
+    return .{};
+}
+
+/// `x += <expr>` (non-wrapping).  For an unsigned `x`, addition never
+/// decreases the value, so:
+///   - `x += <positive literal>` establishes `x >= 1` (x_old >= 0 + >=1).
+///     This matches safe-build semantics — `+=` panics on overflow rather than
+///     wrapping; a ReleaseFast wrap would need `x == maxInt`, unreachable for a
+///     loop index.  Covers `ev_i += 1; … arr[ev_i - 1]`.
+///   - any other addend leaves an existing nonzero fact intact (unsigned add
+///     can only grow `x`), so the fact is preserved rather than dropped.
+fn analyzeCompoundAdd(o: *Oracle, node: Ast.Node.Index, st: *State) error{OutOfMemory}!Flow {
+    const tree = o.tree;
+    const data = tree.nodeData(node).node_and_node;
+    const lhs = data[0];
+    const rhs = data[1];
+    if (o.tokenInNode(rhs)) {
+        const flow = try analyzeNode(o, rhs, st);
+        if (flow.answer != null) return flow;
+    }
+    if (identName(tree, lhs)) |name| {
+        if (isPositiveIntLiteral(tree, rhs)) try st.scalars.add(o.gpa, name);
+        // The value changed: a `n = c.len` snapshot no longer holds, and any
+        // container path rooted at `name` is stale.
+        dropContainersRootedAt(st, name);
+        st.dropAliasesByScalar(name);
+    } else {
         killMutatedContainers(o, node, st);
     }
     return .{};
