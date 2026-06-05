@@ -63,7 +63,21 @@ const Dep = struct {
 const Deinit = struct {
     recv_name: []const u8, // last identifier of `<chain>.deinit(`
     tok: Ast.TokenIndex,
+    deferred: bool, // true when this deinit is wrapped in `defer`
 };
+
+/// Returns true when the deinit call at `t` is of the form `defer <chain>.deinit(`.
+/// Walks backward past the receiver chain to find `keyword_defer` immediately before it.
+fn isDeferredDeinit(tags: []const std.zig.Token.Tag, t: Ast.TokenIndex) bool {
+    if (t < 2 or tags[t - 1] != .period) return false;
+    var u = t - 2;
+    // Walk backward through dotted chain: ident (. ident)*
+    while (u >= 2 and tags[u] == .identifier and tags[u - 1] == .period) {
+        u -= 2;
+    }
+    if (tags[u] != .identifier) return false;
+    return u >= 1 and tags[u - 1] == .keyword_defer;
+}
 
 fn checkBody(
     gpa: std.mem.Allocator,
@@ -118,14 +132,18 @@ fn checkBody(
         if (t == 0 or tags[t - 1] != .period) continue;
         if (tags[t + 1] != .l_paren) continue;
         const recv = lastIdentSegmentBack(tree, tags, t - 1);
-        try deinits.append(gpa, .{ .recv_name = recv, .tok = t });
+        const deferred = isDeferredDeinit(tags, t);
+        try deinits.append(gpa, .{ .recv_name = recv, .tok = t, .deferred = deferred });
     }
     if (deinits.items.len < 2) return;
 
     // For each ordered pair (deinit[i], deinit[j]) with i<j,
     // check if deps contains (a=deinit[j].recv, b=deinit[i].recv).
+    // When BOTH are `defer`-wrapped, LIFO reverses execution order so
+    // source order j>i becomes execution order j-first — correct, no fire.
     for (deinits.items, 0..) |di, i| {
         for (deinits.items[i + 1 ..]) |dj| {
+            if (di.deferred and dj.deferred) continue;
             for (deps.items) |d| {
                 if (std.mem.eql(u8, d.a_name, dj.recv_name) and
                     std.mem.eql(u8, d.b_name, di.recv_name))
@@ -320,4 +338,54 @@ test "deinit-order-violates-construction-dep: correct LIFO order doesn't fire" {
     );
     defer freeProblems(gpa, &problems);
     try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
+test "deinit-order-violates-construction-dep: defer LIFO reversal is correct, no fire" {
+    // `defer` reverses source order: `defer qc.deinit()` (line 2) runs BEFORE
+    // `defer tls_ctx.deinit()` (line 1) at scope exit — correct dependency order.
+    const gpa = std.testing.allocator;
+    var problems = try testing.runRule(gpa, check,
+        \\const TlsCtx = struct {
+        \\    pub fn init() TlsCtx { return .{}; }
+        \\    pub fn deinit(_: *TlsCtx) void {}
+        \\};
+        \\const QuicConn = struct {
+        \\    pub fn init(_: *TlsCtx) QuicConn { return .{}; }
+        \\    pub fn deinit(_: *QuicConn) void {}
+        \\};
+        \\pub fn run() void {
+        \\    var tls_ctx = TlsCtx.init();
+        \\    defer tls_ctx.deinit();
+        \\    var qc = QuicConn.init(&tls_ctx);
+        \\    defer qc.deinit();
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
+test "deinit-order-violates-construction-dep: explicit b before deferred a fires" {
+    // `b.deinit()` runs immediately (source line 1), `defer a.deinit()` runs at scope
+    // exit (after b). a depends on b, so b must outlive a — this is wrong.
+    const gpa = std.testing.allocator;
+    var problems = try testing.runRule(gpa, check,
+        \\const B = struct {
+        \\    pub fn init() B { return .{}; }
+        \\    pub fn deinit(_: *B) void {}
+        \\};
+        \\const A = struct {
+        \\    pub fn init(_: *B) A { return .{}; }
+        \\    pub fn deinit(_: *A) void {}
+        \\};
+        \\pub fn run() void {
+        \\    var b = B.init();
+        \\    var a = A.init(&b);
+        \\    b.deinit();
+        \\    defer a.deinit();
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expect(problems.items.len >= 1);
 }
