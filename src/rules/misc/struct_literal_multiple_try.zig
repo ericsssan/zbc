@@ -103,9 +103,12 @@ pub fn check(
 
         // If the surrounding function uses an arena-backed allocator (i.e.
         // there is a `const X = ARENA.allocator()` within 100 tokens before
-        // this struct literal), every allocation is freed when the arena is
-        // reset — no per-field leak is possible even if a later `try` fails.
+        // this struct literal, or the first-try expression passes an
+        // "arena"-named argument directly), every allocation is freed when
+        // the arena resets — no per-field leak is possible even if a later
+        // `try` fails.
         if (nearbyArenaAllocator(tree, tags, t)) continue;
+        if (tryExprPassesArena(tree, tags, t + 4, i)) continue;
 
         // Check the next field starts with . identifier = try
         const next = i + 1;
@@ -215,6 +218,33 @@ fn nearbyArenaAllocator(
         if (tags[k + 3] != .l_paren) continue;
         if (tags[k + 4] != .r_paren) continue;
         return true;
+    }
+    return false;
+}
+
+/// Returns true if the first-try expression `[start, end)` passes an
+/// "arena"-named identifier as a CALL ARGUMENT (in argument position,
+/// i.e. preceded by `(` or `,`).  This covers the common pattern of
+/// passing an arena allocator parameter directly — e.g.
+/// `pool.toOwnedSlice(arena)` — where `arena: std.mem.Allocator` is a
+/// function parameter rather than derived from `arena.allocator()`.
+/// In that case, allocations go into the arena and are freed as a unit
+/// when the caller destroys the arena, so no individual field leaks.
+fn tryExprPassesArena(
+    tree: *const Ast,
+    tags: []const std.zig.Token.Tag,
+    start: Ast.TokenIndex,
+    end: Ast.TokenIndex,
+) bool {
+    if (start >= end) return false;
+    var t = start;
+    while (t < end) : (t += 1) {
+        if (tags[t] != .identifier) continue;
+        if (std.ascii.findIgnoreCase(tree.tokenSlice(t), "arena") == null) continue;
+        // Require argument position: preceded by '(' or ','.
+        if (t == start) continue; // first token, no predecessor
+        const prev = tags[t - 1];
+        if (prev == .l_paren or prev == .comma) return true;
     }
     return false;
 }
@@ -395,6 +425,22 @@ test "struct-literal-multiple-try: method .create fires" {
         \\    return .{
         \\        .left  = try gpa.create(LeftNode),
         \\        .right = try gpa.create(RightNode),
+        \\    };
+        \\}
+        \\
+    );
+}
+
+test "struct-literal-multiple-try: arena parameter passed to toOwnedSlice does not fire" {
+    // When the arena allocator is passed directly as a parameter — e.g.
+    // `fn f(arena: std.mem.Allocator)` — and the first-try expression is
+    // `try x.toOwnedSlice(arena)`, the allocation is arena-backed and freed
+    // as a unit; no individual per-field leak is possible.
+    try testing.expectNoFire(check,
+        \\fn writeRecord(arena: Allocator, out: *ArrayList(u8), map: *ArrayList(u32)) !Result {
+        \\    return Result{
+        \\        .bytes = try out.toOwnedSlice(arena),
+        \\        .source_offsets = try map.toOwnedSlice(arena),
         \\    };
         \\}
         \\
