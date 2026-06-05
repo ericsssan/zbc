@@ -176,6 +176,10 @@ fn findOwnershipCall(
                 },
                 .identifier => {
                     if (depth == 1 and std.mem.eql(u8, tree.tokenSlice(u), x_name)) {
+                        // Reject `x_name.field` / `x_name.method()` — x is
+                        // used as a receiver, not passed as a direct argument.
+                        const next = u + 1;
+                        if (next <= last and tags[next] == .period) break;
                         found_x = true;
                     }
                 },
@@ -287,6 +291,21 @@ test "errdefer-alive-after-ownership-transfer: non-ownership call does not fire"
         \\    const s = try display(global, path);
         \\    try doMoreWork();
         \\    return s;
+        \\}
+        \\
+    );
+}
+
+test "errdefer-alive-after-ownership-transfer: x.method() receiver is not ownership transfer" {
+    // `arena.allocator()` passes the allocator interface, not arena itself.
+    // The errdefer on `arena` should not fire.
+    try testing.expectNoFire(check,
+        \\fn init(io: Io, gpa: Allocator) !Self {
+        \\    var arena = std.heap.ArenaAllocator.init(gpa);
+        \\    errdefer arena.deinit();
+        \\    const state = try Response.State.init(arena.allocator(), &config);
+        \\    try doMoreWork();
+        \\    return .{ .arena = arena, .state = state };
         \\}
         \\
     );

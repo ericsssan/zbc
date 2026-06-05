@@ -123,9 +123,10 @@ fn checkFn(
         while (k + 1 <= args_range.last) : (k += 1) {
             if (tags[k] != .ampersand) continue;
             if (tags[k + 1] != .identifier) continue;
-            // Reject `& <ident> .` — that's a borrow into the
-            // ident's storage (typically a heap pointer field).
-            if (k + 2 <= args_range.last and tags[k + 2] == .period) continue;
+            // Reject `& <ident> .` or `& <ident> [` — borrows into
+            // heap-allocated storage (field or slice element).
+            if (k + 2 <= args_range.last and
+                (tags[k + 2] == .period or tags[k + 2] == .l_bracket)) continue;
             const name = tree.tokenSlice(k + 1);
             if (!locals_only.contains(name)) continue;
             try report(gpa, problems, tree, k, name);
@@ -271,6 +272,26 @@ test "thread-spawn-local-pointer: heap-allocated arg does NOT fire" {
     defer freeProblems(gpa, &problems);
     // `counter` is passed directly (not `&counter`) — already a
     // heap pointer.  Rule must not fire.
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
+test "thread-spawn-local-pointer: &slice[i] element address does NOT fire (heap slice)" {
+    const gpa = std.testing.allocator;
+    var problems = try testing.runRule(gpa, check,
+        \\const std = @import("std");
+        \\const Worker = struct { val: u32 };
+        \\fn run(w: *Worker) void { _ = w; }
+        \\pub fn init(allocator: std.mem.Allocator, n: usize) !void {
+        \\    const workers = try allocator.alloc(Worker, n);
+        \\    for (0..n) |i| {
+        \\        const t = try std.Thread.spawn(.{}, run, .{&workers[i]});
+        \\        t.detach();
+        \\    }
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    // &workers[i] is a pointer into a heap-allocated slice — not a stack address.
     try std.testing.expectEqual(@as(usize, 0), problems.items.len);
 }
 
