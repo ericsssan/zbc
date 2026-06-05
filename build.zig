@@ -76,44 +76,35 @@ pub fn build(b: *std.Build) void {
     const cli_tests = b.addTest(.{ .root_module = cli_test_mod });
     test_step.dependOn(&b.addRunArtifact(cli_tests).step);
 
-    // Fuzz tests — run once in normal test mode (seed replay); run
-    // continuously under libfuzzer with `zig build fuzz`.
+    // Fuzz smoke test — runs each seed once under the normal test runner.
     const fuzz_mod = b.createModule(.{
         .root_source_file = b.path("src/fuzz_check.zig"),
         .target = target,
         .optimize = optimize,
     });
     fuzz_mod.addImport("type_engine", engine_mod);
-    // Import the library's sub-modules that fuzz_check.zig references
-    // directly (cfg_builder, worklist, rule_catalog, etc.).  Resolved
-    // through the library module's own import graph.
     const fuzz_tests = b.addTest(.{ .root_module = fuzz_mod });
     test_step.dependOn(&b.addRunArtifact(fuzz_tests).step);
 
-    // `zig build fuzz` — compile fuzz_check with coverage instrumentation.
-    // Produces an instrumented test binary at zig-out/bin/fuzz-zbc that
-    // is driven by Zig's built-in fuzzer UI server.
+    // `zig build fuzz` — stdin-reading binary for AFL++ / honggfuzz.
+    // No server, no IPC, no special runtime required.
     //
-    // Usage (Zig 0.17+):
-    //   zig build fuzz           # builds the instrumented binary
-    //   zig test --fuzz src/fuzz_check.zig   # run under the fuzzer UI
+    // Quick start:
+    //   zig build fuzz
+    //   mkdir -p corpus && cp test/fixtures/*.zig corpus/
+    //   afl-fuzz -i corpus/ -o findings/ -- ./zig-out/bin/fuzz-zbc
     //
-    // Note: the instrumented binary requires a running Zig fuzzer UI
-    // process to coordinate corpus mutation; running it standalone
-    // crashes in the IPC layer (known Zig 0.17-dev limitation).
-    const fuzz_step = b.step("fuzz", "Compile fuzz target with coverage instrumentation");
-    const fuzz_instrumented_mod = b.createModule(.{
+    // Also exports LLVMFuzzerTestOneInput for manual libfuzzer use:
+    //   zig cc -fsanitize=fuzzer src/fuzz_check.zig [imports...] -o fuzz-lf
+    //   ./fuzz-lf corpus/
+    const fuzz_step = b.step("fuzz", "Build AFL++/honggfuzz stdin fuzz target");
+    const fuzz_exe_mod = b.createModule(.{
         .root_source_file = b.path("src/fuzz_check.zig"),
         .target = target,
         .optimize = .Debug,
-        .fuzz = true,
     });
-    fuzz_instrumented_mod.addImport("type_engine", engine_mod);
-    const fuzz_instrumented = b.addTest(.{
-        .name = "fuzz-zbc",
-        .root_module = fuzz_instrumented_mod,
-    });
-    // Install the binary so it can be invoked by the fuzzer UI.
-    b.installArtifact(fuzz_instrumented);
-    fuzz_step.dependOn(&b.addInstallArtifact(fuzz_instrumented, .{}).step);
+    fuzz_exe_mod.addImport("type_engine", engine_mod);
+    const fuzz_exe = b.addExecutable(.{ .name = "fuzz-zbc", .root_module = fuzz_exe_mod });
+    b.installArtifact(fuzz_exe);
+    fuzz_step.dependOn(&b.addInstallArtifact(fuzz_exe, .{}).step);
 }

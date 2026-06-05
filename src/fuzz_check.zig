@@ -1,14 +1,20 @@
-//! Fuzz target: the full AST + CFG + pattern-rule pipeline must not
-//! crash on arbitrary Zig source bytes.
+//! Fuzz harness for the full AST + CFG + pattern-rule pipeline.
 //!
-//! Normal test mode (`zig build test`): runs once with each seed entry
-//! to verify the pipeline handles known shapes without crashing.
-//! Fuzz mode (libfuzzer/AFL via `zig build fuzz`): feeds mutated corpus
-//! entries; the harness accepts anything the fuzzer mutates from the seeds.
+//! Three entry points, all backed by the same `analyzeBytes` core:
 //!
-//! The harness intentionally omits the ZLS type engine (which requires
-//! a real file path and project context) — pattern rules and CFG analysis
-//! both fall through to AST-only mode, which is the dominant code path.
+//!   1. `test "fuzz smoke"` — runs each seed once under `zig build test`.
+//!      No server, no instrumentation, just crash-free confirmation.
+//!
+//!   2. `pub fn main()` — reads stdin and analyses it.  Used with AFL++:
+//!        afl-fuzz -i corpus/ -o findings/ -- ./fuzz-zbc
+//!      Build:  zig build fuzz
+//!
+//!   3. `LLVMFuzzerTestOneInput` export — libfuzzer entry point.
+//!      Build:  zig build fuzz-libfuzzer   (links -fsanitize=fuzzer)
+//!      Run:    ./fuzz-zbc-libfuzzer corpus/
+//!
+//! The harness omits the ZLS type engine (needs a file path + project
+//! context) and falls through to AST-only analysis — the dominant path.
 
 const std = @import("std");
 const Ast = std.zig.Ast;
@@ -20,28 +26,23 @@ const config_mod = @import("config.zig");
 const file_cache_mod = @import("cache/file_cache.zig");
 const problem_mod = @import("problem.zig");
 
-/// Seed corpus — representative Zig snippets covering the main rule
-/// classes.  The fuzzer mutates from these, so diverse seeds improve
-/// coverage faster than random-byte starts.
-const seeds: []const []const u8 = &.{
-    // Minimal valid function
+// ── Seeds ─────────────────────────────────────────────────────────────
+// Representative Zig snippets covering the major rule classes.
+// Used as the smoke-test corpus and as AFL++ / libfuzzer seed inputs.
+pub const seeds: []const []const u8 = &.{
     "fn f() void {}",
-    // Unsigned index minus one (index-minus-one-without-zero-guard)
     \\fn g(i: usize, buf: []const u8) u8 {
     \\    if (i > 0) return buf[i - 1];
     \\    return 0;
     \\}
     ,
-    // Arena escape
     \\const std = @import("std");
     \\fn leak(a: std.mem.Allocator) ![]u8 {
     \\    var arena = std.heap.ArenaAllocator.init(a);
     \\    defer arena.deinit();
-    \\    const s = try arena.allocator().alloc(u8, 16);
-    \\    return s;
+    \\    return try arena.allocator().alloc(u8, 16);
     \\}
     ,
-    // Defer LIFO (deinit-order-violates-construction-dep)
     \\fn run() void {
     \\    var grid = Grid.init();
     \\    defer grid.deinit();
@@ -49,7 +50,6 @@ const seeds: []const []const u8 = &.{
     \\    defer log.deinit();
     \\}
     ,
-    // struct-literal-multiple-try
     \\const std = @import("std");
     \\fn make(a: std.mem.Allocator) !Pair {
     \\    return .{
@@ -58,74 +58,96 @@ const seeds: []const []const u8 = &.{
     \\    };
     \\}
     ,
-    // intcast-of-negated-signed
-    \\fn fmt(ns: i64) u64 { return @as(u64, @intCast(-ns)); }
-    ,
-    // use-undefined
-    \\fn f() u8 {
-    \\    var x: u8 = undefined;
-    \\    return x;
-    \\}
-    ,
-    // Pathological: empty file
+    "fn fmt(ns: i64) u64 { return @as(u64, @intCast(-ns)); }",
+    "fn f() u8 { var x: u8 = undefined; return x; }",
+    // Pathological inputs
     "",
-    // Pathological: only whitespace
     "   \n\t  ",
-    // Pathological: not Zig at all
-    "hello world this is not zig code !!!",
-    // Pathological: deeply nested braces
+    "this is not zig at all !!!",
     "fn f() void { { { { { { { { { {} } } } } } } } } }",
 };
 
-test "fuzz: full analysis pipeline is crash-free on arbitrary input" {
-    try std.testing.fuzz({}, fuzzOne, .{});
-}
-
-fn fuzzOne(_: void, smith: *std.testing.Smith) !void {
-    // Use an arena so all per-iteration allocations are freed in one shot.
-    // Page allocator avoids the leak-detection overhead of testing.allocator.
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-    const gpa = arena.allocator();
-
-    // smith.in is the raw input from the fuzzer (or null in seed-replay mode).
-    const raw = smith.in orelse return;
+// ── Core ───────────────────────────────────────────────────────────────
+/// Run the full analysis pipeline on `raw` bytes.  Returns without
+/// reporting findings — caller only cares whether the pipeline crashes.
+pub fn analyzeBytes(gpa: std.mem.Allocator, raw: []const u8) !void {
+    if (raw.len == 0) return;
 
     // Ast.parse requires a null-terminated sentinel string.
-    const src = gpa.allocSentinel(u8, raw.len, 0) catch return;
+    const src = try gpa.allocSentinel(u8, raw.len, 0);
+    defer gpa.free(src);
     @memcpy(src[0..raw.len], raw);
 
-    // Parse — may contain syntax errors; that's fine and expected.
-    // An OOM here means the input triggered huge memory use; return quietly.
-    var tree = Ast.parse(gpa, src, .zig) catch return;
+    var tree = try Ast.parse(gpa, src, .zig);
     defer tree.deinit(gpa);
 
     const config = &config_mod.Default;
     var problems: std.ArrayListUnmanaged(problem_mod.Problem) = .empty;
 
-    // Per-file cache used by both pipelines.
     var cache = file_cache_mod.FileCache.init(gpa, &tree);
     defer cache.deinit();
 
-    // ── CFG + worklist (flow analysis) ─────────────────────────────
-    // Iterate all fn_decls and run the abstract interpretation pipeline.
-    // Skip on error (OOM), not on crash — a crash here is a bug.
     var node_idx: u32 = 1;
     while (node_idx < tree.nodes.len) : (node_idx += 1) {
         const node: Ast.Node.Index = @enumFromInt(node_idx);
         if (tree.nodeTag(node) != .fn_decl) continue;
-        const cfg = (cfg_builder.lowerFunctionFull(
+        const cfg = (try cfg_builder.lowerFunctionFull(
             gpa, &tree, node, config, &cache,
-        ) catch continue) orelse continue;
+        )) orelse continue;
         var cfg_mut = cfg;
         defer cfg_mut.deinit(gpa);
-        worklist.check(gpa, &cfg_mut, .{ .path = "<fuzz>", .config = config }, &problems) catch continue;
+        try worklist.check(gpa, &cfg_mut, .{ .path = "<fuzz>", .config = config }, &problems);
     }
 
-    // ── Pattern detectors ───────────────────────────────────────────
-    rule_catalog.runEscape(gpa, &tree, &cache, config, &problems) catch {};
+    try rule_catalog.runEscape(gpa, &tree, &cache, config, &problems);
 
-    // Free Problem messages — arena owns the slice but Problem.deinit
-    // releases the gpa-allocated message string.
     for (problems.items) |*p| p.deinit(gpa);
+    problems.deinit(gpa);
+}
+
+// ── Entry point 1: smoke test ──────────────────────────────────────────
+test "fuzz smoke: seeds do not crash the analysis pipeline" {
+    const gpa = std.testing.allocator;
+    for (seeds) |seed| {
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        analyzeBytes(arena.allocator(), seed) catch |err| switch (err) {
+            error.OutOfMemory => {}, // OOM on a seed is not a logic crash
+            else => return err,
+        };
+    }
+}
+
+// ── Entry point 2: stdin reader (AFL++ / honggfuzz / manual) ───────────
+// Compile with `zig build fuzz`, then:
+//   afl-fuzz -i corpus/ -o findings/ -- ./fuzz-zbc
+//   honggfuzz --input corpus/ -- ./fuzz-zbc
+pub fn main(init: std.process.Init) !void {
+    const gpa = init.gpa;
+    const io = init.io;
+
+    // AFL++ / honggfuzz write their mutated input to stdin.
+    var buf: [65536]u8 = undefined;
+    var stdin_reader = std.Io.File.stdin().readerStreaming(io, &buf);
+    const raw = stdin_reader.interface.allocRemaining(gpa, .limited(4 * 1024 * 1024)) catch |err| switch (err) {
+        error.OutOfMemory, error.StreamTooLong => return,
+        else => return err,
+    };
+    defer gpa.free(raw);
+
+    analyzeBytes(gpa, raw) catch |err| switch (err) {
+        error.OutOfMemory => return,
+        else => return err,
+    };
+}
+
+// ── Entry point 3: libfuzzer (AFL++ with -fsanitize=fuzzer) ────────────
+// Compile with `zig build fuzz-libfuzzer`, then:
+//   ./fuzz-zbc-libfuzzer corpus/
+//   # or with AFL++LLVM mode: afl-fuzz -i corpus -o out -- ./fuzz-zbc-libfuzzer @@
+export fn LLVMFuzzerTestOneInput(data: [*]const u8, size: usize) callconv(.c) i32 {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    analyzeBytes(arena.allocator(), data[0..size]) catch {};
+    return 0;
 }
