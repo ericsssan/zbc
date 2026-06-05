@@ -176,8 +176,64 @@ fn checkBody(
         const window_start = t -| 10;
         if (hasRefAcquireCall(tree, tags, window_start, t -| 1, source_recv, source_field)) continue;
 
+        // Suppress the MOVE pattern: if within the next 100 tokens the SOURCE
+        // is reset to empty (`source_recv.source_field = {}` or `.{}`), the
+        // assignment is an ownership transfer, not a shared-ref copy.  A move
+        // does not increase the refcount — the receiver acquires the single
+        // existing ref and the source is disarmed.
+        if (sourceIsClearedAfter(tree, tags, t + 6, @min(t + 100, last), source_recv, source_field))
+            continue;
+
         try report(gpa, state.problems, tree, t + 1, dest_field, source_recv);
     }
+}
+
+/// True iff within `[start, end]` the SOURCE is reset to an empty value
+/// (`source_recv . source_field = { }` or `= .{ }` or `= .empty`).  This
+/// pattern signals an ownership MOVE — the field is transferred from the
+/// source to the destination, then zeroed.  A move does not increment the
+/// refcount; both sides share the original (sole) reference, and the source
+/// being cleared prevents any double-release.
+fn sourceIsClearedAfter(
+    tree: *const Ast,
+    tags: []const std.zig.Token.Tag,
+    start: Ast.TokenIndex,
+    end: Ast.TokenIndex,
+    source_recv: []const u8,
+    source_field: []const u8,
+) bool {
+    if (start + 4 > end) return false;
+    var k = start;
+    while (k + 4 <= end) : (k += 1) {
+        // Pattern: identifier(source_recv) . identifier(source_field) = { }
+        if (tags[k] != .identifier) continue;
+        if (!std.mem.eql(u8, tree.tokenSlice(k), source_recv)) continue;
+        if (k + 1 > end or tags[k + 1] != .period) continue;
+        if (k + 2 > end or tags[k + 2] != .identifier) continue;
+        if (!std.mem.eql(u8, tree.tokenSlice(k + 2), source_field)) continue;
+        if (k + 3 > end or tags[k + 3] != .equal) continue;
+        // Empty init: `= {}`, `= .{}`, or `.empty`
+        if (k + 4 > end) continue;
+        switch (tags[k + 4]) {
+            .l_brace => return true,               // `= {`
+            .period => {
+                if (k + 5 > end) continue;
+                switch (tags[k + 5]) {
+                    .l_brace => return true,       // `= .{`
+                    .identifier => {               // `= .empty` / `= .none` / `= .zero`
+                        const w = tree.tokenSlice(k + 5);
+                        if (std.mem.eql(u8, w, "empty") or
+                            std.mem.eql(u8, w, "none") or
+                            std.mem.eql(u8, w, "zero") or
+                            std.mem.eql(u8, w, "init")) return true;
+                    },
+                    else => {},
+                }
+            },
+            else => {},
+        }
+    }
+    return false;
 }
 
 /// True iff `name` is a method that RELEASES or deallocates a refcounted value.
@@ -460,6 +516,21 @@ test "ref-counted-copy-without-dupe: .ref = other.ref fires when ref() call exis
         \\fn acquire(s: anytype) void { _ = s.ref.ref(); }
         \\fn copy(st: anytype) void {
         \\    const result = .{ .ref = st.ref };
+        \\    _ = result;
+        \\}
+        \\
+    );
+}
+
+test "ref-counted-copy-without-dupe: move pattern (source cleared after) does not fire" {
+    // `.ref = this.ref` followed by `this.ref = {}` is an OWNERSHIP TRANSFER
+    // (move), not a shared-copy.  The source is zeroed out so there is only
+    // ever one live reference at a time — no double-free.
+    try testing.expectNoFire(check,
+        \\fn acquire(s: anytype) void { _ = s.ref.ref(); }
+        \\fn move(this: *Self) void {
+        \\    const result = .{ .ref = this.ref };
+        \\    this.ref = {};
         \\    _ = result;
         \\}
         \\
