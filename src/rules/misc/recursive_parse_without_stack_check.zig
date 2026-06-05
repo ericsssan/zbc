@@ -102,6 +102,14 @@ fn checkFn(
     // bounds it.  bun's LinkerGraph.visit / bundle_v2 graph walkers use this.
     if (hasVisitedSetGuard(tags, tree, first, last)) return;
 
+    // Step 5c (suppression): a recursion-depth guard idiom.  The body references
+    // a `recursion`-named token — a guard method (`self.enterRecursion()` /
+    // `leaveRecursion()`) or an inline depth cap (`if (self.recursion_depth >=
+    // max_recursion_depth) return error.ParseError;`).  Either way the
+    // self-recursion is bounded by a depth counter.  (es-parser's enter/leave-
+    // Recursion chokepoint, cap 400.)
+    if (hasRecursionGuardToken(tags, tree, first, last)) return;
+
     try report(gpa, problems, tree, rec_tok, fn_name);
 }
 
@@ -260,6 +268,30 @@ fn hasVisitedSetGuard(
     return false;
 }
 
+/// True iff `[first, last]` references any `recursion`-named identifier — a
+/// recursion-depth guard method (`enterRecursion`/`leaveRecursion`/
+/// `checkRecursion`) OR an inline depth-counter field (`recursion_depth` /
+/// `max_recursion_depth`).  Both forms bound the self-recursion by a depth cap.
+/// Catches the call form (`self.enterRecursion()`) and the field-check form
+/// (`if (self.recursion_depth >= MAX) return error.X;`) uniformly.
+fn hasRecursionGuardToken(
+    tags: []const std.zig.Token.Tag,
+    tree: *const Ast,
+    first: Ast.TokenIndex,
+    last: Ast.TokenIndex,
+) bool {
+    var t: Ast.TokenIndex = first;
+    while (t <= last) : (t += 1) {
+        if (tags[t] == .keyword_fn) {
+            t = skipNestedFn(tags, t, last);
+            continue;
+        }
+        if (tags[t] != .identifier) continue;
+        if (std.ascii.findIgnoreCase(tree.tokenSlice(t), "recursion") != null) return true;
+    }
+    return false;
+}
+
 fn isStackGuardName(name: []const u8) bool {
     return std.mem.eql(u8, name, "is_safe_to_recurse") or
         std.mem.eql(u8, name, "isSafeToRecurse") or
@@ -402,6 +434,33 @@ test "recursive-parse-fn-without-stack-check: visitor with seen.contains guard d
         \\    pub fn visitNode(self: *Walker, n: *Node) void {
         \\        if (self.seen.contains(n)) return;
         \\        self.visitNode(n.child);
+        \\    }
+        \\};
+        \\
+    );
+}
+
+test "recursive-parse-fn-without-stack-check: enterRecursion() guard does not fire" {
+    try testing.expectNoFire(check,
+        \\const Parser = struct {
+        \\    pub fn parseStatement(self: *Parser) !void {
+        \\        try self.enterRecursion();
+        \\        defer self.leaveRecursion();
+        \\        return self.parseStatement();
+        \\    }
+        \\};
+        \\
+    );
+}
+
+test "recursive-parse-fn-without-stack-check: inline recursion_depth field cap does not fire" {
+    try testing.expectNoFire(check,
+        \\const Parser = struct {
+        \\    pub fn parseType(p: *Parser) !void {
+        \\        if (p.recursion_depth >= 400) return error.NestingTooDeep;
+        \\        p.recursion_depth += 1;
+        \\        defer p.recursion_depth -= 1;
+        \\        return p.parseType();
         \\    }
         \\};
         \\
