@@ -140,12 +140,17 @@ fn checkFn(
             continue;
         }
         if (query.matchAt(tree, defer_cleanup, t, last, null)) |m| {
-            const range = enclosingScope(tags, t, first, last);
-            try deferred.append(gpa, .{
-                .name = m.captureText(tree, 0).?,
-                .scope_open = range.open,
-                .scope_close = range.close,
-            });
+            const name = m.captureText(tree, 0).?;
+            // Skip module/namespace identifiers (e.g. `defer posix.close(fd)`
+            // where `posix` is `std.posix`) — they are not local variables.
+            if (bindings.find(name) != null) {
+                const range = enclosingScope(tags, t, first, last);
+                try deferred.append(gpa, .{
+                    .name = name,
+                    .scope_open = range.open,
+                    .scope_close = range.close,
+                });
+            }
             t = m.end + 1;
             continue;
         }
@@ -1123,5 +1128,19 @@ test "deferred arg IS the embedded param — fires" {
         \\    // in transpile's return — so this must fire.
         \\    ret.* = transpile(slice.items, other);
         \\}
+    );
+}
+
+test "namespace defer (defer posix.close) is not tracked as local — does NOT fire" {
+    // `posix` is `std.posix` (module namespace), not a local variable.
+    // `defer posix.close(fd)` must not register `posix` as a deferred name.
+    try testing.expectNoFire(check,
+        \\const posix = std.posix;
+        \\pub fn setupSocket(client: *posix.socket_t) !void {
+        \\    const listener = posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0) catch unreachable;
+        \\    defer posix.close(listener);
+        \\    client.* = posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0) catch unreachable;
+        \\}
+        \\
     );
 }
