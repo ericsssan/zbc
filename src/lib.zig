@@ -249,6 +249,136 @@ test "lib API: analyzeEscape end-to-end flags arena escape" {
     try std.testing.expect(found);
 }
 
+// ── Suppression integration tests ───────────────────────────────
+//
+// These tests run the full analyzeEscape pipeline on real files to
+// verify that filterSuppressed correctly removes or keeps problems
+// based on // zbc-disable-line / // zbc-disable-next-line directives.
+// They use ptrfromint-zero as the trigger — easy to place and the
+// finding lands on a predictable source line.
+
+fn analyzeSrc(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    tmp: *std.testing.TmpDir,
+    src: []const u8,
+) ![]Problem {
+    const name = "check.zig";
+    try tmp.dir.writeFile(io, .{ .sub_path = name, .data = src });
+    const base_dir = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer gpa.free(base_dir);
+    const path = try std.fs.path.join(gpa, &.{ base_dir, name });
+    defer gpa.free(path);
+    return analyzeEscape(gpa, io, path, &DefaultConfig, null);
+}
+
+fn countByRule(problems: []const Problem, rule_id: []const u8) usize {
+    var n: usize = 0;
+    for (problems) |p| {
+        if (std.mem.eql(u8, p.rule_id, rule_id)) n += 1;
+    }
+    return n;
+}
+
+test "suppression: zbc-disable-line drops the finding on the same line" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Without directive: @ptrFromInt(0) on line 2 → 1 problem.
+    // With directive on the same line: 0 problems.
+    const problems = try analyzeSrc(gpa, std.testing.io, &tmp,
+        \\fn zero_ptr() *anyopaque {
+        \\    return @ptrFromInt(0); // zbc-disable-line: ptrfromint-zero
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, problems);
+    try std.testing.expectEqual(@as(usize, 0), countByRule(problems, "ptrfromint-zero"));
+}
+
+test "suppression: without directive the finding is not dropped" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const problems = try analyzeSrc(gpa, std.testing.io, &tmp,
+        \\fn zero_ptr() *anyopaque {
+        \\    return @ptrFromInt(0);
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, problems);
+    try std.testing.expect(countByRule(problems, "ptrfromint-zero") >= 1);
+}
+
+test "suppression: zbc-disable-next-line drops the finding on the following line" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const problems = try analyzeSrc(gpa, std.testing.io, &tmp,
+        \\fn zero_ptr() *anyopaque {
+        \\    // zbc-disable-next-line: ptrfromint-zero
+        \\    return @ptrFromInt(0);
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, problems);
+    try std.testing.expectEqual(@as(usize, 0), countByRule(problems, "ptrfromint-zero"));
+}
+
+test "suppression: wildcard zbc-disable-line: * drops any rule" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const problems = try analyzeSrc(gpa, std.testing.io, &tmp,
+        \\fn zero_ptr() *anyopaque {
+        \\    return @ptrFromInt(0); // zbc-disable-line: *
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, problems);
+    try std.testing.expectEqual(@as(usize, 0), countByRule(problems, "ptrfromint-zero"));
+}
+
+test "suppression: wrong rule id leaves the finding" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Directive targets a different rule → ptrfromint-zero still fires.
+    const problems = try analyzeSrc(gpa, std.testing.io, &tmp,
+        \\fn zero_ptr() *anyopaque {
+        \\    return @ptrFromInt(0); // zbc-disable-line: some-other-rule
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, problems);
+    try std.testing.expect(countByRule(problems, "ptrfromint-zero") >= 1);
+}
+
+test "suppression: directive only suppresses its own line, not others" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Two @ptrFromInt(0) calls on different lines.
+    // Only the first has a directive — second still fires.
+    const problems = try analyzeSrc(gpa, std.testing.io, &tmp,
+        \\fn a() *anyopaque {
+        \\    return @ptrFromInt(0); // zbc-disable-line: ptrfromint-zero
+        \\}
+        \\fn b() *anyopaque {
+        \\    return @ptrFromInt(0);
+        \\}
+        \\
+    );
+    defer freeProblems(gpa, problems);
+    try std.testing.expectEqual(@as(usize, 1), countByRule(problems, "ptrfromint-zero"));
+}
+
 test {
     _ = cfg_mod;
     _ = worklist;
