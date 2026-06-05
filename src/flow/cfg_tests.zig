@@ -1428,3 +1428,177 @@ test "try unwraps inner expression: copy_of(src) preserved through try" {
     }
     try std.testing.expect(found_copy_of);
 }
+
+// ── Divergent builtins ─────────────────────────────────────────────────────
+
+test "@panic as statement: creates dead continuation block, no lowering_gap" {
+    // The builder replaces `cur` with a fresh block on @panic so subsequent
+    // (unreachable) stmts don't pollute the pre-panic abstract state.
+    const gpa = std.testing.allocator;
+    var result = try parseAndLower(gpa,
+        \\pub fn foo() void {
+        \\    @panic("nope");
+        \\    return;
+        \\}
+        \\
+    );
+    defer result.deinit(gpa);
+    const cfg = result.cfg.?;
+
+    // @panic creates a fresh dead block, so we get entry + dead-continuation
+    // (with ret) + dead-post-ret = at least 3 blocks.  Without divergent
+    // handling we'd only get 2 (entry has the lowering_gap, then dead-post-ret).
+    try std.testing.expect(cfg.blocks.len >= 3);
+
+    // @panic must NOT produce a lowering_gap — it's handled as divergent.
+    for (cfg.blocks) |b| {
+        for (b.stmts) |s| {
+            if (s.kind == .lowering_gap) {
+                const note = s.kind.lowering_gap.note;
+                const is_builtin = std.mem.startsWith(u8, note, "builtin_call");
+                try std.testing.expect(!is_builtin);
+            }
+        }
+    }
+}
+
+test "@trap as statement: creates dead continuation block, no lowering_gap" {
+    // Same divergent treatment as @panic — @trap is listed alongside it
+    // in builtinIsDivergent.
+    const gpa = std.testing.allocator;
+    var result = try parseAndLower(gpa,
+        \\pub fn foo() void {
+        \\    @trap();
+        \\    return;
+        \\}
+        \\
+    );
+    defer result.deinit(gpa);
+    const cfg = result.cfg.?;
+
+    try std.testing.expect(cfg.blocks.len >= 3);
+
+    for (cfg.blocks) |b| {
+        for (b.stmts) |s| {
+            if (s.kind == .lowering_gap) {
+                const note = s.kind.lowering_gap.note;
+                try std.testing.expect(!std.mem.startsWith(u8, note, "builtin_call"));
+            }
+        }
+    }
+}
+
+test "unreachable literal: creates dead continuation block, no lowering_gap" {
+    // `.unreachable_literal` is handled identically to @panic/@trap:
+    // cur is replaced with a fresh block.
+    const gpa = std.testing.allocator;
+    var result = try parseAndLower(gpa,
+        \\pub fn foo() void {
+        \\    unreachable;
+        \\    return;
+        \\}
+        \\
+    );
+    defer result.deinit(gpa);
+    const cfg = result.cfg.?;
+
+    try std.testing.expect(cfg.blocks.len >= 3);
+
+    for (cfg.blocks) |b| {
+        for (b.stmts) |s| {
+            if (s.kind == .lowering_gap) {
+                try std.testing.expect(!std.mem.eql(u8, s.kind.lowering_gap.note, "unreachable_literal"));
+            }
+        }
+    }
+}
+
+// ── Nested unlabeled blocks ────────────────────────────────────────────────
+
+test "nested unlabeled block fires scope-bound defer before outer continuation" {
+    // A `defer` inside `{ ... }` must fire when the inner block exits,
+    // not at the function return.  Concretely: the arena_kill from
+    // `defer x.deinit()` inside the nested block appears in the stmt
+    // list BETWEEN x's declaration and y's declaration.
+    const gpa = std.testing.allocator;
+    var result = try parseAndLower(gpa,
+        \\pub fn foo() void {
+        \\    var x = Arena.init(0);
+        \\    {
+        \\        defer x.deinit();
+        \\    }
+        \\    var y = Arena.init(0);
+        \\    _ = y;
+        \\    return;
+        \\}
+        \\const Arena = struct {
+        \\    pub fn init(_: u32) Arena { return .{}; }
+        \\    pub fn deinit(_: *Arena) void {}
+        \\};
+        \\
+    );
+    defer result.deinit(gpa);
+    const cfg = result.cfg.?;
+
+    // In the (only) non-branching block: decl(x) … arena_kill(x) … decl(y) … ret.
+    const stmts = cfg.blocks[0].stmts;
+    var first_decl: ?usize = null;
+    var kill_pos: ?usize = null;
+    var second_decl: ?usize = null;
+    for (stmts, 0..) |s, i| {
+        switch (s.kind) {
+            .decl => {
+                if (first_decl == null) first_decl = i else second_decl = i;
+            },
+            .arena_kill => kill_pos = i,
+            else => {},
+        }
+    }
+    // All three must be present.
+    try std.testing.expect(first_decl != null);
+    try std.testing.expect(kill_pos != null);
+    try std.testing.expect(second_decl != null);
+    // kill must be between the two decls — fired at inner-block exit, not at fn return.
+    try std.testing.expect(kill_pos.? > first_decl.?);
+    try std.testing.expect(kill_pos.? < second_decl.?);
+}
+
+// ── else-if chains ─────────────────────────────────────────────────────────
+
+test "else-if chain: multi-branch CFG, no lowering_gap for if constructs" {
+    // `if/else if/else` is a nested if in the else arm.  lowerIf recurses
+    // correctly, producing more blocks than a plain if/else and no lowering_gap.
+    const gpa = std.testing.allocator;
+    var result = try parseAndLower(gpa,
+        \\pub fn classify(x: u32) u32 {
+        \\    if (x == 0) {
+        \\        return 1;
+        \\    } else if (x == 1) {
+        \\        return 2;
+        \\    } else {
+        \\        return 3;
+        \\    }
+        \\}
+        \\
+    );
+    defer result.deinit(gpa);
+    const cfg = result.cfg.?;
+
+    // entry + then_1 + else_1 + merge_1 + then_2 + else_2 + merge_2 = 7,
+    // plus dead blocks created at each return.  Conservative lower bound: 6.
+    try std.testing.expect(cfg.blocks.len >= 6);
+
+    // Entry must fork into exactly 2 successors (outer if condition).
+    try std.testing.expectEqual(@as(usize, 2), cfg.blocks[0].successors.len);
+
+    // No lowering_gap with an "if"-related note — the else-if arm is
+    // lowered via recursive lowerIf, not treated as an unknown node.
+    for (cfg.blocks) |b| {
+        for (b.stmts) |s| {
+            if (s.kind == .lowering_gap) {
+                const note = s.kind.lowering_gap.note;
+                try std.testing.expect(!std.mem.startsWith(u8, note, "if"));
+            }
+        }
+    }
+}
