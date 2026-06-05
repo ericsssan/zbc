@@ -35,11 +35,24 @@ pub fn check(
     problems: *std.ArrayListUnmanaged(Problem),
 ) !void {
     if (!config_mod.isEnabled(config, .midpoint_addition_overflow)) return;
-    _ = cache;
 
     const tags = tree.tokens.items(.tag);
     if (tree.tokens.len < 7) return;
     const last_tok: Ast.TokenIndex = @intCast(tree.tokens.len -| 1);
+
+    // Map identifier-reference AST nodes by their main token so the type
+    // engine can resolve the operand types.  Empty when engine is absent.
+    var ident_nodes: std.AutoHashMapUnmanaged(Ast.TokenIndex, Ast.Node.Index) = .empty;
+    defer ident_nodes.deinit(gpa);
+    {
+        var ni: u32 = 0;
+        while (ni < tree.nodes.len) : (ni += 1) {
+            const node: Ast.Node.Index = @enumFromInt(ni);
+            if (tree.nodeTag(node) == .identifier) {
+                try ident_nodes.put(gpa, tree.nodeMainToken(node), node);
+            }
+        }
+    }
 
     var t: Ast.TokenIndex = 0;
     while (t + 6 <= last_tok) : (t += 1) {
@@ -55,12 +68,34 @@ pub fn check(
 
         const a = tree.tokenSlice(t + 1);
         const b = tree.tokenSlice(t + 3);
-        // Suppress when either operand is declared with float arithmetic nearby.
-        // For float types (f32/f64/f128), addition cannot overflow in the integer
-        // sense — `(r + g) / 2` on f32 pixel values is not a midpoint-overflow bug.
+
+        // Type-engine suppression: if the type engine resolves either
+        // operand to a float type (f16/f32/f64/f128), addition cannot
+        // overflow in the integer sense — suppress.
+        if (operandIsFloat(cache, &ident_nodes, t + 1) or
+            operandIsFloat(cache, &ident_nodes, t + 3)) continue;
+
+        // Syntactic fallback: suppress when either operand is declared
+        // with float arithmetic nearby (catches @floatFromInt / f64 decls
+        // when the type engine is absent).
         if (hasFloatDecl(tags, tree, t, a) or hasFloatDecl(tags, tree, t, b)) continue;
         try report(gpa, problems, tree, t, a, b);
     }
+}
+
+/// True iff the identifier at `tok` resolves to a float type via the type engine.
+fn operandIsFloat(
+    cache: *file_cache_mod.FileCache,
+    ident_nodes: *const std.AutoHashMapUnmanaged(Ast.TokenIndex, Ast.Node.Index),
+    tok: Ast.TokenIndex,
+) bool {
+    const node = ident_nodes.get(tok) orelse return false;
+    const tyname = cache.typeNameOfNode(node) orelse return false;
+    return std.mem.eql(u8, tyname, "f16") or
+        std.mem.eql(u8, tyname, "f32") or
+        std.mem.eql(u8, tyname, "f64") or
+        std.mem.eql(u8, tyname, "f128") or
+        std.mem.eql(u8, tyname, "f80");
 }
 
 fn report(
