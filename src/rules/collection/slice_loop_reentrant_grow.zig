@@ -174,8 +174,37 @@ fn checkLoopBody(
         const summary = (cache.summaryByName(callee) catch null) orelse continue;
         if (!summary.may_grow_collections) continue;
 
+        // Suppress when `recv` doesn't appear anywhere in the call's
+        // argument list.  If the callee can't reach the iterated
+        // collection (it isn't passed as an argument), it cannot
+        // reallocate it — the slice pointer remains valid.
+        const call_rp = matchParen(tags, t + 1, end) orelse {
+            try reportCallee(gpa, problems, tree, t, callee, recv);
+            continue;
+        };
+        if (!identAppearsIn(tree, tags, t + 2, call_rp - 1, recv)) {
+            t = call_rp;
+            continue;
+        }
+
         try reportCallee(gpa, problems, tree, t, callee, recv);
+        t = call_rp;
     }
+}
+
+fn identAppearsIn(
+    tree: *const Ast,
+    tags: []const std.zig.Token.Tag,
+    start: Ast.TokenIndex,
+    end: Ast.TokenIndex,
+    name: []const u8,
+) bool {
+    if (start > end) return false;
+    var s: Ast.TokenIndex = start;
+    while (s <= end) : (s += 1) {
+        if (tags[s] == .identifier and std.mem.eql(u8, tree.tokenSlice(s), name)) return true;
+    }
+    return false;
 }
 
 fn report(
@@ -275,6 +304,38 @@ test "slice-loop-reentrant-grow: grow on different recv doesn't fire" {
         \\    for (a.items) |item| {
         \\        _ = item;
         \\        b.append(99) catch {};
+        \\    }
+        \\}
+        \\
+    );
+}
+
+test "slice-loop-reentrant-grow: may_grow callee not passed recv doesn't fire" {
+    try testing.expectNoFire(check,
+        \\const List = std.ArrayList(u32);
+        \\fn growOther(other: *List) void {
+        \\    other.append(1) catch {};
+        \\}
+        \\pub fn safe(list: *List, other: *List) void {
+        \\    for (list.items) |item| {
+        \\        _ = item;
+        \\        growOther(other);
+        \\    }
+        \\}
+        \\
+    );
+}
+
+test "slice-loop-reentrant-grow: may_grow callee passed recv fires" {
+    try testing.expectFires(check, R,
+        \\const List = std.ArrayList(u32);
+        \\fn mayGrow(list: *List, x: u32) void {
+        \\    _ = x;
+        \\    list.append(1) catch {};
+        \\}
+        \\pub fn buggy(list: *List) void {
+        \\    for (list.items) |item| {
+        \\        mayGrow(list, item);
         \\    }
         \\}
         \\
