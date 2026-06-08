@@ -408,3 +408,113 @@ test "alias: unrelated container not proven by scalar guard" {
         \\
     , "arr", "arr"));
 }
+
+// ── applyCmp: lit >= 2 (N-bounded guards) ────────────────────
+
+test "nonzero: if (n < 2) return diverges, fall-through n >= 2 >= 1" {
+    try std.testing.expect(try proveAt(
+        \\fn f(n: usize, buf: []const u8) u8 {
+        \\    if (n < 2) return 0;
+        \\    return buf[n - 1];
+        \\}
+        \\
+    , "n", "buf"));
+}
+
+test "nonzero: if (n >= 3) then n nonzero" {
+    try std.testing.expect(try proveAt(
+        \\fn f(n: usize, buf: []const u8) u8 {
+        \\    if (n >= 3) return buf[n - 1];
+        \\    return 0;
+        \\}
+        \\
+    , "n", "buf"));
+}
+
+test "nonzero: if (2 > n) return diverges, fall-through n >= 2 >= 1 (flipped)" {
+    try std.testing.expect(try proveAt(
+        \\fn f(n: usize, buf: []const u8) u8 {
+        \\    if (2 > n) return 0;
+        \\    return buf[n - 1];
+        \\}
+        \\
+    , "n", "buf"));
+}
+
+test "nonzero: if (n == 0) and if (n < 2) both still nonzero in fall-through" {
+    try std.testing.expect(try proveAt(
+        \\fn f(n: usize, buf: []const u8) u8 {
+        \\    if (n < 5) return 0;
+        \\    return buf[n - 1];
+        \\}
+        \\
+    , "n", "buf"));
+}
+
+// ── DiffAlias: n = A - B, n nonzero → A nonzero ──────────────
+// These tests use subtrahends that are provably non-negative WITHOUT the type
+// engine (literal 0 or .len field), so they work in the cache-null test harness.
+// The real-world case (identifier subtrahend, e.g. `range.end - range.start`)
+// requires ZLS confirmation that the subtrahend is unsigned.
+
+test "diff-alias: n = end - 0, if (n == 0) return, buf[end - 1] suppressed" {
+    // Subtrahend is literal 0: operandProvablyNonneg = true, no type engine needed.
+    try std.testing.expect(try proveAt(
+        \\fn f(end: usize, buf: []const u8) u8 {
+        \\    const n = end - 0;
+        \\    if (n == 0) return 0;
+        \\    return buf[end - 1];
+        \\}
+        \\
+    , "end", "buf"));
+}
+
+test "diff-alias: n = end - other.len, if (n == 0) return, buf[end - 1] suppressed" {
+    // Subtrahend is .len (provably >= 0), no type engine needed.
+    try std.testing.expect(try proveAt(
+        \\fn f(end: usize, other: []const u8, buf: []const u8) u8 {
+        \\    const n = end - other.len;
+        \\    if (n == 0) return 0;
+        \\    return buf[end - 1];
+        \\}
+        \\
+    , "end", "buf"));
+}
+
+test "diff-alias: n = end - 0, if (n < 2) return, buf[end - 1] suppressed (combined)" {
+    // Both the lit>=2 applyCmp extension AND the DiffAlias are exercised.
+    try std.testing.expect(try proveAt(
+        \\fn f(end: usize, buf: []const u8) u8 {
+        \\    const n = end - 0;
+        \\    if (n < 2) return 0;
+        \\    return buf[end - 1];
+        \\}
+        \\
+    , "end", "buf"));
+}
+
+test "diff-alias: unrelated var not proven" {
+    try std.testing.expect(!try proveAt(
+        \\fn f(end: usize, start: usize, other: usize, buf: []const u8) u8 {
+        \\    const n = end - 0;
+        \\    if (n == 0) return 0;
+        \\    return buf[other - 1];
+        \\}
+        \\
+    , "other", "buf"));
+}
+
+test "diff-alias: rebinding end clears diff fact" {
+    try std.testing.expect(!try proveAt(
+        \\fn f(end: usize, buf: []const u8) u8 {
+        \\    const n = end - 0;
+        \\    if (n == 0) return 0;
+        \\    const end2 = end;
+        \\    _ = end2;
+        \\    var end_mut: usize = 0;
+        \\    end_mut = end;
+        \\    return buf[end_mut - 1];
+        \\}
+        \\
+    , "end_mut", "buf"));
+}

@@ -75,22 +75,35 @@ const KeySet = struct {
 /// nonempty(c)).  Dropped when `n` is rebound or `c` is mutated.
 const Alias = struct { scalar: []const u8, container: []const u8 };
 
-/// Abstract state: two fact sets + len-alias bindings.
+/// A `const DIFF = MINUEND - SUBTRAHEND` binding.
+/// Propagation: DIFF nonzero AND SUBTRAHEND provably >= 0 → MINUEND nonzero.
+/// Sound because MINUEND - SUBTRAHEND > 0 and SUBTRAHEND >= 0 implies MINUEND >= 1.
+/// Dropped when DIFF or MINUEND is rebound.
+const DiffAlias = struct {
+    diff: []const u8,
+    minuend: []const u8,
+    sub_node: Ast.Node.Index, // AST node of the subtrahend (for provablyNonneg check)
+};
+
+/// Abstract state: two fact sets + len-alias bindings + diff-alias bindings.
 const State = struct {
     scalars: KeySet = .{}, // locals known != 0
     containers: KeySet = .{}, // container paths known non-empty
     aliases: std.ArrayListUnmanaged(Alias) = .empty, // n == c.len
+    diff_aliases: std.ArrayListUnmanaged(DiffAlias) = .empty, // n = A - B
 
     fn deinit(self: *State, gpa: std.mem.Allocator) void {
         self.scalars.deinit(gpa);
         self.containers.deinit(gpa);
         self.aliases.deinit(gpa);
+        self.diff_aliases.deinit(gpa);
     }
     fn clone(self: *const State, gpa: std.mem.Allocator) !State {
         var out: State = .{};
         try out.scalars.keys.appendSlice(gpa, self.scalars.keys.items);
         try out.containers.keys.appendSlice(gpa, self.containers.keys.items);
         try out.aliases.appendSlice(gpa, self.aliases.items);
+        try out.diff_aliases.appendSlice(gpa, self.diff_aliases.items);
         return out;
     }
     fn intersectWith(self: *State, other: *const State) void {
@@ -100,14 +113,21 @@ const State = struct {
         while (i < self.aliases.items.len) {
             if (other.hasAlias(self.aliases.items[i])) i += 1 else _ = self.aliases.swapRemove(i);
         }
+        // Conservatively keep diff_aliases present in both states.
+        var j: usize = 0;
+        while (j < self.diff_aliases.items.len) {
+            if (other.hasDiffAlias(self.diff_aliases.items[j])) j += 1 else _ = self.diff_aliases.swapRemove(j);
+        }
     }
     fn replaceWith(self: *State, gpa: std.mem.Allocator, src: *const State) !void {
         self.scalars.keys.clearRetainingCapacity();
         self.containers.keys.clearRetainingCapacity();
         self.aliases.clearRetainingCapacity();
+        self.diff_aliases.clearRetainingCapacity();
         try self.scalars.keys.appendSlice(gpa, src.scalars.keys.items);
         try self.containers.keys.appendSlice(gpa, src.containers.keys.items);
         try self.aliases.appendSlice(gpa, src.aliases.items);
+        try self.diff_aliases.appendSlice(gpa, src.diff_aliases.items);
     }
     fn hasAlias(self: *const State, a: Alias) bool {
         for (self.aliases.items) |e|
@@ -128,6 +148,26 @@ const State = struct {
         var i: usize = 0;
         while (i < self.aliases.items.len) {
             if (std.mem.eql(u8, self.aliases.items[i].container, container)) _ = self.aliases.swapRemove(i) else i += 1;
+        }
+    }
+    fn hasDiffAlias(self: *const State, da: DiffAlias) bool {
+        for (self.diff_aliases.items) |e|
+            if (std.mem.eql(u8, e.diff, da.diff) and std.mem.eql(u8, e.minuend, da.minuend)) return true;
+        return false;
+    }
+    fn addDiffAlias(self: *State, gpa: std.mem.Allocator, da: DiffAlias) !void {
+        if (self.hasDiffAlias(da)) return;
+        try self.diff_aliases.append(gpa, da);
+    }
+    /// Drop diff_aliases where the diff variable or minuend equals `name`
+    /// (called when `name` is rebound — both bindings become stale).
+    fn dropDiffAliasesByName(self: *State, name: []const u8) void {
+        var i: usize = 0;
+        while (i < self.diff_aliases.items.len) {
+            const da = self.diff_aliases.items[i];
+            if (std.mem.eql(u8, da.diff, name) or std.mem.eql(u8, da.minuend, name)) {
+                _ = self.diff_aliases.swapRemove(i);
+            } else i += 1;
         }
     }
 };
@@ -276,9 +316,24 @@ fn analyzeVarDecl(o: *Oracle, node: Ast.Node.Index, st: *State) error{OutOfMemor
     // Re-binding `name` invalidates prior facts/aliases keyed on it.
     dropContainersRootedAt(st, name);
     st.dropAliasesByScalar(name);
+    st.dropDiffAliasesByName(name);
     // Record a `const/var name = <c>.len` length-snapshot alias.
     if (lenContainerPath(o, init_node)) |cpath| {
         try st.addAlias(o.gpa, .{ .scalar = name, .container = cpath });
+    }
+    // Record a `const/var name = MINUEND - SUBTRAHEND` diff alias.
+    // Used to propagate: when `name` is proven nonzero AND the subtrahend
+    // is provably >= 0 (non-negative literal, .len, or unsigned by type engine),
+    // then MINUEND is also nonzero (MINUEND > SUBTRAHEND >= 0 → MINUEND >= 1).
+    if (tree.nodeTag(init_node) == .sub) {
+        const sub_data = tree.nodeData(init_node).node_and_node;
+        if (identName(tree, sub_data[0])) |lhs_name| {
+            try st.addDiffAlias(o.gpa, .{
+                .diff = name,
+                .minuend = lhs_name,
+                .sub_node = sub_data[1],
+            });
+        }
     }
     return .{};
 }
@@ -300,6 +355,7 @@ fn analyzeAssign(o: *Oracle, node: Ast.Node.Index, st: *State) error{OutOfMemory
         }
         dropContainersRootedAt(st, name);
         st.dropAliasesByScalar(name);
+        st.dropDiffAliasesByName(name);
         // A re-bind to `c.len` re-establishes the alias.
         if (lenContainerPath(o, rhs)) |cpath| try st.addAlias(o.gpa, .{ .scalar = name, .container = cpath });
     } else {
@@ -333,6 +389,7 @@ fn analyzeCompoundAdd(o: *Oracle, node: Ast.Node.Index, st: *State) error{OutOfM
         // container path rooted at `name` is stale.
         dropContainersRootedAt(st, name);
         st.dropAliasesByScalar(name);
+        st.dropDiffAliasesByName(name);
     } else {
         killMutatedContainers(o, node, st);
     }
@@ -418,6 +475,17 @@ fn applyRefine(o: *Oracle, st: *State, scalar: ?[]const u8, container: ?[]const 
         for (st.aliases.items) |a| {
             if (std.mem.eql(u8, a.scalar, s)) try st.containers.add(o.gpa, a.container);
         }
+        // Propagate via `const s = MINUEND - SUBTRAHEND`: s != 0 and
+        // SUBTRAHEND >= 0 (provably) ⟹ MINUEND > SUBTRAHEND >= 0 ⟹ MINUEND >= 1.
+        // Sound when operandProvablyNonneg(sub_node): literal, .len field, or
+        // ZLS-confirmed unsigned type.  Identifier subtrahends (e.g. `range.start`)
+        // require ZLS; without it, the propagation is silently skipped.
+        for (st.diff_aliases.items) |da| {
+            if (!std.mem.eql(u8, da.diff, s)) continue;
+            if (operandProvablyNonneg(o, da.sub_node)) {
+                try st.scalars.add(o.gpa, da.minuend);
+            }
+        }
     }
     if (container) |c| {
         try st.containers.add(o.gpa, c);
@@ -480,6 +548,7 @@ fn collectRefinement(o: *Oracle, cond: Ast.Node.Index, out: *Refinement) void {
     if (lhs_key) |lk| {
         if (isIntLiteralValue(tree, d[1], 0)) applyCmp(out, lk, cmp, 0, false);
         if (isIntLiteralValue(tree, d[1], 1)) applyCmp(out, lk, cmp, 1, false);
+        if (intLiteralVal(tree, d[1])) |v| if (v >= 2) applyCmp(out, lk, cmp, v, false);
         // GENERALIZED strict lower bound: `key > X` where X is provably >= 0
         // (non-negative literal, a `.len`, or an UNSIGNED-typed operand per the
         // type engine).  Then `key > X >= 0` implies `key >= 1` in the THEN arm.
@@ -491,6 +560,7 @@ fn collectRefinement(o: *Oracle, cond: Ast.Node.Index, out: *Refinement) void {
         // literal on the left → flip orientation
         if (isIntLiteralValue(tree, d[0], 0)) applyCmp(out, rk, cmp, 0, true);
         if (isIntLiteralValue(tree, d[0], 1)) applyCmp(out, rk, cmp, 1, true);
+        if (intLiteralVal(tree, d[0])) |v| if (v >= 2) applyCmp(out, rk, cmp, v, true);
         // `X < key`  ⟺  `key > X`  → key >= 1 in the THEN arm (X provably >= 0).
         if (cmp == .lt and operandProvablyNonneg(o, d[0])) setThenNonzero(out, rk);
     }
@@ -568,6 +638,14 @@ fn applyCmp(out: *Refinement, ok: OperandKey, cmp: Cmp, lit: u64, flipped: bool)
         switch (op) {
             .ge => then_true = true, // key >= 1
             .lt => else_true = true, // key < 1 ⟹ key == 0 ⟹ else: key > 0
+            else => {},
+        }
+    } else { // lit >= 2
+        switch (op) {
+            // then arm: key >= lit >= 2 >= 1
+            .ge, .gt, .eq => then_true = true,
+            // else arm: key >= lit >= 2 >= 1 (from `key < lit` or `key <= lit` diverging)
+            .lt, .le => else_true = true,
             else => {},
         }
     }
@@ -743,6 +821,12 @@ fn isIntLiteralValue(tree: *const Ast, node: Ast.Node.Index, want: u64) bool {
     if (tree.nodeTag(node) != .number_literal) return false;
     const v = std.fmt.parseInt(u64, tree.tokenSlice(tree.nodeMainToken(node)), 0) catch return false;
     return v == want;
+}
+
+/// Returns the unsigned value of a number-literal node, or null if not a literal.
+fn intLiteralVal(tree: *const Ast, node: Ast.Node.Index) ?u64 {
+    if (tree.nodeTag(node) != .number_literal) return null;
+    return std.fmt.parseInt(u64, tree.tokenSlice(tree.nodeMainToken(node)), 0) catch null;
 }
 
 /// Source substring spanning a node (for canonical container-path keys).

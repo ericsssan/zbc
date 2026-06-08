@@ -2160,6 +2160,45 @@ test "index-minus-one-without-zero-guard: compound or-return on different ident 
     );
 }
 
+// ── Derived-variable guard tests (#9) — value-range DiffAlias + lit>=2 ───────
+// These exercise the full chain: `const n = end - 0 (or .len)` +
+// `if (n < 2) return` → n >= 2 in fall-through → end >= 2 >= 1 → no fire.
+// The real-world case `range.end - range.start` (identifier subtrahend) only
+// fires in production where ZLS can confirm `range.start` is unsigned.
+
+test "index-minus-one-without-zero-guard: diff-alias n=end-0 + if (n<2) return suppresses" {
+    try testing.expectNoFire(check,
+        \\fn f(end: usize, buf: []const u8) u8 {
+        \\    const n = end - 0;
+        \\    if (n < 2) return 0;
+        \\    return buf[end - 1];
+        \\}
+        \\
+    );
+}
+
+test "index-minus-one-without-zero-guard: diff-alias n=end-other.len + if (n<2) return suppresses" {
+    try testing.expectNoFire(check,
+        \\fn f(end: usize, other: []const u8, buf: []const u8) u8 {
+        \\    const n = end - other.len;
+        \\    if (n < 2) return 0;
+        \\    return buf[end - 1];
+        \\}
+        \\
+    );
+}
+
+test "index-minus-one-without-zero-guard: if (n < 2) return without diff-alias fires" {
+    // Guard on unrelated `n` does not suppress `end - 1`.
+    try testing.expectFires(check, R,
+        \\fn f(end: usize, n: usize, buf: []const u8) u8 {
+        \\    if (n < 2) return 0;
+        \\    return buf[end - 1];
+        \\}
+        \\
+    );
+}
+
 // ── Or-guard (same-expression short-circuit) tests ────────────────────────
 
 test "index-minus-one-without-zero-guard: same-expression i==0 or-guard suppresses" {
