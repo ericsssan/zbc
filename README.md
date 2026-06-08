@@ -1,8 +1,7 @@
 # zbc
 
-A bug checker for Zig.  Catches use-after-free, double-free, arena escape,
-missing errdefer, refcount leaks, pointer-stability bugs, and 45+ other
-lifetime/ownership/cleanup issues — with no annotations.
+A bug checker for Zig — 45 rules covering lifetime, ownership, and cleanup
+bugs with no annotations required.
 
 ## Example
 
@@ -20,13 +19,10 @@ owner.deinit(gpa);        // inferred: takes ownership of self.data
 _ = x;                    // → heap-use-after-free
 ```
 
-No annotations.  The body of `deinit` is enough for zbc to infer that
-calling `owner.deinit(gpa)` invalidates `owner.data`.
+The body of `deinit` is enough for zbc to infer that calling
+`owner.deinit(gpa)` invalidates `owner.data`.
 
 ## Build integration
-
-The primary use case is running zbc as a step in `zig build` so it
-runs before (or alongside) compilation.
 
 **`build.zig.zon`**
 
@@ -34,7 +30,7 @@ runs before (or alongside) compilation.
 .dependencies = .{
     .zbc = .{
         .url = "https://github.com/ericsssan/zbc/archive/refs/tags/v0.1.0.tar.gz",
-        .hash = "<hash>",  // zig fetch --save fills this in
+        .hash = "<hash>",  // run: zig fetch --save <url>
     },
 },
 ```
@@ -44,28 +40,27 @@ runs before (or alongside) compilation.
 ```zig
 const zbc_dep = b.dependency("zbc", .{
     .target = target,
-    .optimize = .ReleaseFast,  // zbc is ~200× faster at ReleaseFast
+    .optimize = .ReleaseFast,
 });
 
 const zbc_run = b.addRunArtifact(zbc_dep.artifact("zbc"));
-zbc_run.addArg("src/");  // directory or file to analyze
+zbc_run.addArg("src/");
 
-// Wire to the default step so `zig build` always runs zbc first.
 b.default_step.dependOn(&zbc_run.step);
 ```
-
-`zig fetch --save https://github.com/ericsssan/zbc/archive/refs/tags/v0.1.0.tar.gz`
-fills in the hash automatically.
 
 ## CLI
 
 ```sh
 zig build -Doptimize=ReleaseFast
-./zig-out/bin/zbc src/
-./zig-out/bin/zbc path/to/file.zig
-./zig-out/bin/zbc --format=compact src/   # grep-friendly output
-./zig-out/bin/zbc --list-rules
-./zig-out/bin/zbc --explain <rule-id>
+```
+
+```sh
+zbc src/
+zbc path/to/file.zig
+zbc --format=compact src/
+zbc --list-rules
+zbc --explain <rule-id>
 ```
 
 Exit 0 if clean, 1 if problems found.
@@ -110,15 +105,10 @@ mined from open-source Zig PRs:
 - Concurrency / hardening: `publish-then-touch-self`,
   `assert-on-untrusted-input`
 
-Run `zbc --list-rules` for descriptions, or `zbc --explain <rule-id>`
-for rationale, canonical bug, fix, and detection notes.
-
 ## Suppressions
 
-When a finding is a false positive, suppress it inline:
-
 ```zig
-const x = buf[idx - 1]; // zbc-disable-line: index-minus-one-without-zero-guard
+buf[idx - 1] // zbc-disable-line: index-minus-one-without-zero-guard
 
 // zbc-disable-next-line: heap-use-after-free
 _ = ptr;
