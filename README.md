@@ -91,6 +91,13 @@ per-fn CFG and abstract interpretation:
 
 `zbc --explain <rule-id>` prints the rationale, canonical bug, and fix.
 
+## False positives and missed bugs
+
+If zbc fires on correct code (false positive) or misses a real bug (false
+negative), please [open an issue](https://github.com/ericsssan/zbc/issues)
+with a minimal reproducer.  Both matter — FP reports drive suppression
+improvements, FN reports drive new rules and deeper inference.
+
 ## Suppressions
 
 Silence a false positive with a source comment:
