@@ -87,7 +87,9 @@ pub fn parse(gpa: std.mem.Allocator, source: []const u8) !Suppressions {
         const directive = parseDirective(body) orelse {
             // Not a zbc-disable comment — skip to end of line so we
             // don't re-scan inside the comment body.
-            i = eol;
+            // Use eol - 1 so the outer `i += 1` lands on the '\n' and
+            // triggers the line_no increment (eol points to '\n' or EOF).
+            i = if (eol > 0) eol - 1 else eol;
             continue;
         };
 
@@ -107,7 +109,7 @@ pub fn parse(gpa: std.mem.Allocator, source: []const u8) !Suppressions {
                 try a.dupe(u8, id);
             try entries.append(a, .{ .line = target_line, .rule_id = stored });
         }
-        i = eol;
+        i = if (eol > 0) eol - 1 else eol;
     }
 
     return .{
@@ -203,4 +205,21 @@ test "parse: empty source" {
     var s = try parse(testing.allocator, "");
     defer s.deinit();
     try testing.expectEqual(@as(usize, 0), s.entries.len);
+}
+
+test "parse: line_no not skewed by leading non-zbc comments" {
+    // Each `// comment` line was previously consuming the '\n' without
+    // incrementing line_no, causing stored suppression lines to drift.
+    var s = try parse(testing.allocator,
+        \\// comment line 1
+        \\// comment line 2
+        \\// comment line 3
+        \\fn f(buf: []const u8, x: usize) u8 {
+        \\    return buf[x - 1]; // zbc-disable-line: index-minus-one-without-zero-guard
+        \\}
+    );
+    defer s.deinit();
+    // The directive is on line 5; must not be stored as line 2 (drift of 3).
+    try testing.expect(s.isSuppressed("index-minus-one-without-zero-guard", 5));
+    try testing.expect(!s.isSuppressed("index-minus-one-without-zero-guard", 2));
 }

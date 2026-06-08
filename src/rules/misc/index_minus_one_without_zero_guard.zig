@@ -461,10 +461,30 @@ fn hasAndGuard(
         k -= 1;
         if (tags[k] != .keyword_and) continue;
         if (k < 3) continue;
-        if (!isPositiveGuardTriple(tags, tree, k - 3, k - 2, k - 1)) continue;
-        const guard_id = tree.tokenSlice(k - 3);
-        for (guard_names) |gn| {
-            if (std.mem.eql(u8, guard_id, gn)) return true;
+        // Standard 3-token guard: GUARD_IDENT cmp VALUE
+        if (isPositiveGuardTriple(tags, tree, k - 3, k - 2, k - 1)) {
+            const guard_id = tree.tokenSlice(k - 3);
+            for (guard_names) |gn| {
+                if (std.mem.eql(u8, guard_id, gn)) return true;
+            }
+        }
+        // Extended: `GUARD >= IDENT + N keyword_and` (N ≥ 1).
+        // Since IDENT is unsigned (≥ 0) and N ≥ 1, GUARD ≥ IDENT + N ≥ 1.
+        // Token layout: GUARD(k-5) >=(k-4) IDENT(k-3) +(k-2) N(k-1) and(k).
+        if (k >= 5 and
+            tags[k - 5] == .identifier and
+            tags[k - 4] == .angle_bracket_right_equal and
+            tags[k - 3] == .identifier and
+            tags[k - 2] == .plus and
+            tags[k - 1] == .number_literal)
+        {
+            const n_val = std.fmt.parseUnsigned(u64, tree.tokenSlice(k - 1), 0) catch 0;
+            if (n_val >= 1) {
+                const guard_id2 = tree.tokenSlice(k - 5);
+                for (guard_names) |gn| {
+                    if (std.mem.eql(u8, guard_id2, gn)) return true;
+                }
+            }
         }
     }
     return false;
@@ -752,6 +772,27 @@ fn collectGuardedRanges(
                     }
                 }
                 ct += 2;
+                continue;
+            }
+            // IDENT >= IDENT + N (N ≥ 1): since the RHS IDENT is unsigned (≥ 0),
+            // this implies IDENT ≥ N ≥ 1 — record then_expr as a guarded range.
+            if (ct + 4 <= cl and
+                ttags[ct + 1] == .angle_bracket_right_equal and
+                ttags[ct + 2] == .identifier and
+                ttags[ct + 3] == .plus and
+                ttags[ct + 4] == .number_literal)
+            {
+                const n_val = std.fmt.parseUnsigned(u64, tree.tokenSlice(ct + 4), 0) catch 0;
+                if (n_val >= 1) {
+                    try out.append(gpa, .{
+                        .names = .{ tree.tokenSlice(ct), "", "" },
+                        .n = 1,
+                        .pair = false,
+                        .first = tree.firstToken(ifd.ast.then_expr),
+                        .last = tree.lastToken(ifd.ast.then_expr),
+                    });
+                }
+                ct += 4;
                 continue;
             }
         }
@@ -1199,6 +1240,35 @@ fn hasEarlyReturnGuard(
                     if (std.mem.eql(u8, inner_id, gn)) has_inner = true;
                 }
                 if (has_outer and has_inner) return true;
+            }
+        }
+
+        // Compound `<=` early-exit: `if (GUARD <= ... or ...) return/break/continue`.
+        // For unsigned GUARD, `GUARD <= anything` is satisfied when GUARD == 0
+        // (0 ≤ any unsigned value).  After the early-exit, GUARD ≥ 1 is guaranteed.
+        // Scan forward from the opening `(` to find the matching `)`, then check
+        // for a return/break/continue within 3 tokens.
+        if (k + 3 < t and
+            tags[k + 1] == .l_paren and
+            tags[k + 2] == .identifier and
+            tags[k + 3] == .angle_bracket_left_equal)
+        {
+            const guard_id = tree.tokenSlice(k + 2);
+            var matched = false;
+            for (guard_names) |gn| {
+                if (std.mem.eql(u8, guard_id, gn)) { matched = true; break; }
+            }
+            if (matched) {
+                // Walk forward to find the closing `)`.
+                var depth: u32 = 1;
+                var j: Ast.TokenIndex = k + 2;
+                while (j < t and j < k + 60) : (j += 1) {
+                    if (tags[j] == .l_paren) depth += 1 else if (tags[j] == .r_paren) {
+                        depth -= 1;
+                        if (depth == 0) break;
+                    }
+                }
+                if (depth == 0 and hasExitWithin(tags, j + 1, j + 4, t)) return true;
             }
         }
     }
@@ -2001,6 +2071,90 @@ test "index-minus-one-without-zero-guard: alloc different local still fires" {
         \\fn f(gpa: anytype, src: []const u8, other: []const u8) void {
         \\    _ = try gpa.alloc(u8, src.len + 1);
         \\    _ = other[other.len - 1];
+        \\}
+        \\
+    );
+}
+
+// ── Cross-variable >= N+M guard tests (#7) ────────────────────────────────
+
+test "index-minus-one-without-zero-guard: x >= y+2 and-guard suppresses" {
+    // span_end >= span_start + 2 guarantees span_end >= 2 > 0.
+    try testing.expectNoFire(check,
+        \\fn f(src: []const u8, span_end: usize, span_start: usize) bool {
+        \\    if (span_end >= span_start + 2 and src[span_end - 1] == '{') return true;
+        \\    return false;
+        \\}
+        \\
+    );
+}
+
+test "index-minus-one-without-zero-guard: x >= y+1 and-guard suppresses" {
+    try testing.expectNoFire(check,
+        \\fn f(buf: []const u8, end: usize, start: usize) u8 {
+        \\    return if (end >= start + 1 and buf[end - 1] == 0) 1 else 0;
+        \\}
+        \\
+    );
+}
+
+test "index-minus-one-without-zero-guard: x >= y+2 in if-body suppresses" {
+    try testing.expectNoFire(check,
+        \\fn f(src: []const u8, end: usize, start: usize) u8 {
+        \\    if (end >= start + 2) return src[end - 1];
+        \\    return 0;
+        \\}
+        \\
+    );
+}
+
+test "index-minus-one-without-zero-guard: x >= y+0 does not suppress" {
+    // N == 0 does not imply x >= 1.
+    try testing.expectFires(check, R,
+        \\fn f(src: []const u8, end: usize, start: usize) u8 {
+        \\    return if (end >= start + 0 and src[end - 1] == 0) 1 else 0;
+        \\}
+        \\
+    );
+}
+
+test "index-minus-one-without-zero-guard: different ident >= y+2 still fires" {
+    try testing.expectFires(check, R,
+        \\fn f(src: []const u8, end: usize, start: usize, other: usize) u8 {
+        \\    return if (other >= start + 2 and src[end - 1] == 0) 1 else 0;
+        \\}
+        \\
+    );
+}
+
+// ── Compound or early-return guard tests (#8) ─────────────────────────────
+
+test "index-minus-one-without-zero-guard: if (e <= s or ...) return suppresses" {
+    // e <= s catches e == 0 (usize), so after the return e >= 1.
+    try testing.expectNoFire(check,
+        \\fn f(buf: []const u8, e: usize, s: usize, len: usize) !u8 {
+        \\    if (e <= s or e > len) return error.OutOfRange;
+        \\    return buf[e - 1];
+        \\}
+        \\
+    );
+}
+
+test "index-minus-one-without-zero-guard: if (e <= s) return suppresses" {
+    try testing.expectNoFire(check,
+        \\fn f(buf: []const u8, e: usize, s: usize) !u8 {
+        \\    if (e <= s) return error.Empty;
+        \\    return buf[e - 1];
+        \\}
+        \\
+    );
+}
+
+test "index-minus-one-without-zero-guard: compound or-return on different ident still fires" {
+    try testing.expectFires(check, R,
+        \\fn f(buf: []const u8, e: usize, s: usize, other: usize) !u8 {
+        \\    if (other <= s or other > buf.len) return error.OutOfRange;
+        \\    return buf[e - 1];
         \\}
         \\
     );
