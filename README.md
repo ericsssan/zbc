@@ -107,7 +107,7 @@ No annotations are read.  Every signal — heap-vs-arena origin,
 ownership transfer, borrow-from-parameter, allocator identity — is
 derived from body shape via the flow analyzer and the per-file
 FnSummary inference (`fn_summary.zig`).  Cross-module type
-questions go through ZLS (`zls_resolver.zig`).
+questions go through the embedded type engine (`src/type_engine/`).
 
 When a finding is wrong, suppress that line with
 `// zbc-disable-line:<rule-id>` or
@@ -123,10 +123,12 @@ const problems = try zbc.analyzeEscape(gpa, io, path, &zbc.DefaultConfig);
 defer zbc.freeProblems(gpa, problems);
 ```
 
-Cross-module type resolution is handled internally via ZLS (declared as
-a build-time dependency in `build.zig.zon`).  No setup required.
+Cross-module type resolution is handled internally by the embedded type
+engine (`src/type_engine/`).  No setup required.
 
 ## Acknowledgements
 
-- [ZLS](https://github.com/zigtools/zls) — used for cross-module type
-  resolution at analysis time.
+- [ZLS](https://github.com/zigtools/zls) — type-resolution internals
+  (`DocumentStore`, `InternPool`, `Analyser`) extracted and adapted into
+  `src/type_engine/` as zbc's embedded type engine.  ZLS is not imported
+  as a package; the relevant files are vendored and modified in-tree.
