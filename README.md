@@ -111,6 +111,10 @@ _ = ptr;
 _ = val; // zbc-disable-line: *   (all rules on this line)
 ```
 
+## Sponsor
+
+If zbc saves you debugging time, consider [sponsoring development](https://github.com/sponsors/ericsssan).
+
 ## Acknowledgements
 
 - [ZLS](https://github.com/zigtools/zls) — type-resolution internals
