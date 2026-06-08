@@ -70,11 +70,6 @@ zig build -Doptimize=ReleaseFast
 
 Exit 0 if clean, 1 if problems found.
 
-**Build mode matters.**  Debug is ~200× slower than ReleaseFast on
-multi-file sweeps (bun's 1290-file corpus: Debug ~6 min, ReleaseFast
-~1.8 s).  Use ReleaseFast for all sweeps; Debug is fine for single-file
-or test-driven work.
-
 ## Rules
 
 45 rules in two families:
@@ -118,9 +113,6 @@ mined from open-source Zig PRs:
 Run `zbc --list-rules` for descriptions, or `zbc --explain <rule-id>`
 for rationale, canonical bug, fix, and detection notes.
 
-Each rule was extracted from real bug-fix PRs in Bun, TigerBeetle,
-Ghostty, Mach, or the Zig standard library.
-
 ## Suppressions
 
 When a finding is a false positive, suppress it inline:
@@ -133,16 +125,6 @@ _ = ptr;
 
 _ = val; // zbc-disable-line: *   (suppress all rules on this line)
 ```
-
-## Analysis
-
-Every signal — heap-vs-arena origin, ownership transfer, allocator
-identity, borrow-from-parameter — is inferred from body shape.  No
-annotations are read or required.
-
-Cross-module type resolution uses an embedded type engine
-(`src/type_engine/`) built on ZLS internals.  See [ARCHITECTURE.md](ARCHITECTURE.md)
-for the infrastructure layout and how to add rules.
 
 ## Acknowledgements
 
