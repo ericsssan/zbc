@@ -1,11 +1,10 @@
 # zbc
 
-A Bug Checker for Zig.  Catches use-after-free, double-free,
-arena escape, missing errdefer, stack-fallback escape, refcount
-leaks, pointer-stability footguns, and 30+ other lifetime /
-ownership / cleanup bugs.
+A bug checker for Zig.  Catches use-after-free, double-free, arena escape,
+missing errdefer, refcount leaks, pointer-stability bugs, and 45+ other
+lifetime/ownership/cleanup issues — with no annotations.
 
-## Quick example
+## Example
 
 ```zig
 const Owner = struct {
@@ -16,119 +15,138 @@ const Owner = struct {
 };
 
 var owner = Owner{ .data = try gpa.alloc(u8, 16) };
-const x = owner.data;       // borrow of owner.data
-owner.deinit(gpa);          // gpa.free(self.data) inferred as takes-ownership
-_ = x;                      // → heap-use-after-free
+const x = owner.data;    // borrows owner.data
+owner.deinit(gpa);        // inferred: takes ownership of self.data
+_ = x;                    // → heap-use-after-free
 ```
 
-No annotations, no setup — the body of `deinit` is enough for inference to
-recognize that calling `owner.deinit(gpa)` invalidates `owner.data`.
+No annotations.  The body of `deinit` is enough for zbc to infer that
+calling `owner.deinit(gpa)` invalidates `owner.data`.
 
-## Usage
+## Build integration
+
+The primary use case is running zbc as a step in `zig build` so it
+runs before (or alongside) compilation.
+
+**`build.zig.zon`**
+
+```zig
+.dependencies = .{
+    .zbc = .{
+        .url = "https://github.com/ericsssan/zbc/archive/refs/tags/v0.1.0.tar.gz",
+        .hash = "<hash>",  // zig fetch --save fills this in
+    },
+},
+```
+
+**`build.zig`**
+
+```zig
+const zbc_dep = b.dependency("zbc", .{
+    .target = target,
+    .optimize = .ReleaseFast,  // zbc is ~200× faster at ReleaseFast
+});
+
+const zbc_run = b.addRunArtifact(zbc_dep.artifact("zbc"));
+zbc_run.addArg("src/");  // directory or file to analyze
+
+// Wire to the default step so `zig build` always runs zbc first.
+b.default_step.dependOn(&zbc_run.step);
+```
+
+`zig fetch --save https://github.com/ericsssan/zbc/archive/refs/tags/v0.1.0.tar.gz`
+fills in the hash automatically.
+
+## CLI
 
 ```sh
-zig build -Doptimize=ReleaseFast   # ~200× faster than Debug on sweeps
-zbc path/to/file.zig
-zbc path/to/dir              # recursive
-zbc --format=compact path     # grep-friendly
-zbc --list-rules
-zbc --explain <rule-id>
+zig build -Doptimize=ReleaseFast
+./zig-out/bin/zbc src/
+./zig-out/bin/zbc path/to/file.zig
+./zig-out/bin/zbc --format=compact src/   # grep-friendly output
+./zig-out/bin/zbc --list-rules
+./zig-out/bin/zbc --explain <rule-id>
 ```
 
-**Build mode matters.** Default `zig build` produces Debug, which
-is ~200× slower than ReleaseFast on multi-file sweeps (bun's
-1290-file corpus: Debug ~6 min wall, ReleaseFast ~1.8 s wall).
-Always prefer ReleaseFast (or ReleaseSafe for bounds-checked
-runs) on sweeps; Debug is fine only for single-file or
-test-driven workflows.
+Exit 0 if clean, 1 if problems found.
 
-Exit 0 if clean, 1 if problems found.  Default output uses a
-caret + secondary span pointing at the free / kill / borrow site.
+**Build mode matters.**  Debug is ~200× slower than ReleaseFast on
+multi-file sweeps (bun's 1290-file corpus: Debug ~6 min, ReleaseFast
+~1.8 s).  Use ReleaseFast for all sweeps; Debug is fine for single-file
+or test-driven work.
 
 ## Rules
 
-45 rules in two analysis families:
+45 rules in two families:
 
-**Flow analysis** — full per-fn control-flow graph + abstract
-interpretation:
+**Flow analysis** — full per-fn CFG + abstract interpretation, tracking
+values across branches, loops, defers, captures, and out-params:
 
-- `heap-use-after-free`, `heap-double-free`, `arena-use-after-kill`,
-  `arena-escape`, `stack-escape`, `use-undefined`,
-  `allocator-mismatch`, `interior-pointer-destroy`
+`heap-use-after-free`, `heap-double-free`, `arena-use-after-kill`,
+`arena-escape`, `stack-escape`, `use-undefined`, `allocator-mismatch`,
+`interior-pointer-destroy`
 
-**Pattern detectors** — per-fn token-walk over canonical bug shapes
-mined from open-source Zig PRs.  Shared infrastructure in `lexer.zig`
-/ `scope.zig` / `receiver.zig` / `model.zig` / `local.zig`; see
-[ARCHITECTURE.md](ARCHITECTURE.md).
+**Pattern detectors** — per-fn token/AST walks over canonical bug shapes
+mined from open-source Zig PRs:
 
-- Heap-leak / aliasing: `heap-leak`, `partial-union-write`,
-  `aliased-heap-dupe`, `clobbered-by-struct-reset`,
-  `realloc-byte-count`, `asymmetric-field-free`,
-  `free-without-null-then-check`,
+- Heap leak / aliasing: `heap-leak`, `partial-union-write`,
+  `aliased-heap-dupe`, `clobbered-by-struct-reset`, `realloc-byte-count`,
+  `asymmetric-field-free`, `free-without-null-then-check`,
   `overwrite-without-deinit`
 - Error-path cleanup: `missing-errdefer-between-tries`,
   `free-then-try-realloc`, `destroy-after-deinit-in-loop`,
   `dead-errdefer-in-result-fn`, `duplicate-errdefer`,
   `missing-errdefer-on-out-param`, `unreleased-refs-on-error`,
   `unreleased-factory-handle`
-- Pointer/slice stability: `hashmap-getptr-rehash`,
+- Pointer / slice stability: `hashmap-getptr-rehash`,
   `arraylist-items-slice`, `fd-write-after-close`,
   `stack-fallback-escape`, `slice-of-arena-into-heap`,
   `borrowed-slice-into-out-param`,
   `borrowed-slice-into-stack-buffer-returned`,
   `memset-undef-after-len-truncation`,
   `sentinel-strip-free-size-mismatch`
-- Tagged-union semantics:
-  `tagged-union-retag-with-old-payload-read`,
-  `union-deinit-without-inert-reset`,
-  `self-undefined-after-destroy`,
+- Tagged-union semantics: `tagged-union-retag-with-old-payload-read`,
+  `union-deinit-without-inert-reset`, `self-undefined-after-destroy`,
   `return-borrowed-payload`
-- Lifecycle / sibling-method consistency:
-  `reset-skips-pooled-resource-release`,
-  `missing-deinit-on-composed-owner`,
-  `owned-field-no-outer-cleanup`,
+- Lifecycle / sibling consistency: `reset-skips-pooled-resource-release`,
+  `missing-deinit-on-composed-owner`, `owned-field-no-outer-cleanup`,
   `deinit-order-violates-construction-dep`,
-  `defer-and-errdefer-free-overlap`,
-  `move-out-without-restore`
+  `defer-and-errdefer-free-overlap`, `move-out-without-restore`
 - Concurrency / hardening: `publish-then-touch-self`,
   `assert-on-untrusted-input`
 
-Run `zbc --list-rules` for the full descriptions, or
-`zbc --explain <rule-id>` for the rule's rationale, canonical bug,
-fix, and detection notes.
+Run `zbc --list-rules` for descriptions, or `zbc --explain <rule-id>`
+for rationale, canonical bug, fix, and detection notes.
 
 Each rule was extracted from real bug-fix PRs in Bun, TigerBeetle,
-Ghostty, Mach, or ziglang/zig's standard library.  The fixture
-in `test/fixtures/` documents the PR each rule was mined from.
+Ghostty, Mach, or the Zig standard library.
 
-## Analysis is pure-inference
+## Suppressions
 
-No annotations are read.  Every signal — heap-vs-arena origin,
-ownership transfer, borrow-from-parameter, allocator identity — is
-derived from body shape via the flow analyzer and the per-file
-FnSummary inference (`fn_summary.zig`).  Cross-module type
-questions go through the embedded type engine (`src/type_engine/`).
-
-When a finding is wrong, suppress that line with
-`// zbc-disable-line:<rule-id>` or
-`// zbc-disable-next-line:<rule-id>`.  There is no syntax for
-asserting alternative semantics — the tool's belief is what it is.
-
-## Library use
+When a finding is a false positive, suppress it inline:
 
 ```zig
-const zbc = @import("zbc");
+const x = buf[idx - 1]; // zbc-disable-line: index-minus-one-without-zero-guard
 
-const problems = try zbc.analyzeEscape(gpa, io, path, &zbc.DefaultConfig);
-defer zbc.freeProblems(gpa, problems);
+// zbc-disable-next-line: heap-use-after-free
+_ = ptr;
+
+_ = val; // zbc-disable-line: *   (suppress all rules on this line)
 ```
 
-Cross-module type resolution is handled internally by the embedded type
-engine (`src/type_engine/`).  No setup required.
+## Analysis
+
+Every signal — heap-vs-arena origin, ownership transfer, allocator
+identity, borrow-from-parameter — is inferred from body shape.  No
+annotations are read or required.
+
+Cross-module type resolution uses an embedded type engine
+(`src/type_engine/`) built on ZLS internals.  See [ARCHITECTURE.md](ARCHITECTURE.md)
+for the infrastructure layout and how to add rules.
 
 ## Acknowledgements
 
 - [ZLS](https://github.com/zigtools/zls) — type-resolution internals
   (`DocumentStore`, `InternPool`, `Analyser`) extracted and adapted into
-  `src/type_engine/` as zbc's embedded type engine.  ZLS is not imported
-  as a package; the relevant files are vendored and modified in-tree.
+  `src/type_engine/` as zbc's embedded type engine.  Not imported as a
+  package; vendored and modified in-tree.
