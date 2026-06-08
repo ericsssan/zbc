@@ -796,6 +796,45 @@ fn collectGuardedRanges(
                 continue;
             }
         }
+
+        // ── Inverted early-exit: `if (IDENT < IDENT + N) exit; rest_guarded` ──
+        // When the condition is `IDENT < OTHER + N` (N ≥ 1), the then_expr
+        // exits (return/break/continue), and there is no else branch, execution
+        // past the if guarantees IDENT ≥ OTHER + N ≥ N ≥ 1.
+        // Record [after_if, body_last] as guarded for IDENT.
+        //
+        // Covers patterns like:
+        //   `if (end < start + 2) return null;` → end ≥ 2 after
+        //   `if (rparen < t + 4) continue;`    → rparen ≥ 4 after
+        if (ifd.ast.else_expr == .none) {
+            const then_first_tag = ttags[tree.firstToken(ifd.ast.then_expr)];
+            const is_exit_body = then_first_tag == .keyword_return or
+                then_first_tag == .keyword_break or
+                then_first_tag == .keyword_continue;
+            if (is_exit_body) {
+                var ct2 = cf;
+                while (ct2 + 4 <= cl) : (ct2 += 1) {
+                    if (ttags[ct2] != .identifier) continue;
+                    if (ttags[ct2 + 1] != .angle_bracket_left) continue;
+                    if (ttags[ct2 + 2] != .identifier) continue;
+                    if (ttags[ct2 + 3] != .plus) continue;
+                    if (ttags[ct2 + 4] != .number_literal) continue;
+                    const n_val = std.fmt.parseUnsigned(u64, tree.tokenSlice(ct2 + 4), 0) catch 0;
+                    if (n_val < 1) continue;
+                    const after_if = tree.lastToken(node) + 1;
+                    if (after_if <= body_last) {
+                        try out.append(gpa, .{
+                            .names = .{ tree.tokenSlice(ct2), "", "" },
+                            .n = 1,
+                            .pair = false,
+                            .first = after_if,
+                            .last = body_last,
+                        });
+                    }
+                    ct2 += 4;
+                }
+            }
+        }
     }
 
     // ── Cross-pass 1: for-input slice-to-len-minus-one ────────────────────
@@ -1269,6 +1308,86 @@ fn hasEarlyReturnGuard(
                     }
                 }
                 if (depth == 0 and hasExitWithin(tags, j + 1, j + 4, t)) return true;
+            }
+        }
+
+        // Cross-variable `<` early-exit: `if (GUARD < OTHER + N) return/break/continue`
+        // where N >= 1.  After the early-exit, GUARD >= OTHER + N >= N >= 1.
+        // Pattern: `if ( GUARD_ID < OTHER_ID + N_LIT ) exit`
+        if (k + 8 < t and
+            tags[k + 1] == .l_paren and
+            tags[k + 2] == .identifier and
+            tags[k + 3] == .angle_bracket_left and
+            tags[k + 4] == .identifier and
+            tags[k + 5] == .plus and
+            tags[k + 6] == .number_literal and
+            tags[k + 7] == .r_paren)
+        {
+            const n_val = std.fmt.parseUnsigned(u64, tree.tokenSlice(k + 6), 10) catch 0;
+            if (n_val >= 1) {
+                const guard_id = tree.tokenSlice(k + 2);
+                var matched = false;
+                for (guard_names) |gn| {
+                    if (std.mem.eql(u8, guard_id, gn)) { matched = true; break; }
+                }
+                if (matched and hasExitWithin(tags, k + 8, k + 11, t)) return true;
+            }
+        }
+
+        // OR-branch early-exit: `if (A or GUARD == 0) return/break/continue`
+        //   Dotted: `if (... or OUTER . INNER == 0) exit`
+        //   Simple: `if (... or GUARD == 0) exit`
+        // After the early-exit any path that reaches [t] has GUARD != 0.
+        // Walk the condition of the if and look for `keyword_or GUARD == 0`
+        // followed by `)` and then an exit.
+        if (k + 2 < t and tags[k + 1] == .l_paren) {
+            // Walk forward to find closing `)` at depth 0.
+            // Start at k+2 (first token inside the paren) with depth=1.
+            var depth2: u32 = 1;
+            var j2: Ast.TokenIndex = k + 2;
+            while (j2 < t and j2 < k + 80) : (j2 += 1) {
+                if (tags[j2] == .l_paren) depth2 += 1 else if (tags[j2] == .r_paren) {
+                    depth2 -= 1;
+                    if (depth2 == 0) break;
+                }
+            }
+            if (depth2 == 0 and hasExitWithin(tags, j2 + 1, j2 + 4, t)) {
+                // Scan condition interior for `keyword_or GUARD == 0` patterns.
+                var ci = k + 2;
+                while (ci + 3 < j2) : (ci += 1) {
+                    if (tags[ci] != .keyword_or) continue;
+                    // Dotted: or OUTER . INNER == 0 ) — ci+6 must be j2
+                    if (ci + 6 == j2 and
+                        tags[ci + 1] == .identifier and
+                        tags[ci + 2] == .period and
+                        tags[ci + 3] == .identifier and
+                        tags[ci + 4] == .equal_equal and
+                        tags[ci + 5] == .number_literal and
+                        std.mem.eql(u8, tree.tokenSlice(ci + 5), "0"))
+                    {
+                        const outer_id = tree.tokenSlice(ci + 1);
+                        const inner_id = tree.tokenSlice(ci + 3);
+                        var has_outer = false;
+                        var has_inner = false;
+                        for (guard_names) |gn| {
+                            if (std.mem.eql(u8, outer_id, gn)) has_outer = true;
+                            if (std.mem.eql(u8, inner_id, gn)) has_inner = true;
+                        }
+                        if (has_outer and has_inner) return true;
+                    }
+                    // Simple: or GUARD == 0 ) — ci+4 must be j2
+                    if (ci + 4 == j2 and
+                        tags[ci + 1] == .identifier and
+                        tags[ci + 2] == .equal_equal and
+                        tags[ci + 3] == .number_literal and
+                        std.mem.eql(u8, tree.tokenSlice(ci + 3), "0"))
+                    {
+                        const guard_id = tree.tokenSlice(ci + 1);
+                        for (guard_names) |gn| {
+                            if (std.mem.eql(u8, guard_id, gn)) return true;
+                        }
+                    }
+                }
             }
         }
     }
@@ -2127,6 +2246,51 @@ test "index-minus-one-without-zero-guard: different ident >= y+2 still fires" {
     );
 }
 
+// ── Cross-variable early-exit guard tests (#7b) ───────────────────────────
+
+test "index-minus-one-without-zero-guard: if (x < y+N) return suppresses" {
+    // After `if (end < start + 2) return null`, end >= start+2 >= 2 > 0.
+    try testing.expectNoFire(check,
+        \\fn f(tags: []const u8, end: usize, start: usize) ?u8 {
+        \\    if (end < start + 2) return null;
+        \\    return tags[end - 1];
+        \\}
+        \\
+    );
+}
+
+test "index-minus-one-without-zero-guard: if (x < y+1) return suppresses" {
+    try testing.expectNoFire(check,
+        \\fn f(tags: []const u8, rparen: usize, t: usize) ?u8 {
+        \\    if (rparen < t + 1) return null;
+        \\    return tags[rparen - 1];
+        \\}
+        \\
+    );
+}
+
+test "index-minus-one-without-zero-guard: if (x < y+0) return does not suppress" {
+    // N == 0 does not guarantee x >= 1.
+    try testing.expectFires(check, R,
+        \\fn f(tags: []const u8, end: usize, start: usize) ?u8 {
+        \\    if (end < start + 0) return null;
+        \\    return tags[end - 1];
+        \\}
+        \\
+    );
+}
+
+test "index-minus-one-without-zero-guard: different ident in if-x-lt-y+N still fires" {
+    // `other < start + 2` guards `other`, not `end`.
+    try testing.expectFires(check, R,
+        \\fn f(tags: []const u8, end: usize, start: usize, other: usize) ?u8 {
+        \\    if (other < start + 2) return null;
+        \\    return tags[end - 1];
+        \\}
+        \\
+    );
+}
+
 // ── Compound or early-return guard tests (#8) ─────────────────────────────
 
 test "index-minus-one-without-zero-guard: if (e <= s or ...) return suppresses" {
@@ -2155,6 +2319,40 @@ test "index-minus-one-without-zero-guard: compound or-return on different ident 
         \\fn f(buf: []const u8, e: usize, s: usize, other: usize) !u8 {
         \\    if (other <= s or other > buf.len) return error.OutOfRange;
         \\    return buf[e - 1];
+        \\}
+        \\
+    );
+}
+
+test "index-minus-one-without-zero-guard: if (A or p.tok_i == 0) return suppresses dotted" {
+    // `p.tok_i == 0` is the RHS of OR early-return; after return tok_i != 0.
+    try testing.expectNoFire(check,
+        \\fn emitJsxGap(p: *Parser, last_child_was_text: bool, starts: []u32, lens: []u16) !void {
+        \\    if (last_child_was_text or p.tok_i == 0) return;
+        \\    const prev_end = starts[p.tok_i - 1] + lens[p.tok_i - 1];
+        \\    _ = prev_end;
+        \\}
+        \\const Parser = struct { tok_i: usize };
+        \\
+    );
+}
+
+test "index-minus-one-without-zero-guard: if (A or x == 0) return suppresses simple" {
+    try testing.expectNoFire(check,
+        \\fn f(buf: []const u8, flag: bool, x: usize) !u8 {
+        \\    if (flag or x == 0) return error.Empty;
+        \\    return buf[x - 1];
+        \\}
+        \\
+    );
+}
+
+test "index-minus-one-without-zero-guard: if (A or other == 0) return still fires for different ident" {
+    // `other == 0` guards `other`, not `x`.
+    try testing.expectFires(check, R,
+        \\fn f(buf: []const u8, flag: bool, x: usize, other: usize) !u8 {
+        \\    if (flag or other == 0) return error.Empty;
+        \\    return buf[x - 1];
         \\}
         \\
     );

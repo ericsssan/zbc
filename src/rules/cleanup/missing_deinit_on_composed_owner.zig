@@ -406,7 +406,7 @@ fn bodyHandlesFieldViaUnwrap(tree: *const Ast, method: *const file_model.MethodI
         // The condition's last two tokens must be `.<field_name>`.
         if (rparen < t + 4) continue;
         if (tags[rparen - 2] != .period) continue;
-        if (tags[rparen - 1] != .identifier) continue; // zbc-disable-line: index-minus-one-without-zero-guard — rparen>=t+4 via guard above; rparen>=4>0
+        if (tags[rparen - 1] != .identifier) continue;
         if (!std.mem.eql(u8, tree.tokenSlice(rparen - 1), field_name)) continue;
         // Capture: `|...|` immediately after `)`.
         if (rparen + 1 > last or tags[rparen + 1] != .pipe) continue;

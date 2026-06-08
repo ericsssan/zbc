@@ -164,7 +164,7 @@ fn receiverPathRange(
         }
     }
     // Trailing projector: `. <projector>` at the end.
-    if (tags[end - 1] != .period) return null; // zbc-disable-line: index-minus-one-without-zero-guard — end>=start+2 via guard above; end>=2>0
+    if (tags[end - 1] != .period) return null;
     if (tags[end] != .identifier) return null;
     const proj = tree.tokenSlice(end);
     if (!std.mem.eql(u8, proj, "items") and

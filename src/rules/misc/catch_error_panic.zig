@@ -106,6 +106,14 @@ fn checkBody(
             std.mem.eql(u8, tree.tokenSlice(t + 4), "@panic") and
             tags[t + 5] == .l_paren)
         {
+            // `catch |e| @panic(@errorName(e))` is strictly better than
+            // `catch unreachable` — it crashes with a named error message
+            // instead of silent UB.  Treat it as the documented-safe form
+            // and do not flag it.
+            if (t + 7 <= last and
+                tags[t + 6] == .builtin and
+                std.mem.eql(u8, tree.tokenSlice(t + 6), "@errorName") and
+                tags[t + 7] == .l_paren) continue;
             try report(gpa, state.problems, tree, t, t + 5);
             continue;
         }
@@ -239,6 +247,29 @@ test "catch-error-panic: catch return does not fire" {
         \\    var buff: [1024]u8 = undefined;
         \\    encode(&buff, input) catch |err| return err;
         \\}
+        \\
+    );
+}
+
+test "catch-error-panic: catch |e| @panic(@errorName(e)) does not fire" {
+    // @panic(@errorName(e)) is strictly better than catch unreachable:
+    // named crash message instead of UB in ReleaseFast.
+    try testing.expectNoFire(check,
+        \\fn finish(self: *Self) void {
+        \\    self.flattenCpPools() catch |e| @panic(@errorName(e));
+        \\}
+        \\
+    );
+}
+
+test "catch-error-panic: catch |e| @panic(fixed-string) still fires" {
+    // A fixed-string panic hides which error occurred; still suspicious.
+    try testing.expectFires(check, R,
+        \\fn run(input: []const u8) void {
+        \\    encode(input) catch |e| @panic("unexpected error");
+        \\    _ = e;
+        \\}
+        \\fn encode(_: []const u8) !void {}
         \\
     );
 }

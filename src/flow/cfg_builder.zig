@@ -477,7 +477,7 @@ const Builder = struct {
     owns_line_offsets: bool = false,
 
     fn tempDeinit(self: *Builder) void {
-        if (self.owns_line_offsets and self.line_offsets.len > 0) self.gpa.free(self.line_offsets); // zbc-disable-line: free-without-null-then-check — terminal deinit; Builder is not used after tempDeinit
+        if (self.owns_line_offsets and self.line_offsets.len > 0) self.gpa.free(self.line_offsets);
         for (self.block_stmts.items) |*s| s.deinit(self.gpa);
         self.block_stmts.deinit(self.gpa);
         for (self.block_successors.items) |*s| s.deinit(self.gpa);

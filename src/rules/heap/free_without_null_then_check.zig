@@ -94,7 +94,7 @@ fn isDestructorName(name: []const u8) bool {
     // gave the destructor a more specific name.  Also `take*` /
     // `consume*` / `into*` methods which by convention consume the
     // receiver (the struct is intentionally invalid after the call).
-    return std.mem.startsWith(u8, name, "deinit") or
+    if (std.mem.startsWith(u8, name, "deinit") or
         std.mem.startsWith(u8, name, "destroy") or
         std.mem.startsWith(u8, name, "finalize") or
         std.mem.startsWith(u8, name, "dispose") or
@@ -102,11 +102,17 @@ fn isDestructorName(name: []const u8) bool {
         std.mem.startsWith(u8, name, "consume") or
         std.mem.startsWith(u8, name, "into") or
         // Prefix match for `free*` catches `freeAndClear`, `freeAll`,
-        // `freeBuffers`, etc. — `free`-prefixed helpers, like other
-        // destructor-named fns, leave it to the caller to either
-        // discard or repopulate the freed slots.
+        // `freeBuffers`, etc.
         std.mem.startsWith(u8, name, "free") or
-        std.mem.eql(u8, name, "close");
+        std.mem.eql(u8, name, "close")) return true;
+    // Substring match (capitalized): catches camelCase-prefixed
+    // variants like `tempDeinit`, `partialDestroy`, `doCleanup`
+    // where a qualifying prefix precedes the cleanup verb.
+    return std.mem.indexOf(u8, name, "Deinit") != null or
+        std.mem.indexOf(u8, name, "Destroy") != null or
+        std.mem.indexOf(u8, name, "Cleanup") != null or
+        std.mem.indexOf(u8, name, "Finalize") != null or
+        std.mem.indexOf(u8, name, "Dispose") != null;
 }
 
 const Free = struct {
@@ -520,6 +526,40 @@ test "free-without-null-then-check: destructor of self (bun.destroy(this)) skipp
     );
     defer freeProblems(gpa, &problems);
     try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
+test "free-without-null-then-check: camelCase-prefixed destructor (tempDeinit) skipped" {
+    const gpa = std.testing.allocator;
+    var problems = try testing.runRule(gpa, check,
+        \\const std = @import("std");
+        \\const Builder = struct {
+        \\    gpa: std.mem.Allocator,
+        \\    line_offsets: []u8,
+        \\    pub fn tempDeinit(self: *Builder) void {
+        \\        self.gpa.free(self.line_offsets);
+        \\    }
+        \\};
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
+test "free-without-null-then-check: camelCase-prefixed destructor fires in non-cleanup fn" {
+    const gpa = std.testing.allocator;
+    var problems = try testing.runRule(gpa, check,
+        \\const std = @import("std");
+        \\const Builder = struct {
+        \\    gpa: std.mem.Allocator,
+        \\    line_offsets: []u8,
+        \\    pub fn process(self: *Builder) void {
+        \\        self.gpa.free(self.line_offsets);
+        \\    }
+        \\};
+        \\
+    );
+    defer freeProblems(gpa, &problems);
+    try std.testing.expectEqual(@as(usize, 1), problems.items.len);
 }
 
 test "free-without-null-then-check: reassign to a fresh allocation counts as reset" {

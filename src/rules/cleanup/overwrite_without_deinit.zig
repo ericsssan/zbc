@@ -474,7 +474,7 @@ fn classifySwitchArm(
     // `s` is the switch-body `{`.  Walk back past `)` to `(` to
     // `switch`.
     if (s < body_first + 5) return null;
-    if (tags[s - 1] != .r_paren) return null; // zbc-disable-line: index-minus-one-without-zero-guard — s>=body_first+5>=5>0 via guard above
+    if (tags[s - 1] != .r_paren) return null;
     var pd: i32 = 1;
     var q: Ast.TokenIndex = s - 1;
     while (q > body_first and pd > 0) {

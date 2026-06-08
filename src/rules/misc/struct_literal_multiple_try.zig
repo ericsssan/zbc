@@ -102,13 +102,15 @@ pub fn check(
             !tryExprAllocates(tree, tags, t + 4, i)) continue;
 
         // If the surrounding function uses an arena-backed allocator (i.e.
-        // there is a `const X = ARENA.allocator()` within 100 tokens before
+        // there is a `const X = ARENA.allocator()` within 200 tokens before
         // this struct literal, or the first-try expression passes an
-        // "arena"-named argument directly), every allocation is freed when
-        // the arena resets — no per-field leak is possible even if a later
+        // "arena"-named argument directly, or the enclosing function has
+        // `errdefer ARENA.deinit()`), every allocation is freed when the
+        // arena resets — no per-field leak is possible even if a later
         // `try` fails.
         if (nearbyArenaAllocator(tree, tags, t)) continue;
         if (tryExprPassesArena(tree, tags, t + 4, i)) continue;
+        if (enclosingFnHasArenaErrdefer(tree, tags, t)) continue;
 
         // Check the next field starts with . identifier = try
         const next = i + 1;
@@ -217,6 +219,32 @@ fn nearbyArenaAllocator(
         if (!std.mem.eql(u8, tree.tokenSlice(k + 2), "allocator")) continue;
         if (tags[k + 3] != .l_paren) continue;
         if (tags[k + 4] != .r_paren) continue;
+        return true;
+    }
+    return false;
+}
+
+/// Returns true if within the backward scan from `anchor` (up to 1000 tokens)
+/// there is an `errdefer IDENT_ARENA . deinit` pattern.  Long function bodies
+/// can place `errdefer arena.deinit()` hundreds of tokens before the struct
+/// literal, beyond the 200-token window of `nearbyArenaAllocator`.  When such
+/// an errdefer exists, all arena-backed allocations in the function are cleaned
+/// up on error, so no per-field leak is possible.
+fn enclosingFnHasArenaErrdefer(
+    tree: *const Ast,
+    tags: []const std.zig.Token.Tag,
+    anchor: Ast.TokenIndex,
+) bool {
+    const back: Ast.TokenIndex = 1000;
+    const start: Ast.TokenIndex = if (anchor >= back) anchor - back else 0;
+    var k = start;
+    while (k + 4 < anchor) : (k += 1) {
+        if (tags[k] != .keyword_errdefer) continue;
+        if (tags[k + 1] != .identifier) continue;
+        if (std.ascii.findIgnoreCase(tree.tokenSlice(k + 1), "arena") == null) continue;
+        if (tags[k + 2] != .period) continue;
+        if (tags[k + 3] != .identifier) continue;
+        if (!std.mem.eql(u8, tree.tokenSlice(k + 3), "deinit")) continue;
         return true;
     }
     return false;
@@ -460,6 +488,51 @@ test "struct-literal-multiple-try: pool.put(allocator, bytes) does not fire" {
         \\        .tokens = try pool.put(allocator, ln.tokens),
         \\    };
         \\}
+        \\
+    );
+}
+
+test "struct-literal-multiple-try: errdefer arena.deinit() in enclosing fn suppresses" {
+    // Long function bodies place `errdefer arena.deinit()` hundreds of tokens
+    // before the struct literal — beyond the nearbyArenaAllocator window.
+    // The enclosingFnHasArenaErrdefer check covers this case.
+    try testing.expectNoFire(check,
+        \\const std = @import("std");
+        \\const ArenaAllocator = std.heap.ArenaAllocator;
+        \\const ArrayList = std.ArrayListUnmanaged;
+        \\fn buildModel(gpa: std.mem.Allocator, count: usize) !Model {
+        \\    var arena = ArenaAllocator.init(gpa);
+        \\    errdefer arena.deinit();
+        \\    const a = arena.allocator();
+        \\    var names: ArrayList([]const u8) = .empty;
+        \\    var fns: ArrayList([]const u8) = .empty;
+        \\    var i: usize = 0;
+        \\    while (i < count) : (i += 1) {
+        \\        try names.append(a, "x");
+        \\        try fns.append(a, "y");
+        \\    }
+        \\    return .{
+        \\        .names = try names.toOwnedSlice(a),
+        \\        .fns = try fns.toOwnedSlice(a),
+        \\    };
+        \\}
+        \\const Model = struct { names: [][]const u8, fns: [][]const u8 };
+        \\
+    );
+}
+
+test "struct-literal-multiple-try: no errdefer arena still fires" {
+    // Control: without errdefer arena.deinit(), the rule must still fire
+    // so the suppressor is not inadvertently always-true.
+    try testing.expectFires(check, R,
+        \\const std = @import("std");
+        \\fn buildPair(gpa: std.mem.Allocator) !Pair {
+        \\    return Pair{
+        \\        .a = try gpa.alloc(u8, 4),
+        \\        .b = try gpa.alloc(u8, 4),
+        \\    };
+        \\}
+        \\const Pair = struct { a: []u8, b: []u8 };
         \\
     );
 }
