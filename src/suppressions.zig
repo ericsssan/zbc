@@ -101,7 +101,14 @@ pub fn parse(gpa: std.mem.Allocator, source: []const u8) !Suppressions {
         // Split the comma-separated rule list.
         var it = std.mem.splitScalar(u8, directive.list, ',');
         while (it.next()) |raw| {
-            const id = std.mem.trim(u8, raw, " \t");
+            // Trim surrounding whitespace, then drop any trailing annotation
+            // (e.g. "rule-id — explanation" or "rule-id  # note") by stopping
+            // at the first whitespace character inside the token.
+            const trimmed = std.mem.trim(u8, raw, " \t");
+            const id = if (std.mem.indexOfAny(u8, trimmed, " \t")) |ws|
+                trimmed[0..ws]
+            else
+                trimmed;
             if (id.len == 0) continue;
             const stored: []const u8 = if (std.mem.eql(u8, id, "*"))
                 ""
@@ -222,4 +229,23 @@ test "parse: line_no not skewed by leading non-zbc comments" {
     // The directive is on line 5; must not be stored as line 2 (drift of 3).
     try testing.expect(s.isSuppressed("index-minus-one-without-zero-guard", 5));
     try testing.expect(!s.isSuppressed("index-minus-one-without-zero-guard", 2));
+}
+
+test "parse: trailing annotation after rule-id is ignored" {
+    var s = try parse(testing.allocator,
+        \\_ = x; // zbc-disable-line: my-rule — this is safe because reasons
+    );
+    defer s.deinit();
+    try testing.expect(s.isSuppressed("my-rule", 1));
+    try testing.expect(!s.isSuppressed("my-rule — this is safe because reasons", 1));
+}
+
+test "parse: trailing annotation does not bleed into next comma-token" {
+    var s = try parse(testing.allocator,
+        \\_ = x; // zbc-disable-line: rule-a — note, rule-b
+    );
+    defer s.deinit();
+    try testing.expect(s.isSuppressed("rule-a", 1));
+    try testing.expect(s.isSuppressed("rule-b", 1));
+    try testing.expect(!s.isSuppressed("rule-a — note", 1));
 }
