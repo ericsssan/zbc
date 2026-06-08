@@ -91,7 +91,7 @@ pub const ProjectCache = struct {
         }
 
         pub fn tree(self: TypeEntry) *const Ast {
-            return &self.entry.tree; // zbc-disable-line: stack-escape — self.entry is *Entry (heap); field address is valid
+            return &self.entry.tree;
         }
     };
 
@@ -495,7 +495,7 @@ pub const ProjectCache = struct {
     ) !?*const model_mod.FileModel {
         if (self.entries.get(abs_path)) |e| {
             self.gpa.free(abs_path);
-            return &e.model; // zbc-disable-line: stack-escape — entries stores *Entry (heap); e is a pointer, &e.model points into heap
+            return &e.model;
         }
         // Load the file.
         const src_bytes = std.Io.Dir.cwd().readFileAlloc(

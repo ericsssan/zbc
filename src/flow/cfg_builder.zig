@@ -3989,6 +3989,22 @@ const Builder = struct {
                     if (fieldPathHasPointerName(fref.name)) {
                         return .unknown;
                     }
+                    // Type engine: check if the direct LHS of this
+                    // field_access resolves to a pointer type.  Covers
+                    // two cases the syntactic checks above miss:
+                    //   1. `&ptr_local.field` where the local's type
+                    //      wasn't annotated as a pointer (e.g. a capture
+                    //      from a HashMap.get call whose return type is
+                    //      `?*V`).
+                    //   2. `&local.ptr_field.sub` where an intermediate
+                    //      field in the chain is `*T` — the address-of
+                    //      borrows through the heap pointer, not the stack.
+                    if (self.zls) |zls| {
+                        const child = tree.nodeData(inner).node_and_token[0];
+                        if (zls.resolvedTypeIsPointer(child) catch false) {
+                            return .unknown;
+                        }
+                    }
                     return .{ .stack_ref = fref.parent };
                 }
             }
