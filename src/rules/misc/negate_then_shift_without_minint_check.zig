@@ -105,7 +105,7 @@ fn isUnaryContext(
     first: Ast.TokenIndex,
 ) bool {
     if (t == first) return true;
-    return switch (tags[t - 1]) {
+    return switch (tags[t - 1]) { // zbc-disable-line: index-minus-one-without-zero-guard — t==first returns early above; t>first>=1 in fall-through
         .l_paren,
         .equal,
         .keyword_else,

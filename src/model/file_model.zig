@@ -993,7 +993,7 @@ pub fn buildWithPath(gpa: std.mem.Allocator, tree: *const Ast, file_path: ?[]con
         .arena = arena,
         .tree = tree,
         .types = try types.toOwnedSlice(a),
-        .fns = try fns.toOwnedSlice(a),
+        .fns = try fns.toOwnedSlice(a), // zbc-disable-line: struct-literal-multiple-try — arena covers error cleanup via errdefer arena.deinit()
     };
 }
 

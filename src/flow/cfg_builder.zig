@@ -477,7 +477,7 @@ const Builder = struct {
     owns_line_offsets: bool = false,
 
     fn tempDeinit(self: *Builder) void {
-        if (self.owns_line_offsets and self.line_offsets.len > 0) self.gpa.free(self.line_offsets);
+        if (self.owns_line_offsets and self.line_offsets.len > 0) self.gpa.free(self.line_offsets); // zbc-disable-line: free-without-null-then-check — terminal deinit; Builder is not used after tempDeinit
         for (self.block_stmts.items) |*s| s.deinit(self.gpa);
         self.block_stmts.deinit(self.gpa);
         for (self.block_successors.items) |*s| s.deinit(self.gpa);
@@ -2840,7 +2840,7 @@ const Builder = struct {
                 const s: u32 = @intFromEnum(d.start);
                 const e: u32 = @intFromEnum(d.end);
                 if (e == s) return null;
-                return @as(Ast.Node.Index, @enumFromInt(tree.extra_data[e - 1]));
+                return @as(Ast.Node.Index, @enumFromInt(tree.extra_data[e - 1])); // zbc-disable-line: index-minus-one-without-zero-guard — e > s proven by `if (e == s) return null` above
             },
             else => return null,
         }
@@ -6205,11 +6205,10 @@ const Builder = struct {
     ) !Cfg {
         const blocks = try self.gpa.alloc(BasicBlock, self.blocks.items.len);
         for (self.blocks.items, 0..) |bb, i| {
-            blocks[i] = .{
-                .id = bb.id,
-                .stmts = try self.block_stmts.items[i].toOwnedSlice(self.gpa),
-                .successors = try self.block_successors.items[i].toOwnedSlice(self.gpa),
-            };
+            const stmts = try self.block_stmts.items[i].toOwnedSlice(self.gpa);
+            errdefer self.gpa.free(stmts);
+            const successors = try self.block_successors.items[i].toOwnedSlice(self.gpa);
+            blocks[i] = .{ .id = bb.id, .stmts = stmts, .successors = successors };
         }
         const locals = try self.locals.toOwnedSlice(self.gpa);
         const owned_paths = try self.owned_paths.toOwnedSlice(self.gpa);

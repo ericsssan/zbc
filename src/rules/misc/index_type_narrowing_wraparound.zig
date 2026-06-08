@@ -167,7 +167,7 @@ fn isNarrowSignedType(s: []const u8) bool {
 /// diagnostic message.  Only called for types `isNarrowSignedType` accepted,
 /// so `1 <= N < 64`.
 fn maxValueForType(s: []const u8) i64 {
-    const bits = std.fmt.parseInt(u16, s[1..], 10) catch return 0;
+    const bits = std.fmt.parseInt(u16, s[1..], 10) catch return 0; // zbc-disable-line: slice-from-fixed-offset-without-len-check — only called for isNarrowSignedType; those are "iN" strings with len>=2
     if (bits == 0 or bits >= 64) return 0;
     const shift: u6 = @intCast(bits - 1);
     return (@as(i64, 1) << shift) - 1;

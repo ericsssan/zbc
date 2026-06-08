@@ -56,6 +56,11 @@ pub fn build(b: *std.Build) void {
     exe_mod.link_libc = true; // project_cache.zig uses std.c.realpath on non-absolute paths
     b.installArtifact(exe);
 
+    // ── Dogfood: self-check on every `zig build` ────────────
+    const self_check = b.addRunArtifact(exe);
+    self_check.addDirectoryArg(b.path("src/"));
+    b.default_step.dependOn(&self_check.step);
+
     const run_cmd = b.addRunArtifact(exe);
     const run_step = b.step("run", "Run zbc CLI");
     run_step.dependOn(&run_cmd.step);

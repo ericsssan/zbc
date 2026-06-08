@@ -243,7 +243,7 @@ fn tryExprPassesArena(
         if (std.ascii.findIgnoreCase(tree.tokenSlice(t), "arena") == null) continue;
         // Require argument position: preceded by '(' or ','.
         if (t == start) continue; // first token, no predecessor
-        const prev = tags[t - 1];
+        const prev = tags[t - 1]; // zbc-disable-line: index-minus-one-without-zero-guard — t==start is skipped above; t>start>=1 in fall-through
         if (prev == .l_paren or prev == .comma) return true;
     }
     return false;

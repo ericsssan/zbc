@@ -283,7 +283,7 @@ fn argMinLen(
     }
 
     // Call argument: ends in `)`; callee is the identifier before its `(`.
-    if (tags[end - 1] == .r_paren) {
+    if (tags[end - 1] == .r_paren) { // zbc-disable-line: index-minus-one-without-zero-guard — end>s>=0 via `if (s >= end) return 0` above
         var d: u32 = 0;
         var k = end - 1;
         while (k > s) : (k -= 1) {

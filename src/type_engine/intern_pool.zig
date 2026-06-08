@@ -1740,7 +1740,7 @@ pub fn coerce(
                 const elem_res = try ip.coerceInMemoryAllowed(arena, dest_info.elem_type, array_elem_type, dest_info.flags.is_const, target);
                 if (elem_res != .ok) {
                     in_memory_result = .{ .ptr_child = .{
-                        .child = try elem_res.dupe(arena),
+                        .child = try elem_res.dupe(arena), // zbc-disable-line: tagged-union-payload-early-exit — arena-allocated; arena owns cleanup on error
                         .actual = array_elem_type,
                         .wanted = dest_info.elem_type,
                     } };

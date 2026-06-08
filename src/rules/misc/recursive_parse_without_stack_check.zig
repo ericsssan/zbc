@@ -210,7 +210,7 @@ fn findRecursiveCall(
         }
 
         // Bare form: NOT preceded by `.`
-        if (t == first or tags[t - 1] != .period) return t;
+        if (t == first or tags[t - 1] != .period) return t; // zbc-disable-line: index-minus-one-without-zero-guard — short-circuit or; t-1 only evaluated when t!=first, and t>first>=1
     }
     return null;
 }

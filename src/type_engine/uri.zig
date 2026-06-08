@@ -452,7 +452,7 @@ pub fn resolveImport(
     const joined_path = try std.Io.Dir.path.resolvePosix(allocator, &.{ percent_encoded_path, "..", aw.written() });
     defer allocator.free(joined_path);
 
-    var buffer = aw.toArrayList();
+    var buffer = aw.toArrayList(); // zbc-disable-line: move-out-without-restore — ZLS pattern; defer buffer.deinit below handles cleanup
     defer buffer.deinit(allocator);
     buffer.clearRetainingCapacity();
 

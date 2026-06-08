@@ -419,7 +419,7 @@ pub fn renderBuiltinFunctionSignature(
     }
     try signature.appendSlice(arena, ") ");
     try signature.appendSlice(arena, builtin_data.return_type);
-    return signature.items;
+    return signature.items; // zbc-disable-line: return-arraylist-items — intentional arena-backed borrow; caller's arena owns the allocation
 }
 
 pub fn isInstanceCall(
@@ -1734,7 +1734,7 @@ fn resolvePeerTypesInternal(analyser: *Analyser, a: Type, b: Type) error{OutOfMe
                     .data = .{
                         .error_union = .{
                             .error_set = try analyser.allocType(try a.typeOf(analyser)),
-                            .payload = try analyser.allocType(try b.typeOf(analyser)),
+                            .payload = try analyser.allocType(try b.typeOf(analyser)), // zbc-disable-line: struct-literal-multiple-try — allocType uses analyser.arena; error path frees the arena
                         },
                     },
                     .is_type_val = false,
@@ -2870,7 +2870,7 @@ fn resolveTypeOfNodeUncached(analyser: *Analyser, options: ResolveOptions) Error
             defer analyser.arena.free(lineage);
 
             const tag = offsets.identifierTokenToNameSlice(tree, tree.nodeMainToken(node));
-            const decl, const type_maybe = (try analyser.lookupSymbolFieldInit(handle, tag, node, lineage[1..])) orelse return Type.fromIP(analyser, .enum_literal_type, null);
+            const decl, const type_maybe = (try analyser.lookupSymbolFieldInit(handle, tag, node, lineage[1..])) orelse return Type.fromIP(analyser, .enum_literal_type, null); // zbc-disable-line: slice-from-fixed-offset-without-len-check — enum_literal node is always nested; nodesOverlappingIndex returns len>=2
             return type_maybe orelse decl.resolveType(analyser);
         },
 

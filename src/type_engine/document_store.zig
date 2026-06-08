@@ -390,7 +390,7 @@ pub const Handle = struct {
         if (results.items.len == 0) {
             self.impl.associated_compilation_units = .none;
         } else {
-            self.impl.associated_compilation_units = .{ .resolved = try results.toOwnedSlice(allocator) };
+            self.impl.associated_compilation_units = .{ .resolved = try results.toOwnedSlice(allocator) }; // zbc-disable-line: tagged-union-payload-early-exit — ZLS pattern; failure leaves impl in .none state set on the line above
         }
         return self.impl.associated_compilation_units;
     }

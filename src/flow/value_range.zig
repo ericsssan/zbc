@@ -100,6 +100,7 @@ const State = struct {
     }
     fn clone(self: *const State, gpa: std.mem.Allocator) !State {
         var out: State = .{};
+        errdefer out.deinit(gpa);
         try out.scalars.keys.appendSlice(gpa, self.scalars.keys.items);
         try out.containers.keys.appendSlice(gpa, self.containers.keys.items);
         try out.aliases.appendSlice(gpa, self.aliases.items);

@@ -278,7 +278,7 @@ fn fullForComponents(tree: *const Ast, info: full.For.Components) full.For {
     {
         result.label_token = tok_i -| 1;
     }
-    const last_cond_token = lastToken(tree, info.inputs[info.inputs.len - 1]);
+    const last_cond_token = lastToken(tree, info.inputs[info.inputs.len - 1]); // zbc-disable-line: index-minus-one-without-zero-guard — for loop always has at least one input; inputs.len>=1 invariant
     result.payload_token = last_cond_token + 3 + @intFromBool(tree.tokenTag(last_cond_token + 1) == .comma);
     if (info.else_expr != .none) {
         const possible_else_token = lastToken(tree, info.then_expr) + 1;

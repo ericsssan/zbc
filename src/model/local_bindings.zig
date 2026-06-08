@@ -461,8 +461,8 @@ fn classifyOrigin(tree: *const Ast, first: TokenIndex, last: TokenIndex) Origin 
             var info: CallInfo = .{
                 .receiver = id,
                 .receiver_token = id_tok,
-                .method = if (first_is_free) null else tree.tokenSlice(chain_buf[chain_len - 1]),
-                .method_token = if (first_is_free) null else chain_buf[chain_len - 1],
+                .method = if (first_is_free) null else tree.tokenSlice(chain_buf[chain_len - 1]), // zbc-disable-line: index-minus-one-without-zero-guard — first_is_free = chain_len==1; else branch only reached when chain_len>=2
+                .method_token = if (first_is_free) null else chain_buf[chain_len - 1], // zbc-disable-line: index-minus-one-without-zero-guard — same guard
                 .paren_token = first_paren,
             };
 
