@@ -1,43 +1,30 @@
 # zbc
 
-A bug checker for Zig — 45 rules covering lifetime, ownership, and cleanup
-bugs with no annotations required.
+Infers Zig lifetime, ownership, and cleanup bugs from your code — no
+annotations, no runtime instrumentation.
 
 ## Example
 
 ```zig
 const Owner = struct {
     data: []u8,
-    pub fn deinit(self: *Owner, gpa: std.mem.Allocator) void {
-        gpa.free(self.data);
-    }
+    pub fn deinit(self: *Owner, gpa: Allocator) void { gpa.free(self.data); }
 };
 
 var owner = Owner{ .data = try gpa.alloc(u8, 16) };
-const x = owner.data;    // borrows owner.data
-owner.deinit(gpa);        // inferred: takes ownership of self.data
-_ = x;                    // → heap-use-after-free
+const x = owner.data;
+owner.deinit(gpa);   // frees self.data — zbc reads the body to know this
+_ = x;               // → heap-use-after-free
 ```
-
-The body of `deinit` is enough for zbc to infer that calling
-`owner.deinit(gpa)` invalidates `owner.data`.
 
 ## Build integration
 
-**`build.zig.zon`**
-
-```zig
-.dependencies = .{
-    .zbc = .{
-        .url = "https://github.com/ericsssan/zbc/archive/refs/tags/v0.1.0.tar.gz",
-        .hash = "<hash>",  // run: zig fetch --save <url>
-    },
-},
+```sh
+zig fetch --save https://github.com/ericsssan/zbc/archive/refs/tags/v0.1.0.tar.gz
 ```
 
-**`build.zig`**
-
 ```zig
+// build.zig
 const zbc_dep = b.dependency("zbc", .{
     .target = target,
     .optimize = .ReleaseFast,
@@ -51,14 +38,12 @@ b.default_step.dependOn(&zbc_run.step);
 
 ## CLI
 
-```sh
-zig build -Doptimize=ReleaseFast
-```
+For standalone use:
 
 ```sh
+zig build -Doptimize=ReleaseFast
 zbc src/
-zbc path/to/file.zig
-zbc --format=compact src/
+zbc --format=compact src/   # grep-friendly
 zbc --list-rules
 zbc --explain <rule-id>
 ```
@@ -69,15 +54,14 @@ Exit 0 if clean, 1 if problems found.
 
 45 rules in two families:
 
-**Flow analysis** — full per-fn CFG + abstract interpretation, tracking
-values across branches, loops, defers, captures, and out-params:
+**Flow analysis** — must-not-escape / must-not-free-twice guarantees via
+per-fn CFG and abstract interpretation:
 
 `heap-use-after-free`, `heap-double-free`, `arena-use-after-kill`,
 `arena-escape`, `stack-escape`, `use-undefined`, `allocator-mismatch`,
 `interior-pointer-destroy`
 
-**Pattern detectors** — per-fn token/AST walks over canonical bug shapes
-mined from open-source Zig PRs:
+**Pattern detectors** — catches recurring bug shapes from real Zig PRs:
 
 - Heap leak / aliasing: `heap-leak`, `partial-union-write`,
   `aliased-heap-dupe`, `clobbered-by-struct-reset`, `realloc-byte-count`,
@@ -105,7 +89,11 @@ mined from open-source Zig PRs:
 - Concurrency / hardening: `publish-then-touch-self`,
   `assert-on-untrusted-input`
 
+`zbc --explain <rule-id>` prints the rationale, canonical bug, and fix.
+
 ## Suppressions
+
+Silence a false positive with a source comment:
 
 ```zig
 buf[idx - 1] // zbc-disable-line: index-minus-one-without-zero-guard
@@ -113,7 +101,7 @@ buf[idx - 1] // zbc-disable-line: index-minus-one-without-zero-guard
 // zbc-disable-next-line: heap-use-after-free
 _ = ptr;
 
-_ = val; // zbc-disable-line: *   (suppress all rules on this line)
+_ = val; // zbc-disable-line: *   (all rules on this line)
 ```
 
 ## Acknowledgements
