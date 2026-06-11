@@ -9,6 +9,19 @@ const std = @import("std");
 
 pub const Severity = enum { off, warning, @"error" };
 
+/// Three-valued confirmation status (issue #18 — a truth oracle for
+/// findings).  Static analysis always emits `.unknown`: the rule fired,
+/// but nothing has proven the finding true or false.  A downstream
+/// confirmation oracle (e.g. the fuzz-harness runner) may upgrade it to:
+///   - `.confirmed` — a real bug, reproduced dynamically; `witness`
+///     holds the input that triggers it.
+///   - `.refuted`   — proven impossible by a SOUND static argument.
+///
+/// Asymmetry that matters: a fuzzer that fails to crash does NOT justify
+/// `.refuted` — absence of a witness is not a proof of safety, so an
+/// unconfirmed finding stays `.unknown`, never auto-`.refuted`.
+pub const Verdict = enum { unknown, confirmed, refuted };
+
 pub const Pos = struct {
     /// 1-indexed line number.
     line: u32,
@@ -58,10 +71,17 @@ pub const Problem = struct {
     /// Optional secondary spans.  Owned (each `label`) plus the slice
     /// itself.  Empty slice == no notes; `&.{}` is fine.
     notes: []Note = &.{},
+    /// Confirmation status (issue #18).  Defaults to `.unknown`; only a
+    /// confirmation oracle sets `.confirmed` / `.refuted`.  See Verdict.
+    verdict: Verdict = .unknown,
+    /// Reproducing input that confirmed this finding, set together with
+    /// `verdict == .confirmed`.  Owned (caller dupes).  Null otherwise.
+    witness: ?[]const u8 = null,
 
     pub fn deinit(self: *Problem, gpa: std.mem.Allocator) void {
         gpa.free(self.message);
         for (self.notes) |n| gpa.free(n.label);
         if (self.notes.len > 0) gpa.free(self.notes);
+        if (self.witness) |w| gpa.free(w);
     }
 };
