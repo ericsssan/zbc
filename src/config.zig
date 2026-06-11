@@ -612,6 +612,10 @@ pub const Invariant = enum {
     /// (spins forever) and asserts in Debug.  Unlock before re-acquiring.
     /// Catches oven-sh/bun#28907 class (ThreadPool sync deadlock).
     mutex_double_lock,
+    /// `recv.lock()` released by a later `recv.unlock()`, but a `return`
+    /// / `try` in between can exit with the lock held — leaking it (next
+    /// acquirer deadlocks).  Use `defer recv.unlock();` after locking.
+    lock_held_across_early_exit,
     /// `@ptrFromInt(0)` creates a null pointer to a non-nullable type.
     /// Dereferencing it is undefined behaviour on every platform:
     /// traps in Debug/ReleaseSafe, silent corruption in ReleaseFast.
@@ -825,7 +829,7 @@ pub const Invariant = enum {
     clamp_wrong_direction,
 };
 
-pub const all_invariants: [112]Invariant = .{
+pub const all_invariants: [113]Invariant = .{
     .arena_escape,
     .stack_escape,
     .use_undefined,
@@ -899,6 +903,7 @@ pub const all_invariants: [112]Invariant = .{
     .int_sum_overflow_in_bounds_cmp,
     .ptr_slice_without_bounds_check,
     .mutex_double_lock,
+    .lock_held_across_early_exit,
     .ptrfromint_zero,
     .resize_result_discarded,
     .errdefer_alive_after_ownership_transfer,

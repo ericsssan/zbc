@@ -391,6 +391,11 @@ pub const all = [_]Rule{
         .body = @embedFile("rules/misc/mutex-double-lock.md"),
     },
     .{
+        .id = "lock-held-across-early-exit",
+        .title = "`recv.lock()` leaked on an early-exit path — a `return`/`try` before the matching `recv.unlock()` exits with the lock held; use `defer recv.unlock()`",
+        .body = @embedFile("rules/misc/lock-held-across-early-exit.md"),
+    },
+    .{
         .id = "ptrfromint-zero",
         .title = "`@ptrFromInt(0)` — null pointer to non-nullable type is UB (trap in Debug/Safe, silent corruption in ReleaseFast)",
         .body = @embedFile("rules/misc/ptrfromint-zero.md"),
@@ -615,6 +620,7 @@ const intfromfloat_without_clamp_mod = @import("rules/misc/intfromfloat_without_
 const int_sum_overflow_in_bounds_cmp_mod = @import("rules/misc/int_sum_overflow_in_bounds_cmp.zig");
 const ptr_slice_without_bounds_check_mod = @import("rules/misc/ptr_slice_without_bounds_check.zig");
 const mutex_double_lock_mod = @import("rules/misc/mutex_double_lock.zig");
+const lock_held_across_early_exit_mod = @import("rules/misc/lock_held_across_early_exit.zig");
 const ptrfromint_zero_mod = @import("rules/misc/ptrfromint_zero.zig");
 const resize_result_discarded_mod = @import("rules/heap/resize_result_discarded.zig");
 const errdefer_alive_after_ownership_transfer_mod = @import("rules/errdefer/errdefer_alive_after_ownership_transfer.zig");
@@ -729,6 +735,7 @@ const escape_detectors = [_]Detector{
     .{ .id = "int-sum-overflow-in-bounds-cmp",             .check = int_sum_overflow_in_bounds_cmp_mod.check },
     .{ .id = "ptr-slice-without-bounds-check",             .check = ptr_slice_without_bounds_check_mod.check },
     .{ .id = "mutex-double-lock",                          .check = mutex_double_lock_mod.check },
+    .{ .id = "lock-held-across-early-exit",                .check = lock_held_across_early_exit_mod.check },
     .{ .id = "ptrfromint-zero",                            .check = ptrfromint_zero_mod.check },
     .{ .id = "resize-result-discarded",                    .check = resize_result_discarded_mod.check },
     .{ .id = "errdefer-alive-after-ownership-transfer",    .check = errdefer_alive_after_ownership_transfer_mod.check },
@@ -892,6 +899,7 @@ test "registry: pull in every rule module so inline tests run" {
     _ = int_sum_overflow_in_bounds_cmp_mod;
     _ = ptr_slice_without_bounds_check_mod;
     _ = mutex_double_lock_mod;
+    _ = lock_held_across_early_exit_mod;
     _ = ptrfromint_zero_mod;
     _ = resize_result_discarded_mod;
     _ = errdefer_alive_after_ownership_transfer_mod;
