@@ -440,7 +440,13 @@ pub const ProjectCache = struct {
         root: []const u8,
         module_name: []const u8,
     ) !?[]u8 {
-        // Phase 1: try build.zig parsing.
+        // Phase 1: build.zig parsing.  When a build.zig is PRESENT it is
+        // the authoritative source for module wiring, so we trust ONLY the
+        // parse and do NOT fall back to layout guessing — guessing against
+        // a known-but-unparsed build is exactly where mis-resolution
+        // (silently wrong cross-file analysis) comes from.  A parse miss
+        // returns null (the module is likely a dependency package or built
+        // by code we can't statically follow).
         const build_zig = try std.fs.path.join(self.gpa, &.{ root, "build.zig" });
         defer self.gpa.free(build_zig);
         if (pathExists(self.io, build_zig)) {
@@ -452,8 +458,12 @@ pub const ProjectCache = struct {
                 if (pathExists(self.io, abs)) return abs;
                 self.gpa.free(abs);
             }
+            return null;
         }
-        // Phase 2: conventional layouts.  Probe in priority order.
+        // Phase 2: conventional layouts — only when there is NO build.zig
+        // (a loose project with no module system to consult, so these
+        // filename conventions are the only available signal).  Probe in
+        // priority order.
         // Each entry is the candidate path RELATIVE to `root`,
         // assembled at runtime from `module_name`.
         const x = module_name;
@@ -627,62 +637,141 @@ fn containsBadChar(s: []const u8) bool {
     return false;
 }
 
-/// Best-effort parse of a `build.zig` looking for a module
-/// declaration matching `module_name`.  Matches the canonical
-/// patterns:
-///   `b.addModule("name", .{ .root_source_file = b.path("X") })`
-///   `b.addModule("name", .{ .root_source_file = .{ .path = "X" } })`
-///   `b.createModule(.{ .root_source_file = b.path("X") })`  (when assigned to a const named `name`)
-///
+fn isWsByte(c: u8) bool {
+    return c == ' ' or c == '\n' or c == '\t' or c == '\r';
+}
+fn isIdentByte(c: u8) bool {
+    return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or
+        (c >= '0' and c <= '9') or c == '_';
+}
+
+/// First `"..."` string literal after the first occurrence of `key` in
+/// `hay`.  Returns a slice INTO `hay` (caller dupes if it must outlive).
+fn firstStringAfter(hay: []const u8, key: []const u8) ?[]const u8 {
+    const idx = std.mem.indexOf(u8, hay, key) orelse return null;
+    const after = hay[idx + key.len ..];
+    const q1 = std.mem.indexOfScalar(u8, after, '"') orelse return null;
+    const rest = after[q1 + 1 ..];
+    const q2 = std.mem.indexOfScalar(u8, rest, '"') orelse return null;
+    return rest[0..q2];
+}
+
+/// The variable wired as `@import(import_name)` via
+/// `<x>.addImport("<import_name>", <var>)`.  Slice into `src`, or null.
+/// Handles the common identifier-variable 2nd-arg form (not an inline
+/// module-construction expression) — the dominant build.zig idiom that
+/// DECOUPLES the import alias from the module's own declared name.
+fn addImportAliasVar(src: []const u8, import_name: []const u8) ?[]const u8 {
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, src, from, "addImport")) |hit| {
+        from = hit + "addImport".len;
+        var j = from;
+        while (j < src.len and isWsByte(src[j])) : (j += 1) {}
+        if (j >= src.len or src[j] != '(') continue;
+        j += 1;
+        while (j < src.len and isWsByte(src[j])) : (j += 1) {}
+        if (j >= src.len or src[j] != '"') continue;
+        j += 1;
+        const ns = j;
+        while (j < src.len and src[j] != '"') : (j += 1) {}
+        if (j >= src.len) continue;
+        if (!std.mem.eql(u8, src[ns..j], import_name)) continue;
+        j += 1; // past the closing quote of arg1
+        while (j < src.len and src[j] != ',' and src[j] != ')') : (j += 1) {}
+        if (j >= src.len or src[j] != ',') continue;
+        j += 1;
+        while (j < src.len and isWsByte(src[j])) : (j += 1) {}
+        const id_start = j;
+        while (j < src.len and isIdentByte(src[j])) : (j += 1) {}
+        if (j == id_start) continue; // 2nd arg wasn't a bare identifier
+        return src[id_start..j];
+    }
+    return null;
+}
+
+/// `root_source_file` path of a `const <var> = …createModule(.{…})` or
+/// `const <var> = …addModule(<name>, .{…})` declaration.  Slice into
+/// `src`, or null.  `<var>` must be a whole token immediately preceded
+/// by `const `/`var `, and a createModule/addModule call must appear in
+/// the decl window before the path (so we don't grab an unrelated one).
+fn declRootSourceFile(src: []const u8, var_name: []const u8) ?[]const u8 {
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, src, from, var_name)) |hit| {
+        from = hit + var_name.len;
+        const tail_ok = hit + var_name.len >= src.len or !isIdentByte(src[hit + var_name.len]);
+        if (!tail_ok) continue;
+        const pre = src[0..hit];
+        if (!std.mem.endsWith(u8, pre, "const ") and !std.mem.endsWith(u8, pre, "var ")) continue;
+        const win = src[hit..@min(src.len, hit + 4096)];
+        // Anchor on whichever module-construction call comes FIRST after
+        // the decl — `indexOf(createModule) orelse …` would wrongly skip
+        // past the var's own `addModule` to a later `createModule` (e.g.
+        // an exe's root_module) elsewhere in the window.
+        const ci = std.mem.indexOf(u8, win, "createModule");
+        const ai = std.mem.indexOf(u8, win, "addModule");
+        const cm = blk: {
+            if (ci) |c| break :blk if (ai) |a| @min(c, a) else c;
+            break :blk ai orelse continue;
+        };
+        if (firstStringAfter(win[cm..], "root_source_file")) |p| return p;
+    }
+    return null;
+}
+
+/// Direct `…addModule("<module_name>", .{ .root_source_file = … })` —
+/// used when the @import name IS the declared module name (no separate
+/// addImport alias).  Slice into `src`, or null.
+fn directAddModulePath(src: []const u8, module_name: []const u8) ?[]const u8 {
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, src, from, "addModule")) |hit| {
+        from = hit + "addModule".len;
+        var j = from;
+        while (j < src.len and isWsByte(src[j])) : (j += 1) {}
+        if (j >= src.len or src[j] != '(') continue;
+        j += 1;
+        while (j < src.len and isWsByte(src[j])) : (j += 1) {}
+        if (j >= src.len or src[j] != '"') continue;
+        j += 1;
+        const ns = j;
+        while (j < src.len and src[j] != '"') : (j += 1) {}
+        if (j >= src.len) continue;
+        if (!std.mem.eql(u8, src[ns..j], module_name)) continue;
+        const win = src[j..@min(src.len, j + 2048)];
+        if (firstStringAfter(win, "root_source_file")) |p| return p;
+    }
+    return null;
+}
+
+/// Best-effort SOUND parse of a `build.zig` for the module wired as
+/// `@import(module_name)`.  Reads only EXPLICIT declarations (no
+/// layout guessing).  Two strategies, in precision order:
+///   1. `<x>.addImport("module_name", <var>)` -> `<var>`'s
+///      createModule/addModule -> `root_source_file`.  Resolves the
+///      import-alias-vs-declared-name decoupling that the old direct
+///      match missed.
+///   2. `…addModule("module_name", .{ .root_source_file = "X" })` when
+///      the alias equals the declared name.
 /// Returns the relative-to-build.zig path on success, owned by `gpa`.
-/// Heuristic — handles ~90% of real-world build.zig idioms; deviates
-/// for projects using complex programmatic module construction.
+/// Inherently incomplete — build.zig is arbitrary code (loops, deps,
+/// computed paths); correct resolution needs running the build graph.
 fn parseBuildZigModulePath(
     gpa: std.mem.Allocator,
     io: std.Io,
     build_zig_path: []const u8,
     module_name: []const u8,
 ) !?[]u8 {
-    const src_bytes = std.Io.Dir.cwd().readFileAlloc(
+    const src = std.Io.Dir.cwd().readFileAlloc(
         io,
         build_zig_path,
         gpa,
         std.Io.Limit.limited(1024 * 1024),
     ) catch return null;
-    defer gpa.free(src_bytes);
-    // Scan for `addModule("<name>"` and capture the next
-    // `b.path("...")` or `.path = "..."` literal.
-    var i: usize = 0;
-    while (i + 16 < src_bytes.len) : (i += 1) {
-        if (!std.mem.startsWith(u8, src_bytes[i..], "addModule")) continue;
-        // Skip to `(`.
-        var j = i + "addModule".len;
-        while (j < src_bytes.len and src_bytes[j] != '(') : (j += 1) {}
-        if (j >= src_bytes.len) continue;
-        j += 1;
-        // Skip whitespace and find opening `"`.
-        while (j < src_bytes.len and (src_bytes[j] == ' ' or src_bytes[j] == '\n' or src_bytes[j] == '\t')) : (j += 1) {}
-        if (j >= src_bytes.len or src_bytes[j] != '"') continue;
-        j += 1;
-        const name_start = j;
-        while (j < src_bytes.len and src_bytes[j] != '"') : (j += 1) {}
-        if (j >= src_bytes.len) continue;
-        const name = src_bytes[name_start..j];
-        if (!std.mem.eql(u8, name, module_name)) continue;
-        // Found the module decl.  Walk forward to a `root_source_file`
-        // key, then the next quoted string literal.  Bounded scan so
-        // we don't pick up an unrelated path elsewhere.
-        const window_end = @min(src_bytes.len, j + 2048);
-        const window = src_bytes[j..window_end];
-        const rsf_idx = std.mem.indexOf(u8, window, "root_source_file") orelse continue;
-        const after_rsf = window[rsf_idx + "root_source_file".len ..];
-        // First `"..."` literal after the key.
-        const quote_idx = std.mem.indexOfScalar(u8, after_rsf, '"') orelse continue;
-        const lit_start = quote_idx + 1;
-        const lit_end_rel = std.mem.indexOfScalar(u8, after_rsf[lit_start..], '"') orelse continue;
-        const path_slice = after_rsf[lit_start .. lit_start + lit_end_rel];
-        return try gpa.dupe(u8, path_slice);
+    defer gpa.free(src);
+
+    if (addImportAliasVar(src, module_name)) |var_name| {
+        if (declRootSourceFile(src, var_name)) |p| return try gpa.dupe(u8, p);
     }
+    if (directAddModulePath(src, module_name)) |p| return try gpa.dupe(u8, p);
     return null;
 }
 
@@ -759,4 +848,129 @@ test "ProjectCache: module-name imports return null" {
     defer pc.deinit();
     const fm = try pc.modelForRelativeImport("/anywhere/x.zig", "std");
     try std.testing.expect(fm == null);
+}
+
+fn writeTmpBuildZig(tmp: *std.testing.TmpDir, tio: std.Io, data: []const u8) !void {
+    try tmp.dir.writeFile(tio, .{ .sub_path = "build.zig", .data = data });
+}
+
+test "parseBuildZigModulePath: @import alias via createModule var (#20)" {
+    const gpa = std.testing.allocator;
+    const tio = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // @import("bun") is wired through addImport("bun", foo), and foo is a
+    // createModule whose root file is src/foo.zig — the decoupled-alias
+    // pattern the old direct-name match could not follow.
+    try writeTmpBuildZig(&tmp, tio,
+        \\const std = @import("std");
+        \\pub fn build(b: *std.Build) void {
+        \\    const foo = b.createModule(.{ .root_source_file = b.path("src/foo.zig") });
+        \\    const exe = b.addExecutable(.{ .name = "x", .root_module = b.createModule(.{}) });
+        \\    exe.root_module.addImport("bun", foo);
+        \\}
+    );
+    const p = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path, "build.zig" });
+    defer gpa.free(p);
+    const rel = try parseBuildZigModulePath(gpa, tio, p, "bun");
+    defer if (rel) |r| gpa.free(r);
+    try std.testing.expect(rel != null);
+    try std.testing.expectEqualStrings("src/foo.zig", rel.?);
+}
+
+test "parseBuildZigModulePath: @import alias via addModule var (#20)" {
+    const gpa = std.testing.allocator;
+    const tio = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // Declared module name ("internal") differs from the @import alias ("bun").
+    try writeTmpBuildZig(&tmp, tio,
+        \\const std = @import("std");
+        \\pub fn build(b: *std.Build) void {
+        \\    const foo = b.addModule("internal", .{ .root_source_file = b.path("src/foo.zig") });
+        \\    const exe = b.addExecutable(.{ .name = "x", .root_module = b.createModule(.{}) });
+        \\    exe.root_module.addImport("bun", foo);
+        \\}
+    );
+    const p = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path, "build.zig" });
+    defer gpa.free(p);
+    const rel = try parseBuildZigModulePath(gpa, tio, p, "bun");
+    defer if (rel) |r| gpa.free(r);
+    try std.testing.expect(rel != null);
+    try std.testing.expectEqualStrings("src/foo.zig", rel.?);
+}
+
+test "parseBuildZigModulePath: direct addModule(name) still resolves (#20)" {
+    const gpa = std.testing.allocator;
+    const tio = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTmpBuildZig(&tmp, tio,
+        \\const std = @import("std");
+        \\pub fn build(b: *std.Build) void {
+        \\    _ = b.addModule("bun", .{ .root_source_file = b.path("lib/bun.zig") });
+        \\}
+    );
+    const p = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path, "build.zig" });
+    defer gpa.free(p);
+    const rel = try parseBuildZigModulePath(gpa, tio, p, "bun");
+    defer if (rel) |r| gpa.free(r);
+    try std.testing.expect(rel != null);
+    try std.testing.expectEqualStrings("lib/bun.zig", rel.?);
+}
+
+test "parseBuildZigModulePath: undeclared module returns null (#20)" {
+    const gpa = std.testing.allocator;
+    const tio = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTmpBuildZig(&tmp, tio,
+        \\const std = @import("std");
+        \\pub fn build(b: *std.Build) void {
+        \\    const foo = b.createModule(.{ .root_source_file = b.path("src/foo.zig") });
+        \\    _ = foo;
+        \\}
+    );
+    const p = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path, "build.zig" });
+    defer gpa.free(p);
+    const rel = try parseBuildZigModulePath(gpa, tio, p, "bun");
+    defer if (rel) |r| gpa.free(r);
+    try std.testing.expect(rel == null);
+}
+
+test "discoverModulePath: build.zig present blocks layout guessing (#20 gating)" {
+    const gpa = std.testing.allocator;
+    const tio = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // build.zig present but does NOT declare `bun`; a bun.zig sits at root.
+    // The gating must NOT guess it (a known-but-unparsed build => no guess).
+    try writeTmpBuildZig(&tmp, tio,
+        \\pub fn build(b: *@import("std").Build) void { _ = b; }
+    );
+    try tmp.dir.writeFile(tio, .{ .sub_path = "bun.zig", .data = "pub const X = 1;" });
+    const root = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer gpa.free(root);
+    var pc = ProjectCache.init(gpa, tio);
+    defer pc.deinit();
+    const r = try pc.discoverModulePath(root, "bun");
+    defer if (r) |x| gpa.free(x);
+    try std.testing.expect(r == null);
+}
+
+test "discoverModulePath: no build.zig allows conventional layout (#20 gating)" {
+    const gpa = std.testing.allocator;
+    const tio = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // No build.zig — layout conventions are the only signal, so bun.zig
+    // at root resolves.
+    try tmp.dir.writeFile(tio, .{ .sub_path = "bun.zig", .data = "pub const X = 1;" });
+    const root = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer gpa.free(root);
+    var pc = ProjectCache.init(gpa, tio);
+    defer pc.deinit();
+    const r = try pc.discoverModulePath(root, "bun");
+    defer if (r) |x| gpa.free(x);
+    try std.testing.expect(r != null);
 }
