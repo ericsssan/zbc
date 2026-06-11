@@ -194,12 +194,24 @@ fn isFirstNextOnSplitIterator(
     }
     const decl_tok = decl orelse return false;
 
-    // The RHS (decl .. semicolon) must name a `split*` constructor.
+    // The RHS (decl .. semicolon) must name an iterator constructor whose first
+    // `.next()` is guaranteed non-null: a `split*` constructor, or a
+    // `std.process.args()` / `argsWithAllocator()` ArgIterator (argv[0], the
+    // program name, is always present).
     var has_split = false;
     var j = decl_tok + 1;
     while (j < next_period and tags[j] != .semicolon) : (j += 1) {
         if (tags[j] != .identifier) continue;
-        if (isSplitConstructor(tree.tokenSlice(j))) {
+        const nm = tree.tokenSlice(j);
+        // `argsWithAllocator` is distinctive; bare `args` only counts when it is
+        // the `process.args` method (preceded by `process .`) to avoid matching
+        // unrelated `.args` fields.
+        if (isSplitConstructor(nm) or
+            std.mem.eql(u8, nm, "argsWithAllocator") or
+            (std.mem.eql(u8, nm, "args") and j >= 2 and
+                tags[j - 1] == .period and tags[j - 2] == .identifier and
+                std.mem.eql(u8, tree.tokenSlice(j - 2), "process")))
+        {
             has_split = true;
             break;
         }
@@ -414,6 +426,29 @@ test "forced-unwrap-iterator-next: fn not starting with test still fires" {
     try testing.expectFires(check, R,
         \\fn parse(p: *Parser) Attribute {
         \\    return p.next().?;
+        \\}
+        \\
+    );
+}
+
+test "forced-unwrap-iterator-next: first next on std.process.args suppressed" {
+    try testing.expectNoFire(check,
+        \\fn run() void {
+        \\    var args = std.process.args();
+        \\    const exe = args.next().?;
+        \\    _ = exe;
+        \\}
+        \\
+    );
+}
+
+test "forced-unwrap-iterator-next: second next on args still fires" {
+    try testing.expectFires(check, R,
+        \\fn run() void {
+        \\    var args = std.process.args();
+        \\    _ = args.next();
+        \\    const second = args.next().?;
+        \\    _ = second;
         \\}
         \\
     );
