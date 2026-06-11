@@ -98,6 +98,14 @@ pub const FileCache = struct {
         return z.intInfo(node) catch null;
     }
 
+    /// Whether `node`'s type resolves to a floating-point type.  False when the
+    /// type engine is unavailable or the type isn't a float.  Floats are not
+    /// containers, so `typeNameOfNode` can't report them — use this instead.
+    pub fn isFloatType(self: *FileCache, node: std.zig.Ast.Node.Index) bool {
+        const z = self.zls orelse return false;
+        return z.isFloatType(node) catch false;
+    }
+
     /// For `x.ptr` (x a slice): whether x's element is byte-sized (align 1) —
     /// true=byte slice, false=wider element, null=unresolved/unknown.  Null
     /// when the type engine is unavailable.
