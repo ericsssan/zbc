@@ -103,6 +103,14 @@ const ScalarVal = struct {
     val: u64,
 };
 
+/// Container `path` is known to have length >= `n` on this path, established
+/// by a guard `if (path.len >= n) { … }` / `if (path.len < n) return;` etc.
+/// (`containers` tracks the special case n == 1; this carries n >= 2 too).
+const MinLen = struct {
+    path: []const u8,
+    n: u64,
+};
+
 /// Abstract state: two fact sets + len-alias bindings + diff-alias bindings.
 const State = struct {
     scalars: KeySet = .{}, // locals known != 0
@@ -111,6 +119,7 @@ const State = struct {
     diff_aliases: std.ArrayListUnmanaged(DiffAlias) = .empty, // n = A - B
     value_aliases: std.ArrayListUnmanaged(ValueAlias) = .empty, // local == path
     scalar_vals: std.ArrayListUnmanaged(ScalarVal) = .empty, // scalar == const K
+    min_lens: std.ArrayListUnmanaged(MinLen) = .empty, // path.len >= n
 
     fn deinit(self: *State, gpa: std.mem.Allocator) void {
         self.scalars.deinit(gpa);
@@ -119,6 +128,7 @@ const State = struct {
         self.diff_aliases.deinit(gpa);
         self.value_aliases.deinit(gpa);
         self.scalar_vals.deinit(gpa);
+        self.min_lens.deinit(gpa);
     }
     fn clone(self: *const State, gpa: std.mem.Allocator) !State {
         var out: State = .{};
@@ -129,6 +139,7 @@ const State = struct {
         try out.diff_aliases.appendSlice(gpa, self.diff_aliases.items);
         try out.value_aliases.appendSlice(gpa, self.value_aliases.items);
         try out.scalar_vals.appendSlice(gpa, self.scalar_vals.items);
+        try out.min_lens.appendSlice(gpa, self.min_lens.items);
         return out;
     }
     fn intersectWith(self: *State, other: *const State) void {
@@ -151,6 +162,16 @@ const State = struct {
         while (m < self.scalar_vals.items.len) {
             if (other.hasScalarVal(self.scalar_vals.items[m])) m += 1 else _ = self.scalar_vals.swapRemove(m);
         }
+        // min_lens: keep paths present in BOTH branches; the proven minimum
+        // after a join is the WEAKER (smaller) of the two branch bounds.
+        var p: usize = 0;
+        while (p < self.min_lens.items.len) {
+            const e = self.min_lens.items[p];
+            if (other.minLenOf(e.path)) |ov| {
+                if (ov < e.n) self.min_lens.items[p].n = ov;
+                p += 1;
+            } else _ = self.min_lens.swapRemove(p);
+        }
     }
     fn replaceWith(self: *State, gpa: std.mem.Allocator, src: *const State) !void {
         self.scalars.keys.clearRetainingCapacity();
@@ -159,12 +180,14 @@ const State = struct {
         self.diff_aliases.clearRetainingCapacity();
         self.value_aliases.clearRetainingCapacity();
         self.scalar_vals.clearRetainingCapacity();
+        self.min_lens.clearRetainingCapacity();
         try self.scalars.keys.appendSlice(gpa, src.scalars.keys.items);
         try self.containers.keys.appendSlice(gpa, src.containers.keys.items);
         try self.aliases.appendSlice(gpa, src.aliases.items);
         try self.diff_aliases.appendSlice(gpa, src.diff_aliases.items);
         try self.value_aliases.appendSlice(gpa, src.value_aliases.items);
         try self.scalar_vals.appendSlice(gpa, src.scalar_vals.items);
+        try self.min_lens.appendSlice(gpa, src.min_lens.items);
     }
     fn hasAlias(self: *const State, a: Alias) bool {
         for (self.aliases.items) |e|
@@ -252,6 +275,36 @@ const State = struct {
             } else i += 1;
         }
     }
+    fn minLenOf(self: *const State, path: []const u8) ?u64 {
+        var best: ?u64 = null;
+        for (self.min_lens.items) |e| {
+            if (!std.mem.eql(u8, e.path, path)) continue;
+            if (best == null or e.n > best.?) best = e.n;
+        }
+        return best;
+    }
+    /// Record `path.len >= n`, raising any existing bound (knowledge only
+    /// strengthens within a path).
+    fn setMinLen(self: *State, gpa: std.mem.Allocator, path: []const u8, n: u64) !void {
+        for (self.min_lens.items) |*e| {
+            if (std.mem.eql(u8, e.path, path)) {
+                if (n > e.n) e.n = n;
+                return;
+            }
+        }
+        try self.min_lens.append(gpa, .{ .path = path, .n = n });
+    }
+    /// Drop min-length facts whose path is rooted at `root` (mutation of the
+    /// container may shrink it — conservative, mirrors container kills).
+    fn dropMinLensByRoot(self: *State, root: []const u8) void {
+        var i: usize = 0;
+        while (i < self.min_lens.items.len) {
+            const path = self.min_lens.items[i].path;
+            const rooted = std.mem.startsWith(u8, path, root) and
+                (path.len == root.len or path[root.len] == '.' or path[root.len] == '[');
+            if (rooted) _ = self.min_lens.swapRemove(i) else i += 1;
+        }
+    }
 };
 
 const Flow = struct {
@@ -292,6 +345,12 @@ const Oracle = struct {
             // (`target.len == scalar`) whose scalar has a known value >= min_n
             // (e.g. from a `switch (scalar)` arm).
             .min_len_container => {
+                // (a) a `target.len >= N` guard refinement (N >= min_n).
+                if (st.minLenOf(self.target)) |v| if (v >= self.min_n) return true;
+                // min_n <= 1 is just "non-empty" — honor a plain nonempty fact.
+                if (self.min_n <= 1 and st.containers.contains(self.target)) return true;
+                // (b) a slice-length alias (`target.len == scalar`) whose
+                // scalar has a known constant value >= min_n (switch arm).
                 for (st.aliases.items) |a| {
                     if (!std.mem.eql(u8, a.container, self.target)) continue;
                     if (st.scalarVal(a.scalar)) |v| if (v >= self.min_n) return true;
@@ -515,6 +574,7 @@ fn analyzeAssign(o: *Oracle, node: Ast.Node.Index, st: *State) error{OutOfMemory
             st.scalars.remove(name);
         }
         dropContainersRootedAt(st, name);
+        st.dropMinLensByRoot(name);
         st.dropAliasesByScalar(name);
         st.dropDiffAliasesByName(name);
         st.dropValueAliasesByRoot(name);
@@ -573,6 +633,7 @@ fn analyzeCompoundAdd(o: *Oracle, node: Ast.Node.Index, st: *State) error{OutOfM
         // The value changed: a `n = c.len` snapshot no longer holds, and any
         // container path rooted at `name` is stale.
         dropContainersRootedAt(st, name);
+        st.dropMinLensByRoot(name);
         st.dropAliasesByScalar(name);
         st.dropDiffAliasesByName(name);
         st.dropValueAliasesByRoot(name);
@@ -597,13 +658,13 @@ fn analyzeIf(o: *Oracle, node: Ast.Node.Index, st: *State) error{OutOfMemory}!Fl
 
     var then_st = try st.clone(o.gpa);
     defer then_st.deinit(o.gpa);
-    try applyRefine(o, &then_st, refine.then_scalar, refine.then_container);
+    try applyRefine(o, &then_st, refine.then_scalar, refine.then_container, refine.then_container_min);
     if (o.tokenInNode(then_node)) return try analyzeNode(o, then_node, &then_st);
     const then_flow = try analyzeNode(o, then_node, &then_st);
 
     var else_st = try st.clone(o.gpa);
     defer else_st.deinit(o.gpa);
-    try applyRefine(o, &else_st, refine.else_scalar, refine.else_container);
+    try applyRefine(o, &else_st, refine.else_scalar, refine.else_container, refine.else_container_min);
     var else_flow: Flow = .{};
     if (else_opt) |else_node| {
         if (o.tokenInNode(else_node)) return try analyzeNode(o, else_node, &else_st);
@@ -640,7 +701,8 @@ fn analyzeShortCircuit(o: *Oracle, node: Ast.Node.Index, st: *State, is_and: boo
         defer rhs_st.deinit(o.gpa);
         const scalar = if (is_and) refine.then_scalar else refine.else_scalar;
         const container = if (is_and) refine.then_container else refine.else_container;
-        try applyRefine(o, &rhs_st, scalar, container);
+        const cmin = if (is_and) refine.then_container_min else refine.else_container_min;
+        try applyRefine(o, &rhs_st, scalar, container, cmin);
         return try analyzeNode(o, rhs, &rhs_st);
     }
     if (o.tokenInNode(lhs)) return try analyzeNode(o, lhs, st);
@@ -704,7 +766,7 @@ fn analyzeLoop(o: *Oracle, node: Ast.Node.Index, st: *State, kind: LoopKind) err
             if (cond_node) |c| {
                 var refine: Refinement = .{};
                 collectRefinement(o, c, &refine);
-                try applyRefine(o, &body_st, refine.then_scalar, refine.then_container);
+                try applyRefine(o, &body_st, refine.then_scalar, refine.then_container, refine.then_container_min);
             }
             return try analyzeNode(o, b, &body_st);
         }
@@ -712,7 +774,7 @@ fn analyzeLoop(o: *Oracle, node: Ast.Node.Index, st: *State, kind: LoopKind) err
     return .{};
 }
 
-fn applyRefine(o: *Oracle, st: *State, scalar: ?[]const u8, container: ?[]const u8) error{OutOfMemory}!void {
+fn applyRefine(o: *Oracle, st: *State, scalar: ?[]const u8, container: ?[]const u8, container_min: u64) error{OutOfMemory}!void {
     if (scalar) |s| {
         try st.scalars.add(o.gpa, s);
         // Propagate via `const s = c.len`: s != 0 ⟹ c non-empty.
@@ -737,6 +799,8 @@ fn applyRefine(o: *Oracle, st: *State, scalar: ?[]const u8, container: ?[]const 
         for (st.aliases.items) |a| {
             if (std.mem.eql(u8, a.container, c)) try st.scalars.add(o.gpa, a.scalar);
         }
+        // Carry the `c.len >= N` lower bound (N >= 2) as a min-length fact.
+        if (container_min >= 2) try st.setMinLen(o.gpa, c, container_min);
     }
 }
 
@@ -745,6 +809,10 @@ const Refinement = struct {
     else_scalar: ?[]const u8 = null,
     then_container: ?[]const u8 = null,
     else_container: ?[]const u8 = null,
+    // Proven minimum length of the container in each arm (>= 1 means
+    // non-empty; > 1 carries the `c.len >= N` bound).
+    then_container_min: u64 = 1,
+    else_container_min: u64 = 1,
 };
 
 /// Parse a condition for nonzero-scalar / non-empty-container refinements.
@@ -868,10 +936,12 @@ fn applyCmp(out: *Refinement, ok: OperandKey, cmp: Cmp, lit: u64, flipped: bool)
         .ne => .ne,
         .eq => .eq,
     };
-    // Determine which arm proves "key is nonzero / nonempty".
-    // Positive (then) facts and negative (else) facts:
+    // Determine which arm proves "key is nonzero / nonempty", and (for
+    // containers) the proven minimum length in that arm.
     var then_true = false; // key>0 holds in THEN
     var else_true = false; // key>0 holds in ELSE
+    var then_min: u64 = 1; // proven min length in THEN
+    var else_min: u64 = 1; // proven min length in ELSE
     if (lit == 0) {
         switch (op) {
             .gt, .ne => then_true = true, // key > 0 / key != 0
@@ -886,28 +956,35 @@ fn applyCmp(out: *Refinement, ok: OperandKey, cmp: Cmp, lit: u64, flipped: bool)
         }
     } else { // lit >= 2
         switch (op) {
-            // then arm: key >= lit >= 2 >= 1
-            .ge, .gt, .eq => then_true = true,
-            // else arm: key >= lit >= 2 >= 1 (from `key < lit` or `key <= lit` diverging)
-            .lt, .le => else_true = true,
+            .ge, .eq => { then_true = true; then_min = lit; }, // key >= lit / == lit
+            .gt => { then_true = true; then_min = lit + 1; }, // key > lit ⟹ >= lit+1
+            .lt => { else_true = true; else_min = lit; }, // else of key<lit ⟹ key >= lit
+            .le => { else_true = true; else_min = lit + 1; }, // else of key<=lit ⟹ >= lit+1
             else => {},
         }
     }
     if (then_true) {
         if (ok.is_container) {
-            if (out.then_container == null) out.then_container = ok.key;
+            if (out.then_container == null) {
+                out.then_container = ok.key;
+                out.then_container_min = then_min;
+            }
         } else if (out.then_scalar == null) out.then_scalar = ok.key;
     }
     if (else_true) {
         if (ok.is_container) {
-            if (out.else_container == null) out.else_container = ok.key;
+            if (out.else_container == null) {
+                out.else_container = ok.key;
+                out.else_container_min = else_min;
+            }
         } else if (out.else_scalar == null) out.else_scalar = ok.key;
     }
 }
 
 /// Drop container facts whose root path is mutated within `node`'s tokens.
 fn killMutatedContainers(o: *Oracle, node: Ast.Node.Index, st: *State) void {
-    if (st.containers.keys.items.len == 0 and st.aliases.items.len == 0) return;
+    if (st.containers.keys.items.len == 0 and st.aliases.items.len == 0 and
+        st.min_lens.items.len == 0) return;
     const tree = o.tree;
     const first = tree.firstToken(node);
     const last = tree.lastToken(node);
@@ -957,7 +1034,8 @@ fn dropContainersMutatedInTokens(
     last: Ast.TokenIndex,
     st: *State,
 ) void {
-    if (st.containers.keys.items.len == 0 and st.aliases.items.len == 0) return;
+    if (st.containers.keys.items.len == 0 and st.aliases.items.len == 0 and
+        st.min_lens.items.len == 0) return;
     const tags = tree.tokens.items(.tag);
     var i: usize = 0;
     while (i < st.containers.keys.items.len) {
@@ -972,6 +1050,14 @@ fn dropContainersMutatedInTokens(
         if (containerMutatedInTokens(tree, tags, first, last, st.aliases.items[ai].container)) {
             _ = st.aliases.swapRemove(ai);
         } else ai += 1;
+    }
+    // ...and any proven `path.len >= N` lower bound (a grow/shrink/clear
+    // may invalidate it).
+    var mi: usize = 0;
+    while (mi < st.min_lens.items.len) {
+        if (containerMutatedInTokens(tree, tags, first, last, st.min_lens.items[mi].path)) {
+            _ = st.min_lens.swapRemove(mi);
+        } else mi += 1;
     }
 }
 

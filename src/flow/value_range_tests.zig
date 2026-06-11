@@ -412,6 +412,62 @@ test "minlen: no switch ⟹ unproven (no false-negative)" {
     , "k", 16, "k"));
 }
 
+test "minlen: `if (b.len >= 4)` guard proves len >= 4 in then-arm (#23)" {
+    try std.testing.expect(try proveMinLenAt(
+        \\fn f(b: []const u8) u8 {
+        \\    if (b.len >= 4) {
+        \\        return b[3];
+        \\    }
+        \\    return 0;
+        \\}
+    , "b", 4, "b"));
+}
+
+test "minlen: `if (b.len > 3)` guard proves len >= 4 (#23)" {
+    try std.testing.expect(try proveMinLenAt(
+        \\fn f(b: []const u8) u8 {
+        \\    if (b.len > 3) return b[3];
+        \\    return 0;
+        \\}
+    , "b", 4, "b"));
+}
+
+test "minlen: early-return `if (b.len < 4) return` proves len >= 4 after (#23)" {
+    try std.testing.expect(try proveMinLenAt(
+        \\fn f(b: []const u8) u8 {
+        \\    if (b.len < 4) return 0;
+        \\    return b[3];
+        \\}
+    , "b", 4, "b"));
+}
+
+test "minlen: guard for N=4 does NOT prove len >= 5 (no over-claim)" {
+    try std.testing.expect(!try proveMinLenAt(
+        \\fn f(b: []const u8) u8 {
+        \\    if (b.len >= 4) return b[3];
+        \\    return 0;
+        \\}
+    , "b", 5, "b"));
+}
+
+test "minlen: reassigning the slice drops the bound (sound kill)" {
+    // Same-path mutation (here a reassignment of `b`) invalidates the
+    // proven bound — mirrors how the existing nonempty-container tracking
+    // is killed.  (Root-level mutation of a sub-path, e.g. `x.clear()`
+    // dropping an `x.items.len` bound, is the same pre-existing limitation
+    // the whole container model shares; guard+access are normally adjacent.)
+    try std.testing.expect(!try proveMinLenAt(
+        \\fn f(input: []const u8) u8 {
+        \\    var b = input;
+        \\    if (b.len >= 4) {
+        \\        b = input[0..2];
+        \\        return b[3];
+        \\    }
+        \\    return 0;
+        \\}
+    , "b", 4, "b"));
+}
+
 test "nonempty: bare arr.len-1 is unknown (fires)" {
     try std.testing.expect(!try proveNonemptyAt(
         \\fn f(arr: []const u8) u8 {

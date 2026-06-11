@@ -38,6 +38,7 @@ const config_mod = @import("../../config.zig");
 const file_cache_mod = @import("../../cache/file_cache.zig");
 
 const tokens = @import("../../ast/tokens.zig");
+const value_range = @import("../../flow/value_range.zig");
 const testing = @import("../../testing.zig");
 
 const skipNestedFn = tokens.skipNestedFn;
@@ -91,6 +92,18 @@ fn checkBody(
         const n_str = tree.tokenSlice(t + 5);
         const n = std.fmt.parseInt(u32, n_str, 10) catch continue;
         if (n < 2 or n > 4) continue;
+
+        // Suppress when the slice is PROVABLY at least N long: a dominating
+        // `if (recv.len >= N)` / `if (recv.len < N) return` guard makes the
+        // `recv.ptr[0..N]` window in-bounds (value-range, issue #23).  Only
+        // when the receiver of `.ptr` is a plain identifier / field path
+        // (`buf`, `self.bytes`); call results etc. aren't tracked.
+        if (t >= 1 and tags[t - 1] == .identifier) {
+            var start = t - 1;
+            while (start >= 2 and tags[start - 1] == .period and tags[start - 2] == .identifier) start -= 2;
+            const recv = tree.source[tree.tokenStart(start)..(tree.tokenStart(t - 1) + tree.tokenSlice(t - 1).len)];
+            if (value_range.provesMinLen(gpa, tree, body, recv, n, t + 2, null)) continue;
+        }
 
         try report(gpa, problems, tree, t + 2, n);
     }
@@ -172,6 +185,44 @@ test "ptr-slice-without-bounds-check: normal slice does not fire" {
     try testing.expectNoFire(check,
         \\fn slice(buf: []const u8) []const u8 {
         \\    return buf[0..4];
+        \\}
+        \\
+    );
+}
+
+test "ptr-slice-without-bounds-check: suppressed by `len >= N` guard (#23)" {
+    try testing.expectNoFire(check,
+        \\fn decode(bytes: []const u8) u8 {
+        \\    if (bytes.len >= 4) {
+        \\        const window = bytes.ptr[0..4];
+        \\        return window[0];
+        \\    }
+        \\    return 0;
+        \\}
+        \\
+    );
+}
+
+test "ptr-slice-without-bounds-check: suppressed by early-return `len < N` guard (#23)" {
+    try testing.expectNoFire(check,
+        \\fn decode(bytes: []const u8) u8 {
+        \\    if (bytes.len < 4) return 0;
+        \\    const window = bytes.ptr[0..4];
+        \\    return window[0];
+        \\}
+        \\
+    );
+}
+
+test "ptr-slice-without-bounds-check: guard for smaller N does NOT suppress larger window (#23)" {
+    // `len >= 2` does not justify a `[0..4]` window — must still fire.
+    try testing.expectFires(check, R,
+        \\fn decode(bytes: []const u8) u8 {
+        \\    if (bytes.len >= 2) {
+        \\        const window = bytes.ptr[0..4];
+        \\        return window[0];
+        \\    }
+        \\    return 0;
         \\}
         \\
     );
