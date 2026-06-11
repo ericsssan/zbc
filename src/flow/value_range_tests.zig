@@ -366,6 +366,52 @@ fn proveNonemptyAt(src: [:0]const u8, container: []const u8, arr: []const u8) !b
     return value_range.provesNonempty(gpa, &tree, body, container, lbracket, null);
 }
 
+/// Query `provesMinLen(container, n)` at the `[` token after identifier `arr`.
+fn proveMinLenAt(src: [:0]const u8, container: []const u8, n: u64, arr: []const u8) !bool {
+    const gpa = std.testing.allocator;
+    var tree = try Ast.parse(gpa, src, .zig);
+    defer tree.deinit(gpa);
+    const body = firstFnBody(&tree) orelse return error.NoFnBody;
+    const lbracket = subscriptLBracket(&tree, arr) orelse return error.NoSubscript;
+    return value_range.provesMinLen(gpa, &tree, body, container, n, lbracket, null);
+}
+
+test "minlen: switch-arm bounds a slice-from-range length (k.len >= 16 in arm 20)" {
+    try std.testing.expect(try proveMinLenAt(
+        \\fn f(b: []const u8) u8 {
+        \\    const n = b.len;
+        \\    const k = b[0..n];
+        \\    return switch (n) {
+        \\        20 => k[16],
+        \\        else => 0,
+        \\    };
+        \\}
+    , "k", 16, "k"));
+}
+
+test "minlen: switch arm BELOW threshold is UNPROVEN (no false-negative)" {
+    try std.testing.expect(!try proveMinLenAt(
+        \\fn f(b: []const u8) u8 {
+        \\    const n = b.len;
+        \\    const k = b[0..n];
+        \\    return switch (n) {
+        \\        10 => k[16],
+        \\        else => 0,
+        \\    };
+        \\}
+    , "k", 16, "k"));
+}
+
+test "minlen: no switch ⟹ unproven (no false-negative)" {
+    try std.testing.expect(!try proveMinLenAt(
+        \\fn f(b: []const u8) u8 {
+        \\    const n = b.len;
+        \\    const k = b[0..n];
+        \\    return k[16];
+        \\}
+    , "k", 16, "k"));
+}
+
 test "nonempty: bare arr.len-1 is unknown (fires)" {
     try std.testing.expect(!try proveNonemptyAt(
         \\fn f(arr: []const u8) u8 {

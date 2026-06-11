@@ -68,6 +68,7 @@ const file_cache_mod = @import("../../cache/file_cache.zig");
 
 const tokens = @import("../../ast/tokens.zig");
 const testing = @import("../../testing.zig");
+const value_range = @import("../../flow/value_range.zig");
 
 const skipNestedFn = tokens.skipNestedFn;
 
@@ -497,6 +498,11 @@ fn checkBody(
         // (Generalises the old `buf[0]`-for-offset-1 check to any offset.)
         if (offsetValue(offset_str)) |off| {
             if (provenMinLenBefore(tree, tags, first, t, buf_name) >= off) continue;
+            // Value-range oracle: `buf.len >= off` proven via a slice-length alias
+            // whose scalar has a known value (e.g. an enclosing `switch (rem_len)`
+            // arm K bounds `rem_key = b[0..rem_len]` to len K). Covers the wyhash
+            // hash-tail family `switch (rem_len) { K => rem_key[N..] }` (K >= N).
+            if (value_range.provesMinLen(gpa, tree, body, buf_name, off, t, cache)) continue;
         }
 
         // Suppression: a prefix-check guard `startsWith*/hasPrefix*(…, buf,

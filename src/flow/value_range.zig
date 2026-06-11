@@ -96,6 +96,13 @@ const ValueAlias = struct {
     path: []const u8,
 };
 
+/// `scalar` is known to equal the comptime constant `val` on this path (e.g.
+/// inside `switch (scalar) { K => … }` arm K, or after `const scalar = K`).
+const ScalarVal = struct {
+    name: []const u8,
+    val: u64,
+};
+
 /// Abstract state: two fact sets + len-alias bindings + diff-alias bindings.
 const State = struct {
     scalars: KeySet = .{}, // locals known != 0
@@ -103,6 +110,7 @@ const State = struct {
     aliases: std.ArrayListUnmanaged(Alias) = .empty, // n == c.len
     diff_aliases: std.ArrayListUnmanaged(DiffAlias) = .empty, // n = A - B
     value_aliases: std.ArrayListUnmanaged(ValueAlias) = .empty, // local == path
+    scalar_vals: std.ArrayListUnmanaged(ScalarVal) = .empty, // scalar == const K
 
     fn deinit(self: *State, gpa: std.mem.Allocator) void {
         self.scalars.deinit(gpa);
@@ -110,6 +118,7 @@ const State = struct {
         self.aliases.deinit(gpa);
         self.diff_aliases.deinit(gpa);
         self.value_aliases.deinit(gpa);
+        self.scalar_vals.deinit(gpa);
     }
     fn clone(self: *const State, gpa: std.mem.Allocator) !State {
         var out: State = .{};
@@ -119,6 +128,7 @@ const State = struct {
         try out.aliases.appendSlice(gpa, self.aliases.items);
         try out.diff_aliases.appendSlice(gpa, self.diff_aliases.items);
         try out.value_aliases.appendSlice(gpa, self.value_aliases.items);
+        try out.scalar_vals.appendSlice(gpa, self.scalar_vals.items);
         return out;
     }
     fn intersectWith(self: *State, other: *const State) void {
@@ -137,6 +147,10 @@ const State = struct {
         while (k < self.value_aliases.items.len) {
             if (other.hasValueAlias(self.value_aliases.items[k])) k += 1 else _ = self.value_aliases.swapRemove(k);
         }
+        var m: usize = 0;
+        while (m < self.scalar_vals.items.len) {
+            if (other.hasScalarVal(self.scalar_vals.items[m])) m += 1 else _ = self.scalar_vals.swapRemove(m);
+        }
     }
     fn replaceWith(self: *State, gpa: std.mem.Allocator, src: *const State) !void {
         self.scalars.keys.clearRetainingCapacity();
@@ -144,11 +158,13 @@ const State = struct {
         self.aliases.clearRetainingCapacity();
         self.diff_aliases.clearRetainingCapacity();
         self.value_aliases.clearRetainingCapacity();
+        self.scalar_vals.clearRetainingCapacity();
         try self.scalars.keys.appendSlice(gpa, src.scalars.keys.items);
         try self.containers.keys.appendSlice(gpa, src.containers.keys.items);
         try self.aliases.appendSlice(gpa, src.aliases.items);
         try self.diff_aliases.appendSlice(gpa, src.diff_aliases.items);
         try self.value_aliases.appendSlice(gpa, src.value_aliases.items);
+        try self.scalar_vals.appendSlice(gpa, src.scalar_vals.items);
     }
     fn hasAlias(self: *const State, a: Alias) bool {
         for (self.aliases.items) |e|
@@ -214,6 +230,28 @@ const State = struct {
             } else i += 1;
         }
     }
+    fn hasScalarVal(self: *const State, sv: ScalarVal) bool {
+        for (self.scalar_vals.items) |e|
+            if (std.mem.eql(u8, e.name, sv.name) and e.val == sv.val) return true;
+        return false;
+    }
+    fn setScalarVal(self: *State, gpa: std.mem.Allocator, name: []const u8, val: u64) !void {
+        self.dropScalarValsByName(name);
+        try self.scalar_vals.append(gpa, .{ .name = name, .val = val });
+    }
+    fn scalarVal(self: *const State, name: []const u8) ?u64 {
+        for (self.scalar_vals.items) |e|
+            if (std.mem.eql(u8, e.name, name)) return e.val;
+        return null;
+    }
+    fn dropScalarValsByName(self: *State, name: []const u8) void {
+        var i: usize = 0;
+        while (i < self.scalar_vals.items.len) {
+            if (std.mem.eql(u8, self.scalar_vals.items[i].name, name)) {
+                _ = self.scalar_vals.swapRemove(i);
+            } else i += 1;
+        }
+    }
 };
 
 const Flow = struct {
@@ -221,7 +259,7 @@ const Flow = struct {
     diverged: bool = false,
 };
 
-const Query = enum { nonzero_scalar, nonempty_container };
+const Query = enum { nonzero_scalar, nonempty_container, min_len_container };
 
 const Oracle = struct {
     gpa: std.mem.Allocator,
@@ -229,6 +267,8 @@ const Oracle = struct {
     query: Query,
     target: []const u8,
     use_token: Ast.TokenIndex,
+    /// For `min_len_container`: the threshold N — is `target.len >= N`?
+    min_n: u64 = 0,
     /// Optional type engine, used only to confirm a comparison operand is an
     /// UNSIGNED integer (so `key > operand` soundly implies `key >= 1`).  Null
     /// in unit tests → the type-gated `>` generalization simply doesn't apply.
@@ -248,6 +288,16 @@ const Oracle = struct {
         return switch (self.query) {
             .nonzero_scalar => st.scalars.contains(self.target),
             .nonempty_container => st.containers.contains(self.target),
+            // `target.len >= min_n`: proven via a slice-length alias
+            // (`target.len == scalar`) whose scalar has a known value >= min_n
+            // (e.g. from a `switch (scalar)` arm).
+            .min_len_container => {
+                for (st.aliases.items) |a| {
+                    if (!std.mem.eql(u8, a.container, self.target)) continue;
+                    if (st.scalarVal(a.scalar)) |v| if (v >= self.min_n) return true;
+                }
+                return false;
+            },
         };
     }
 };
@@ -262,7 +312,7 @@ pub fn provesNonzero(
     use_token: Ast.TokenIndex,
     cache: ?*file_cache_mod.FileCache,
 ) bool {
-    return run(gpa, tree, body_node, .nonzero_scalar, target, use_token, cache);
+    return run(gpa, tree, body_node, .nonzero_scalar, target, use_token, 0, cache);
 }
 
 /// Is container `target` (a source-spelling like "arr" or "self.items")
@@ -275,7 +325,23 @@ pub fn provesNonempty(
     use_token: Ast.TokenIndex,
     cache: ?*file_cache_mod.FileCache,
 ) bool {
-    return run(gpa, tree, body_node, .nonempty_container, target, use_token, cache);
+    return run(gpa, tree, body_node, .nonempty_container, target, use_token, 0, cache);
+}
+
+/// Is container `target` provably of length >= `n` at `use_token`?  Proven via a
+/// slice-length alias (`target = base[0..S]` ⟹ `target.len == S`) whose scalar
+/// `S` has a known constant value >= n (e.g. from an enclosing `switch (S)` arm).
+/// Covers the wyhash-style `switch (rem_len) { K => rem_key[N..] }` family.
+pub fn provesMinLen(
+    gpa: std.mem.Allocator,
+    tree: *const Ast,
+    body_node: Ast.Node.Index,
+    target: []const u8,
+    n: u64,
+    use_token: Ast.TokenIndex,
+    cache: ?*file_cache_mod.FileCache,
+) bool {
+    return run(gpa, tree, body_node, .min_len_container, target, use_token, n, cache);
 }
 
 fn run(
@@ -285,6 +351,7 @@ fn run(
     query: Query,
     target: []const u8,
     use_token: Ast.TokenIndex,
+    min_n: u64,
     cache: ?*file_cache_mod.FileCache,
 ) bool {
     var oracle: Oracle = .{
@@ -293,6 +360,7 @@ fn run(
         .query = query,
         .target = target,
         .use_token = use_token,
+        .min_n = min_n,
         .cache = cache,
     };
     var st: State = .{};
@@ -310,6 +378,7 @@ fn analyzeNode(o: *Oracle, node: Ast.Node.Index, st: *State) error{OutOfMemory}!
             return analyzeSeq(o, blockStmts(tree, node, &buf), st);
         },
         .@"if", .if_simple => return analyzeIf(o, node, st),
+        .@"switch", .switch_comma => return analyzeSwitch(o, node, st),
         .@"while", .while_simple, .while_cont => return analyzeLoop(o, node, st, .while_),
         .@"for", .for_simple => return analyzeLoop(o, node, st, .for_),
         .simple_var_decl, .local_var_decl, .aligned_var_decl => return analyzeVarDecl(o, node, st),
@@ -380,6 +449,7 @@ fn analyzeVarDecl(o: *Oracle, node: Ast.Node.Index, st: *State) error{OutOfMemor
     st.dropAliasesByScalar(name);
     st.dropDiffAliasesByName(name);
     st.dropValueAliasesByRoot(name);
+    st.dropScalarValsByName(name);
     // Record a `const name = <field-path>` value alias (e.g.
     // `const bit_length = self.bit_length`): name and the path are equal, so a
     // guard on `name` later proves the path non-zero (see argProvablyNonzero).
@@ -448,6 +518,7 @@ fn analyzeAssign(o: *Oracle, node: Ast.Node.Index, st: *State) error{OutOfMemory
         st.dropAliasesByScalar(name);
         st.dropDiffAliasesByName(name);
         st.dropValueAliasesByRoot(name);
+    st.dropScalarValsByName(name);
         // A re-bind to `c.len` re-establishes the alias.
         if (lenContainerPath(o, rhs)) |cpath| try st.addAlias(o.gpa, .{ .scalar = name, .container = cpath });
     } else {
@@ -505,6 +576,7 @@ fn analyzeCompoundAdd(o: *Oracle, node: Ast.Node.Index, st: *State) error{OutOfM
         st.dropAliasesByScalar(name);
         st.dropDiffAliasesByName(name);
         st.dropValueAliasesByRoot(name);
+    st.dropScalarValsByName(name);
     } else {
         killMutatedContainers(o, node, st);
     }
@@ -573,6 +645,34 @@ fn analyzeShortCircuit(o: *Oracle, node: Ast.Node.Index, st: *State, is_and: boo
     }
     if (o.tokenInNode(lhs)) return try analyzeNode(o, lhs, st);
     if (o.tokenInNode(node)) return .{ .answer = o.answerAt(st) };
+    return .{};
+}
+
+/// `switch (scrutinee) { K => arm, … }`.  When the use is in an arm whose single
+/// label is an integer literal `K` and the scrutinee is a simple scalar, record
+/// `scrutinee == K` (and nonzero if K != 0) for that arm — so a slice whose
+/// length aliases the scrutinee is known to have length K inside the arm.
+fn analyzeSwitch(o: *Oracle, node: Ast.Node.Index, st: *State) error{OutOfMemory}!Flow {
+    const tree = o.tree;
+    const sw = tree.fullSwitch(node) orelse return .{};
+    if (o.tokenInNode(sw.ast.condition)) return .{ .answer = o.answerAt(st) };
+    const scrut = identName(tree, sw.ast.condition);
+    for (sw.ast.cases) |case_node| {
+        const sc = tree.fullSwitchCase(case_node) orelse continue;
+        const body = sc.ast.target_expr;
+        if (!o.tokenInNode(body)) continue;
+        var arm_st = try st.clone(o.gpa);
+        defer arm_st.deinit(o.gpa);
+        if (scrut) |sn| {
+            if (sc.ast.values.len == 1) {
+                if (intLiteralVal(tree, sc.ast.values[0])) |k| {
+                    try arm_st.setScalarVal(o.gpa, sn, k);
+                    if (k != 0) try arm_st.scalars.add(o.gpa, sn);
+                }
+            }
+        }
+        return try analyzeNode(o, body, &arm_st);
+    }
     return .{};
 }
 
