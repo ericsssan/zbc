@@ -184,7 +184,25 @@ pub const TypeResolver = struct {
         self.arena = std.heap.ArenaAllocator.init(gpa);
         errdefer self.arena.deinit();
 
-        const handle_uri: Uri = try .fromPath(self.arena.allocator(), file_path);
+        // `@import` resolution joins the imported path against the *handle's*
+        // URI, so the handle URI must be absolute.  A relative `file_path`
+        // (e.g. `find … | xargs zbc` yields CWD-relative paths) would become
+        // `file:///<relative>` → filesystem root → every relative import fails
+        // to load → cross-file types silently never resolve.  Canonicalize to
+        // an absolute path first so imports resolve regardless of CWD/argv form.
+        // Canonicalize via libc `realpath(3)`: it resolves relative inputs
+        // against CWD and follows symlinks.  `std.fs.path.resolve` does NEITHER
+        // in this Zig version (only normalises `./`/`../`), so it can't be used.
+        const aa = self.arena.allocator();
+        const abs_path: []const u8 = blk: {
+            if (std.fs.path.isAbsolute(file_path)) break :blk file_path;
+            const z = aa.dupeSentinel(u8, file_path, 0) catch break :blk file_path;
+            var resolved_buf: [std.fs.max_path_bytes]u8 = undefined;
+            const got = std.c.realpath(z.ptr, &resolved_buf) orelse break :blk file_path;
+            const len = std.mem.indexOfSentinel(u8, 0, got);
+            break :blk aa.dupe(u8, resolved_buf[0..len]) catch file_path;
+        };
+        const handle_uri: Uri = try .fromPath(aa, abs_path);
         try ctx.store.openLspSyncedDocument(handle_uri, source);
         self.handle = ctx.store.getHandle(handle_uri) orelse return error.HandleMissing;
 
@@ -277,6 +295,26 @@ pub const TypeResolver = struct {
             },
             else => return null,
         }
+    }
+
+    /// True iff `node`'s type resolves to a floating-point type (f16/f32/f64/
+    /// f80/f128 or c_longdouble).  Floats are `simple_type`s in the InternPool,
+    /// not containers, so `typeNameOfNode` (container-only) can never report
+    /// them — rules needing "is this a float?" must use this query.  Used e.g.
+    /// to suppress integer-overflow rules on float operands (`(a + b) / 2` on
+    /// f64 cannot overflow in the integer sense).
+    pub fn isFloatType(self: *TypeResolver, node: Ast.Node.Index) !bool {
+        const ty = (try self.analyser.resolveTypeOfNode(.of(node, self.handle))) orelse return false;
+        return switch (ty.data) {
+            .ip_index => |payload| switch (self.ctx.ip.indexToKey(payload.type)) {
+                .simple_type => |st| switch (st) {
+                    .f16, .f32, .f64, .f80, .f128, .c_longdouble => true,
+                    else => false,
+                },
+                else => false,
+            },
+            else => false,
+        };
     }
 
     pub const IntInfo = struct { signed: bool, bits: u16 };
