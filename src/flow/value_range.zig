@@ -38,6 +38,7 @@
 const std = @import("std");
 const Ast = std.zig.Ast;
 const file_cache_mod = @import("../cache/file_cache.zig");
+const fn_summary = @import("../model/fn_summary.zig");
 
 /// A set of string keys (source slices, stable for the tree's lifetime).
 const KeySet = struct {
@@ -85,18 +86,39 @@ const DiffAlias = struct {
     sub_node: Ast.Node.Index, // AST node of the subtrahend (for provablyNonneg check)
 };
 
+/// A `const LOCAL = <field-path>` binding (e.g. `const bit_length = self.bit_length`):
+/// LOCAL and the path hold the same value.  Lets a guard on the simple local
+/// (`if (bit_length == 0) return;`) establish that a later use of the path
+/// (`numMasks(self.bit_length)`) sees a non-zero argument.  Dropped when LOCAL is
+/// rebound or anything touches the path's root.
+const ValueAlias = struct {
+    local: []const u8,
+    path: []const u8,
+};
+
+/// `scalar` is known to equal the comptime constant `val` on this path (e.g.
+/// inside `switch (scalar) { K => … }` arm K, or after `const scalar = K`).
+const ScalarVal = struct {
+    name: []const u8,
+    val: u64,
+};
+
 /// Abstract state: two fact sets + len-alias bindings + diff-alias bindings.
 const State = struct {
     scalars: KeySet = .{}, // locals known != 0
     containers: KeySet = .{}, // container paths known non-empty
     aliases: std.ArrayListUnmanaged(Alias) = .empty, // n == c.len
     diff_aliases: std.ArrayListUnmanaged(DiffAlias) = .empty, // n = A - B
+    value_aliases: std.ArrayListUnmanaged(ValueAlias) = .empty, // local == path
+    scalar_vals: std.ArrayListUnmanaged(ScalarVal) = .empty, // scalar == const K
 
     fn deinit(self: *State, gpa: std.mem.Allocator) void {
         self.scalars.deinit(gpa);
         self.containers.deinit(gpa);
         self.aliases.deinit(gpa);
         self.diff_aliases.deinit(gpa);
+        self.value_aliases.deinit(gpa);
+        self.scalar_vals.deinit(gpa);
     }
     fn clone(self: *const State, gpa: std.mem.Allocator) !State {
         var out: State = .{};
@@ -105,6 +127,8 @@ const State = struct {
         try out.containers.keys.appendSlice(gpa, self.containers.keys.items);
         try out.aliases.appendSlice(gpa, self.aliases.items);
         try out.diff_aliases.appendSlice(gpa, self.diff_aliases.items);
+        try out.value_aliases.appendSlice(gpa, self.value_aliases.items);
+        try out.scalar_vals.appendSlice(gpa, self.scalar_vals.items);
         return out;
     }
     fn intersectWith(self: *State, other: *const State) void {
@@ -119,16 +143,28 @@ const State = struct {
         while (j < self.diff_aliases.items.len) {
             if (other.hasDiffAlias(self.diff_aliases.items[j])) j += 1 else _ = self.diff_aliases.swapRemove(j);
         }
+        var k: usize = 0;
+        while (k < self.value_aliases.items.len) {
+            if (other.hasValueAlias(self.value_aliases.items[k])) k += 1 else _ = self.value_aliases.swapRemove(k);
+        }
+        var m: usize = 0;
+        while (m < self.scalar_vals.items.len) {
+            if (other.hasScalarVal(self.scalar_vals.items[m])) m += 1 else _ = self.scalar_vals.swapRemove(m);
+        }
     }
     fn replaceWith(self: *State, gpa: std.mem.Allocator, src: *const State) !void {
         self.scalars.keys.clearRetainingCapacity();
         self.containers.keys.clearRetainingCapacity();
         self.aliases.clearRetainingCapacity();
         self.diff_aliases.clearRetainingCapacity();
+        self.value_aliases.clearRetainingCapacity();
+        self.scalar_vals.clearRetainingCapacity();
         try self.scalars.keys.appendSlice(gpa, src.scalars.keys.items);
         try self.containers.keys.appendSlice(gpa, src.containers.keys.items);
         try self.aliases.appendSlice(gpa, src.aliases.items);
         try self.diff_aliases.appendSlice(gpa, src.diff_aliases.items);
+        try self.value_aliases.appendSlice(gpa, src.value_aliases.items);
+        try self.scalar_vals.appendSlice(gpa, src.scalar_vals.items);
     }
     fn hasAlias(self: *const State, a: Alias) bool {
         for (self.aliases.items) |e|
@@ -171,6 +207,51 @@ const State = struct {
             } else i += 1;
         }
     }
+    fn hasValueAlias(self: *const State, va: ValueAlias) bool {
+        for (self.value_aliases.items) |e|
+            if (std.mem.eql(u8, e.local, va.local) and std.mem.eql(u8, e.path, va.path)) return true;
+        return false;
+    }
+    fn addValueAlias(self: *State, gpa: std.mem.Allocator, va: ValueAlias) !void {
+        if (self.hasValueAlias(va)) return;
+        try self.value_aliases.append(gpa, va);
+    }
+    /// Drop value_aliases whose local or whose path *starts with* `root` (so a
+    /// rebind of the local, or a mutation of the path's root identifier,
+    /// invalidates the equality).
+    fn dropValueAliasesByRoot(self: *State, root: []const u8) void {
+        var i: usize = 0;
+        while (i < self.value_aliases.items.len) {
+            const va = self.value_aliases.items[i];
+            const path_root_match = std.mem.startsWith(u8, va.path, root) and
+                (va.path.len == root.len or va.path[root.len] == '.' or va.path[root.len] == '[');
+            if (std.mem.eql(u8, va.local, root) or path_root_match) {
+                _ = self.value_aliases.swapRemove(i);
+            } else i += 1;
+        }
+    }
+    fn hasScalarVal(self: *const State, sv: ScalarVal) bool {
+        for (self.scalar_vals.items) |e|
+            if (std.mem.eql(u8, e.name, sv.name) and e.val == sv.val) return true;
+        return false;
+    }
+    fn setScalarVal(self: *State, gpa: std.mem.Allocator, name: []const u8, val: u64) !void {
+        self.dropScalarValsByName(name);
+        try self.scalar_vals.append(gpa, .{ .name = name, .val = val });
+    }
+    fn scalarVal(self: *const State, name: []const u8) ?u64 {
+        for (self.scalar_vals.items) |e|
+            if (std.mem.eql(u8, e.name, name)) return e.val;
+        return null;
+    }
+    fn dropScalarValsByName(self: *State, name: []const u8) void {
+        var i: usize = 0;
+        while (i < self.scalar_vals.items.len) {
+            if (std.mem.eql(u8, self.scalar_vals.items[i].name, name)) {
+                _ = self.scalar_vals.swapRemove(i);
+            } else i += 1;
+        }
+    }
 };
 
 const Flow = struct {
@@ -178,7 +259,7 @@ const Flow = struct {
     diverged: bool = false,
 };
 
-const Query = enum { nonzero_scalar, nonempty_container };
+const Query = enum { nonzero_scalar, nonempty_container, min_len_container };
 
 const Oracle = struct {
     gpa: std.mem.Allocator,
@@ -186,6 +267,8 @@ const Oracle = struct {
     query: Query,
     target: []const u8,
     use_token: Ast.TokenIndex,
+    /// For `min_len_container`: the threshold N — is `target.len >= N`?
+    min_n: u64 = 0,
     /// Optional type engine, used only to confirm a comparison operand is an
     /// UNSIGNED integer (so `key > operand` soundly implies `key >= 1`).  Null
     /// in unit tests → the type-gated `>` generalization simply doesn't apply.
@@ -205,6 +288,16 @@ const Oracle = struct {
         return switch (self.query) {
             .nonzero_scalar => st.scalars.contains(self.target),
             .nonempty_container => st.containers.contains(self.target),
+            // `target.len >= min_n`: proven via a slice-length alias
+            // (`target.len == scalar`) whose scalar has a known value >= min_n
+            // (e.g. from a `switch (scalar)` arm).
+            .min_len_container => {
+                for (st.aliases.items) |a| {
+                    if (!std.mem.eql(u8, a.container, self.target)) continue;
+                    if (st.scalarVal(a.scalar)) |v| if (v >= self.min_n) return true;
+                }
+                return false;
+            },
         };
     }
 };
@@ -219,7 +312,7 @@ pub fn provesNonzero(
     use_token: Ast.TokenIndex,
     cache: ?*file_cache_mod.FileCache,
 ) bool {
-    return run(gpa, tree, body_node, .nonzero_scalar, target, use_token, cache);
+    return run(gpa, tree, body_node, .nonzero_scalar, target, use_token, 0, cache);
 }
 
 /// Is container `target` (a source-spelling like "arr" or "self.items")
@@ -232,7 +325,23 @@ pub fn provesNonempty(
     use_token: Ast.TokenIndex,
     cache: ?*file_cache_mod.FileCache,
 ) bool {
-    return run(gpa, tree, body_node, .nonempty_container, target, use_token, cache);
+    return run(gpa, tree, body_node, .nonempty_container, target, use_token, 0, cache);
+}
+
+/// Is container `target` provably of length >= `n` at `use_token`?  Proven via a
+/// slice-length alias (`target = base[0..S]` ⟹ `target.len == S`) whose scalar
+/// `S` has a known constant value >= n (e.g. from an enclosing `switch (S)` arm).
+/// Covers the wyhash-style `switch (rem_len) { K => rem_key[N..] }` family.
+pub fn provesMinLen(
+    gpa: std.mem.Allocator,
+    tree: *const Ast,
+    body_node: Ast.Node.Index,
+    target: []const u8,
+    n: u64,
+    use_token: Ast.TokenIndex,
+    cache: ?*file_cache_mod.FileCache,
+) bool {
+    return run(gpa, tree, body_node, .min_len_container, target, use_token, n, cache);
 }
 
 fn run(
@@ -242,6 +351,7 @@ fn run(
     query: Query,
     target: []const u8,
     use_token: Ast.TokenIndex,
+    min_n: u64,
     cache: ?*file_cache_mod.FileCache,
 ) bool {
     var oracle: Oracle = .{
@@ -250,6 +360,7 @@ fn run(
         .query = query,
         .target = target,
         .use_token = use_token,
+        .min_n = min_n,
         .cache = cache,
     };
     var st: State = .{};
@@ -267,14 +378,33 @@ fn analyzeNode(o: *Oracle, node: Ast.Node.Index, st: *State) error{OutOfMemory}!
             return analyzeSeq(o, blockStmts(tree, node, &buf), st);
         },
         .@"if", .if_simple => return analyzeIf(o, node, st),
+        .@"switch", .switch_comma => return analyzeSwitch(o, node, st),
         .@"while", .while_simple, .while_cont => return analyzeLoop(o, node, st, .while_),
         .@"for", .for_simple => return analyzeLoop(o, node, st, .for_),
         .simple_var_decl, .local_var_decl, .aligned_var_decl => return analyzeVarDecl(o, node, st),
         .assign => return analyzeAssign(o, node, st),
         .assign_add => return analyzeCompoundAdd(o, node, st),
+        // Short-circuit operators refine their RHS: in `A and B`, A is true while
+        // B evaluates; in `A or B`, A is false while B evaluates.  Covers the
+        // canonical guarded last-element idioms `c.len > 0 and c[c.len-1]` and
+        // `c.len == 0 or c[c.len-1]` (endsWith/startsWith), where the bounds
+        // proof lives in the same expression rather than an enclosing `if`.
+        .bool_and => return analyzeShortCircuit(o, node, st, true),
+        .bool_or => return analyzeShortCircuit(o, node, st, false),
         .@"return", .@"break", .@"continue", .unreachable_literal => {
             var flow: Flow = .{ .diverged = true };
-            if (o.tokenInNode(node)) flow.answer = o.answerAt(st);
+            if (o.tokenInNode(node)) {
+                // Descend into a `return <expr>;` operand so short-circuit
+                // refinement (bool_and/bool_or) applies before answering.
+                const operand: ?Ast.Node.Index = if (tree.nodeTag(node) == .@"return")
+                    tree.nodeData(node).opt_node.unwrap()
+                else
+                    null;
+                if (operand) |e| {
+                    const sub = try analyzeNode(o, e, st);
+                    flow.answer = sub.answer orelse o.answerAt(st);
+                } else flow.answer = o.answerAt(st);
+            }
             return flow;
         },
         else => {
@@ -318,9 +448,31 @@ fn analyzeVarDecl(o: *Oracle, node: Ast.Node.Index, st: *State) error{OutOfMemor
     dropContainersRootedAt(st, name);
     st.dropAliasesByScalar(name);
     st.dropDiffAliasesByName(name);
+    st.dropValueAliasesByRoot(name);
+    st.dropScalarValsByName(name);
+    // Record a `const name = <field-path>` value alias (e.g.
+    // `const bit_length = self.bit_length`): name and the path are equal, so a
+    // guard on `name` later proves the path non-zero (see argProvablyNonzero).
+    if (fieldPathSrc(o, init_node)) |psrc| {
+        try st.addValueAlias(o.gpa, .{ .local = name, .path = psrc });
+    }
+    // Cross-fn: `const name = callee(arg)` where `callee` provably returns a
+    // non-zero value given a non-zero argument (e.g. ceil-division `numMasks`),
+    // and `arg` is proven non-zero here.  Then `name` is non-zero.
+    if (callResultNonzero(o, init_node, st)) try st.scalars.add(o.gpa, name);
     // Record a `const/var name = <c>.len` length-snapshot alias.
     if (lenContainerPath(o, init_node)) |cpath| {
         try st.addAlias(o.gpa, .{ .scalar = name, .container = cpath });
+    }
+    // Record a `const/var name = base[0..N]` slice alias: name.len == N (same
+    // semantics as a `.len` snapshot, scalar=N container=name).  So a nonzero N
+    // ⟹ name non-empty, making `name[name.len - 1]` safe.  Restricted to a `0`
+    // start so the length is exactly the single scalar N.
+    if (sliceLenScalarName(o, init_node)) |nname| {
+        try st.addAlias(o.gpa, .{ .scalar = nname, .container = name });
+        // Immediate propagation: if N is already proven nonzero (e.g. a prior
+        // `if (N == 0) return` guard), `name` is non-empty right now.
+        if (st.scalars.contains(nname)) try st.containers.add(o.gpa, name);
     }
     // Record a `const/var name = MINUEND - SUBTRAHEND` diff alias.
     // Used to propagate: when `name` is proven nonzero AND the subtrahend
@@ -344,6 +496,14 @@ fn analyzeAssign(o: *Oracle, node: Ast.Node.Index, st: *State) error{OutOfMemory
     const data = tree.nodeData(node).node_and_node;
     const lhs = data[0];
     const rhs = data[1];
+    // The use may be in the LHS index expression of a subscript write
+    // (`buf[idx - 1] = …`).  The index is READ before the store, so answer the
+    // query against the current state — otherwise a provably-nonzero index on
+    // the write side is never resolved and the rule false-positives.
+    if (o.tokenInNode(lhs)) {
+        const flow = try analyzeNode(o, lhs, st);
+        if (flow.answer != null) return flow;
+    }
     if (o.tokenInNode(rhs)) {
         const flow = try analyzeNode(o, rhs, st);
         if (flow.answer != null) return flow;
@@ -357,14 +517,33 @@ fn analyzeAssign(o: *Oracle, node: Ast.Node.Index, st: *State) error{OutOfMemory
         dropContainersRootedAt(st, name);
         st.dropAliasesByScalar(name);
         st.dropDiffAliasesByName(name);
+        st.dropValueAliasesByRoot(name);
+    st.dropScalarValsByName(name);
         // A re-bind to `c.len` re-establishes the alias.
         if (lenContainerPath(o, rhs)) |cpath| try st.addAlias(o.gpa, .{ .scalar = name, .container = cpath });
     } else {
         // Assignment through a field/index (`c.items = ...`) — conservatively
         // drop container facts whose path the LHS could alter.
         killMutatedContainers(o, node, st);
+        // A field write (`self.bit_length = …`) invalidates value-aliases whose
+        // path is rooted at the written path's head identifier.
+        if (lhsRootIdent(o, lhs)) |root| st.dropValueAliasesByRoot(root);
     }
     return .{};
+}
+
+/// Root identifier of an assignment LHS path (`self` from `self.bit_length`,
+/// `arr` from `arr[i].x`), or null.
+fn lhsRootIdent(o: *Oracle, lhs: Ast.Node.Index) ?[]const u8 {
+    const tree = o.tree;
+    var n = lhs;
+    while (true) switch (tree.nodeTag(n)) {
+        .identifier => return tree.tokenSlice(tree.nodeMainToken(n)),
+        .field_access => n = tree.nodeData(n).node_and_token[0],
+        .array_access => n = tree.nodeData(n).node_and_node[0],
+        .deref => n = tree.nodeData(n).node,
+        else => return null,
+    };
 }
 
 /// `x += <expr>` (non-wrapping).  For an unsigned `x`, addition never
@@ -380,6 +559,11 @@ fn analyzeCompoundAdd(o: *Oracle, node: Ast.Node.Index, st: *State) error{OutOfM
     const data = tree.nodeData(node).node_and_node;
     const lhs = data[0];
     const rhs = data[1];
+    // Use may be in the LHS subscript (`buf[idx - 1] += …`) — answer first.
+    if (o.tokenInNode(lhs)) {
+        const flow = try analyzeNode(o, lhs, st);
+        if (flow.answer != null) return flow;
+    }
     if (o.tokenInNode(rhs)) {
         const flow = try analyzeNode(o, rhs, st);
         if (flow.answer != null) return flow;
@@ -391,6 +575,8 @@ fn analyzeCompoundAdd(o: *Oracle, node: Ast.Node.Index, st: *State) error{OutOfM
         dropContainersRootedAt(st, name);
         st.dropAliasesByScalar(name);
         st.dropDiffAliasesByName(name);
+        st.dropValueAliasesByRoot(name);
+    st.dropScalarValsByName(name);
     } else {
         killMutatedContainers(o, node, st);
     }
@@ -437,6 +623,59 @@ fn analyzeIf(o: *Oracle, node: Ast.Node.Index, st: *State) error{OutOfMemory}!Fl
     return .{};
 }
 
+/// `A and B` / `A or B` as a (sub)expression.  When the use token is inside the
+/// RHS, evaluate it under the short-circuit refinement of the LHS: for `and`,
+/// the LHS's THEN-facts hold (A is true); for `or`, the LHS's ELSE-facts hold
+/// (A is false).  Sound because Zig `and`/`or` only evaluate B when A is
+/// true/false respectively.
+fn analyzeShortCircuit(o: *Oracle, node: Ast.Node.Index, st: *State, is_and: bool) error{OutOfMemory}!Flow {
+    const tree = o.tree;
+    const d = tree.nodeData(node).node_and_node;
+    const lhs = d[0];
+    const rhs = d[1];
+    if (o.tokenInNode(rhs)) {
+        var refine: Refinement = .{};
+        collectRefinement(o, lhs, &refine);
+        var rhs_st = try st.clone(o.gpa);
+        defer rhs_st.deinit(o.gpa);
+        const scalar = if (is_and) refine.then_scalar else refine.else_scalar;
+        const container = if (is_and) refine.then_container else refine.else_container;
+        try applyRefine(o, &rhs_st, scalar, container);
+        return try analyzeNode(o, rhs, &rhs_st);
+    }
+    if (o.tokenInNode(lhs)) return try analyzeNode(o, lhs, st);
+    if (o.tokenInNode(node)) return .{ .answer = o.answerAt(st) };
+    return .{};
+}
+
+/// `switch (scrutinee) { K => arm, … }`.  When the use is in an arm whose single
+/// label is an integer literal `K` and the scrutinee is a simple scalar, record
+/// `scrutinee == K` (and nonzero if K != 0) for that arm — so a slice whose
+/// length aliases the scrutinee is known to have length K inside the arm.
+fn analyzeSwitch(o: *Oracle, node: Ast.Node.Index, st: *State) error{OutOfMemory}!Flow {
+    const tree = o.tree;
+    const sw = tree.fullSwitch(node) orelse return .{};
+    if (o.tokenInNode(sw.ast.condition)) return .{ .answer = o.answerAt(st) };
+    const scrut = identName(tree, sw.ast.condition);
+    for (sw.ast.cases) |case_node| {
+        const sc = tree.fullSwitchCase(case_node) orelse continue;
+        const body = sc.ast.target_expr;
+        if (!o.tokenInNode(body)) continue;
+        var arm_st = try st.clone(o.gpa);
+        defer arm_st.deinit(o.gpa);
+        if (scrut) |sn| {
+            if (sc.ast.values.len == 1) {
+                if (intLiteralVal(tree, sc.ast.values[0])) |k| {
+                    try arm_st.setScalarVal(o.gpa, sn, k);
+                    if (k != 0) try arm_st.scalars.add(o.gpa, sn);
+                }
+            }
+        }
+        return try analyzeNode(o, body, &arm_st);
+    }
+    return .{};
+}
+
 const LoopKind = enum { while_, for_ };
 
 fn analyzeLoop(o: *Oracle, node: Ast.Node.Index, st: *State, kind: LoopKind) error{OutOfMemory}!Flow {
@@ -453,7 +692,11 @@ fn analyzeLoop(o: *Oracle, node: Ast.Node.Index, st: *State, kind: LoopKind) err
         .while_ => if (tree.fullWhile(node)) |w| w.ast.cond_expr else null,
         .for_ => null,
     };
-    if (cond_node) |c| if (o.tokenInNode(c)) return .{ .answer = o.answerAt(st) };
+    // Use inside the loop condition itself: descend so short-circuit refinement
+    // applies (`while (tmp > beg and self.text[tmp-1] == …)` — the `and`'s LHS
+    // guards its RHS).  analyzeNode handles bool_and/bool_or; a plain comparison
+    // falls through to answerAt.
+    if (cond_node) |c| if (o.tokenInNode(c)) return try analyzeNode(o, c, st);
     if (body_node) |b| {
         if (o.tokenInNode(b)) {
             var body_st = try st.clone(o.gpa);
@@ -676,11 +919,17 @@ fn dropLoopMutated(o: *Oracle, loop_node: Ast.Node.Index, st: *State) void {
     const first = tree.firstToken(loop_node);
     const last = tree.lastToken(loop_node);
     const tags = tree.tokens.items(.tag);
-    // Scalars: any `NAME <assign-op>` inside the loop.
+    // Scalars: drop a nonzero fact only when the loop mutates the name
+    // NON-monotonically.  `NAME += …` on an unsigned can only grow the value
+    // (the safe/panic-on-overflow build never wraps to 0), so a scalar that is
+    // nonzero before the loop and *only* `+=`-mutated stays nonzero on every
+    // iteration — keep it.  Any other assign op (`=`, `-=`, `*=`, …) can reach
+    // 0, so drop.  Covers `var p: usize = 1; while (…) { …a[p-1]…; p += 1; }`.
     var t = first;
     while (t < last) : (t += 1) {
         if (tags[t] != .identifier) continue;
-        if (isAssignOp(tags[t + 1])) st.scalars.remove(tree.tokenSlice(t));
+        if (!isAssignOp(tags[t + 1])) continue;
+        if (tags[t + 1] != .plus_equal) st.scalars.remove(tree.tokenSlice(t));
     }
     dropContainersMutatedInTokens(tree, first, last, st);
 }
@@ -797,6 +1046,17 @@ fn identName(tree: *const Ast, node: Ast.Node.Index) ?[]const u8 {
     return tree.tokenSlice(tree.nodeMainToken(node));
 }
 
+/// For a slice expression `base[0..N]` (start literal 0, end an identifier),
+/// return N's name — the slice's length equals N.  Null for non-slices,
+/// non-zero starts, open-ended slices, or non-identifier ends.
+fn sliceLenScalarName(o: *Oracle, node: Ast.Node.Index) ?[]const u8 {
+    const tree = o.tree;
+    const sl = tree.fullSlice(node) orelse return null;
+    if (!isIntLiteralValue(tree, sl.ast.start, 0)) return null;
+    const end = sl.ast.end.unwrap() orelse return null;
+    return identName(tree, end);
+}
+
 fn isAssignOp(tag: std.zig.Token.Tag) bool {
     return switch (tag) {
         .equal,
@@ -838,6 +1098,150 @@ fn nodeSrc(tree: *const Ast, node: Ast.Node.Index) []const u8 {
     const start: usize = starts[ft];
     const end: usize = starts[lt] + tree.tokenSlice(lt).len;
     return tree.source[start..end];
+}
+
+fn unwrapGrouped(tree: *const Ast, node: Ast.Node.Index) Ast.Node.Index {
+    var n = node;
+    while (tree.nodeTag(n) == .grouped_expression) n = tree.nodeData(n).node_and_token[0];
+    return n;
+}
+
+/// True iff `node` is a pure field-access chain rooted at an identifier
+/// (`self.bit_length`, `a.b.c`) — no calls, no subscripts.
+fn isPureFieldPath(tree: *const Ast, node: Ast.Node.Index) bool {
+    return switch (tree.nodeTag(node)) {
+        .identifier => true,
+        .field_access => isPureFieldPath(tree, tree.nodeData(node).node_and_token[0]),
+        else => false,
+    };
+}
+
+/// Source spelling of a pure field-access path with at least one `.`, else null.
+fn fieldPathSrc(o: *Oracle, node: Ast.Node.Index) ?[]const u8 {
+    const tree = o.tree;
+    if (tree.nodeTag(node) != .field_access) return null;
+    if (!isPureFieldPath(tree, node)) return null;
+    return nodeSrc(tree, node);
+}
+
+/// Is the call argument `arg` provably non-zero in `st`?  A simple identifier is
+/// looked up in the nonzero set; a field-path is matched against a value-alias
+/// (`const local = path`) whose local is non-zero.
+fn argProvablyNonzero(o: *Oracle, st: *const State, arg: Ast.Node.Index) bool {
+    const tree = o.tree;
+    if (identName(tree, arg)) |nm| return st.scalars.contains(nm);
+    if (fieldPathSrc(o, arg)) |psrc| {
+        if (st.scalars.contains(psrc)) return true;
+        for (st.value_aliases.items) |va|
+            if (std.mem.eql(u8, va.path, psrc) and st.scalars.contains(va.local)) return true;
+    }
+    return false;
+}
+
+/// Cross-fn: is `init` a call `callee(arg)` whose result is provably non-zero?
+/// True when `callee` is an in-file single-return function whose return is
+/// non-zero given its first parameter non-zero (e.g. ceil-division), AND `arg`
+/// is proven non-zero at the call.  Single-argument callees only (v1).
+fn callResultNonzero(o: *Oracle, init: Ast.Node.Index, st: *const State) bool {
+    const tree = o.tree;
+    var buf: [1]Ast.Node.Index = undefined;
+    const call = tree.fullCall(&buf, init) orelse return false;
+    const callee = identName(tree, call.ast.fn_expr) orelse return false;
+    if (call.ast.params.len != 1) return false;
+    if (!argProvablyNonzero(o, st, call.ast.params[0])) return false;
+    return calleeReturnsNonzeroGivenArg(o, callee);
+}
+
+/// Every in-file function (top-level or method) named `name` has a single
+/// `return EXPR` whose value is provably non-zero given its first parameter
+/// non-zero.  Conservative: false if no such function is found, or ANY same-named
+/// function fails (so it holds whichever overload is actually called).
+fn calleeReturnsNonzeroGivenArg(o: *Oracle, name: []const u8) bool {
+    const tree = o.tree;
+    var found = false;
+    var ni: u32 = 0;
+    while (ni < tree.nodes.len) : (ni += 1) {
+        const fnode: Ast.Node.Index = @enumFromInt(ni);
+        if (tree.nodeTag(fnode) != .fn_decl) continue;
+        const fdata = tree.nodeData(fnode).node_and_node;
+        var pbuf: [1]Ast.Node.Index = undefined;
+        const proto = tree.fullFnProto(&pbuf, fdata[0]) orelse continue;
+        const nt = proto.name_token orelse continue;
+        if (!std.mem.eql(u8, tree.tokenSlice(nt), name)) continue;
+        found = true;
+        const ret = fn_summary.singleReturnExpr(tree, fdata[1]) orelse return false;
+        var it = proto.iterate(tree);
+        const p0 = it.next() orelse return false;
+        const pname = if (p0.name_token) |t| tree.tokenSlice(t) else return false;
+        if (!exprNonzeroPostcond(o, ret, pname)) return false;
+    }
+    return found;
+}
+
+/// Is `expr` provably non-zero assuming the single parameter `pname` is non-zero?
+/// Handles: positive literals, the parameter itself, unsigned addition (either
+/// operand non-zero), and ceil-division `(A + C) / D` with A non-zero and
+/// comptime constants `C >= D - 1` (⟹ `A + C >= D` ⟹ quotient >= 1).
+fn exprNonzeroPostcond(o: *Oracle, expr: Ast.Node.Index, pname: []const u8) bool {
+    const tree = o.tree;
+    const e = unwrapGrouped(tree, expr);
+    switch (tree.nodeTag(e)) {
+        .number_literal => return isPositiveIntLiteral(tree, e),
+        .identifier => return std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(e)), pname),
+        .add, .add_wrap, .add_sat => {
+            const d = tree.nodeData(e).node_and_node;
+            return exprNonzeroPostcond(o, d[0], pname) or exprNonzeroPostcond(o, d[1], pname);
+        },
+        .div => {
+            const d = tree.nodeData(e).node_and_node;
+            const div_node = d[1];
+            const num = unwrapGrouped(tree, d[0]);
+            if (tree.nodeTag(num) != .add) return false;
+            const ad = tree.nodeData(num).node_and_node;
+            return ceilDivBase(o, ad[0], ad[1], div_node, pname) or
+                ceilDivBase(o, ad[1], ad[0], div_node, pname);
+        },
+        else => return false,
+    }
+}
+
+/// `(base + addend) / divisor` is non-zero when `base` is non-zero and
+/// `addend >= divisor - 1` (⟹ `base + addend >= divisor` ⟹ quotient >= 1).
+/// The bound is proven two ways: (1) comptime values `C >= D - 1`; (2) STRUCTURAL
+/// — `addend` is syntactically `divisor - 1` (e.g. ceil-div idiom
+/// `(x + (@bitSizeOf(T) - 1)) / @bitSizeOf(T)`), which holds for ANY value of the
+/// divisor even when the engine can't evaluate it (`@bitSizeOf` isn't a literal).
+fn ceilDivBase(o: *Oracle, base: Ast.Node.Index, addend: Ast.Node.Index, div_node: Ast.Node.Index, pname: []const u8) bool {
+    if (!exprNonzeroPostcond(o, base, pname)) return false;
+    if (comptimeValOf(o, div_node)) |dval| {
+        if (dval != 0) {
+            if (comptimeValOf(o, addend)) |cval| {
+                if (cval + 1 >= dval) return true;
+            }
+        }
+    }
+    return addendIsDivisorMinusOne(o, addend, div_node);
+}
+
+/// True iff `addend` is syntactically `<X> - 1` where `<X>` has the same source
+/// spelling as `div_node` — so `addend == divisor - 1` exactly, regardless of
+/// the (possibly engine-opaque) value.
+fn addendIsDivisorMinusOne(o: *Oracle, addend: Ast.Node.Index, div_node: Ast.Node.Index) bool {
+    const tree = o.tree;
+    const a = unwrapGrouped(tree, addend);
+    if (tree.nodeTag(a) != .sub) return false;
+    const sd = tree.nodeData(a).node_and_node;
+    if (!isIntLiteralValue(tree, sd[1], 1)) return false;
+    const left = unwrapGrouped(tree, sd[0]);
+    const div = unwrapGrouped(tree, div_node);
+    return std.mem.eql(u8, nodeSrc(tree, left), nodeSrc(tree, div));
+}
+
+/// Comptime value of `node` via the type engine, or null (also null without a
+/// resolver — keeps the cross-fn check sound in token-only mode).
+fn comptimeValOf(o: *Oracle, node: Ast.Node.Index) ?u64 {
+    const cache = o.cache orelse return null;
+    return cache.comptimeIntValueOf(unwrapGrouped(o.tree, node));
 }
 
 fn blockStmts(

@@ -83,6 +83,15 @@ pub const FileCache = struct {
         return z.fixedArrayLen(node) catch null;
     }
 
+    /// Comptime-known non-negative value of `node`, or null when not
+    /// comptime-resolvable / engine unavailable.  A comptime index can't cause a
+    /// runtime underflow/OOB (it would be a compile error), so a non-null result
+    /// means the access is comptime-verified safe.
+    pub fn comptimeIntValueOf(self: *FileCache, node: std.zig.Ast.Node.Index) ?u64 {
+        const z = self.zls orelse return null;
+        return z.comptimeIntValue(node) catch null;
+    }
+
     /// For a type-name reference node `T`: whether `T` denotes a pointer/
     /// optional type (true), a value type (false), or couldn't resolve (null).
     /// Null when the type engine is unavailable.
@@ -96,6 +105,14 @@ pub const FileCache = struct {
     pub fn intInfoOf(self: *FileCache, node: std.zig.Ast.Node.Index) ?zls_resolver_mod.TypeResolver.IntInfo {
         const z = self.zls orelse return null;
         return z.intInfo(node) catch null;
+    }
+
+    /// Whether `node`'s type resolves to a floating-point type.  False when the
+    /// type engine is unavailable or the type isn't a float.  Floats are not
+    /// containers, so `typeNameOfNode` can't report them — use this instead.
+    pub fn isFloatType(self: *FileCache, node: std.zig.Ast.Node.Index) bool {
+        const z = self.zls orelse return false;
+        return z.isFloatType(node) catch false;
     }
 
     /// For `x.ptr` (x a slice): whether x's element is byte-sized (align 1) —

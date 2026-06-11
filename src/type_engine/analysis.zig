@@ -1466,7 +1466,7 @@ fn resolveInternPoolValue(analyser: *Analyser, options: ResolveOptions) Error!?I
     }
 }
 
-fn resolveIntegerLiteral(analyser: *Analyser, comptime T: type, options: ResolveOptions) Error!?T {
+pub fn resolveIntegerLiteral(analyser: *Analyser, comptime T: type, options: ResolveOptions) Error!?T {
     const ip_index = try analyser.resolveInternPoolValue(options) orelse return null;
     return analyser.ip.toInt(ip_index, T);
 }

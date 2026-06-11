@@ -15,9 +15,14 @@
 //!   - `return EXPR;` (function exit)
 //!   - `if/else`, `while`, `for`, `switch` branching (real CFG edges)
 //!   - `defer` / `errdefer` (replayed at function-exit / return sites)
+//!   - `try` / `catch` (error-exit sinks + catch-arm forks; errdefers
+//!     replayed on error returns, including `return error.X` and
+//!     `return <error-capture>` from `catch |err|` / `else |err|`)
 //!
 //! What we DON'T model (yet):
-//!   - `try` / `catch` (error-path forking + error-set tracking)
+//!   - error-UNION returns (`return foo()` yielding `!T`): the success
+//!     vs error path isn't forked, so errdefers are not replayed there
+//!     (sound: a residual false-negative, never a false-positive)
 //!   - generics / comptime
 //!   - for-loop iteration variable origin (treated as .plain)
 //!   - switch-case pattern bindings (treated as .plain)
@@ -328,6 +333,12 @@ pub const LocalInfo = struct {
     /// treated as a borrow source.  Set at registerLocalFull from
     /// the same classifier that produces the .decl's init_kind.
     init_hint: InitHint = .other,
+    /// True iff this local is the error-value capture of a `catch |err|`
+    /// or `else |err|` arm.  Such a value is *definitely* an error, so a
+    /// `return <this>` fires errdefers (Zig only runs errdefers on error
+    /// returns).  Lets lowerReturn replay errdefers at `return err`,
+    /// closing the errdefer-double-free-on-error-return false negative.
+    is_error_capture: bool = false,
     /// If this local was declared from a bare identifier that names
     /// a fn in our annotation DB, the name of that fn.  Lets call
     /// sites `local(args)` resolve through the binding to the

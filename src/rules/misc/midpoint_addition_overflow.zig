@@ -83,19 +83,19 @@ pub fn check(
     }
 }
 
-/// True iff the identifier at `tok` resolves to a float type via the type engine.
+/// True iff the identifier at `tok` resolves to a float type via the type
+/// engine.  Floats are `simple_type`s, not containers, so `typeNameOfNode`
+/// (container-only) can never report them — `isFloatType` inspects the
+/// resolved type's InternPool key directly.  Resolves through local-variable
+/// initializers (`const start_y = metrics.face_y + …` ⇒ f64), so float
+/// midpoints written over derived locals are suppressed.
 fn operandIsFloat(
     cache: *file_cache_mod.FileCache,
     ident_nodes: *const std.AutoHashMapUnmanaged(Ast.TokenIndex, Ast.Node.Index),
     tok: Ast.TokenIndex,
 ) bool {
     const node = ident_nodes.get(tok) orelse return false;
-    const tyname = cache.typeNameOfNode(node) orelse return false;
-    return std.mem.eql(u8, tyname, "f16") or
-        std.mem.eql(u8, tyname, "f32") or
-        std.mem.eql(u8, tyname, "f64") or
-        std.mem.eql(u8, tyname, "f128") or
-        std.mem.eql(u8, tyname, "f80");
+    return cache.isFloatType(node);
 }
 
 fn report(
@@ -222,6 +222,13 @@ test "midpoint-addition-overflow: variable divisor does not fire" {
         \\
     );
 }
+
+// NOTE: the type-engine float suppression (`operandIsFloat` → `isFloatType`)
+// is validated live against the corpus, not here: the unit-test harness runs
+// token-only (no resolver), so f64-typed locals can't be distinguished from
+// integers without the engine.  The `hasFloatDecl` syntactic fallback is what
+// the tests below exercise.  Regression covered live by ghostty font/face.zig
+// (`(start_y + end_y) / 2`, start_y/end_y inferred f64 → suppressed).
 
 test "midpoint-addition-overflow: f32 pixel operands do not fire" {
     try testing.expectNoFire(check,

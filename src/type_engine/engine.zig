@@ -12,6 +12,7 @@
 //!                the per-file arena and Analyser.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Ast = std.zig.Ast;
 
 const DocumentStore = @import("document_store.zig");
@@ -184,7 +185,25 @@ pub const TypeResolver = struct {
         self.arena = std.heap.ArenaAllocator.init(gpa);
         errdefer self.arena.deinit();
 
-        const handle_uri: Uri = try .fromPath(self.arena.allocator(), file_path);
+        // `@import` resolution joins the imported path against the *handle's*
+        // URI, so the handle URI must be absolute.  A relative `file_path`
+        // (e.g. `find … | xargs zbc` yields CWD-relative paths) would become
+        // `file:///<relative>` → filesystem root → every relative import fails
+        // to load → cross-file types silently never resolve.  Canonicalize to
+        // an absolute path first so imports resolve regardless of CWD/argv form.
+        // Canonicalize via libc `realpath(3)`: it resolves relative inputs
+        // against CWD and follows symlinks.  `std.fs.path.resolve` does NEITHER
+        // in this Zig version (only normalises `./`/`../`), so it can't be used.
+        const aa = self.arena.allocator();
+        const abs_path: []const u8 = blk: {
+            if (std.fs.path.isAbsolute(file_path)) break :blk file_path;
+            const z = aa.dupeSentinel(u8, file_path, 0) catch break :blk file_path;
+            var resolved_buf: [std.fs.max_path_bytes]u8 = undefined;
+            const got = std.c.realpath(z.ptr, &resolved_buf) orelse break :blk file_path;
+            const len = std.mem.indexOfSentinel(u8, 0, got);
+            break :blk aa.dupe(u8, resolved_buf[0..len]) catch file_path;
+        };
+        const handle_uri: Uri = try .fromPath(aa, abs_path);
         try ctx.store.openLspSyncedDocument(handle_uri, source);
         self.handle = ctx.store.getHandle(handle_uri) orelse return error.HandleMissing;
 
@@ -279,6 +298,26 @@ pub const TypeResolver = struct {
         }
     }
 
+    /// True iff `node`'s type resolves to a floating-point type (f16/f32/f64/
+    /// f80/f128 or c_longdouble).  Floats are `simple_type`s in the InternPool,
+    /// not containers, so `typeNameOfNode` (container-only) can never report
+    /// them — rules needing "is this a float?" must use this query.  Used e.g.
+    /// to suppress integer-overflow rules on float operands (`(a + b) / 2` on
+    /// f64 cannot overflow in the integer sense).
+    pub fn isFloatType(self: *TypeResolver, node: Ast.Node.Index) !bool {
+        const ty = (try self.analyser.resolveTypeOfNode(.of(node, self.handle))) orelse return false;
+        return switch (ty.data) {
+            .ip_index => |payload| switch (self.ctx.ip.indexToKey(payload.type)) {
+                .simple_type => |st| switch (st) {
+                    .f16, .f32, .f64, .f80, .f128, .c_longdouble => true,
+                    else => false,
+                },
+                else => false,
+            },
+            else => false,
+        };
+    }
+
     pub const IntInfo = struct { signed: bool, bits: u16 };
 
     /// Signedness and bit-width of `node`'s type when it resolves to an integer
@@ -286,13 +325,20 @@ pub const TypeResolver = struct {
     /// can't "wrap to a huge value") from unsigned underflow.
     pub fn intInfo(self: *TypeResolver, node: Ast.Node.Index) !?IntInfo {
         const ty = (try self.analyser.resolveTypeOfNode(.of(node, self.handle))) orelse return null;
-        return switch (ty.data) {
-            .ip_index => |payload| switch (self.ctx.ip.indexToKey(payload.type)) {
-                .int_type => |i| .{ .signed = i.signedness == .signed, .bits = i.bits },
-                else => null,
-            },
-            else => null,
+        const idx = switch (ty.data) {
+            .ip_index => |payload| payload.type,
+            else => return null,
         };
+        // `ip.intInfo` resolves usize/isize/c_int/… (which are `simple_type`s,
+        // NOT `int_type`) plus packed-struct/enum tag widths — but it is
+        // `unreachable` on non-integers, so gate on the .int type tag first.
+        // (The earlier `.int_type`-only match returned null for usize, silently
+        // breaking every unsigned-operand query — e.g. the value-range oracle's
+        // `i > usize_var ⟹ i != 0` generalization.)
+        const tag = self.ctx.ip.zigTypeTag(idx) orelse return null;
+        if (tag != .int) return null;
+        const info = self.ctx.ip.intInfo(idx, builtin.target);
+        return .{ .signed = info.signedness == .signed, .bits = info.bits };
     }
 
     /// For `x.ptr` where `x`'s type resolves to a slice / many-pointer:
@@ -354,6 +400,15 @@ pub const TypeResolver = struct {
         const ty_maybe = try self.analyser.resolveTypeOfNode(.of(node, self.handle));
         const ty = ty_maybe orelse return null;
         return self.fixedArrayLenOfType(ty, 0);
+    }
+
+    /// If `node` resolves to a comptime-known non-negative integer, return its
+    /// value, else null.  A comptime-known index can never cause a *runtime*
+    /// underflow/OOB: `CONST - 1` with `CONST == 0`, or an out-of-range constant
+    /// subscript, is a COMPILE error (never ships).  So any successful
+    /// resolution here means the access is comptime-verified safe.
+    pub fn comptimeIntValue(self: *TypeResolver, node: Ast.Node.Index) !?u64 {
+        return self.analyser.resolveIntegerLiteral(u64, .of(node, self.handle));
     }
 
     fn fixedArrayLenOfType(self: *TypeResolver, ty: Analyser.Type, depth: u8) ?u64 {

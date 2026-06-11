@@ -200,6 +200,126 @@ test "nonzero: guard in while condition refines body" {
     , "i", "buf"));
 }
 
+test "nonzero: use on LHS of a subscript write (buf[i-1] = …)" {
+    // Regression: analyzeAssign only inspected the RHS for the use token, so a
+    // provably-nonzero index on the WRITE side (`buf[i-1] = 0`) was never
+    // resolved and the rule false-positived. `.len` guard needs no type engine.
+    try std.testing.expect(try proveAt(
+        \\fn f(i: usize, buf: []u8, other: []const u8) void {
+        \\    if (i > other.len) {
+        \\        buf[i - 1] = 0;
+        \\    }
+        \\}
+        \\
+    , "i", "buf"));
+}
+
+test "nonzero: LHS subscript write under a bare (no-block) if" {
+    try std.testing.expect(try proveAt(
+        \\fn f(i: usize, buf: []u8, other: []const u8) void {
+        \\    if (i > other.len) buf[i - 1] = 0;
+        \\}
+        \\
+    , "i", "buf"));
+}
+
+test "nonzero: no false-negative — unguarded LHS write still unproven" {
+    try std.testing.expect(!try proveAt(
+        \\fn f(i: usize, buf: []u8) void {
+        \\    buf[i - 1] = 0;
+        \\}
+        \\
+    , "i", "buf"));
+}
+
+test "nonzero: cross-fn ceil-div postcondition (numMasks) with guarded arg" {
+    // `m = numMasks(k)` where numMasks is `(x + (D-1)) / D` (ceil-div, structural
+    // D-1 == D-1), and k is guarded non-zero ⟹ m non-zero. Caller listed first so
+    // `proveAt` analyzes it; the callee scan finds `numMasks` regardless of order.
+    try std.testing.expect(try proveAt(
+        \\fn f(a: []u8, k: usize) u8 {
+        \\    if (k == 0) return 0;
+        \\    const m = numMasks(k);
+        \\    return a[m - 1];
+        \\}
+        \\fn numMasks(x: usize) usize {
+        \\    return (x + (64 - 1)) / 64;
+        \\}
+    , "m", "a"));
+}
+
+test "nonzero: cross-fn — unguarded arg leaves result UNPROVEN (no false-negative)" {
+    try std.testing.expect(!try proveAt(
+        \\fn f(a: []u8, k: usize) u8 {
+        \\    const m = numMasks(k);
+        \\    return a[m - 1];
+        \\}
+        \\fn numMasks(x: usize) usize {
+        \\    return (x + (64 - 1)) / 64;
+        \\}
+    , "m", "a"));
+}
+
+test "nonzero: cross-fn via field-path value-alias (const L = s.len guards s.len arg)" {
+    try std.testing.expect(try proveAt(
+        \\fn f(s: S, a: []u8) u8 {
+        \\    const L = s.len;
+        \\    if (L == 0) return 0;
+        \\    const m = numMasks(s.len);
+        \\    return a[m - 1];
+        \\}
+        \\fn numMasks(x: usize) usize {
+        \\    return (x + (64 - 1)) / 64;
+        \\}
+    , "m", "a"));
+}
+
+test "nonempty: `s = base[0..n]` with n guarded nonzero ⟹ s non-empty" {
+    try std.testing.expect(try proveNonemptyAt(
+        \\fn f(buf: []u8, n: usize) u8 {
+        \\    if (n == 0) return 0;
+        \\    const s = buf[0..n];
+        \\    return s[s.len - 1];
+        \\}
+    , "s", "s"));
+}
+
+test "nonempty: `s = base[0..n]` with n unguarded is UNPROVEN (no false-negative)" {
+    try std.testing.expect(!try proveNonemptyAt(
+        \\fn f(buf: []u8, n: usize) u8 {
+        \\    const s = buf[0..n];
+        \\    return s[s.len - 1];
+        \\}
+    , "s", "s"));
+}
+
+test "nonempty: short-circuit `c.len > 0 and c[c.len-1]` (endsWith idiom)" {
+    try std.testing.expect(try proveNonemptyAt(
+        \\fn endsWith(self: []const u8, ch: u8) bool {
+        \\    return self.len > 0 and self[self.len - 1] == ch;
+        \\}
+        \\
+    , "self", "self"));
+}
+
+test "nonempty: short-circuit `c.len == 0 or c[c.len-1]` (or-form)" {
+    try std.testing.expect(try proveNonemptyAt(
+        \\fn endsWithOrEmpty(self: []const u8, ch: u8) bool {
+        \\    return self.len == 0 or self[self.len - 1] == ch;
+        \\}
+        \\
+    , "self", "self"));
+}
+
+test "nonempty: no false-negative — unguarded access in same fn still unproven" {
+    try std.testing.expect(!try proveNonemptyAt(
+        \\fn last(self: []const u8) u8 {
+        \\    return self[self.len - 1];
+        \\}
+        \\
+    , "self", "self"));
+}
+
 test "nonzero: and-chain guard (i > 0 and c)" {
     try std.testing.expect(try proveAt(
         \\fn f(i: usize, c: bool, buf: []const u8) u8 {
@@ -244,6 +364,52 @@ fn proveNonemptyAt(src: [:0]const u8, container: []const u8, arr: []const u8) !b
     const body = firstFnBody(&tree) orelse return error.NoFnBody;
     const lbracket = subscriptLBracket(&tree, arr) orelse return error.NoSubscript;
     return value_range.provesNonempty(gpa, &tree, body, container, lbracket, null);
+}
+
+/// Query `provesMinLen(container, n)` at the `[` token after identifier `arr`.
+fn proveMinLenAt(src: [:0]const u8, container: []const u8, n: u64, arr: []const u8) !bool {
+    const gpa = std.testing.allocator;
+    var tree = try Ast.parse(gpa, src, .zig);
+    defer tree.deinit(gpa);
+    const body = firstFnBody(&tree) orelse return error.NoFnBody;
+    const lbracket = subscriptLBracket(&tree, arr) orelse return error.NoSubscript;
+    return value_range.provesMinLen(gpa, &tree, body, container, n, lbracket, null);
+}
+
+test "minlen: switch-arm bounds a slice-from-range length (k.len >= 16 in arm 20)" {
+    try std.testing.expect(try proveMinLenAt(
+        \\fn f(b: []const u8) u8 {
+        \\    const n = b.len;
+        \\    const k = b[0..n];
+        \\    return switch (n) {
+        \\        20 => k[16],
+        \\        else => 0,
+        \\    };
+        \\}
+    , "k", 16, "k"));
+}
+
+test "minlen: switch arm BELOW threshold is UNPROVEN (no false-negative)" {
+    try std.testing.expect(!try proveMinLenAt(
+        \\fn f(b: []const u8) u8 {
+        \\    const n = b.len;
+        \\    const k = b[0..n];
+        \\    return switch (n) {
+        \\        10 => k[16],
+        \\        else => 0,
+        \\    };
+        \\}
+    , "k", 16, "k"));
+}
+
+test "minlen: no switch ⟹ unproven (no false-negative)" {
+    try std.testing.expect(!try proveMinLenAt(
+        \\fn f(b: []const u8) u8 {
+        \\    const n = b.len;
+        \\    const k = b[0..n];
+        \\    return k[16];
+        \\}
+    , "k", 16, "k"));
 }
 
 test "nonempty: bare arr.len-1 is unknown (fires)" {
@@ -517,4 +683,29 @@ test "diff-alias: rebinding end clears diff fact" {
         \\}
         \\
     , "end_mut", "buf"));
+}
+
+test "nonzero: loop var only `+=`'d keeps its positive init (monotonic)" {
+    try std.testing.expect(try proveAt(
+        \\fn f(buf: []u8) void {
+        \\    var p: usize = 1;
+        \\    while (p < buf.len) {
+        \\        buf[p - 1] = 0;
+        \\        p += 1;
+        \\    }
+        \\}
+    , "p", "buf"));
+}
+
+test "nonzero: loop var reset to 0 then accessed is UNPROVEN (no false-negative)" {
+    try std.testing.expect(!try proveAt(
+        \\fn f(buf: []u8) void {
+        \\    var p: usize = 1;
+        \\    while (p < buf.len) {
+        \\        p = 0;
+        \\        buf[p - 1] = 0;
+        \\        p += 1;
+        \\    }
+        \\}
+    , "p", "buf"));
 }
