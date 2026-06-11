@@ -38,6 +38,7 @@
 const std = @import("std");
 const Ast = std.zig.Ast;
 const file_cache_mod = @import("../cache/file_cache.zig");
+const fn_summary = @import("../model/fn_summary.zig");
 
 /// A set of string keys (source slices, stable for the tree's lifetime).
 const KeySet = struct {
@@ -85,18 +86,30 @@ const DiffAlias = struct {
     sub_node: Ast.Node.Index, // AST node of the subtrahend (for provablyNonneg check)
 };
 
+/// A `const LOCAL = <field-path>` binding (e.g. `const bit_length = self.bit_length`):
+/// LOCAL and the path hold the same value.  Lets a guard on the simple local
+/// (`if (bit_length == 0) return;`) establish that a later use of the path
+/// (`numMasks(self.bit_length)`) sees a non-zero argument.  Dropped when LOCAL is
+/// rebound or anything touches the path's root.
+const ValueAlias = struct {
+    local: []const u8,
+    path: []const u8,
+};
+
 /// Abstract state: two fact sets + len-alias bindings + diff-alias bindings.
 const State = struct {
     scalars: KeySet = .{}, // locals known != 0
     containers: KeySet = .{}, // container paths known non-empty
     aliases: std.ArrayListUnmanaged(Alias) = .empty, // n == c.len
     diff_aliases: std.ArrayListUnmanaged(DiffAlias) = .empty, // n = A - B
+    value_aliases: std.ArrayListUnmanaged(ValueAlias) = .empty, // local == path
 
     fn deinit(self: *State, gpa: std.mem.Allocator) void {
         self.scalars.deinit(gpa);
         self.containers.deinit(gpa);
         self.aliases.deinit(gpa);
         self.diff_aliases.deinit(gpa);
+        self.value_aliases.deinit(gpa);
     }
     fn clone(self: *const State, gpa: std.mem.Allocator) !State {
         var out: State = .{};
@@ -105,6 +118,7 @@ const State = struct {
         try out.containers.keys.appendSlice(gpa, self.containers.keys.items);
         try out.aliases.appendSlice(gpa, self.aliases.items);
         try out.diff_aliases.appendSlice(gpa, self.diff_aliases.items);
+        try out.value_aliases.appendSlice(gpa, self.value_aliases.items);
         return out;
     }
     fn intersectWith(self: *State, other: *const State) void {
@@ -119,16 +133,22 @@ const State = struct {
         while (j < self.diff_aliases.items.len) {
             if (other.hasDiffAlias(self.diff_aliases.items[j])) j += 1 else _ = self.diff_aliases.swapRemove(j);
         }
+        var k: usize = 0;
+        while (k < self.value_aliases.items.len) {
+            if (other.hasValueAlias(self.value_aliases.items[k])) k += 1 else _ = self.value_aliases.swapRemove(k);
+        }
     }
     fn replaceWith(self: *State, gpa: std.mem.Allocator, src: *const State) !void {
         self.scalars.keys.clearRetainingCapacity();
         self.containers.keys.clearRetainingCapacity();
         self.aliases.clearRetainingCapacity();
         self.diff_aliases.clearRetainingCapacity();
+        self.value_aliases.clearRetainingCapacity();
         try self.scalars.keys.appendSlice(gpa, src.scalars.keys.items);
         try self.containers.keys.appendSlice(gpa, src.containers.keys.items);
         try self.aliases.appendSlice(gpa, src.aliases.items);
         try self.diff_aliases.appendSlice(gpa, src.diff_aliases.items);
+        try self.value_aliases.appendSlice(gpa, src.value_aliases.items);
     }
     fn hasAlias(self: *const State, a: Alias) bool {
         for (self.aliases.items) |e|
@@ -168,6 +188,29 @@ const State = struct {
             const da = self.diff_aliases.items[i];
             if (std.mem.eql(u8, da.diff, name) or std.mem.eql(u8, da.minuend, name)) {
                 _ = self.diff_aliases.swapRemove(i);
+            } else i += 1;
+        }
+    }
+    fn hasValueAlias(self: *const State, va: ValueAlias) bool {
+        for (self.value_aliases.items) |e|
+            if (std.mem.eql(u8, e.local, va.local) and std.mem.eql(u8, e.path, va.path)) return true;
+        return false;
+    }
+    fn addValueAlias(self: *State, gpa: std.mem.Allocator, va: ValueAlias) !void {
+        if (self.hasValueAlias(va)) return;
+        try self.value_aliases.append(gpa, va);
+    }
+    /// Drop value_aliases whose local or whose path *starts with* `root` (so a
+    /// rebind of the local, or a mutation of the path's root identifier,
+    /// invalidates the equality).
+    fn dropValueAliasesByRoot(self: *State, root: []const u8) void {
+        var i: usize = 0;
+        while (i < self.value_aliases.items.len) {
+            const va = self.value_aliases.items[i];
+            const path_root_match = std.mem.startsWith(u8, va.path, root) and
+                (va.path.len == root.len or va.path[root.len] == '.' or va.path[root.len] == '[');
+            if (std.mem.eql(u8, va.local, root) or path_root_match) {
+                _ = self.value_aliases.swapRemove(i);
             } else i += 1;
         }
     }
@@ -336,6 +379,17 @@ fn analyzeVarDecl(o: *Oracle, node: Ast.Node.Index, st: *State) error{OutOfMemor
     dropContainersRootedAt(st, name);
     st.dropAliasesByScalar(name);
     st.dropDiffAliasesByName(name);
+    st.dropValueAliasesByRoot(name);
+    // Record a `const name = <field-path>` value alias (e.g.
+    // `const bit_length = self.bit_length`): name and the path are equal, so a
+    // guard on `name` later proves the path non-zero (see argProvablyNonzero).
+    if (fieldPathSrc(o, init_node)) |psrc| {
+        try st.addValueAlias(o.gpa, .{ .local = name, .path = psrc });
+    }
+    // Cross-fn: `const name = callee(arg)` where `callee` provably returns a
+    // non-zero value given a non-zero argument (e.g. ceil-division `numMasks`),
+    // and `arg` is proven non-zero here.  Then `name` is non-zero.
+    if (callResultNonzero(o, init_node, st)) try st.scalars.add(o.gpa, name);
     // Record a `const/var name = <c>.len` length-snapshot alias.
     if (lenContainerPath(o, init_node)) |cpath| {
         try st.addAlias(o.gpa, .{ .scalar = name, .container = cpath });
@@ -393,14 +447,32 @@ fn analyzeAssign(o: *Oracle, node: Ast.Node.Index, st: *State) error{OutOfMemory
         dropContainersRootedAt(st, name);
         st.dropAliasesByScalar(name);
         st.dropDiffAliasesByName(name);
+        st.dropValueAliasesByRoot(name);
         // A re-bind to `c.len` re-establishes the alias.
         if (lenContainerPath(o, rhs)) |cpath| try st.addAlias(o.gpa, .{ .scalar = name, .container = cpath });
     } else {
         // Assignment through a field/index (`c.items = ...`) — conservatively
         // drop container facts whose path the LHS could alter.
         killMutatedContainers(o, node, st);
+        // A field write (`self.bit_length = …`) invalidates value-aliases whose
+        // path is rooted at the written path's head identifier.
+        if (lhsRootIdent(o, lhs)) |root| st.dropValueAliasesByRoot(root);
     }
     return .{};
+}
+
+/// Root identifier of an assignment LHS path (`self` from `self.bit_length`,
+/// `arr` from `arr[i].x`), or null.
+fn lhsRootIdent(o: *Oracle, lhs: Ast.Node.Index) ?[]const u8 {
+    const tree = o.tree;
+    var n = lhs;
+    while (true) switch (tree.nodeTag(n)) {
+        .identifier => return tree.tokenSlice(tree.nodeMainToken(n)),
+        .field_access => n = tree.nodeData(n).node_and_token[0],
+        .array_access => n = tree.nodeData(n).node_and_node[0],
+        .deref => n = tree.nodeData(n).node,
+        else => return null,
+    };
 }
 
 /// `x += <expr>` (non-wrapping).  For an unsigned `x`, addition never
@@ -432,6 +504,7 @@ fn analyzeCompoundAdd(o: *Oracle, node: Ast.Node.Index, st: *State) error{OutOfM
         dropContainersRootedAt(st, name);
         st.dropAliasesByScalar(name);
         st.dropDiffAliasesByName(name);
+        st.dropValueAliasesByRoot(name);
     } else {
         killMutatedContainers(o, node, st);
     }
@@ -925,6 +998,150 @@ fn nodeSrc(tree: *const Ast, node: Ast.Node.Index) []const u8 {
     const start: usize = starts[ft];
     const end: usize = starts[lt] + tree.tokenSlice(lt).len;
     return tree.source[start..end];
+}
+
+fn unwrapGrouped(tree: *const Ast, node: Ast.Node.Index) Ast.Node.Index {
+    var n = node;
+    while (tree.nodeTag(n) == .grouped_expression) n = tree.nodeData(n).node_and_token[0];
+    return n;
+}
+
+/// True iff `node` is a pure field-access chain rooted at an identifier
+/// (`self.bit_length`, `a.b.c`) — no calls, no subscripts.
+fn isPureFieldPath(tree: *const Ast, node: Ast.Node.Index) bool {
+    return switch (tree.nodeTag(node)) {
+        .identifier => true,
+        .field_access => isPureFieldPath(tree, tree.nodeData(node).node_and_token[0]),
+        else => false,
+    };
+}
+
+/// Source spelling of a pure field-access path with at least one `.`, else null.
+fn fieldPathSrc(o: *Oracle, node: Ast.Node.Index) ?[]const u8 {
+    const tree = o.tree;
+    if (tree.nodeTag(node) != .field_access) return null;
+    if (!isPureFieldPath(tree, node)) return null;
+    return nodeSrc(tree, node);
+}
+
+/// Is the call argument `arg` provably non-zero in `st`?  A simple identifier is
+/// looked up in the nonzero set; a field-path is matched against a value-alias
+/// (`const local = path`) whose local is non-zero.
+fn argProvablyNonzero(o: *Oracle, st: *const State, arg: Ast.Node.Index) bool {
+    const tree = o.tree;
+    if (identName(tree, arg)) |nm| return st.scalars.contains(nm);
+    if (fieldPathSrc(o, arg)) |psrc| {
+        if (st.scalars.contains(psrc)) return true;
+        for (st.value_aliases.items) |va|
+            if (std.mem.eql(u8, va.path, psrc) and st.scalars.contains(va.local)) return true;
+    }
+    return false;
+}
+
+/// Cross-fn: is `init` a call `callee(arg)` whose result is provably non-zero?
+/// True when `callee` is an in-file single-return function whose return is
+/// non-zero given its first parameter non-zero (e.g. ceil-division), AND `arg`
+/// is proven non-zero at the call.  Single-argument callees only (v1).
+fn callResultNonzero(o: *Oracle, init: Ast.Node.Index, st: *const State) bool {
+    const tree = o.tree;
+    var buf: [1]Ast.Node.Index = undefined;
+    const call = tree.fullCall(&buf, init) orelse return false;
+    const callee = identName(tree, call.ast.fn_expr) orelse return false;
+    if (call.ast.params.len != 1) return false;
+    if (!argProvablyNonzero(o, st, call.ast.params[0])) return false;
+    return calleeReturnsNonzeroGivenArg(o, callee);
+}
+
+/// Every in-file function (top-level or method) named `name` has a single
+/// `return EXPR` whose value is provably non-zero given its first parameter
+/// non-zero.  Conservative: false if no such function is found, or ANY same-named
+/// function fails (so it holds whichever overload is actually called).
+fn calleeReturnsNonzeroGivenArg(o: *Oracle, name: []const u8) bool {
+    const tree = o.tree;
+    var found = false;
+    var ni: u32 = 0;
+    while (ni < tree.nodes.len) : (ni += 1) {
+        const fnode: Ast.Node.Index = @enumFromInt(ni);
+        if (tree.nodeTag(fnode) != .fn_decl) continue;
+        const fdata = tree.nodeData(fnode).node_and_node;
+        var pbuf: [1]Ast.Node.Index = undefined;
+        const proto = tree.fullFnProto(&pbuf, fdata[0]) orelse continue;
+        const nt = proto.name_token orelse continue;
+        if (!std.mem.eql(u8, tree.tokenSlice(nt), name)) continue;
+        found = true;
+        const ret = fn_summary.singleReturnExpr(tree, fdata[1]) orelse return false;
+        var it = proto.iterate(tree);
+        const p0 = it.next() orelse return false;
+        const pname = if (p0.name_token) |t| tree.tokenSlice(t) else return false;
+        if (!exprNonzeroPostcond(o, ret, pname)) return false;
+    }
+    return found;
+}
+
+/// Is `expr` provably non-zero assuming the single parameter `pname` is non-zero?
+/// Handles: positive literals, the parameter itself, unsigned addition (either
+/// operand non-zero), and ceil-division `(A + C) / D` with A non-zero and
+/// comptime constants `C >= D - 1` (⟹ `A + C >= D` ⟹ quotient >= 1).
+fn exprNonzeroPostcond(o: *Oracle, expr: Ast.Node.Index, pname: []const u8) bool {
+    const tree = o.tree;
+    const e = unwrapGrouped(tree, expr);
+    switch (tree.nodeTag(e)) {
+        .number_literal => return isPositiveIntLiteral(tree, e),
+        .identifier => return std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(e)), pname),
+        .add, .add_wrap, .add_sat => {
+            const d = tree.nodeData(e).node_and_node;
+            return exprNonzeroPostcond(o, d[0], pname) or exprNonzeroPostcond(o, d[1], pname);
+        },
+        .div => {
+            const d = tree.nodeData(e).node_and_node;
+            const div_node = d[1];
+            const num = unwrapGrouped(tree, d[0]);
+            if (tree.nodeTag(num) != .add) return false;
+            const ad = tree.nodeData(num).node_and_node;
+            return ceilDivBase(o, ad[0], ad[1], div_node, pname) or
+                ceilDivBase(o, ad[1], ad[0], div_node, pname);
+        },
+        else => return false,
+    }
+}
+
+/// `(base + addend) / divisor` is non-zero when `base` is non-zero and
+/// `addend >= divisor - 1` (⟹ `base + addend >= divisor` ⟹ quotient >= 1).
+/// The bound is proven two ways: (1) comptime values `C >= D - 1`; (2) STRUCTURAL
+/// — `addend` is syntactically `divisor - 1` (e.g. ceil-div idiom
+/// `(x + (@bitSizeOf(T) - 1)) / @bitSizeOf(T)`), which holds for ANY value of the
+/// divisor even when the engine can't evaluate it (`@bitSizeOf` isn't a literal).
+fn ceilDivBase(o: *Oracle, base: Ast.Node.Index, addend: Ast.Node.Index, div_node: Ast.Node.Index, pname: []const u8) bool {
+    if (!exprNonzeroPostcond(o, base, pname)) return false;
+    if (comptimeValOf(o, div_node)) |dval| {
+        if (dval != 0) {
+            if (comptimeValOf(o, addend)) |cval| {
+                if (cval + 1 >= dval) return true;
+            }
+        }
+    }
+    return addendIsDivisorMinusOne(o, addend, div_node);
+}
+
+/// True iff `addend` is syntactically `<X> - 1` where `<X>` has the same source
+/// spelling as `div_node` — so `addend == divisor - 1` exactly, regardless of
+/// the (possibly engine-opaque) value.
+fn addendIsDivisorMinusOne(o: *Oracle, addend: Ast.Node.Index, div_node: Ast.Node.Index) bool {
+    const tree = o.tree;
+    const a = unwrapGrouped(tree, addend);
+    if (tree.nodeTag(a) != .sub) return false;
+    const sd = tree.nodeData(a).node_and_node;
+    if (!isIntLiteralValue(tree, sd[1], 1)) return false;
+    const left = unwrapGrouped(tree, sd[0]);
+    const div = unwrapGrouped(tree, div_node);
+    return std.mem.eql(u8, nodeSrc(tree, left), nodeSrc(tree, div));
+}
+
+/// Comptime value of `node` via the type engine, or null (also null without a
+/// resolver — keeps the cross-fn check sound in token-only mode).
+fn comptimeValOf(o: *Oracle, node: Ast.Node.Index) ?u64 {
+    const cache = o.cache orelse return null;
+    return cache.comptimeIntValueOf(unwrapGrouped(o.tree, node));
 }
 
 fn blockStmts(

@@ -232,6 +232,48 @@ test "nonzero: no false-negative — unguarded LHS write still unproven" {
     , "i", "buf"));
 }
 
+test "nonzero: cross-fn ceil-div postcondition (numMasks) with guarded arg" {
+    // `m = numMasks(k)` where numMasks is `(x + (D-1)) / D` (ceil-div, structural
+    // D-1 == D-1), and k is guarded non-zero ⟹ m non-zero. Caller listed first so
+    // `proveAt` analyzes it; the callee scan finds `numMasks` regardless of order.
+    try std.testing.expect(try proveAt(
+        \\fn f(a: []u8, k: usize) u8 {
+        \\    if (k == 0) return 0;
+        \\    const m = numMasks(k);
+        \\    return a[m - 1];
+        \\}
+        \\fn numMasks(x: usize) usize {
+        \\    return (x + (64 - 1)) / 64;
+        \\}
+    , "m", "a"));
+}
+
+test "nonzero: cross-fn — unguarded arg leaves result UNPROVEN (no false-negative)" {
+    try std.testing.expect(!try proveAt(
+        \\fn f(a: []u8, k: usize) u8 {
+        \\    const m = numMasks(k);
+        \\    return a[m - 1];
+        \\}
+        \\fn numMasks(x: usize) usize {
+        \\    return (x + (64 - 1)) / 64;
+        \\}
+    , "m", "a"));
+}
+
+test "nonzero: cross-fn via field-path value-alias (const L = s.len guards s.len arg)" {
+    try std.testing.expect(try proveAt(
+        \\fn f(s: S, a: []u8) u8 {
+        \\    const L = s.len;
+        \\    if (L == 0) return 0;
+        \\    const m = numMasks(s.len);
+        \\    return a[m - 1];
+        \\}
+        \\fn numMasks(x: usize) usize {
+        \\    return (x + (64 - 1)) / 64;
+        \\}
+    , "m", "a"));
+}
+
 test "nonempty: `s = base[0..n]` with n guarded nonzero ⟹ s non-empty" {
     try std.testing.expect(try proveNonemptyAt(
         \\fn f(buf: []u8, n: usize) u8 {
