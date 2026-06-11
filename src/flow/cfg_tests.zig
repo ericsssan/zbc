@@ -281,6 +281,78 @@ test "plain defer DOES fire on return — kill visible before ret stmt" {
     try std.testing.expect(saw_kill);
 }
 
+test "errdefer DOES fire on `return err` from a catch capture" {
+    // `errdefer arena.deinit()` must be replayed when the function
+    // returns an error value — here `return err` re-raises the captured
+    // error from `catch |err|`.  Before the fix, only literal
+    // `return error.X` was recognised, so this `.arena_kill` was
+    // silently dropped (the errdefer-double-free-on-error-return FN).
+    const gpa = std.testing.allocator;
+    var result = try parseAndLower(gpa,
+        \\pub fn foo() !void {
+        \\    var arena = Arena.init(0);
+        \\    errdefer arena.deinit();
+        \\    sideEffect() catch |err| {
+        \\        return err;
+        \\    };
+        \\    return;
+        \\}
+        \\const Arena = struct {
+        \\    pub fn init(_: u32) Arena { return .{}; }
+        \\    pub fn deinit(_: *Arena) void {}
+        \\};
+        \\pub fn sideEffect() !void {}
+        \\
+    );
+    defer result.deinit(gpa);
+    const cfg = result.cfg.?;
+
+    // The errdefer's `arena.deinit()` (→ .arena_kill) must be replayed
+    // on the `return err` path.  The trailing `return;` is a success
+    // return and must NOT replay it — so exactly one kill appears.
+    var kill_count: usize = 0;
+    for (cfg.blocks) |b| {
+        for (b.stmts) |s| {
+            if (s.kind == .arena_kill) kill_count += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), kill_count);
+}
+
+test "errdefer does NOT fire on a non-error `return` from a catch arm" {
+    // Symmetric guard against a false positive: a catch arm that
+    // returns a NON-error value (a literal here) is a success return,
+    // so the errdefer must stay silent — no `.arena_kill` anywhere.
+    const gpa = std.testing.allocator;
+    var result = try parseAndLower(gpa,
+        \\pub fn foo() !u32 {
+        \\    var arena = Arena.init(0);
+        \\    errdefer arena.deinit();
+        \\    const v: u32 = compute() catch |err| {
+        \\        _ = err;
+        \\        return 0;
+        \\    };
+        \\    return v;
+        \\}
+        \\const Arena = struct {
+        \\    pub fn init(_: u32) Arena { return .{}; }
+        \\    pub fn deinit(_: *Arena) void {}
+        \\};
+        \\pub fn compute() !u32 { return 1; }
+        \\
+    );
+    defer result.deinit(gpa);
+    const cfg = result.cfg.?;
+
+    var saw_kill = false;
+    for (cfg.blocks) |b| {
+        for (b.stmts) |s| {
+            if (s.kind == .arena_kill) saw_kill = true;
+        }
+    }
+    try std.testing.expect(!saw_kill);
+}
+
 test "try at statement position creates error-exit sink with defers replayed" {
     // `try call();` — adds an error-exit block reachable from cur.
     // The sink should contain whatever defers were active (here:

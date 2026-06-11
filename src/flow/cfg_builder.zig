@@ -666,7 +666,14 @@ const Builder = struct {
     /// the body now resolve via name_to_local rather than falling
     /// through to .unknown identifier classification.
     fn registerCaptures(self: *Builder, payload_token: Ast.TokenIndex) !void {
-        _ = try self.registerCapturesWith(payload_token, null);
+        _ = try self.registerCapturesImpl(payload_token, null, false);
+    }
+
+    /// Error-capture variant of `registerCaptures`: each registered
+    /// capture is marked `is_error_capture` so `return <cap>` is treated
+    /// as an error return.  Used for `catch |err|`.
+    fn registerErrorCaptures(self: *Builder, payload_token: Ast.TokenIndex) !void {
+        _ = try self.registerCapturesImpl(payload_token, null, true);
     }
 
     /// Heuristic: when an `if (<Type>.fromJS(...))` scrutinee
@@ -792,6 +799,19 @@ const Builder = struct {
     }
 
     fn registerCapturesWith(self: *Builder, payload_token: Ast.TokenIndex, reset_into: ?BlockId) !void {
+        _ = try self.registerCapturesImpl(payload_token, reset_into, false);
+    }
+
+    /// Error-capture variant of `registerCapturesWith`: marks each
+    /// registered capture `is_error_capture`.  Used for `else |err|`.
+    fn registerErrorCapturesWith(self: *Builder, payload_token: Ast.TokenIndex, reset_into: ?BlockId) !void {
+        _ = try self.registerCapturesImpl(payload_token, reset_into, true);
+    }
+
+    /// Shared body for the capture-registration wrappers.  When
+    /// `mark_error` is set, every registered capture local gets
+    /// `is_error_capture = true` (see LocalInfo).
+    fn registerCapturesImpl(self: *Builder, payload_token: Ast.TokenIndex, reset_into: ?BlockId, mark_error: bool) !void {
         const tree = self.tree;
         const tags = tree.tokens.items(.tag);
         var t: Ast.TokenIndex = payload_token;
@@ -802,6 +822,7 @@ const Builder = struct {
                     const name = tree.tokenSlice(t);
                     if (std.mem.eql(u8, name, "_")) continue;
                     const lid = try self.registerLocal(name, self.posOfToken(t));
+                    if (mark_error) self.locals.items[@intFromEnum(lid)].is_error_capture = true;
                     if (reset_into) |blk| {
                         try self.appendStmt(blk, .{
                             .kind = .{ .reset_capture = .{ .local = lid } },
@@ -1098,7 +1119,7 @@ const Builder = struct {
         // Lower the else branch if present.  `else |err|` payload is
         // in scope for the else-body only.
         if (else_block) |eb| {
-            if (if_data.error_token) |et| try self.registerCapturesWith(et, eb);
+            if (if_data.error_token) |et| try self.registerErrorCapturesWith(et, eb);
             var else_cur = eb;
             try self.lowerStmt(if_data.ast.else_expr.unwrap().?, &else_cur);
             try self.addEdge(else_cur, merge_block);
@@ -2069,7 +2090,7 @@ const Builder = struct {
         // `catch |err| BODY` — payload is `main_token + 2` when the
         // token immediately following `catch` is `|`.  Scope: body only.
         if (self.catchPayloadToken(catch_node)) |pt| {
-            try self.registerCaptures(pt);
+            try self.registerErrorCaptures(pt);
         }
 
         var catch_cur = catch_block;
@@ -2715,20 +2736,24 @@ const Builder = struct {
 
         // Now flush defers — fires after the .use's, before the .ret.
         //
-        // `return error.X` (or `return .{...}` resolving to an error-only
-        // path) returns an error value, so Zig fires errdefers too.
-        // Detect the syntactic `error.X` shape and use the error-path
-        // flush; everything else uses the normal-only flush.  This is
-        // conservative — `return foo()` where `foo()` returns an error
-        // also fires errdefers, but we can't tell that from the AST
-        // without callee resolution.  Catching the literal case is the
-        // common bug shape (`errdefer free(p); return error.X` after an
-        // explicit free of `p` is a textbook double-free).
-        const value_is_literal_error = if (value_opt) |expr|
-            isLiteralErrorReturn(tree, expr)
+        // Zig fires errdefers only on returns that yield an ERROR value.
+        // `returnExprIsError` recognises the statically-decidable error
+        // shapes — a literal `error.X` and a returned error-capture
+        // identifier (`catch |err| { ...; return err; }`) — and uses the
+        // error-path flush for them; everything else uses normal-only.
+        //
+        // This is a sound under-approximation: `return foo()` where
+        // `foo()` returns an error UNION (`!T`) may or may not be an
+        // error at runtime, so it is NOT classified here — flushing
+        // errdefers unconditionally would false-positive on the success
+        // path, and deciding it needs callee return-type resolution.
+        // Both caught shapes are common double-free sources, e.g.
+        // `errdefer free(p); something() catch |err| { free(p); return err; }`.
+        const value_is_error = if (value_opt) |expr|
+            self.returnExprIsError(expr)
         else
             false;
-        if (value_is_literal_error) {
+        if (value_is_error) {
             try self.flushErrAndNormalDefers(cur);
         } else {
             try self.flushDefers(cur);
@@ -4549,6 +4574,26 @@ const Builder = struct {
             },
             else => return false,
         }
+    }
+
+    /// True iff the returned expression is statically known to be an
+    /// error value, so Zig fires errdefers on this return.  Covers:
+    ///   - literal `error.X` (and `try`-wrapped) — `isLiteralErrorReturn`
+    ///   - a bare identifier naming an in-scope error capture
+    ///     (`catch |err|` / `else |err|`), marked `is_error_capture`.
+    /// Sound under-approximation: returns of error UNIONS (`return foo()`
+    /// yielding `!T`) are deliberately NOT classified here — see the
+    /// rationale at the call site in `lowerReturn`.
+    fn returnExprIsError(self: *const Builder, expr: Ast.Node.Index) bool {
+        const tree = self.tree;
+        if (isLiteralErrorReturn(tree, expr)) return true;
+        if (tree.nodeTag(expr) == .identifier) {
+            const name = tree.tokenSlice(tree.nodeMainToken(expr));
+            if (self.name_to_local.get(name)) |lid| {
+                return self.locals.items[@intFromEnum(lid)].is_error_capture;
+            }
+        }
+        return false;
     }
 
     fn isConstructorName(name: []const u8) bool {
