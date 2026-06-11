@@ -344,6 +344,14 @@ fn analyzeAssign(o: *Oracle, node: Ast.Node.Index, st: *State) error{OutOfMemory
     const data = tree.nodeData(node).node_and_node;
     const lhs = data[0];
     const rhs = data[1];
+    // The use may be in the LHS index expression of a subscript write
+    // (`buf[idx - 1] = …`).  The index is READ before the store, so answer the
+    // query against the current state — otherwise a provably-nonzero index on
+    // the write side is never resolved and the rule false-positives.
+    if (o.tokenInNode(lhs)) {
+        const flow = try analyzeNode(o, lhs, st);
+        if (flow.answer != null) return flow;
+    }
     if (o.tokenInNode(rhs)) {
         const flow = try analyzeNode(o, rhs, st);
         if (flow.answer != null) return flow;
@@ -380,6 +388,11 @@ fn analyzeCompoundAdd(o: *Oracle, node: Ast.Node.Index, st: *State) error{OutOfM
     const data = tree.nodeData(node).node_and_node;
     const lhs = data[0];
     const rhs = data[1];
+    // Use may be in the LHS subscript (`buf[idx - 1] += …`) — answer first.
+    if (o.tokenInNode(lhs)) {
+        const flow = try analyzeNode(o, lhs, st);
+        if (flow.answer != null) return flow;
+    }
     if (o.tokenInNode(rhs)) {
         const flow = try analyzeNode(o, rhs, st);
         if (flow.answer != null) return flow;

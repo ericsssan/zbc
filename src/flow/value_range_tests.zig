@@ -200,6 +200,38 @@ test "nonzero: guard in while condition refines body" {
     , "i", "buf"));
 }
 
+test "nonzero: use on LHS of a subscript write (buf[i-1] = …)" {
+    // Regression: analyzeAssign only inspected the RHS for the use token, so a
+    // provably-nonzero index on the WRITE side (`buf[i-1] = 0`) was never
+    // resolved and the rule false-positived. `.len` guard needs no type engine.
+    try std.testing.expect(try proveAt(
+        \\fn f(i: usize, buf: []u8, other: []const u8) void {
+        \\    if (i > other.len) {
+        \\        buf[i - 1] = 0;
+        \\    }
+        \\}
+        \\
+    , "i", "buf"));
+}
+
+test "nonzero: LHS subscript write under a bare (no-block) if" {
+    try std.testing.expect(try proveAt(
+        \\fn f(i: usize, buf: []u8, other: []const u8) void {
+        \\    if (i > other.len) buf[i - 1] = 0;
+        \\}
+        \\
+    , "i", "buf"));
+}
+
+test "nonzero: no false-negative — unguarded LHS write still unproven" {
+    try std.testing.expect(!try proveAt(
+        \\fn f(i: usize, buf: []u8) void {
+        \\    buf[i - 1] = 0;
+        \\}
+        \\
+    , "i", "buf"));
+}
+
 test "nonzero: and-chain guard (i > 0 and c)" {
     try std.testing.expect(try proveAt(
         \\fn f(i: usize, c: bool, buf: []const u8) u8 {
