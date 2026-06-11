@@ -83,8 +83,49 @@ pub fn check(
             if (found_capacity) continue;
         }
 
+        // Suppress when `recv` is a POINTER parameter (`recv: *ArrayList(T)`):
+        // the caller owns the list it passed in and will `deinit` it, so the
+        // returned `.items` is an intentional borrow into the caller's own
+        // allocation — there is no orphaned backing buffer to leak.  (A by-value
+        // param could leak a post-append realloc, so only pointer params qualify.)
+        if (recvIsPointerParam(tree, t, recv)) continue;
+
         try report(gpa, problems, tree, t);
     }
+}
+
+/// True iff `recv` is a pointer-typed parameter of the function enclosing `tok`.
+fn recvIsPointerParam(tree: *const Ast, tok: Ast.TokenIndex, recv: []const u8) bool {
+    // Innermost fn_decl containing `tok` (largest firstToken).  Keep only the
+    // proto NODE — `fullFnProto` stores params in a local buf that must outlive
+    // the iteration, so resolve the proto here, not in a helper that returns it.
+    var best_proto: ?Ast.Node.Index = null;
+    var best_first: Ast.TokenIndex = 0;
+    var ni: u32 = 0;
+    while (ni < tree.nodes.len) : (ni += 1) {
+        const node: Ast.Node.Index = @enumFromInt(ni);
+        if (tree.nodeTag(node) != .fn_decl) continue;
+        const ft = tree.firstToken(node);
+        if (tok < ft or tok > tree.lastToken(node)) continue;
+        if (best_proto == null or ft > best_first) {
+            best_proto = tree.nodeData(node).node_and_node[0];
+            best_first = ft;
+        }
+    }
+    const proto_node = best_proto orelse return false;
+    var buf: [1]Ast.Node.Index = undefined;
+    const proto = tree.fullFnProto(&buf, proto_node) orelse return false;
+    var it = proto.iterate(tree);
+    while (it.next()) |p| {
+        const nt = p.name_token orelse continue;
+        if (!std.mem.eql(u8, tree.tokenSlice(nt), recv)) continue;
+        const te = p.type_expr orelse return false;
+        return switch (tree.nodeTag(te)) {
+            .ptr_type, .ptr_type_aligned, .ptr_type_bit_range, .ptr_type_sentinel => true,
+            else => false,
+        };
+    }
+    return false;
 }
 
 fn report(
@@ -170,6 +211,25 @@ test "return-arraylist-items: no capacity check still fires" {
         \\fn build(allocator: Allocator) ![]u8 {
         \\    var list = try std.ArrayList(u8).initCapacity(allocator, 64);
         \\    try list.appendSlice(data);
+        \\    return list.items;
+        \\}
+        \\
+    );
+}
+
+test "return-arraylist-items: pointer param (caller-owned) suppresses" {
+    try testing.expectNoFire(check,
+        \\fn collect(out: *std.ArrayList(u8)) []u8 {
+        \\    out.append(1) catch {};
+        \\    return out.items;
+        \\}
+        \\
+    );
+}
+
+test "return-arraylist-items: by-value param still fires (post-append realloc leaks)" {
+    try testing.expectFires(check, R,
+        \\fn collect(list: std.ArrayList(u8)) []u8 {
         \\    return list.items;
         \\}
         \\
