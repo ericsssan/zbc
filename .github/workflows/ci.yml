@@ -17,3 +17,7 @@ jobs:
           version: 0.17.0-dev.607+456b2ec07
       - run: zig build test --summary all
       - run: zig build -Doptimize=ReleaseFast
+      - name: Finding-regression check (tools/metrics)
+        run: |
+          zig build
+          python3 tools/metrics/regress.py
