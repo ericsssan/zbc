@@ -12,6 +12,7 @@
 //!                the per-file arena and Analyser.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Ast = std.zig.Ast;
 
 const DocumentStore = @import("document_store.zig");
@@ -324,13 +325,20 @@ pub const TypeResolver = struct {
     /// can't "wrap to a huge value") from unsigned underflow.
     pub fn intInfo(self: *TypeResolver, node: Ast.Node.Index) !?IntInfo {
         const ty = (try self.analyser.resolveTypeOfNode(.of(node, self.handle))) orelse return null;
-        return switch (ty.data) {
-            .ip_index => |payload| switch (self.ctx.ip.indexToKey(payload.type)) {
-                .int_type => |i| .{ .signed = i.signedness == .signed, .bits = i.bits },
-                else => null,
-            },
-            else => null,
+        const idx = switch (ty.data) {
+            .ip_index => |payload| payload.type,
+            else => return null,
         };
+        // `ip.intInfo` resolves usize/isize/c_int/… (which are `simple_type`s,
+        // NOT `int_type`) plus packed-struct/enum tag widths — but it is
+        // `unreachable` on non-integers, so gate on the .int type tag first.
+        // (The earlier `.int_type`-only match returned null for usize, silently
+        // breaking every unsigned-operand query — e.g. the value-range oracle's
+        // `i > usize_var ⟹ i != 0` generalization.)
+        const tag = self.ctx.ip.zigTypeTag(idx) orelse return null;
+        if (tag != .int) return null;
+        const info = self.ctx.ip.intInfo(idx, builtin.target);
+        return .{ .signed = info.signedness == .signed, .bits = info.bits };
     }
 
     /// For `x.ptr` where `x`'s type resolves to a slice / many-pointer:
