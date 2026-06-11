@@ -244,9 +244,17 @@ pub const FileCache = struct {
                 const ti = te.typeInfo();
                 if (ti.findMethod(method_name)) |m| return .{ .tree = te.tree(), .method = m };
             }
-            return null;
+            // No matching (type, method) in the global index.  The index
+            // omits files the project walk skips (vendor/build/cache dirs),
+            // yet such a file can still be reachable through THIS file's
+            // @import declarations.  Fall through to the @import traversal
+            // rather than giving up — a global-index miss is not proof the
+            // type is unreachable.  Bounded: findMethodAcrossImports caches
+            // this result (incl. the negative), so the traversal runs at
+            // most once per (type, method) per file.
         }
-        // OOM fallback: traverse @import graph directly.
+        // @import-graph traversal — reached on an index miss (above) or
+        // when the index was unavailable (OOM `catch null`).
         return findMethodViaImports(pc, self.tree, self.file_path, type_name, method_name, 4);
     }
 
@@ -1851,14 +1859,12 @@ test "FileCache: may_free_fields resolves CROSS-FILE field deinit (#20)" {
 
     try cache.resolveTransitiveTakes();
 
-    // Best-effort like the other cross-file tests: only assert when the
-    // cross-file lookup resolved (tmp paths may be undiscoverable on some
-    // CI).  When it does, the cross-file field-free must be KEPT.
-    if (try cache.summaryByMethodCrossFile("Inner", "deinit")) |_| {
-        const s = (try cache.summaryByMethod("Outer", "deinitOuter")).?;
-        try std.testing.expect(s.may_free_fields.len >= 1);
-        try std.testing.expectEqualStrings("inner", s.may_free_fields[0].field);
-    }
+    // Deterministic: the @import-fallback-on-index-miss fix resolves the
+    // tmp file even though it sits outside the project walk's global index.
+    // The cross-file field-free must be KEPT.
+    const s = (try cache.summaryByMethod("Outer", "deinitOuter")).?;
+    try std.testing.expect(s.may_free_fields.len >= 1);
+    try std.testing.expectEqualStrings("inner", s.may_free_fields[0].field);
 }
 
 test "FileCache: summaryByMethodCrossFile resolves TRANSITIVE takes in foreign file (#20)" {
@@ -1910,16 +1916,14 @@ test "FileCache: summaryByMethodCrossFile resolves TRANSITIVE takes in foreign f
     defer cache.deinit();
     cache.setProject(&pc, from_path);
 
-    // Best-effort, like the other cross-file tests in this file: tmp-path
-    // resolution is environment-dependent (findMethodCrossFile only falls
-    // back to the @import traversal when the global index ERRORS), so we
-    // only assert when the lookup actually resolved.  When it does, `kill`'s
-    // takes_ownership_of must be 0 — inherited transitively from
-    // `reallyFree` inside the foreign file (the #20 behavior).  The
-    // deterministic guard for the underlying mechanism is the next test.
-    if (try cache.summaryByMethodCrossFile("Xf20Node", "kill")) |s| {
-        try std.testing.expectEqual(@as(?u32, 0), s.takes_ownership_of);
-    }
+    // Deterministic since the @import-fallback-on-index-miss fix:
+    // findMethodCrossFile now falls through to the @import traversal when
+    // the global index has no match (the tmp file is outside the project
+    // walk), so this resolves reliably.  `kill`'s takes_ownership_of must be
+    // 0 — inherited transitively from `reallyFree` inside the foreign file.
+    const s = (try cache.summaryByMethodCrossFile("Xf20Node", "kill")) orelse
+        return error.CrossFileResolutionFailed;
+    try std.testing.expectEqual(@as(?u32, 0), s.takes_ownership_of);
 }
 
 test "FileCache: project-less FileCache computes transitive takes (#20 mechanism)" {
