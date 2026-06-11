@@ -577,3 +577,28 @@ test "diff-alias: rebinding end clears diff fact" {
         \\
     , "end_mut", "buf"));
 }
+
+test "nonzero: loop var only `+=`'d keeps its positive init (monotonic)" {
+    try std.testing.expect(try proveAt(
+        \\fn f(buf: []u8) void {
+        \\    var p: usize = 1;
+        \\    while (p < buf.len) {
+        \\        buf[p - 1] = 0;
+        \\        p += 1;
+        \\    }
+        \\}
+    , "p", "buf"));
+}
+
+test "nonzero: loop var reset to 0 then accessed is UNPROVEN (no false-negative)" {
+    try std.testing.expect(!try proveAt(
+        \\fn f(buf: []u8) void {
+        \\    var p: usize = 1;
+        \\    while (p < buf.len) {
+        \\        p = 0;
+        \\        buf[p - 1] = 0;
+        \\        p += 1;
+        \\    }
+        \\}
+    , "p", "buf"));
+}

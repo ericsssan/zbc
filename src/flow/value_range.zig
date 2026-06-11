@@ -509,7 +509,11 @@ fn analyzeLoop(o: *Oracle, node: Ast.Node.Index, st: *State, kind: LoopKind) err
         .while_ => if (tree.fullWhile(node)) |w| w.ast.cond_expr else null,
         .for_ => null,
     };
-    if (cond_node) |c| if (o.tokenInNode(c)) return .{ .answer = o.answerAt(st) };
+    // Use inside the loop condition itself: descend so short-circuit refinement
+    // applies (`while (tmp > beg and self.text[tmp-1] == …)` — the `and`'s LHS
+    // guards its RHS).  analyzeNode handles bool_and/bool_or; a plain comparison
+    // falls through to answerAt.
+    if (cond_node) |c| if (o.tokenInNode(c)) return try analyzeNode(o, c, st);
     if (body_node) |b| {
         if (o.tokenInNode(b)) {
             var body_st = try st.clone(o.gpa);
@@ -732,11 +736,17 @@ fn dropLoopMutated(o: *Oracle, loop_node: Ast.Node.Index, st: *State) void {
     const first = tree.firstToken(loop_node);
     const last = tree.lastToken(loop_node);
     const tags = tree.tokens.items(.tag);
-    // Scalars: any `NAME <assign-op>` inside the loop.
+    // Scalars: drop a nonzero fact only when the loop mutates the name
+    // NON-monotonically.  `NAME += …` on an unsigned can only grow the value
+    // (the safe/panic-on-overflow build never wraps to 0), so a scalar that is
+    // nonzero before the loop and *only* `+=`-mutated stays nonzero on every
+    // iteration — keep it.  Any other assign op (`=`, `-=`, `*=`, …) can reach
+    // 0, so drop.  Covers `var p: usize = 1; while (…) { …a[p-1]…; p += 1; }`.
     var t = first;
     while (t < last) : (t += 1) {
         if (tags[t] != .identifier) continue;
-        if (isAssignOp(tags[t + 1])) st.scalars.remove(tree.tokenSlice(t));
+        if (!isAssignOp(tags[t + 1])) continue;
+        if (tags[t + 1] != .plus_equal) st.scalars.remove(tree.tokenSlice(t));
     }
     dropContainersMutatedInTokens(tree, first, last, st);
 }
