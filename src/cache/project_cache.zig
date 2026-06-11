@@ -24,7 +24,14 @@ const model_mod = @import("../model/file_model.zig");
 /// Cached result of a cross-file `(TypeName, methodName)` summary lookup.
 /// `.found = false` means the method was not found; `.found = true` means
 /// it was found, and `.takes` holds the `takes_ownership_of` value.
-pub const CachedTakes = struct { found: bool, takes: ?u32 = null };
+pub const CachedTakes = struct {
+    found: bool,
+    takes: ?u32 = null,
+    // Cross-file effect flags (#20), so a cache hit doesn't lose them.
+    may_grow: bool = false,
+    may_gc: bool = false,
+    may_thread: bool = false,
+};
 
 pub const ProjectCache = struct {
     gpa: std.mem.Allocator,

@@ -516,71 +516,71 @@ pub const FileCache = struct {
             if (!changed) break;
         }
 
-        // Phase 5: propagate `may_grow_collections` transitively within
-        // the file.  If fn A makes a bare call to fn B (same file) and B
-        // may_grow_collections, A also may_grow_collections.  Direct
-        // detection (body contains `.append(` etc.) is done in
-        // `inferFromBody`; this phase handles one-hop callee chains.
-        iters = 0;
-        while (iters < 16) : (iters += 1) {
-            var changed = false;
-            for (model.fns) |fi| {
-                if (try self.propagateMayGrowOne(fi.fn_decl)) changed = true;
-            }
-            for (model.types) |ti| {
-                for (ti.methods) |m| {
-                    if (try self.propagateMayGrowOne(m.fn_decl)) changed = true;
+        // Phases 5-7: propagate the transitive EFFECT flags
+        // (may_grow_collections / may_invoke_gc / may_run_on_any_thread) to a
+        // fixed point.  Direct detection is done in `inferFromBody`; this
+        // propagates one call-hop at a time.  Each effect considers BOTH
+        // same-file bare calls (`foo()`) AND same-file/cross-file method
+        // calls (`recv.method()`).  The cross-file leg (#20) inherits the
+        // foreign method's direct effect via `summaryByMethodCrossFile`.
+        inline for ([_]Effect{ .grow, .gc, .thread }) |eff| {
+            iters = 0;
+            while (iters < 16) : (iters += 1) {
+                var changed = false;
+                for (model.fns) |fi| {
+                    if (try self.propagateEffectOne(fi.fn_decl, null, eff)) changed = true;
                 }
-            }
-            if (!changed) break;
-        }
-
-        // Phase 6: propagate `may_invoke_gc` transitively within the file.
-        // If fn A calls fn B (bare call, not method) and B may_invoke_gc,
-        // A also may_invoke_gc.  Direct detection is done in `inferFromBody`.
-        iters = 0;
-        while (iters < 16) : (iters += 1) {
-            var changed = false;
-            for (model.fns) |fi| {
-                if (try self.propagateMayInvokeGcOne(fi.fn_decl)) changed = true;
-            }
-            for (model.types) |ti| {
-                for (ti.methods) |m| {
-                    if (try self.propagateMayInvokeGcOne(m.fn_decl)) changed = true;
+                for (model.types) |ti| {
+                    for (ti.methods) |m| {
+                        if (try self.propagateEffectOne(m.fn_decl, ti.name, eff)) changed = true;
+                    }
                 }
+                if (!changed) break;
             }
-            if (!changed) break;
-        }
-
-        // Phase 7: propagate `may_run_on_any_thread` transitively.
-        // A fn that calls a fn registered as an exit/signal callback is also
-        // considered to may_run_on_any_thread (it may be called transitively).
-        iters = 0;
-        while (iters < 16) : (iters += 1) {
-            var changed = false;
-            for (model.fns) |fi| {
-                if (try self.propagateMayRunOnAnyThreadOne(fi.fn_decl)) changed = true;
-            }
-            for (model.types) |ti| {
-                for (ti.methods) |m| {
-                    if (try self.propagateMayRunOnAnyThreadOne(m.fn_decl)) changed = true;
-                }
-            }
-            if (!changed) break;
         }
     }
 
-    /// Propagate `may_grow_collections` from same-file bare-call callees.
-    /// Returns true iff this call updated the fn's flag.
-    fn propagateMayGrowOne(self: *FileCache, fn_decl: Ast.Node.Index) !bool {
+    /// A transitive boolean effect tracked by `propagateEffectOne`.
+    const Effect = enum { grow, gc, thread };
+
+    fn readEffect(s: *const fn_summary.FnSummary, comptime e: Effect) bool {
+        return switch (e) {
+            .grow => s.may_grow_collections,
+            .gc => s.may_invoke_gc,
+            .thread => s.may_run_on_any_thread,
+        };
+    }
+    fn writeEffect(s: *fn_summary.FnSummary, comptime e: Effect) void {
+        switch (e) {
+            .grow => s.may_grow_collections = true,
+            .gc => s.may_invoke_gc = true,
+            .thread => s.may_run_on_any_thread = true,
+        }
+    }
+
+    /// Propagate one transitive EFFECT flag into `fn_decl` from its
+    /// callees.  Considers same-file bare calls (`foo()` -> summaryByName)
+    /// AND same-file/cross-file method calls (`recv.method()` ->
+    /// summaryByMethod / summaryByMethodCrossFile).  `receiver_type` is the
+    /// enclosing type for methods (so `self.method()` resolves), null for
+    /// free fns.  Returns true iff this call set the flag.
+    fn propagateEffectOne(
+        self: *FileCache,
+        fn_decl: Ast.Node.Index,
+        receiver_type: ?[]const u8,
+        comptime e: Effect,
+    ) !bool {
         const s_ptr = try self.summaryOfFn(fn_decl);
-        if (s_ptr.may_grow_collections) return false;
+        if (readEffect(s_ptr, e)) return false;
 
         const tree = self.tree;
         const tags = tree.tokens.items(.tag);
         const body = tokens.bodyOf(tree, fn_decl) orelse return false;
         const first = tree.firstToken(body);
         const last = tree.lastToken(body);
+
+        var pbuf: [1]Ast.Node.Index = undefined;
+        const proto = tokens.fnProto(tree, &pbuf, fn_decl);
 
         var t = first;
         while (t + 1 <= last) : (t += 1) {
@@ -590,88 +590,37 @@ pub const FileCache = struct {
             }
             if (tags[t] != .identifier) continue;
             if (tags[t + 1] != .l_paren) continue;
-            if (t > first and tags[t - 1] == .period) continue;
 
-            const callee_name = tree.tokenSlice(t);
-            if (try self.summaryByName(callee_name)) |cs| {
-                if (cs.may_grow_collections) {
-                    const key = @intFromEnum(body);
-                    if (self.summaries.getPtr(key)) |entry| {
-                        entry.may_grow_collections = true;
-                        return true;
-                    }
+            const is_method = t > first and tags[t - 1] == .period;
+            const has_effect: bool = blk: {
+                if (!is_method) {
+                    // Bare call -> same-file free fn (unchanged behavior).
+                    if (try self.summaryByName(tree.tokenSlice(t))) |cs| break :blk readEffect(cs, e);
+                    break :blk false;
                 }
-            }
-        }
-        return false;
-    }
-
-    /// Propagate `may_invoke_gc` from same-file bare-call callees.
-    /// Returns true iff this call updated the fn's flag.
-    fn propagateMayInvokeGcOne(self: *FileCache, fn_decl: Ast.Node.Index) !bool {
-        const s_ptr = try self.summaryOfFn(fn_decl);
-        if (s_ptr.may_invoke_gc) return false;
-
-        const tree = self.tree;
-        const tags = tree.tokens.items(.tag);
-        const body = tokens.bodyOf(tree, fn_decl) orelse return false;
-        const first = tree.firstToken(body);
-        const last = tree.lastToken(body);
-
-        var t = first;
-        while (t + 1 <= last) : (t += 1) {
-            if (tags[t] == .keyword_fn) {
-                t = tokens.skipNestedFn(tags, t, last);
-                continue;
-            }
-            if (tags[t] != .identifier) continue;
-            if (tags[t + 1] != .l_paren) continue;
-            if (t > first and tags[t - 1] == .period) continue;
-
-            const callee_name = tree.tokenSlice(t);
-            if (try self.summaryByName(callee_name)) |cs| {
-                if (cs.may_invoke_gc) {
-                    const key = @intFromEnum(body);
-                    if (self.summaries.getPtr(key)) |entry| {
-                        entry.may_invoke_gc = true;
-                        return true;
+                // Method call `recv.method(` — recv is two tokens back.
+                if (t < first + 2 or tags[t - 2] != .identifier) break :blk false;
+                const method = tree.tokenSlice(t);
+                const recv = tree.tokenSlice(t - 2);
+                const recv_type: ?[]const u8 = rt: {
+                    if (proto) |p| {
+                        if (paramIndexFor(tree, p, recv)) |pi| {
+                            if (try self.paramContainerName(p, pi)) |tn| break :rt tn;
+                        }
                     }
-                }
-            }
-        }
-        return false;
-    }
-
-    /// Propagate `may_run_on_any_thread` from same-file bare-call callees.
-    /// Returns true iff this call updated the fn's flag.
-    fn propagateMayRunOnAnyThreadOne(self: *FileCache, fn_decl: Ast.Node.Index) !bool {
-        const s_ptr = try self.summaryOfFn(fn_decl);
-        if (s_ptr.may_run_on_any_thread) return false;
-
-        const tree = self.tree;
-        const tags = tree.tokens.items(.tag);
-        const body = tokens.bodyOf(tree, fn_decl) orelse return false;
-        const first = tree.firstToken(body);
-        const last = tree.lastToken(body);
-
-        var t = first;
-        while (t + 1 <= last) : (t += 1) {
-            if (tags[t] == .keyword_fn) {
-                t = tokens.skipNestedFn(tags, t, last);
-                continue;
-            }
-            if (tags[t] != .identifier) continue;
-            if (tags[t + 1] != .l_paren) continue;
-            if (t > first and tags[t - 1] == .period) continue;
-
-            const callee_name = tree.tokenSlice(t);
-            if (try self.summaryByName(callee_name)) |cs| {
-                if (cs.may_run_on_any_thread) {
-                    const key = @intFromEnum(body);
-                    if (self.summaries.getPtr(key)) |entry| {
-                        entry.may_run_on_any_thread = true;
-                        return true;
-                    }
+                    if (std.mem.eql(u8, recv, "self") or std.mem.eql(u8, recv, "this")) break :rt receiver_type;
+                    break :rt null;
+                };
+                const tn = recv_type orelse break :blk false;
+                if (try self.summaryByMethod(tn, method)) |cs| break :blk readEffect(cs, e);
+                if (try self.summaryByMethodCrossFile(tn, method)) |cs| break :blk readEffect(&cs, e);
+                break :blk false;
+            };
+            if (has_effect) {
+                const key = @intFromEnum(body);
+                if (self.summaries.getPtr(key)) |entry| {
+                    writeEffect(entry, e);
+                    return true;
                 }
             }
         }
@@ -1040,6 +989,9 @@ pub const FileCache = struct {
                 if (!cached.found) return null;
                 var s: fn_summary.FnSummary = .{};
                 s.takes_ownership_of = cached.takes;
+                s.may_grow_collections = cached.may_grow;
+                s.may_invoke_gc = cached.may_gc;
+                s.may_run_on_any_thread = cached.may_thread;
                 return s;
             }
         }
@@ -1053,6 +1005,15 @@ pub const FileCache = struct {
         const body = tokens.bodyOf(rm.tree, rm.method.fn_decl) orelse return null;
         var summary: fn_summary.FnSummary = .{};
         summary.takes_ownership_of = fn_summary.inferDirectTakes(rm.tree, proto, body);
+        // Cross-file EFFECT flags (#20): the foreign method's DIRECT effects
+        // (a `.append(` grows, a gc-trigger / exit-callback-register call).
+        // Body-level only — cheap, no foreign-file propagation — so a
+        // foreign method that merely DELEGATES the effect to its own callee
+        // isn't seen (a documented bound; effects are narrow-value).
+        const direct = fn_summary.inferFromBody(rm.tree, proto, body);
+        summary.may_grow_collections = direct.may_grow_collections;
+        summary.may_invoke_gc = direct.may_invoke_gc;
+        summary.may_run_on_any_thread = direct.may_run_on_any_thread;
         // Transitive takes WITHIN the foreign file: if direct inference
         // found nothing, the method may DELEGATE ownership to a same-file
         // callee (`pub fn kill(self, g) { self.reallyFree(g); }`).  Run the
@@ -1074,7 +1035,13 @@ pub const FileCache = struct {
         if (self.project) |pc| pc.putMethodSummaryCache(
             type_name,
             method_name,
-            .{ .found = true, .takes = summary.takes_ownership_of },
+            .{
+                .found = true,
+                .takes = summary.takes_ownership_of,
+                .may_grow = summary.may_grow_collections,
+                .may_gc = summary.may_invoke_gc,
+                .may_thread = summary.may_run_on_any_thread,
+            },
         );
         return summary;
     }
@@ -1951,4 +1918,72 @@ test "FileCache: project-less FileCache computes transitive takes (#20 mechanism
     try std.testing.expectEqual(@as(?u32, 0), reallyFree.takes_ownership_of);
     const kill = (try fc.summaryByMethod("Xf20Node", "kill")).?;
     try std.testing.expectEqual(@as(?u32, 0), kill.takes_ownership_of);
+}
+
+test "effect: may_grow propagates through same-file self.method() (#20)" {
+    // The unified effect propagation now follows METHOD calls (the old
+    // bare-call-only phases skipped `self.grow()`).  `outer` calls
+    // `self.grow()`, which grows a collection -> outer inherits may_grow.
+    const gpa = std.testing.allocator;
+    const src: [:0]const u8 =
+        \\const std = @import("std");
+        \\const T = struct {
+        \\    list: std.ArrayList(u32),
+        \\    fn grow(self: *T, x: u32) void { self.list.append(x) catch {}; }
+        \\    fn outer(self: *T) void { self.grow(1); }
+        \\};
+    ;
+    var tree = try Ast.parse(gpa, src, .zig);
+    defer tree.deinit(gpa);
+    var cache = FileCache.init(gpa, &tree);
+    defer cache.deinit();
+    try cache.resolveTransitiveTakes();
+    const grow_s = (try cache.summaryByMethod("T", "grow")).?;
+    try std.testing.expect(grow_s.may_grow_collections); // direct
+    const outer_s = (try cache.summaryByMethod("T", "outer")).?;
+    try std.testing.expect(outer_s.may_grow_collections); // transitive via self.grow()
+}
+
+test "effect: may_grow propagates across @import via method call (#20)" {
+    // `run` calls `g.add(1)` where `g`'s type lives in another file and
+    // `add` grows a collection.  run must inherit may_grow cross-file.
+    const gpa = std.testing.allocator;
+    const tio = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(tio, .{
+        .sub_path = "grower.zig",
+        .data =
+        \\const std = @import("std");
+        \\pub const Xf20Grower = struct {
+        \\    list: std.ArrayList(u32),
+        \\    pub fn add(self: *Xf20Grower, x: u32) void { self.list.append(x) catch {}; }
+        \\};
+        ,
+    });
+    try tmp.dir.writeFile(tio, .{
+        .sub_path = "caller.zig",
+        .data =
+        \\const grower = @import("./grower.zig");
+        \\pub fn run(g: *grower.Xf20Grower) void { g.add(1); }
+        ,
+    });
+    const from_path = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path, "caller.zig" });
+    defer gpa.free(from_path);
+    const caller_src: [:0]const u8 =
+        \\const grower = @import("./grower.zig");
+        \\pub fn run(g: *grower.Xf20Grower) void { g.add(1); }
+    ;
+    var tree = try Ast.parse(gpa, caller_src, .zig);
+    defer tree.deinit(gpa);
+    var pc = project_cache_mod.ProjectCache.init(gpa, tio);
+    defer pc.deinit();
+    var cache = FileCache.init(gpa, &tree);
+    defer cache.deinit();
+    cache.setProject(&pc, from_path);
+    try cache.resolveTransitiveTakes();
+    // Deterministic since the #27 @import-fallback fix; `add` grows a
+    // collection in the imported file, so `run` inherits may_grow.
+    const s = (try cache.summaryByName("run")).?;
+    try std.testing.expect(s.may_grow_collections);
 }
