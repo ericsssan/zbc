@@ -232,6 +232,25 @@ test "nonzero: no false-negative — unguarded LHS write still unproven" {
     , "i", "buf"));
 }
 
+test "nonempty: `s = base[0..n]` with n guarded nonzero ⟹ s non-empty" {
+    try std.testing.expect(try proveNonemptyAt(
+        \\fn f(buf: []u8, n: usize) u8 {
+        \\    if (n == 0) return 0;
+        \\    const s = buf[0..n];
+        \\    return s[s.len - 1];
+        \\}
+    , "s", "s"));
+}
+
+test "nonempty: `s = base[0..n]` with n unguarded is UNPROVEN (no false-negative)" {
+    try std.testing.expect(!try proveNonemptyAt(
+        \\fn f(buf: []u8, n: usize) u8 {
+        \\    const s = buf[0..n];
+        \\    return s[s.len - 1];
+        \\}
+    , "s", "s"));
+}
+
 test "nonempty: short-circuit `c.len > 0 and c[c.len-1]` (endsWith idiom)" {
     try std.testing.expect(try proveNonemptyAt(
         \\fn endsWith(self: []const u8, ch: u8) bool {

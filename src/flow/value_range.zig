@@ -340,6 +340,16 @@ fn analyzeVarDecl(o: *Oracle, node: Ast.Node.Index, st: *State) error{OutOfMemor
     if (lenContainerPath(o, init_node)) |cpath| {
         try st.addAlias(o.gpa, .{ .scalar = name, .container = cpath });
     }
+    // Record a `const/var name = base[0..N]` slice alias: name.len == N (same
+    // semantics as a `.len` snapshot, scalar=N container=name).  So a nonzero N
+    // ⟹ name non-empty, making `name[name.len - 1]` safe.  Restricted to a `0`
+    // start so the length is exactly the single scalar N.
+    if (sliceLenScalarName(o, init_node)) |nname| {
+        try st.addAlias(o.gpa, .{ .scalar = nname, .container = name });
+        // Immediate propagation: if N is already proven nonzero (e.g. a prior
+        // `if (N == 0) return` guard), `name` is non-empty right now.
+        if (st.scalars.contains(nname)) try st.containers.add(o.gpa, name);
+    }
     // Record a `const/var name = MINUEND - SUBTRAHEND` diff alias.
     // Used to propagate: when `name` is proven nonzero AND the subtrahend
     // is provably >= 0 (non-negative literal, .len, or unsigned by type engine),
@@ -861,6 +871,17 @@ fn dropContainersRootedAt(st: *State, root: []const u8) void {
 fn identName(tree: *const Ast, node: Ast.Node.Index) ?[]const u8 {
     if (tree.nodeTag(node) != .identifier) return null;
     return tree.tokenSlice(tree.nodeMainToken(node));
+}
+
+/// For a slice expression `base[0..N]` (start literal 0, end an identifier),
+/// return N's name — the slice's length equals N.  Null for non-slices,
+/// non-zero starts, open-ended slices, or non-identifier ends.
+fn sliceLenScalarName(o: *Oracle, node: Ast.Node.Index) ?[]const u8 {
+    const tree = o.tree;
+    const sl = tree.fullSlice(node) orelse return null;
+    if (!isIntLiteralValue(tree, sl.ast.start, 0)) return null;
+    const end = sl.ast.end.unwrap() orelse return null;
+    return identName(tree, end);
 }
 
 fn isAssignOp(tag: std.zig.Token.Tag) bool {
