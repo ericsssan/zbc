@@ -402,6 +402,15 @@ pub const TypeResolver = struct {
         return self.fixedArrayLenOfType(ty, 0);
     }
 
+    /// If `node` resolves to a comptime-known non-negative integer, return its
+    /// value, else null.  A comptime-known index can never cause a *runtime*
+    /// underflow/OOB: `CONST - 1` with `CONST == 0`, or an out-of-range constant
+    /// subscript, is a COMPILE error (never ships).  So any successful
+    /// resolution here means the access is comptime-verified safe.
+    pub fn comptimeIntValue(self: *TypeResolver, node: Ast.Node.Index) !?u64 {
+        return self.analyser.resolveIntegerLiteral(u64, .of(node, self.handle));
+    }
+
     fn fixedArrayLenOfType(self: *TypeResolver, ty: Analyser.Type, depth: u8) ?u64 {
         if (depth > 4) return null;
         return switch (ty.data) {

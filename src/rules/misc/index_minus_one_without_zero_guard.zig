@@ -219,10 +219,26 @@ pub fn check(
     if (!config_mod.isEnabled(config, .index_minus_one_without_zero_guard)) return;
     var ctx = try FileCtx.build(gpa, tree);
     defer ctx.deinit(gpa);
+
+    // Map identifier-reference nodes by main token so the type engine can
+    // resolve an index operand to a comptime value (`bytes[max_inline_len-1]`).
+    // Empty when the engine is absent.
+    var ident_nodes: std.AutoHashMapUnmanaged(Ast.TokenIndex, Ast.Node.Index) = .empty;
+    defer ident_nodes.deinit(gpa);
+    {
+        var ni: u32 = 0;
+        while (ni < tree.nodes.len) : (ni += 1) {
+            const node: Ast.Node.Index = @enumFromInt(ni);
+            if (tree.nodeTag(node) == .identifier) {
+                try ident_nodes.put(gpa, tree.nodeMainToken(node), node);
+            }
+        }
+    }
+
     var proto_buf: [1]Ast.Node.Index = undefined;
     var fns = tokens.iterFnDecls(tree);
     while (fns.next(&proto_buf)) |fn_entry| {
-        try checkBody(gpa, tree, fn_entry.body, problems, &ctx, cache);
+        try checkBody(gpa, tree, fn_entry.body, problems, &ctx, cache, &ident_nodes);
     }
 }
 
@@ -233,6 +249,7 @@ fn checkBody(
     problems: *std.ArrayListUnmanaged(Problem),
     ctx: *const FileCtx,
     cache: *file_cache_mod.FileCache,
+    ident_nodes: *const std.AutoHashMapUnmanaged(Ast.TokenIndex, Ast.Node.Index),
 ) !void {
     const tags = tree.tokens.items(.tag);
     const first = tree.firstToken(body);
@@ -271,6 +288,14 @@ fn checkBody(
             tags[t + 4] == .r_bracket)
         {
             const idx_name = tree.tokenSlice(t + 1);
+            // Semantic: a comptime-known index can't underflow at RUNTIME — a
+            // `CONST - 1` with `CONST == 0`, or an out-of-range constant
+            // subscript, is a COMPILE error.  Resolve the operand's value;
+            // any successful resolution ⇒ comptime-verified safe.  Covers
+            // `bytes[max_inline_len - 1]` (max_inline_len a const usize).
+            if (ident_nodes.get(t + 1)) |opnode| {
+                if (cache.comptimeIntValueOf(opnode) != null) continue;
+            }
             if (hasAndGuard(tags, tree, t, &.{idx_name})) continue;
             if (hasOrGuard(tags, tree, t, &.{idx_name})) continue;
             if (isInGuardedRange(guarded.items, t, &.{idx_name})) continue;
