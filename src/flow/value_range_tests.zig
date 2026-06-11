@@ -232,6 +232,33 @@ test "nonzero: no false-negative — unguarded LHS write still unproven" {
     , "i", "buf"));
 }
 
+test "nonempty: short-circuit `c.len > 0 and c[c.len-1]` (endsWith idiom)" {
+    try std.testing.expect(try proveNonemptyAt(
+        \\fn endsWith(self: []const u8, ch: u8) bool {
+        \\    return self.len > 0 and self[self.len - 1] == ch;
+        \\}
+        \\
+    , "self", "self"));
+}
+
+test "nonempty: short-circuit `c.len == 0 or c[c.len-1]` (or-form)" {
+    try std.testing.expect(try proveNonemptyAt(
+        \\fn endsWithOrEmpty(self: []const u8, ch: u8) bool {
+        \\    return self.len == 0 or self[self.len - 1] == ch;
+        \\}
+        \\
+    , "self", "self"));
+}
+
+test "nonempty: no false-negative — unguarded access in same fn still unproven" {
+    try std.testing.expect(!try proveNonemptyAt(
+        \\fn last(self: []const u8) u8 {
+        \\    return self[self.len - 1];
+        \\}
+        \\
+    , "self", "self"));
+}
+
 test "nonzero: and-chain guard (i > 0 and c)" {
     try std.testing.expect(try proveAt(
         \\fn f(i: usize, c: bool, buf: []const u8) u8 {

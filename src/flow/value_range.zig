@@ -272,9 +272,27 @@ fn analyzeNode(o: *Oracle, node: Ast.Node.Index, st: *State) error{OutOfMemory}!
         .simple_var_decl, .local_var_decl, .aligned_var_decl => return analyzeVarDecl(o, node, st),
         .assign => return analyzeAssign(o, node, st),
         .assign_add => return analyzeCompoundAdd(o, node, st),
+        // Short-circuit operators refine their RHS: in `A and B`, A is true while
+        // B evaluates; in `A or B`, A is false while B evaluates.  Covers the
+        // canonical guarded last-element idioms `c.len > 0 and c[c.len-1]` and
+        // `c.len == 0 or c[c.len-1]` (endsWith/startsWith), where the bounds
+        // proof lives in the same expression rather than an enclosing `if`.
+        .bool_and => return analyzeShortCircuit(o, node, st, true),
+        .bool_or => return analyzeShortCircuit(o, node, st, false),
         .@"return", .@"break", .@"continue", .unreachable_literal => {
             var flow: Flow = .{ .diverged = true };
-            if (o.tokenInNode(node)) flow.answer = o.answerAt(st);
+            if (o.tokenInNode(node)) {
+                // Descend into a `return <expr>;` operand so short-circuit
+                // refinement (bool_and/bool_or) applies before answering.
+                const operand: ?Ast.Node.Index = if (tree.nodeTag(node) == .@"return")
+                    tree.nodeData(node).opt_node.unwrap()
+                else
+                    null;
+                if (operand) |e| {
+                    const sub = try analyzeNode(o, e, st);
+                    flow.answer = sub.answer orelse o.answerAt(st);
+                } else flow.answer = o.answerAt(st);
+            }
             return flow;
         },
         else => {
@@ -447,6 +465,31 @@ fn analyzeIf(o: *Oracle, node: Ast.Node.Index, st: *State) error{OutOfMemory}!Fl
         then_st.intersectWith(&else_st);
         try st.replaceWith(o.gpa, &then_st);
     }
+    return .{};
+}
+
+/// `A and B` / `A or B` as a (sub)expression.  When the use token is inside the
+/// RHS, evaluate it under the short-circuit refinement of the LHS: for `and`,
+/// the LHS's THEN-facts hold (A is true); for `or`, the LHS's ELSE-facts hold
+/// (A is false).  Sound because Zig `and`/`or` only evaluate B when A is
+/// true/false respectively.
+fn analyzeShortCircuit(o: *Oracle, node: Ast.Node.Index, st: *State, is_and: bool) error{OutOfMemory}!Flow {
+    const tree = o.tree;
+    const d = tree.nodeData(node).node_and_node;
+    const lhs = d[0];
+    const rhs = d[1];
+    if (o.tokenInNode(rhs)) {
+        var refine: Refinement = .{};
+        collectRefinement(o, lhs, &refine);
+        var rhs_st = try st.clone(o.gpa);
+        defer rhs_st.deinit(o.gpa);
+        const scalar = if (is_and) refine.then_scalar else refine.else_scalar;
+        const container = if (is_and) refine.then_container else refine.else_container;
+        try applyRefine(o, &rhs_st, scalar, container);
+        return try analyzeNode(o, rhs, &rhs_st);
+    }
+    if (o.tokenInNode(lhs)) return try analyzeNode(o, lhs, st);
+    if (o.tokenInNode(node)) return .{ .answer = o.answerAt(st) };
     return .{};
 }
 
