@@ -368,23 +368,34 @@ pub const FileCache = struct {
             // segment chains like "inner.handle" resolve to the
             // deepest type before looking up the method.
             const deepest_path = walkFieldPath(model, param_ty, ff.field) orelse continue;
-            // Resolve the callee summary on the deepest field's TYPE.
-            // Cross-file types (deepest_path.ns != null) are dropped —
-            // we only have summaries for same-file methods.
-            const callee_summary: ?*const fn_summary.FnSummary = blk: {
-                if (deepest_path.ns != null) break :blk null;
-                if (!model.hasType(deepest_path.type_name)) break :blk null;
-                const ti = model.findType(deepest_path.type_name) orelse break :blk null;
-                if (!ti.hasMethod(ff.method)) break :blk null;
-                break :blk try self.summaryByMethod(deepest_path.type_name, ff.method);
+            // Resolve the cleanup method on the deepest field's TYPE and
+            // decide whether to keep this field-free.  Keep iff the
+            // callee takes ownership OR is cleanup-named (deinit/close/…),
+            // in which case we presume it consumes its receiver even
+            // without an explicit takes signal — recovers external-stdlib
+            // deinit cases (e.g. HashMap.deinit) pure inference can't see.
+            //
+            // The field's type may live in another file (the common
+            // composed-owner shape `self.inner.deinit()` where `inner`'s
+            // type is imported, deepest_path.ns != null).  Same-file types
+            // resolve via summaryByMethod; cross-file types via
+            // summaryByMethodCrossFile (@import graph / global type index),
+            // which confirms the method exists across imports before we
+            // apply the cleanup-name presumption.
+            const keep: bool = blk: {
+                if (deepest_path.ns == null) {
+                    if (!model.hasType(deepest_path.type_name)) break :blk false;
+                    const ti = model.findType(deepest_path.type_name) orelse break :blk false;
+                    if (!ti.hasMethod(ff.method)) break :blk false;
+                    const cs = (try self.summaryByMethod(deepest_path.type_name, ff.method)) orelse break :blk false;
+                    break :blk cs.takes_ownership_of != null or
+                        fn_summary.isReceiverCleanupMethodName(ff.method);
+                }
+                const xf = (try self.summaryByMethodCrossFile(deepest_path.type_name, ff.method)) orelse break :blk false;
+                break :blk xf.takes_ownership_of != null or
+                    fn_summary.isReceiverCleanupMethodName(ff.method);
             };
-            const cs = callee_summary orelse continue;
-            // When the inner method is cleanup-named (deinit/close/etc.)
-            // and we lack a contradicting signal, presume it consumes
-            // its receiver — recovers external-stdlib deinit cases
-            // (e.g. HashMap.deinit) that pure-inference can't see.
-            if (cs.takes_ownership_of == null and
-                !fn_summary.isReceiverCleanupMethodName(ff.method)) continue;
+            if (!keep) continue;
             try out.append(arena, ff);
         }
         return out.toOwnedSlice(arena);
@@ -415,7 +426,11 @@ pub const FileCache = struct {
     ///
     /// Idempotent.  Call once per file before any consumer reads
     /// summaries that depend on transitive ownership.
-    pub fn resolveTransitiveTakes(self: *FileCache) !void {
+    // Explicit `anyerror` error set (not inferred) breaks an
+    // inferred-error-set dependency loop: resolveTransitiveTakes ->
+    // propagateTransitiveTakesOne -> summaryByMethodCrossFile (which now
+    // re-enters resolveTransitiveTakes on a project-less foreign cache).
+    pub fn resolveTransitiveTakes(self: *FileCache) anyerror!void {
         const model = try self.fileModel();
         // Phase 1a: pre-warm summaries for every fn.
         for (model.fns) |fi| _ = try self.summaryOfFn(fi.fn_decl);
@@ -1030,6 +1045,24 @@ pub const FileCache = struct {
         const body = tokens.bodyOf(rm.tree, rm.method.fn_decl) orelse return null;
         var summary: fn_summary.FnSummary = .{};
         summary.takes_ownership_of = fn_summary.inferDirectTakes(rm.tree, proto, body);
+        // Transitive takes WITHIN the foreign file: if direct inference
+        // found nothing, the method may DELEGATE ownership to a same-file
+        // callee (`pub fn kill(self, g) { self.reallyFree(g); }`).  Run the
+        // foreign file's own same-file fixed-point propagation over a
+        // throwaway, PROJECT-LESS FileCache and read the method's resolved
+        // takes.  Project-less is the termination guarantee: with no
+        // project the foreign cache's own cross-file fallback is a no-op,
+        // so there is no mutual recursion.  Bounded to one foreign file —
+        // a foreign method that delegates across yet ANOTHER file is not
+        // followed (a deeper, cycle-guarded version is future work).
+        if (summary.takes_ownership_of == null) {
+            var fc = FileCache.init(self.gpa, rm.tree);
+            defer fc.deinit();
+            fc.resolveTransitiveTakes() catch {};
+            if (fc.summaryByMethod(type_name, method_name) catch null) |ts| {
+                summary.takes_ownership_of = ts.takes_ownership_of;
+            }
+        }
         if (self.project) |pc| pc.putMethodSummaryCache(
             type_name,
             method_name,
@@ -1719,4 +1752,199 @@ test "FileCache: resolveTransitiveTakes propagates through cross-file callee" {
             try std.testing.expectEqual(@as(u32, 0), idx);
         }
     }
+}
+
+test "FileCache: may_free_fields keeps same-file field deinit (refactor regression)" {
+    const gpa = std.testing.allocator;
+    const src: [:0]const u8 =
+        \\const Inner = struct {
+        \\    pub fn deinit(self: *Inner) void { _ = self; }
+        \\};
+        \\const Outer = struct {
+        \\    inner: Inner,
+        \\    pub fn deinitOuter(self: *Outer) void { self.inner.deinit(); }
+        \\};
+    ;
+    var tree = try Ast.parse(gpa, src, .zig);
+    defer tree.deinit(gpa);
+    var cache = FileCache.init(gpa, &tree);
+    defer cache.deinit();
+    try cache.resolveTransitiveTakes();
+
+    // `self.inner.deinit()` — Inner.deinit is cleanup-named → field kept.
+    const s = (try cache.summaryByMethod("Outer", "deinitOuter")).?;
+    try std.testing.expect(s.may_free_fields.len >= 1);
+    try std.testing.expectEqualStrings("inner", s.may_free_fields[0].field);
+}
+
+test "FileCache: may_free_fields drops field whose type lacks the method" {
+    const gpa = std.testing.allocator;
+    const src: [:0]const u8 =
+        \\const Inner = struct { x: u32 };
+        \\const Outer = struct {
+        \\    inner: Inner,
+        \\    pub fn deinitOuter(self: *Outer) void { self.inner.deinit(); }
+        \\};
+    ;
+    var tree = try Ast.parse(gpa, src, .zig);
+    defer tree.deinit(gpa);
+    var cache = FileCache.init(gpa, &tree);
+    defer cache.deinit();
+    try cache.resolveTransitiveTakes();
+
+    // Inner has no `deinit` → the raw field-free entry is filtered out.
+    const s = (try cache.summaryByMethod("Outer", "deinitOuter")).?;
+    try std.testing.expectEqual(@as(usize, 0), s.may_free_fields.len);
+}
+
+test "FileCache: may_free_fields resolves CROSS-FILE field deinit (#20)" {
+    // The composed-owner shape `self.inner.deinit()` where `inner`'s type
+    // lives in an @import'd file.  Before #20 the field was unconditionally
+    // dropped at the file boundary; now filterMayFreeFields resolves the
+    // cleanup method cross-file via summaryByMethodCrossFile.
+    const gpa = std.testing.allocator;
+    const tio = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(tio, .{
+        .sub_path = "inner.zig",
+        .data =
+        \\pub const Inner = struct {
+        \\    pub fn deinit(self: *Inner) void { _ = self; }
+        \\};
+        ,
+    });
+    try tmp.dir.writeFile(tio, .{
+        .sub_path = "outer.zig",
+        .data =
+        \\const innermod = @import("./inner.zig");
+        \\pub const Outer = struct {
+        \\    inner: innermod.Inner,
+        \\    pub fn deinitOuter(self: *Outer) void { self.inner.deinit(); }
+        \\};
+        ,
+    });
+
+    // Use the REAL tmp sub-path so @import resolution actually finds
+    // inner.zig (the random subdir under .zig-cache/tmp/).
+    const from_path = try std.fs.path.join(gpa, &.{
+        ".zig-cache", "tmp", &tmp.sub_path, "outer.zig",
+    });
+    defer gpa.free(from_path);
+
+    const outer_src: [:0]const u8 =
+        \\const innermod = @import("./inner.zig");
+        \\pub const Outer = struct {
+        \\    inner: innermod.Inner,
+        \\    pub fn deinitOuter(self: *Outer) void { self.inner.deinit(); }
+        \\};
+    ;
+    var tree = try Ast.parse(gpa, outer_src, .zig);
+    defer tree.deinit(gpa);
+
+    var pc = project_cache_mod.ProjectCache.init(gpa, tio);
+    defer pc.deinit();
+    var cache = FileCache.init(gpa, &tree);
+    defer cache.deinit();
+    cache.setProject(&pc, from_path);
+
+    try cache.resolveTransitiveTakes();
+
+    // Best-effort like the other cross-file tests: only assert when the
+    // cross-file lookup resolved (tmp paths may be undiscoverable on some
+    // CI).  When it does, the cross-file field-free must be KEPT.
+    if (try cache.summaryByMethodCrossFile("Inner", "deinit")) |_| {
+        const s = (try cache.summaryByMethod("Outer", "deinitOuter")).?;
+        try std.testing.expect(s.may_free_fields.len >= 1);
+        try std.testing.expectEqualStrings("inner", s.may_free_fields[0].field);
+    }
+}
+
+test "FileCache: summaryByMethodCrossFile resolves TRANSITIVE takes in foreign file (#20)" {
+    // `kill` doesn't free directly — it DELEGATES to a same-file
+    // `reallyFree` that does.  Direct inference yields null; cross-file
+    // resolution must follow the foreign file's own transitive
+    // propagation to see that `kill` takes ownership of self.
+    const gpa = std.testing.allocator;
+    const tio = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(tio, .{
+        .sub_path = "destroyer.zig",
+        .data =
+        \\pub const Xf20Node = struct {
+        \\    pub fn kill(self: *Xf20Node, gpa: std.mem.Allocator) void {
+        \\        self.reallyFree(gpa);
+        \\    }
+        \\    pub fn reallyFree(self: *Xf20Node, gpa: std.mem.Allocator) void {
+        \\        gpa.destroy(self);
+        \\    }
+        \\};
+        ,
+    });
+    try tmp.dir.writeFile(tio, .{
+        .sub_path = "consumer.zig",
+        .data =
+        \\const destroyer = @import("./destroyer.zig");
+        \\pub fn useNode(n: *destroyer.Xf20Node) void { _ = n; }
+        ,
+    });
+
+    const from_path = try std.fs.path.join(gpa, &.{
+        ".zig-cache", "tmp", &tmp.sub_path, "consumer.zig",
+    });
+    defer gpa.free(from_path);
+
+    const consumer_src: [:0]const u8 =
+        \\const destroyer = @import("./destroyer.zig");
+        \\pub fn useNode(n: *destroyer.Xf20Node) void { _ = n; }
+    ;
+    var tree = try Ast.parse(gpa, consumer_src, .zig);
+    defer tree.deinit(gpa);
+
+    var pc = project_cache_mod.ProjectCache.init(gpa, tio);
+    defer pc.deinit();
+    var cache = FileCache.init(gpa, &tree);
+    defer cache.deinit();
+    cache.setProject(&pc, from_path);
+
+    // Best-effort, like the other cross-file tests in this file: tmp-path
+    // resolution is environment-dependent (findMethodCrossFile only falls
+    // back to the @import traversal when the global index ERRORS), so we
+    // only assert when the lookup actually resolved.  When it does, `kill`'s
+    // takes_ownership_of must be 0 — inherited transitively from
+    // `reallyFree` inside the foreign file (the #20 behavior).  The
+    // deterministic guard for the underlying mechanism is the next test.
+    if (try cache.summaryByMethodCrossFile("Xf20Node", "kill")) |s| {
+        try std.testing.expectEqual(@as(?u32, 0), s.takes_ownership_of);
+    }
+}
+
+test "FileCache: project-less FileCache computes transitive takes (#20 mechanism)" {
+    // Deterministic guard for the mechanism summaryByMethodCrossFile relies
+    // on for cross-file TRANSITIVE takes: a throwaway project-less FileCache
+    // built over a foreign file's tree resolves a delegating method's takes
+    // via the same-file fixed point.  `kill` delegates to `reallyFree` which
+    // destroys self — so kill transitively takes ownership of self (param 0).
+    const gpa = std.testing.allocator;
+    const src: [:0]const u8 =
+        \\pub const Xf20Node = struct {
+        \\    pub fn kill(self: *Xf20Node, g: std.mem.Allocator) void { self.reallyFree(g); }
+        \\    pub fn reallyFree(self: *Xf20Node, g: std.mem.Allocator) void { g.destroy(self); }
+        \\};
+    ;
+    var tree = try Ast.parse(gpa, src, .zig);
+    defer tree.deinit(gpa);
+    // No setProject — exactly the project-less foreign cache that
+    // summaryByMethodCrossFile constructs over rm.tree.
+    var fc = FileCache.init(gpa, &tree);
+    defer fc.deinit();
+    try fc.resolveTransitiveTakes();
+
+    const reallyFree = (try fc.summaryByMethod("Xf20Node", "reallyFree")).?;
+    try std.testing.expectEqual(@as(?u32, 0), reallyFree.takes_ownership_of);
+    const kill = (try fc.summaryByMethod("Xf20Node", "kill")).?;
+    try std.testing.expectEqual(@as(?u32, 0), kill.takes_ownership_of);
 }
