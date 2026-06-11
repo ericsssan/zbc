@@ -24,6 +24,7 @@ pub const Problem = problem_mod.Problem;
 pub const Note = problem_mod.Note;
 pub const Pos = problem_mod.Pos;
 pub const Severity = problem_mod.Severity;
+pub const Verdict = problem_mod.Verdict;
 pub const Rule = rule_catalog_mod.Rule;
 pub const rule_catalog = rule_catalog_mod.all;
 pub const lookupRule = rule_catalog_mod.lookup;

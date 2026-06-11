@@ -130,8 +130,10 @@ pub fn main(init: std.process.Init) !void {
                 format = .compact;
             } else if (std.mem.eql(u8, v, "json")) {
                 format = .json;
+            } else if (std.mem.eql(u8, v, "sarif")) {
+                format = .sarif;
             } else {
-                std.debug.print("zbc: unknown format `{s}` (expected rich, compact, or json)\n", .{v});
+                std.debug.print("zbc: unknown format `{s}` (expected rich, compact, json, or sarif)\n", .{v});
                 std.process.exit(2);
             }
             continue;
@@ -259,6 +261,7 @@ pub fn main(init: std.process.Init) !void {
             }
             std.debug.print("{s}]\n", .{if (first) "" else "\n"});
         },
+        .sarif => try printSarif(gpa, all_problems.items),
         .compact => {
             for (all_problems.items) |ip| {
                 printOneProblemCompact(ip.path, ip.problem);
@@ -313,7 +316,7 @@ fn expandPath(
     }
 }
 
-const Format = enum { rich, compact, json };
+const Format = enum { rich, compact, json, sarif };
 const Op = enum { add, remove };
 
 fn parseInvariantList(
@@ -375,12 +378,14 @@ fn printUsage() void {
         \\                        (default: ArenaAllocator.init).
         \\  --arena-kill=A,B      Patterns that kill the receiver arena
         \\                        (default: .deinit().
-        \\  --format=rich|compact|json
+        \\  --format=rich|compact|json|sarif
         \\                        Output format.  Default `rich` shows
         \\                        gcc/clang-style header (path:line:col:
         \\                        error(rule-id): message) plus a
         \\                        Rust-style source-context block.
         \\                        `compact` is single-line grep-friendly.
+        \\                        `json` is a flat array; `sarif` is
+        \\                        SARIF 2.1.0 (GitHub code scanning etc.).
         \\  --no-color            Disable ANSI color in `rich` output.
         \\  --list-invariants     Print known invariant names and exit.
         \\  --list-rules          Print every rule id and one-line title
@@ -718,7 +723,133 @@ fn printOneProblemJson(path: []const u8, p: lib.Problem, first: *bool) void {
         writeJsonEscaped(n.label);
         std.debug.print("\"}}", .{});
     }
-    std.debug.print("]}}", .{});
+    std.debug.print("],\"verdict\":\"{s}\",\"witness\":", .{verdictName(p.verdict)});
+    if (p.witness) |w| {
+        std.debug.print("\"", .{});
+        writeJsonEscaped(w);
+        std.debug.print("\"", .{});
+    } else {
+        std.debug.print("null", .{});
+    }
+    std.debug.print("}}", .{});
+}
+
+fn verdictName(v: lib.Verdict) []const u8 {
+    return switch (v) {
+        .unknown => "unknown",
+        .confirmed => "confirmed",
+        .refuted => "refuted",
+    };
+}
+
+/// SARIF 2.1.0 severity level for a zbc severity.  SARIF levels are
+/// none|note|warning|error.
+fn sarifLevel(s: lib.Severity) []const u8 {
+    return switch (s) {
+        .@"error" => "error",
+        .warning => "warning",
+        .off => "none",
+    };
+}
+
+/// Emit `{startLine,startColumn,endLine,endColumn,byteOffset,byteLength}`.
+/// zbc positions are 1-indexed line/column, matching SARIF.
+fn printSarifRegion(start: lib.Pos, end: lib.Pos) void {
+    const byte_len: u32 = if (end.byte >= start.byte) end.byte - start.byte else 0;
+    std.debug.print(
+        "{{\"startLine\":{},\"startColumn\":{},\"endLine\":{},\"endColumn\":{}," ++
+            "\"byteOffset\":{},\"byteLength\":{}}}",
+        .{ start.line, start.column, end.line, end.column, start.byte, byte_len },
+    );
+}
+
+/// Emit all findings as a single SARIF 2.1.0 document.
+///
+/// Verdict mapping (issue #18/#19): every fired rule is `kind:"fail"`;
+/// the three-valued verdict rides in `properties.verdict`, with the
+/// `confirmed` reproducing input in `properties.witness`.  A `refuted`
+/// finding additionally carries a SARIF `suppressions[]` entry
+/// (`state:"accepted"`) so consumers treat it as a tool-dismissed
+/// false positive.
+fn printSarif(gpa: std.mem.Allocator, items: []const IndexedProblem) !void {
+    std.debug.print(
+        "{{\"$schema\":\"https://json.schemastore.org/sarif-2.1.0.json\"," ++
+            "\"version\":\"2.1.0\",\"runs\":[{{\"tool\":{{\"driver\":{{" ++
+            "\"name\":\"zbc\",\"informationUri\":\"https://github.com/ericsssan/zbc\"," ++
+            "\"rules\":[",
+        .{},
+    );
+
+    // rules[]: one entry per unique rule id that appears in results.
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    defer seen.deinit(gpa);
+    var first_rule = true;
+    for (items) |ip| {
+        const id = ip.problem.rule_id;
+        if (seen.contains(id)) continue;
+        try seen.put(gpa, id, {});
+        if (!first_rule) std.debug.print(",", .{});
+        first_rule = false;
+        std.debug.print("{{\"id\":\"", .{});
+        writeJsonEscaped(id);
+        std.debug.print("\",\"name\":\"", .{});
+        writeJsonEscaped(id);
+        std.debug.print("\",\"shortDescription\":{{\"text\":\"", .{});
+        if (lib.lookupRule(id)) |r| writeJsonEscaped(r.title) else writeJsonEscaped(id);
+        std.debug.print("\"}}}}", .{});
+    }
+
+    std.debug.print("]}}}},\"results\":[", .{});
+
+    var first_res = true;
+    for (items) |ip| {
+        const p = ip.problem;
+        if (!first_res) std.debug.print(",", .{});
+        first_res = false;
+
+        std.debug.print("{{\"ruleId\":\"", .{});
+        writeJsonEscaped(p.rule_id);
+        std.debug.print("\",\"level\":\"{s}\",\"kind\":\"fail\",\"message\":{{\"text\":\"", .{sarifLevel(p.severity)});
+        writeJsonEscaped(p.message);
+        std.debug.print("\"}},\"locations\":[{{\"physicalLocation\":{{\"artifactLocation\":{{\"uri\":\"", .{});
+        writeJsonEscaped(ip.path);
+        std.debug.print("\"}},\"region\":", .{});
+        printSarifRegion(p.start, p.end);
+        std.debug.print("}}}}]", .{});
+
+        if (p.notes.len > 0) {
+            std.debug.print(",\"relatedLocations\":[", .{});
+            for (p.notes, 0..) |n, i| {
+                if (i > 0) std.debug.print(",", .{});
+                std.debug.print("{{\"physicalLocation\":{{\"artifactLocation\":{{\"uri\":\"", .{});
+                writeJsonEscaped(ip.path);
+                std.debug.print("\"}},\"region\":", .{});
+                printSarifRegion(n.start, n.end);
+                std.debug.print("}},\"message\":{{\"text\":\"", .{});
+                writeJsonEscaped(n.label);
+                std.debug.print("\"}}}}", .{});
+            }
+            std.debug.print("]", .{});
+        }
+
+        if (p.verdict == .refuted) {
+            std.debug.print(
+                ",\"suppressions\":[{{\"kind\":\"external\",\"state\":\"accepted\"," ++
+                    "\"justification\":\"refuted by sound static analysis\"}}]",
+                .{},
+            );
+        }
+
+        std.debug.print(",\"properties\":{{\"verdict\":\"{s}\"", .{verdictName(p.verdict)});
+        if (p.witness) |w| {
+            std.debug.print(",\"witness\":\"", .{});
+            writeJsonEscaped(w);
+            std.debug.print("\"", .{});
+        }
+        std.debug.print("}}}}", .{});
+    }
+
+    std.debug.print("]}}]}}\n", .{});
 }
 
 fn severityName(s: lib.Severity) []const u8 {
