@@ -59,7 +59,7 @@ test "findIdentUseInEnclosingScope stops at enclosing }" {
         \\    for (0..1) |entry| { _ = entry; }
         \\}
     ;
-    var tree = try Ast.parse(std.testing.allocator, src, .zig);
+    var tree = try Ast.parse(std.testing.allocator, src, .{});
     defer tree.deinit(std.testing.allocator);
     const tags = tree.tokens.items(.tag);
     const last: TokenIndex = @intCast(tree.tokens.len - 1);

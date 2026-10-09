@@ -547,7 +547,7 @@ pub fn anyMatchAnywhere(
 const testing = std.testing;
 
 fn parseTokens(src: [:0]const u8) !Ast {
-    return try Ast.parse(testing.allocator, src, .zig);
+    return try Ast.parse(testing.allocator, src, .{});
 }
 
 fn findIdent(tree: *const Ast, name: []const u8) TokenIndex {

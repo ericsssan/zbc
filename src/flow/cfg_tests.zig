@@ -40,7 +40,7 @@ const TestBundle = struct {
 fn parseAndLower(gpa: std.mem.Allocator, src: []const u8) !TestBundle {
     const src_z = try gpa.dupeSentinel(u8, src, 0);
     errdefer gpa.free(src_z);
-    var tree = try Ast.parse(gpa, src_z, .zig);
+    var tree = try Ast.parse(gpa, src_z, .{});
     errdefer tree.deinit(gpa);
 
     var node_idx: u32 = 1;

@@ -458,7 +458,7 @@ pub fn isTrivialBody(tree: *const Ast, body_first: TokenIndex, body_last: TokenI
 
 test "matchBrace pairs simple braces" {
     const src: [:0]const u8 = "fn f() void { { } }";
-    var tree = try Ast.parse(std.testing.allocator, src, .zig);
+    var tree = try Ast.parse(std.testing.allocator, src, .{});
     defer tree.deinit(std.testing.allocator);
     const tags = tree.tokens.items(.tag);
     // Find first `{` (after `void`).
@@ -470,7 +470,7 @@ test "matchBrace pairs simple braces" {
 
 test "findStmtSemicolon skips inner parens" {
     const src: [:0]const u8 = "fn f() void { x(a; b); }";
-    var tree = try Ast.parse(std.testing.allocator, src, .zig);
+    var tree = try Ast.parse(std.testing.allocator, src, .{});
     defer tree.deinit(std.testing.allocator);
     const tags = tree.tokens.items(.tag);
     // Start scanning from the `x` token.
@@ -493,7 +493,7 @@ test "findStmtSemicolon skips inner parens" {
 
 test "hasTokenInRange finds keyword_try" {
     const src: [:0]const u8 = "fn f() !void { _ = try g(); }";
-    var tree = try Ast.parse(std.testing.allocator, src, .zig);
+    var tree = try Ast.parse(std.testing.allocator, src, .{});
     defer tree.deinit(std.testing.allocator);
     const tags = tree.tokens.items(.tag);
     const last: TokenIndex = @intCast(tree.tokens.len - 1);
@@ -506,7 +506,7 @@ test "returnsType detects fn Wrap(T) type" {
         \\    return struct { x: u32 };
         \\}
     ;
-    var tree = try Ast.parse(std.testing.allocator, src, .zig);
+    var tree = try Ast.parse(std.testing.allocator, src, .{});
     defer tree.deinit(std.testing.allocator);
     var idx: u32 = 1;
     while (idx < tree.nodes.len) : (idx += 1) {
@@ -528,7 +528,7 @@ test "isTrivialBody: empty and discard-only bodies are trivial" {
         .{ .src = "fn f() void { foo(); }", .want = false },
     };
     for (cases) |c| {
-        var tree = try Ast.parse(gpa, c.src, .zig);
+        var tree = try Ast.parse(gpa, c.src, .{});
         defer tree.deinit(gpa);
         var idx: u32 = 1;
         while (idx < tree.nodes.len) : (idx += 1) {
@@ -547,7 +547,7 @@ test "skipFnDecl: skips proto+body and handles extern protos" {
     const gpa = std.testing.allocator;
     {
         const src: [:0]const u8 = "const S = struct { fn f(x: u32) void { _ = x; } };";
-        var tree = try Ast.parse(gpa, src, .zig);
+        var tree = try Ast.parse(gpa, src, .{});
         defer tree.deinit(gpa);
         const tags = tree.tokens.items(.tag);
         const last: TokenIndex = @intCast(tree.tokens.len - 1);
@@ -559,7 +559,7 @@ test "skipFnDecl: skips proto+body and handles extern protos" {
     {
         // extern fn: no body — should stop at `;`
         const src: [:0]const u8 = "extern fn malloc(n: usize) ?*anyopaque;";
-        var tree = try Ast.parse(gpa, src, .zig);
+        var tree = try Ast.parse(gpa, src, .{});
         defer tree.deinit(gpa);
         const tags = tree.tokens.items(.tag);
         const last: TokenIndex = @intCast(tree.tokens.len - 1);

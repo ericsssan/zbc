@@ -497,7 +497,7 @@ const testing = std.testing;
 /// build a LocalBindings for `f`'s body.  Returns the bindings plus
 /// the owned tree — caller deinits both (bindings first).
 fn parseFn(src: [:0]const u8) !struct { tree: Ast, bindings: LocalBindings } {
-    var tree = try Ast.parse(testing.allocator, src, .zig);
+    var tree = try Ast.parse(testing.allocator, src, .{});
     errdefer tree.deinit(testing.allocator);
     var idx: u32 = 1;
     while (idx < tree.nodes.len) : (idx += 1) {

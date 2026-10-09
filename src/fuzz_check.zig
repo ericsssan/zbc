@@ -78,7 +78,7 @@ pub fn analyzeBytes(gpa: std.mem.Allocator, raw: []const u8) !void {
     defer gpa.free(src);
     @memcpy(src[0..raw.len], raw);
 
-    var tree = try Ast.parse(gpa, src, .zig);
+    var tree = try Ast.parse(gpa, src, .{});
     defer tree.deinit(gpa);
 
     const config = &config_mod.Default;

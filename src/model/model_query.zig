@@ -279,7 +279,7 @@ test "findTypes: kind + name filter" {
         \\const B = union { x: u32 };
         \\const C = enum { a, b };
     ;
-    var tree = try Ast.parse(testing.allocator, src, .zig);
+    var tree = try Ast.parse(testing.allocator, src, .{});
     defer tree.deinit(testing.allocator);
     var model = try file_model.build(testing.allocator, &tree);
     defer model.deinit();
@@ -304,7 +304,7 @@ test "findTypes: has_method + no_method" {
         \\    x: u32 = 0,
         \\};
     ;
-    var tree = try Ast.parse(testing.allocator, src, .zig);
+    var tree = try Ast.parse(testing.allocator, src, .{});
     defer tree.deinit(testing.allocator);
     var model = try file_model.build(testing.allocator, &tree);
     defer model.deinit();
@@ -335,7 +335,7 @@ test "findFields: value_typed includes ?T, excludes *T / []T" {
         \\};
         \\const Inner = struct {};
     ;
-    var tree = try Ast.parse(testing.allocator, src, .zig);
+    var tree = try Ast.parse(testing.allocator, src, .{});
     defer tree.deinit(testing.allocator);
     var model = try file_model.build(testing.allocator, &tree);
     defer model.deinit();
@@ -360,7 +360,7 @@ test "findFields: type_matches chains to TypePred" {
         \\    c: Inner,
         \\};
     ;
-    var tree = try Ast.parse(testing.allocator, src, .zig);
+    var tree = try Ast.parse(testing.allocator, src, .{});
     defer tree.deinit(testing.allocator);
     var model = try file_model.build(testing.allocator, &tree);
     defer model.deinit();
@@ -384,7 +384,7 @@ test "findMethods: is_cleanup classifier" {
         \\    pub fn ordinary(self: *T) void { _ = self; }
         \\};
     ;
-    var tree = try Ast.parse(testing.allocator, src, .zig);
+    var tree = try Ast.parse(testing.allocator, src, .{});
     defer tree.deinit(testing.allocator);
     var model = try file_model.build(testing.allocator, &tree);
     defer model.deinit();
@@ -407,7 +407,7 @@ test "methodBodyContains: integrates with query.zig" {
         \\    pub fn deinit(self: *Inner) void { _ = self; }
         \\};
     ;
-    var tree = try Ast.parse(testing.allocator, src, .zig);
+    var tree = try Ast.parse(testing.allocator, src, .{});
     defer tree.deinit(testing.allocator);
     var model = try file_model.build(testing.allocator, &tree);
     defer model.deinit();

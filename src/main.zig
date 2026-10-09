@@ -77,8 +77,8 @@ pub fn main(init: std.process.Init) !void {
             std.process.exit(0);
         }
         if (std.mem.eql(u8, a, "--list-invariants")) {
-            inline for (@typeInfo(lib.Invariant).@"enum".fields) |f| {
-                std.debug.print("{s}\n", .{f.name});
+            inline for (@typeInfo(lib.Invariant).@"enum".field_names) |fname| {
+                std.debug.print("{s}\n", .{fname});
             }
             std.process.exit(0);
         }

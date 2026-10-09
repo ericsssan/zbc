@@ -22,6 +22,7 @@ fn fullPtrTypeComponents(tree: *const Ast, info: full.PtrType.Components) full.P
         .allowzero_token = null,
         .const_token = null,
         .volatile_token = null,
+        .duplicate_token = null,
         .ast = info,
     };
     // We need to be careful that we don't iterate over any sub-expressions
@@ -35,9 +36,18 @@ fn fullPtrTypeComponents(tree: *const Ast, info: full.PtrType.Components) full.P
     const end = tree.firstToken(info.child_type);
     while (i < end) : (i += 1) {
         switch (tree.tokenTag(i)) {
-            .keyword_allowzero => result.allowzero_token = i,
-            .keyword_const => result.const_token = i,
-            .keyword_volatile => result.volatile_token = i,
+            .keyword_allowzero => {
+                if (result.allowzero_token != null) result.duplicate_token = i;
+                result.allowzero_token = i;
+            },
+            .keyword_const => {
+                if (result.const_token != null) result.duplicate_token = i;
+                result.const_token = i;
+            },
+            .keyword_volatile => {
+                if (result.volatile_token != null) result.duplicate_token = i;
+                result.volatile_token = i;
+            },
             .keyword_align => {
                 const align_node = info.align_node.unwrap().?;
                 if (info.bit_range_end.unwrap()) |bit_range_end| {

@@ -42,7 +42,7 @@ pub fn runRule(
 ) !std.ArrayListUnmanaged(Problem) {
     const src_z = try gpa.dupeSentinel(u8, src, 0);
     defer gpa.free(src_z);
-    var tree = try Ast.parse(gpa, src_z, .zig);
+    var tree = try Ast.parse(gpa, src_z, .{});
     defer tree.deinit(gpa);
     var cache = FileCache.init(gpa, &tree);
     defer cache.deinit();
@@ -61,7 +61,7 @@ pub fn runRuleWithConfig(
 ) !std.ArrayListUnmanaged(Problem) {
     const src_z = try gpa.dupeSentinel(u8, src, 0);
     defer gpa.free(src_z);
-    var tree = try Ast.parse(gpa, src_z, .zig);
+    var tree = try Ast.parse(gpa, src_z, .{});
     defer tree.deinit(gpa);
     var cache = FileCache.init(gpa, &tree);
     defer cache.deinit();

@@ -1565,7 +1565,7 @@ test "build: single struct with deinit + field" {
         \\    }
         \\};
     ;
-    var tree = try Ast.parse(testing.allocator, src, .zig);
+    var tree = try Ast.parse(testing.allocator, src, .{});
     defer tree.deinit(testing.allocator);
     var model = try build(testing.allocator, &tree);
     defer model.deinit();
@@ -1595,7 +1595,7 @@ test "build: two structs in one file, type lookup" {
         \\    pub fn deinit(self: *Outer) void { _ = self; }
         \\};
     ;
-    var tree = try Ast.parse(testing.allocator, src, .zig);
+    var tree = try Ast.parse(testing.allocator, src, .{});
     defer tree.deinit(testing.allocator);
     var model = try build(testing.allocator, &tree);
     defer model.deinit();
@@ -1619,7 +1619,7 @@ test "build: receiver detection" {
         \\    pub fn noRecv() void {}
         \\};
     ;
-    var tree = try Ast.parse(testing.allocator, src, .zig);
+    var tree = try Ast.parse(testing.allocator, src, .{});
     defer tree.deinit(testing.allocator);
     var model = try build(testing.allocator, &tree);
     defer model.deinit();
@@ -1660,7 +1660,7 @@ test "build: top-level fn (not a method)" {
         \\    _ = x;
         \\}
     ;
-    var tree = try Ast.parse(testing.allocator, src, .zig);
+    var tree = try Ast.parse(testing.allocator, src, .{});
     defer tree.deinit(testing.allocator);
     var model = try build(testing.allocator, &tree);
     defer model.deinit();
@@ -1686,7 +1686,7 @@ test "build: union and enum" {
         \\    pub fn kill(self: *U) void { _ = self; }
         \\};
     ;
-    var tree = try Ast.parse(testing.allocator, src, .zig);
+    var tree = try Ast.parse(testing.allocator, src, .{});
     defer tree.deinit(testing.allocator);
     var model = try build(testing.allocator, &tree);
     defer model.deinit();
@@ -1701,7 +1701,7 @@ test "build: union and enum" {
 }
 
 test "build: empty source" {
-    var tree = try Ast.parse(testing.allocator, "", .zig);
+    var tree = try Ast.parse(testing.allocator, "", .{});
     defer tree.deinit(testing.allocator);
     var model = try build(testing.allocator, &tree);
     defer model.deinit();
@@ -1720,7 +1720,7 @@ test "build: nested type decls collected with parent link" {
         \\    };
         \\};
     ;
-    var tree = try Ast.parse(testing.allocator, src, .zig);
+    var tree = try Ast.parse(testing.allocator, src, .{});
     defer tree.deinit(testing.allocator);
     var model = try build(testing.allocator, &tree);
     defer model.deinit();
@@ -1750,7 +1750,7 @@ test "fieldIsPointer: detects *T / ?*T / *const T" {
         \\};
         \\const Inner = struct {};
     ;
-    var tree = try Ast.parse(testing.allocator, src, .zig);
+    var tree = try Ast.parse(testing.allocator, src, .{});
     defer tree.deinit(testing.allocator);
     var model = try build(testing.allocator, &tree);
     defer model.deinit();
@@ -1771,7 +1771,7 @@ test "containingTypeOf: method's fn_decl resolves to its struct" {
         \\};
         \\pub fn top_level() void {}
     ;
-    var tree = try Ast.parse(testing.allocator, src, .zig);
+    var tree = try Ast.parse(testing.allocator, src, .{});
     defer tree.deinit(testing.allocator);
     var model = try build(testing.allocator, &tree);
     defer model.deinit();
@@ -1806,7 +1806,7 @@ test "fieldType: strips pointer/optional/const/slice wrappers" {
         \\};
         \\const Inner = struct {};
     ;
-    var tree = try Ast.parse(testing.allocator, src, .zig);
+    var tree = try Ast.parse(testing.allocator, src, .{});
     defer tree.deinit(testing.allocator);
     var model = try build(testing.allocator, &tree);
     defer model.deinit();
@@ -1826,7 +1826,7 @@ test "isFlagOwnedField: detects X + X_allocated pair" {
         \\    other: u32,
         \\};
     ;
-    var tree = try Ast.parse(testing.allocator, src, .zig);
+    var tree = try Ast.parse(testing.allocator, src, .{});
     defer tree.deinit(testing.allocator);
     var model = try build(testing.allocator, &tree);
     defer model.deinit();
@@ -1847,7 +1847,7 @@ test "flagOwnedFields: returns the field-name set" {
         \\    three: u32,
         \\};
     ;
-    var tree = try Ast.parse(testing.allocator, src, .zig);
+    var tree = try Ast.parse(testing.allocator, src, .{});
     defer tree.deinit(testing.allocator);
     var model = try build(testing.allocator, &tree);
     defer model.deinit();
@@ -1867,7 +1867,7 @@ test "build: doubly-nested type chains parent links" {
         \\    };
         \\};
     ;
-    var tree = try Ast.parse(testing.allocator, src, .zig);
+    var tree = try Ast.parse(testing.allocator, src, .{});
     defer tree.deinit(testing.allocator);
     var model = try build(testing.allocator, &tree);
     defer model.deinit();

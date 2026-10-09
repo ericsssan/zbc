@@ -881,7 +881,7 @@ fn rhsTextLooksAlloc(text: []const u8) bool {
 const testing = std.testing;
 
 fn parse(src: [:0]const u8) !Ast {
-    return try Ast.parse(testing.allocator, src, .zig);
+    return try Ast.parse(testing.allocator, src, .{});
 }
 
 /// Find the first fn_decl in `tree` and infer its summary.  The

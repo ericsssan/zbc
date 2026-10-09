@@ -9,7 +9,7 @@ const value_range = @import("value_range.zig");
 /// there.  Returns the oracle's answer.
 fn proveAt(src: [:0]const u8, target: []const u8, arr: []const u8) !bool {
     const gpa = std.testing.allocator;
-    var tree = try Ast.parse(gpa, src, .zig);
+    var tree = try Ast.parse(gpa, src, .{});
     defer tree.deinit(gpa);
 
     const body = firstFnBody(&tree) orelse return error.NoFnBody;
@@ -359,7 +359,7 @@ test "nonzero: reassignment after guard clears fact" {
 /// Query `provesNonempty(container)` at the `[` token after identifier `arr`.
 fn proveNonemptyAt(src: [:0]const u8, container: []const u8, arr: []const u8) !bool {
     const gpa = std.testing.allocator;
-    var tree = try Ast.parse(gpa, src, .zig);
+    var tree = try Ast.parse(gpa, src, .{});
     defer tree.deinit(gpa);
     const body = firstFnBody(&tree) orelse return error.NoFnBody;
     const lbracket = subscriptLBracket(&tree, arr) orelse return error.NoSubscript;
@@ -369,7 +369,7 @@ fn proveNonemptyAt(src: [:0]const u8, container: []const u8, arr: []const u8) !b
 /// Query `provesMinLen(container, n)` at the `[` token after identifier `arr`.
 fn proveMinLenAt(src: [:0]const u8, container: []const u8, n: u64, arr: []const u8) !bool {
     const gpa = std.testing.allocator;
-    var tree = try Ast.parse(gpa, src, .zig);
+    var tree = try Ast.parse(gpa, src, .{});
     defer tree.deinit(gpa);
     const body = firstFnBody(&tree) orelse return error.NoFnBody;
     const lbracket = subscriptLBracket(&tree, arr) orelse return error.NoSubscript;

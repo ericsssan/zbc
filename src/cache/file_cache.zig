@@ -1454,7 +1454,7 @@ test "FileCache: fileModel builds once" {
         \\    pub fn deinit(self: *Foo) void { _ = self; }
         \\};
     ;
-    var tree = try Ast.parse(gpa, src, .zig);
+    var tree = try Ast.parse(gpa, src, .{});
     defer tree.deinit(gpa);
     var cache = FileCache.init(gpa, &tree);
     defer cache.deinit();
@@ -1470,7 +1470,7 @@ test "FileCache: localBindings caches per body" {
         \\fn foo(x: u32) void { _ = x; }
         \\fn bar(y: u32) void { _ = y; }
     ;
-    var tree = try Ast.parse(gpa, src, .zig);
+    var tree = try Ast.parse(gpa, src, .{});
     defer tree.deinit(gpa);
     var cache = FileCache.init(gpa, &tree);
     defer cache.deinit();
@@ -1505,7 +1505,7 @@ test "FileCache: resolveTransitiveTakes chains via .destroy(self) seed" {
         \\    }
         \\};
     ;
-    var tree = try Ast.parse(gpa, src, .zig);
+    var tree = try Ast.parse(gpa, src, .{});
     defer tree.deinit(gpa);
     var cache = FileCache.init(gpa, &tree);
     defer cache.deinit();
@@ -1537,7 +1537,7 @@ test "FileCache: anyMethodAllocatesSelf detects type with heap factory method" {
         \\    pub fn deinit(self: *Bar) void { _ = self; }
         \\};
     ;
-    var tree = try Ast.parse(gpa, src, .zig);
+    var tree = try Ast.parse(gpa, src, .{});
     defer tree.deinit(gpa);
     var cache = FileCache.init(gpa, &tree);
     defer cache.deinit();
@@ -1559,7 +1559,7 @@ test "FileCache: summaryOfFn fills deep fields (heap_allocates_self + result_hea
         \\    }
         \\};
     ;
-    var tree = try Ast.parse(gpa, src, .zig);
+    var tree = try Ast.parse(gpa, src, .{});
     defer tree.deinit(gpa);
     var cache = FileCache.init(gpa, &tree);
     defer cache.deinit();
@@ -1584,7 +1584,7 @@ test "FileCache: summaryOf caches per body, classifies alloc as heap" {
         \\    return try gpa.alloc(u8, 1);
         \\}
     ;
-    var tree = try Ast.parse(gpa, src, .zig);
+    var tree = try Ast.parse(gpa, src, .{});
     defer tree.deinit(gpa);
     var cache = FileCache.init(gpa, &tree);
     defer cache.deinit();
@@ -1642,7 +1642,7 @@ test "FileCache: summaryByMethodCrossFile finds direct takes in imported file" {
         \\const destroyer = @import("./destroyer.zig");
         \\pub fn useNode(n: *destroyer.Node) void { _ = n; }
     ;
-    var consumer_tree = try Ast.parse(gpa, consumer_src, .zig);
+    var consumer_tree = try Ast.parse(gpa, consumer_src, .{});
     defer consumer_tree.deinit(gpa);
 
     var pc = project_cache_mod.ProjectCache.init(gpa, tio);
@@ -1703,7 +1703,7 @@ test "FileCache: resolveTransitiveTakes propagates through cross-file callee" {
         \\    node.kill(gpa);
         \\}
     ;
-    var tree = try Ast.parse(gpa, src, .zig);
+    var tree = try Ast.parse(gpa, src, .{});
     defer tree.deinit(gpa);
 
     var pc = project_cache_mod.ProjectCache.init(gpa, tio);
@@ -1740,7 +1740,7 @@ test "FileCache: may_free_fields keeps same-file field deinit (refactor regressi
         \\    pub fn deinitOuter(self: *Outer) void { self.inner.deinit(); }
         \\};
     ;
-    var tree = try Ast.parse(gpa, src, .zig);
+    var tree = try Ast.parse(gpa, src, .{});
     defer tree.deinit(gpa);
     var cache = FileCache.init(gpa, &tree);
     defer cache.deinit();
@@ -1761,7 +1761,7 @@ test "FileCache: may_free_fields drops field whose type lacks the method" {
         \\    pub fn deinitOuter(self: *Outer) void { self.inner.deinit(); }
         \\};
     ;
-    var tree = try Ast.parse(gpa, src, .zig);
+    var tree = try Ast.parse(gpa, src, .{});
     defer tree.deinit(gpa);
     var cache = FileCache.init(gpa, &tree);
     defer cache.deinit();
@@ -1815,7 +1815,7 @@ test "FileCache: may_free_fields resolves CROSS-FILE field deinit (#20)" {
         \\    pub fn deinitOuter(self: *Outer) void { self.inner.deinit(); }
         \\};
     ;
-    var tree = try Ast.parse(gpa, outer_src, .zig);
+    var tree = try Ast.parse(gpa, outer_src, .{});
     defer tree.deinit(gpa);
 
     var pc = project_cache_mod.ProjectCache.init(gpa, tio);
@@ -1874,7 +1874,7 @@ test "FileCache: summaryByMethodCrossFile resolves TRANSITIVE takes in foreign f
         \\const destroyer = @import("./destroyer.zig");
         \\pub fn useNode(n: *destroyer.Xf20Node) void { _ = n; }
     ;
-    var tree = try Ast.parse(gpa, consumer_src, .zig);
+    var tree = try Ast.parse(gpa, consumer_src, .{});
     defer tree.deinit(gpa);
 
     var pc = project_cache_mod.ProjectCache.init(gpa, tio);
@@ -1906,7 +1906,7 @@ test "FileCache: project-less FileCache computes transitive takes (#20 mechanism
         \\    pub fn reallyFree(self: *Xf20Node, g: std.mem.Allocator) void { g.destroy(self); }
         \\};
     ;
-    var tree = try Ast.parse(gpa, src, .zig);
+    var tree = try Ast.parse(gpa, src, .{});
     defer tree.deinit(gpa);
     // No setProject — exactly the project-less foreign cache that
     // summaryByMethodCrossFile constructs over rm.tree.
@@ -1933,7 +1933,7 @@ test "effect: may_grow propagates through same-file self.method() (#20)" {
         \\    fn outer(self: *T) void { self.grow(1); }
         \\};
     ;
-    var tree = try Ast.parse(gpa, src, .zig);
+    var tree = try Ast.parse(gpa, src, .{});
     defer tree.deinit(gpa);
     var cache = FileCache.init(gpa, &tree);
     defer cache.deinit();
@@ -1974,7 +1974,7 @@ test "effect: may_grow propagates across @import via method call (#20)" {
         \\const grower = @import("./grower.zig");
         \\pub fn run(g: *grower.Xf20Grower) void { g.add(1); }
     ;
-    var tree = try Ast.parse(gpa, caller_src, .zig);
+    var tree = try Ast.parse(gpa, caller_src, .{});
     defer tree.deinit(gpa);
     var pc = project_cache_mod.ProjectCache.init(gpa, tio);
     defer pc.deinit();
