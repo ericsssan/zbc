@@ -382,14 +382,16 @@ A clean diff that adds a new rule without trace calls is fine.
    canonical bug + the most likely false-positive shape +
    2-3 edge cases.
 
-5. **Register it** in `detectors.zig`:
-   - `const my_rule_mod = @import("rules/my_rule_name.zig");`
-   - Append `.{ .id = "my-rule-id", .check = my_rule_mod.check }` to
-     the `detectors` list.
-   - Append `_ = my_rule_mod;` to the test block at the bottom of the
-     file (refAllDecls includes inline tests in the test binary).
+5. **Register it** in `detectors.zig` with one line inside `Rules`:
 
-   No edit to `lib.zig` needed — the dispatch loop iterates the list.
+   ```zig
+   pub const @"my-rule-id" = @import("rules/my_rule_name.zig");
+   ```
+
+   The declaration name is the rule id — a quoted identifier, so
+   kebab-case needs no conversion — and the `detectors` dispatch table
+   plus the test refs are derived from it.  No separate id string to
+   keep in sync, and no edit to `lib.zig`.
 
 6. **Add to the rule catalog** in `rule_catalog.zig` (docs only — the
    catalog is not a dispatch list):
