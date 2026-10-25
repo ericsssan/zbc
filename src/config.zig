@@ -41,11 +41,9 @@ pub const Config = struct {
         ".destroy(",
     },
 
-    /// Which invariants to enforce.  zbc currently has exactly one
-    /// — arena_escape (slice borrowed from function-local arena
-    /// must not escape).  Kept as a list so future generic
-    /// invariants can be added without breaking the CLI surface.
-    enabled: []const Invariant = &all_invariants,
+    /// Which invariants to enforce.  Defaults to all of them; the
+    /// CLI narrows it via `--enable` / `--disable`.
+    enabled: []const Invariant = all_invariants,
 };
 
 /// Invariants zbc enforces.  All generic — no language-domain
@@ -829,121 +827,10 @@ pub const Invariant = enum {
     clamp_wrong_direction,
 };
 
-pub const all_invariants: [113]Invariant = .{
-    .arena_escape,
-    .stack_escape,
-    .use_undefined,
-    .heap_double_free,
-    .heap_use_after_free,
-    .arena_use_after_kill,
-    .allocator_mismatch,
-    .interior_pointer_destroy,
-    .heap_leak,
-    .partial_union_write,
-    .aliased_heap_dupe,
-    .clobbered_by_struct_reset,
-    .realloc_byte_count,
-    .asymmetric_field_free,
-    .missing_errdefer_between_tries,
-    .free_then_try_realloc,
-    .destroy_after_deinit_in_loop,
-    .dead_errdefer_in_result_fn,
-    .duplicate_errdefer,
-    .overwrite_without_deinit,
-    .stack_fallback_escape,
-    .unreleased_refs_on_error,
-    .hashmap_getptr_rehash,
-    .arraylist_items_slice,
-    .arraylist_element_ptr,
-    .fd_write_after_close,
-    .slice_of_arena_into_heap,
-    .free_without_null_then_check,
-    .tagged_union_retag_with_old_payload_read,
-    .union_deinit_without_inert_reset,
-    .self_undefined_after_destroy,
-    .missing_errdefer_on_out_param,
-    .reset_skips_pooled_resource_release,
-    .return_borrowed_payload,
-    .unreleased_factory_handle,
-    .memset_undef_after_len_truncation,
-    .publish_then_touch_self,
-    .missing_deinit_on_composed_owner,
-    .owned_field_no_outer_cleanup,
-    .borrowed_slice_into_out_param,
-    .defer_and_errdefer_free_overlap,
-    .sentinel_strip_free_size_mismatch,
-    .move_out_without_restore,
-    .deinit_order_violates_construction_dep,
-    .borrowed_slice_into_stack_buffer_returned,
-    .iterator_invalidation_mutation,
-    .thread_spawn_local_pointer,
-    .self_pointer_in_returned_value,
-    .getorput_unguarded_value_read,
-    .hashmap_iter_mutation,
-    .ref_before_ownership_transfer,
-    .opt_capture_ptr_after_field_clear,
-    .tagged_union_payload_early_exit,
-    .union_payload_ptr_after_variant_change,
-    .flag_reset_after_callback,
-    .slice_loop_reentrant_grow,
-    .scope_push_pop_imbalance,
-    .exit_callback_cross_thread,
-    .index_type_narrowing_wraparound,
-    .ref_counted_copy_without_dupe,
-    .arraybuffer_slice_without_pin,
-    .optional_fallback_wrong_side,
-    .escape_skip_without_bounds_recheck,
-    .recursive_parse_without_stack_check,
-    .slice_from_fixed_offset_without_len_check,
-    .divmod_by_len_without_nonempty_guard,
-    .negate_then_shift_without_minint_check,
-    .readint_unchecked_position_assignment,
-    .arraylist_sentinel_write_without_capacity,
-    .intfromfloat_without_clamp,
-    .int_sum_overflow_in_bounds_cmp,
-    .ptr_slice_without_bounds_check,
-    .mutex_double_lock,
-    .lock_held_across_early_exit,
-    .ptrfromint_zero,
-    .resize_result_discarded,
-    .errdefer_alive_after_ownership_transfer,
-    .f32_narrowing_int_to_float,
-    .array_maxint_off_by_one,
-    .intcast_clamp_uses_max,
-    .forced_unwrap_iterator_next,
-    .impossible_range_and,
-    .intcast_signed_timestamp,
-    .truncate_subtraction_without_guard,
-    .initcapacity_plain_add_overflow,
-    .index_minus_one_without_zero_guard,
-    .else_literal_absorbs_addend,
-    .catch_error_panic,
-    .toutf8_inline_slice_borrow,
-    .uv_return_value_intcast_truncation,
-    .tryget_orelse_unreachable,
-    .aligncast_on_byte_slice,
-    .truncate_len_to_narrow_int,
-    .field_self_assign_with_cast,
-    .maybe_assert_panics,
-    .return_arraylist_items,
-    .lessthan_uses_leq,
-    .duplicate_defer_free,
-    .hashmap_getentry_forced_unwrap,
-    .double_optional_ptr,
-    .aligncast_on_optional_unwrap,
-    .adjacent_decl_same_source_field,
-    .intcast_of_negated_signed,
-    .struct_literal_multiple_try,
-    .writeint_truncated_value,
-    .multiarray_items_deref_assign,
-    .startswith_strip_off_by_one,
-    .midpoint_addition_overflow,
-    .arena_allocator_free_noop,
-    .memcpy_overlapping_slices,
-    .cmpxchgweak_orelse_break,
-    .slice_write_at_len,
-    .clamp_wrong_direction,
-};
+/// Every invariant tag, in declaration order.  Derived from the enum
+/// so the array cannot drift from it.
+pub const all_invariants = std.enums.values(Invariant);
+
 
 pub const Default: Config = .{};
 
@@ -955,15 +842,29 @@ pub fn isEnabled(config: *const Config, inv: Invariant) bool {
     return false;
 }
 
-/// Map a CLI-style name to its Invariant tag.  Returns null on
-/// unknown names so callers can surface a useful error message
-/// rather than silently ignoring typos.
+/// Map a CLI-style name to its Invariant tag.  Accepts both the
+/// `snake_case` tag printed by `--list-invariants` and the kebab-case
+/// rule id printed in diagnostics, so `--disable=<id>` works with the
+/// string the user copied from a finding.  Returns null on unknown
+/// names so callers can surface a useful error rather than silently
+/// ignoring typos.
 pub fn invariantFromName(name: []const u8) ?Invariant {
     const info = @typeInfo(Invariant).@"enum";
     inline for (info.field_names, info.field_values) |fname, fvalue| {
-        if (std.mem.eql(u8, name, fname)) return @enumFromInt(fvalue);
+        if (std.mem.eql(u8, name, fname) or kebabMatches(fname, name))
+            return @enumFromInt(fvalue);
     }
     return null;
+}
+
+/// `field_name` with `_` read as `-` equals `name`.
+fn kebabMatches(field_name: []const u8, name: []const u8) bool {
+    if (field_name.len != name.len) return false;
+    for (field_name, name) |a, b| {
+        const norm: u8 = if (a == '_') '-' else a;
+        if (norm != b) return false;
+    }
+    return true;
 }
 
 // ── Tests ──────────────────────────────────────────────────
@@ -979,6 +880,11 @@ test "invariantFromName round-trips every variant" {
         const got = invariantFromName(fname).?;
         try std.testing.expectEqual(@as(Invariant, @enumFromInt(fvalue)), got);
     }
+}
+
+test "invariantFromName accepts kebab-case rule ids" {
+    try std.testing.expectEqual(Invariant.recursive_parse_without_stack_check, invariantFromName("recursive-parse-without-stack-check").?);
+    try std.testing.expectEqual(Invariant.heap_use_after_free, invariantFromName("heap-use-after-free").?);
 }
 
 test "invariantFromName returns null on unknown" {

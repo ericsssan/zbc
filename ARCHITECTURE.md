@@ -28,7 +28,9 @@ zbc/
 ├── main.zig                  — CLI
 ├── problem.zig               — Problem / Note / Pos / Severity
 ├── config.zig                — Config + Invariant enum
-├── rule_registry.zig         — comptime list of pattern rules + dispatch
+├── detectors.zig             — class 2: pattern rules + dispatch
+├── rule_catalog.zig          — rule docs for --list-rules / --explain
+├── invariants.zig            — reconciles the two check classes (tests)
 ├── file_cache.zig            — per-file shared state (FileModel + LocalBindings)
 │
 ├── lexer.zig                 — token primitives (matchBrace, FnDeclIter, …)
@@ -71,9 +73,8 @@ No umbrella module.  Each module is a clean dependency.
 
 `lib.zig::analyzeEscape` owns one `FileCache` per file.  After CFG
 analysis runs over every fn, it calls
-`rule_registry.runEscape(gpa, &tree, &cache, config, &problems)` —
-ONE call that iterates the comptime `escape_rules` list and dispatches
-each rule.
+`detectors.runEscape(gpa, &tree, &cache, config, &problems)` —
+ONE call that iterates the `detectors` list and dispatches each rule.
 
 Every rule's `check` signature is uniform-ish:
 
@@ -335,12 +336,10 @@ A clean diff that adds a new rule without trace calls is fine.
        ...
        my_rule_name,
    };
-   pub const all_invariants: [N]Invariant = .{
-       ...
-       .my_rule_name,
-   };
    ```
-   Bump the array length.
+   Nothing else: `all_invariants` is derived from the enum with
+   `std.enums.values`, and `invariants.zig` fails the tests until the
+   rule is dispatched and documented.
 
 3. **Write the rule** in `rules/<rule_name>.zig`:
    ```zig
@@ -383,16 +382,19 @@ A clean diff that adds a new rule without trace calls is fine.
    canonical bug + the most likely false-positive shape +
    2-3 edge cases.
 
-5. **Register it** in `rule_registry.zig`:
-   - `const my_rule_mod = @import("rules/my_rule_name.zig");`
-   - Append `.{ .id = "my-rule-id", .check = .{ .plain = my_rule_mod.check } }`
-     to `escape_rules` (or `.with_db = ...` if your rule takes a Db arg).
-   - Append `_ = my_rule_mod;` to the test block at the bottom of
-     the file (refAllDecls includes inline tests in the test binary).
+5. **Register it** in `detectors.zig` with one line inside `Rules`:
 
-   No edit to `lib.zig` needed — the dispatch loop iterates the registry.
+   ```zig
+   pub const @"my-rule-id" = @import("rules/my_rule_name.zig");
+   ```
 
-6. **Add to the rule catalog** in `rule_catalog.zig`:
+   The declaration name is the rule id — a quoted identifier, so
+   kebab-case needs no conversion — and the `detectors` dispatch table
+   plus the test refs are derived from it.  No separate id string to
+   keep in sync, and no edit to `lib.zig`.
+
+6. **Add to the rule catalog** in `rule_catalog.zig` (docs only — the
+   catalog is not a dispatch list):
    ```zig
    .{
        .id = "my-rule-id",
