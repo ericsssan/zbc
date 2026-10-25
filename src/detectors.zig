@@ -38,12 +38,14 @@ pub const Detector = struct {
 // ── Rule table ──────────────────────────────────────────────
 //
 // One line per rule.  The declaration name IS the rule id, written as a
-// quoted identifier so kebab-case needs no conversion.  Zig has no
-// comptime directory reflection, so this list stays written out; the
-// dispatch table and the test refs derive from it, and `invariants.zig`
-// proves each id is the kebab-case form of an `config.Invariant` tag.
+// quoted identifier so kebab-case needs no conversion.  `opaque` because
+// this is a namespace, not a value: it holds declarations and cannot be
+// instantiated.  Zig has no comptime directory reflection, so this list
+// stays written out; the dispatch table and the test refs derive from
+// it, and `invariants.zig` proves each id is the kebab-case form of a
+// `config.Invariant` tag.
 
-const Rules = struct {
+const Rules = opaque {
     pub const @"aliased-heap-dupe" = @import("rules/heap/aliased_heap_dupe.zig");
     pub const @"clobbered-by-struct-reset" = @import("rules/cleanup/clobbered_by_struct_reset.zig");
     pub const @"realloc-byte-count" = @import("rules/heap/realloc_byte_count.zig");
@@ -150,7 +152,7 @@ const Rules = struct {
 };
 
 pub const detectors = blk: {
-    const names = @typeInfo(Rules).@"struct".decl_names;
+    const names = @typeInfo(Rules).@"opaque".decl_names;
     var out: [names.len]Detector = undefined;
     for (names, 0..) |name, i| {
         out[i] = .{ .id = name, .check = @field(Rules, name).check };
