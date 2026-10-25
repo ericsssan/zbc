@@ -34,7 +34,7 @@ const skipNestedFn = tokens.skipNestedFn;
 
 const Problem = problem_mod.Problem;
 const Pos = problem_mod.Pos;
-const R = "recursive-parse-fn-without-stack-check";
+const R = "recursive-parse-without-stack-check";
 
 pub fn check(
     gpa: std.mem.Allocator,
@@ -332,7 +332,7 @@ fn report(
 
 // ── Tests ──────────────────────────────────────────────────
 
-test "recursive-parse-fn-without-stack-check: bare recursive parse call fires" {
+test "recursive-parse-without-stack-check: bare recursive parse call fires" {
     try testing.expectFires(check, R,
         \\const Parser = struct {
         \\    pub fn parseExpr(p: *Parser) !void {
@@ -343,7 +343,7 @@ test "recursive-parse-fn-without-stack-check: bare recursive parse call fires" {
     );
 }
 
-test "recursive-parse-fn-without-stack-check: method recursive call fires" {
+test "recursive-parse-without-stack-check: method recursive call fires" {
     try testing.expectFires(check, R,
         \\const Parser = struct {
         \\    pub fn parseExpr(p: *Parser) !void {
@@ -354,7 +354,7 @@ test "recursive-parse-fn-without-stack-check: method recursive call fires" {
     );
 }
 
-test "recursive-parse-fn-without-stack-check: skip fn without guard fires" {
+test "recursive-parse-without-stack-check: skip fn without guard fires" {
     try testing.expectFires(check, R,
         \\const Parser = struct {
         \\    pub fn skipType(p: *Parser) void {
@@ -365,7 +365,7 @@ test "recursive-parse-fn-without-stack-check: skip fn without guard fires" {
     );
 }
 
-test "recursive-parse-fn-without-stack-check: visit fn without guard fires" {
+test "recursive-parse-without-stack-check: visit fn without guard fires" {
     try testing.expectFires(check, R,
         \\const V = struct {
         \\    pub fn visitNode(self: *V) void {
@@ -376,7 +376,7 @@ test "recursive-parse-fn-without-stack-check: visit fn without guard fires" {
     );
 }
 
-test "recursive-parse-fn-without-stack-check: recursive fn with is_safe_to_recurse guard does not fire" {
+test "recursive-parse-without-stack-check: recursive fn with is_safe_to_recurse guard does not fire" {
     try testing.expectNoFire(check,
         \\const Parser = struct {
         \\    pub fn parseExpr(p: *Parser) !void {
@@ -388,7 +388,7 @@ test "recursive-parse-fn-without-stack-check: recursive fn with is_safe_to_recur
     );
 }
 
-test "recursive-parse-fn-without-stack-check: recursive fn with depth param does not fire" {
+test "recursive-parse-without-stack-check: recursive fn with depth param does not fire" {
     try testing.expectNoFire(check,
         \\const Parser = struct {
         \\    pub fn parseExpr(p: *Parser, depth: u32) !void {
@@ -399,7 +399,7 @@ test "recursive-parse-fn-without-stack-check: recursive fn with depth param does
     );
 }
 
-test "recursive-parse-fn-without-stack-check: non-recursive parse fn does not fire" {
+test "recursive-parse-without-stack-check: non-recursive parse fn does not fire" {
     try testing.expectNoFire(check,
         \\const Parser = struct {
         \\    pub fn parseExpr(p: *Parser) !void {
@@ -410,7 +410,7 @@ test "recursive-parse-fn-without-stack-check: non-recursive parse fn does not fi
     );
 }
 
-test "recursive-parse-fn-without-stack-check: non-parser fn does not fire" {
+test "recursive-parse-without-stack-check: non-parser fn does not fire" {
     try testing.expectNoFire(check,
         \\const Allocator = struct {
         \\    pub fn allocate(a: *Allocator) !void {
@@ -421,7 +421,7 @@ test "recursive-parse-fn-without-stack-check: non-parser fn does not fire" {
     );
 }
 
-test "recursive-parse-fn-without-stack-check: graph visitor with visited-set guard does not fire" {
+test "recursive-parse-without-stack-check: graph visitor with visited-set guard does not fire" {
     try testing.expectNoFire(check,
         \\const Graph = struct {
         \\    pub fn visit(self: *Graph, index: usize) void {
@@ -434,7 +434,7 @@ test "recursive-parse-fn-without-stack-check: graph visitor with visited-set gua
     );
 }
 
-test "recursive-parse-fn-without-stack-check: visitor with seen.contains guard does not fire" {
+test "recursive-parse-without-stack-check: visitor with seen.contains guard does not fire" {
     try testing.expectNoFire(check,
         \\const Walker = struct {
         \\    pub fn visitNode(self: *Walker, n: *Node) void {
@@ -446,7 +446,7 @@ test "recursive-parse-fn-without-stack-check: visitor with seen.contains guard d
     );
 }
 
-test "recursive-parse-fn-without-stack-check: enterRecursion() guard does not fire" {
+test "recursive-parse-without-stack-check: enterRecursion() guard does not fire" {
     try testing.expectNoFire(check,
         \\const Parser = struct {
         \\    pub fn parseStatement(self: *Parser) !void {
@@ -459,7 +459,7 @@ test "recursive-parse-fn-without-stack-check: enterRecursion() guard does not fi
     );
 }
 
-test "recursive-parse-fn-without-stack-check: inline recursion_depth field cap does not fire" {
+test "recursive-parse-without-stack-check: inline recursion_depth field cap does not fire" {
     try testing.expectNoFire(check,
         \\const Parser = struct {
         \\    pub fn parseType(p: *Parser) !void {
@@ -473,7 +473,7 @@ test "recursive-parse-fn-without-stack-check: inline recursion_depth field cap d
     );
 }
 
-test "recursive-parse-fn-without-stack-check: scan fn without guard fires" {
+test "recursive-parse-without-stack-check: scan fn without guard fires" {
     try testing.expectFires(check, R,
         \\const Lexer = struct {
         \\    pub fn scanToken(l: *Lexer) void {
@@ -484,7 +484,7 @@ test "recursive-parse-fn-without-stack-check: scan fn without guard fires" {
     );
 }
 
-test "recursive-parse-fn-without-stack-check: comptime type dispatch does not fire" {
+test "recursive-parse-without-stack-check: comptime type dispatch does not fire" {
     // `fn parse(comptime T: type, …)` — each call instantiates a DIFFERENT
     // function at compile time; there is no runtime recursion.
     try testing.expectNoFire(check,
@@ -502,7 +502,7 @@ test "recursive-parse-fn-without-stack-check: comptime type dispatch does not fi
     );
 }
 
-test "recursive-parse-fn-without-stack-check: comptime bool as first param does not fire" {
+test "recursive-parse-without-stack-check: comptime bool as first param does not fire" {
     // `fn parseKey(comptime check_export: bool, …)` with comptime FIRST —
     // each instantiation is a distinct function; calling with false != true.
     try testing.expectNoFire(check,
@@ -516,7 +516,7 @@ test "recursive-parse-fn-without-stack-check: comptime bool as first param does 
     );
 }
 
-test "recursive-parse-fn-without-stack-check: visits.isSet guard does not fire" {
+test "recursive-parse-without-stack-check: visits.isSet guard does not fire" {
     // Variable named 'visits' (plural) should suppress like 'visited'.
     try testing.expectNoFire(check,
         \\const Walker = struct {

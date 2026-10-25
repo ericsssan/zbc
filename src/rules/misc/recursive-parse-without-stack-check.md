@@ -1,4 +1,4 @@
-# recursive-parse-fn-without-stack-check
+# recursive-parse-without-stack-check
 
 **Severity:** error  
 **Category:** stack overflow / denial of service  

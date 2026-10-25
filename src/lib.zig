@@ -9,6 +9,8 @@ const worklist = @import("flow/worklist.zig");
 const config_mod = @import("config.zig");
 const problem_mod = @import("problem.zig");
 const rule_catalog_mod = @import("rule_catalog.zig");
+const detectors_mod = @import("detectors.zig");
+const invariants_mod = @import("invariants.zig");
 const file_cache_mod = @import("cache/file_cache.zig");
 const suppressions_mod = @import("suppressions.zig");
 const zls_resolver_mod = @import("type_resolver.zig");
@@ -27,6 +29,9 @@ pub const Severity = problem_mod.Severity;
 pub const Verdict = problem_mod.Verdict;
 pub const Rule = rule_catalog_mod.Rule;
 pub const rule_catalog = rule_catalog_mod.all;
+pub const detectors = detectors_mod.detectors;
+pub const InvariantClass = invariants_mod.Class;
+pub const classOfRuleId = invariants_mod.classOfRuleId;
 pub const lookupRule = rule_catalog_mod.lookup;
 pub const trace = @import("trace.zig");
 pub fn analyzeEscape(
@@ -102,9 +107,8 @@ pub fn analyzeEscape(
         try worklist.check(gpa, &cfg, .{ .path = path, .config = config }, &problems);
     }
 
-    // Pattern detectors — dispatched via the comptime registry so
-    // adding a rule is a one-file change (see rule_catalog.zig).
-    try rule_catalog_mod.runEscape(gpa, &tree, &rule_cache, config, &problems);
+    // Class 2 — pattern detectors, dispatched from their own registry.
+    try detectors_mod.runEscape(gpa, &tree, &rule_cache, config, &problems);
 
     // Apply per-line suppressions parsed from `// zbc-disable-line` /
     // `// zbc-disable-next-line` source comments.  Filter happens at
@@ -388,10 +392,11 @@ test {
     _ = @import("flow/abstract_state.zig");
     _ = @import("flow/cfg_transfer.zig");
     _ = @import("flow/value_range.zig");
-    // Pattern rules are registered in rule_catalog_mod alongside the
-    // catalog metadata; pulling it in refAllDecls'es every rule
-    // module so inline tests run.
+    // Detector rules are registered in detectors_mod; pulling it in
+    // refAllDecls'es every rule module so inline tests run.
+    _ = detectors_mod;
     _ = rule_catalog_mod;
+    _ = invariants_mod;
     _ = file_cache_mod;
     _ = suppressions_mod;
     _ = @import("model/fn_summary.zig");

@@ -21,7 +21,7 @@ const Ast = std.zig.Ast;
 
 const cfg_builder = @import("flow/cfg_builder.zig");
 const worklist = @import("flow/worklist.zig");
-const rule_catalog = @import("rule_catalog.zig");
+const detectors = @import("detectors.zig");
 const config_mod = @import("config.zig");
 const file_cache_mod = @import("cache/file_cache.zig");
 const problem_mod = @import("problem.zig");
@@ -99,7 +99,7 @@ pub fn analyzeBytes(gpa: std.mem.Allocator, raw: []const u8) !void {
         try worklist.check(gpa, &cfg_mut, .{ .path = "<fuzz>", .config = config }, &problems);
     }
 
-    try rule_catalog.runEscape(gpa, &tree, &cache, config, &problems);
+    try detectors.runEscape(gpa, &tree, &cache, config, &problems);
 
     for (problems.items) |*p| p.deinit(gpa);
     problems.deinit(gpa);

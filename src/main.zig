@@ -58,7 +58,7 @@ pub fn main(init: std.process.Init) !void {
     defer paths.deinit(gpa);
     var enabled: std.ArrayListUnmanaged(lib.Invariant) = .empty;
     defer enabled.deinit(gpa);
-    try enabled.appendSlice(gpa, &lib.all_invariants);
+    try enabled.appendSlice(gpa, lib.all_invariants);
     var enabled_explicit = false;
     var format: Format = .rich;
     var color_off = false;
@@ -918,7 +918,7 @@ test "parseInvariantList: remove from a set" {
     const gpa = std.testing.allocator;
     var list: std.ArrayListUnmanaged(lib.Invariant) = .empty;
     defer list.deinit(gpa);
-    try list.appendSlice(gpa, &lib.all_invariants);
+    try list.appendSlice(gpa, lib.all_invariants);
     try parseInvariantList(gpa, "arena_escape", &list, .remove);
     try std.testing.expect(!containsInvariant(list.items, .arena_escape));
 }
